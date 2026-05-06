@@ -31,6 +31,21 @@ uniform float u_blacks;
 uniform float u_contrast;
 uniform float u_vibrance;
 uniform float u_saturation;
+uniform float u_clarity;
+uniform float u_dehaze;
+// HSL Color Mixer (8 ranges × 3 adjustments)
+uniform float u_hsl_h[8];
+uniform float u_hsl_s[8];
+uniform float u_hsl_l[8];
+// Color Grading
+uniform float u_grad_sh_h;
+uniform float u_grad_sh_s;
+uniform float u_grad_md_h;
+uniform float u_grad_md_s;
+uniform float u_grad_hl_h;
+uniform float u_grad_hl_s;
+uniform float u_grad_blend;
+uniform float u_grad_balance;
 
 ${LUMA}
 
@@ -50,6 +65,54 @@ vec3 kelvinToRGB(float K) {
 
 float linearToSRGB(float c) {
   return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+
+// --- HSL / Color Grading helpers ---
+
+float rgbHue(vec3 c) {
+  float mx = max(max(c.r, c.g), c.b);
+  float mn = min(min(c.r, c.g), c.b);
+  float ch = mx - mn;
+  if (ch < 1e-5) return 0.0;
+  float h;
+  if (c.r >= mx)      h = (c.g - c.b) / ch;
+  else if (c.g >= mx) h = 2.0 + (c.b - c.r) / ch;
+  else                h = 4.0 + (c.r - c.g) / ch;
+  return fract(h / 6.0);
+}
+
+float hueMask(float h, float center) {
+  float d = abs(h - center);
+  d = min(d, 1.0 - d);
+  return clamp(1.0 - d / 0.07, 0.0, 1.0);
+}
+
+// Rodrigues rotation around the luminance axis (1,1,1)
+vec3 hueRotate(vec3 c, float theta) {
+  if (abs(theta) < 1e-5) return c;
+  float co = cos(theta);
+  float si = sin(theta);
+  float a = (1.0 - co) / 3.0;
+  float b = si / 1.7320508; // sqrt(3)
+  return vec3(
+    c.r * (co + a) + c.g * (a - b) + c.b * (a + b),
+    c.r * (a + b) + c.g * (co + a) + c.b * (a - b),
+    c.r * (a - b) + c.g * (a + b) + c.b * (co + a)
+  );
+}
+
+vec3 hsvToRgb(float h, float s) {
+  h = fract(h) * 6.0;
+  float c = s;
+  float x = c * (1.0 - abs(mod(h, 2.0) - 1.0));
+  vec3 rgb;
+  if (h < 1.0)      rgb = vec3(c, x, 0.0);
+  else if (h < 2.0) rgb = vec3(x, c, 0.0);
+  else if (h < 3.0) rgb = vec3(0.0, c, x);
+  else if (h < 4.0) rgb = vec3(0.0, x, c);
+  else if (h < 5.0) rgb = vec3(x, 0.0, c);
+  else              rgb = vec3(c, 0.0, x);
+  return rgb + (1.0 - c);
 }
 
 void main() {
@@ -99,6 +162,65 @@ void main() {
   }
   c = max(grey + chroma, vec3(0.0));
 
+  // --- Clarity (mid-tone contrast) ---
+  if (u_clarity != 0.0) {
+    float lum2 = dot(c, LUMA);
+    float midMask = clamp(1.0 - abs(lum2 - 0.5) * 2.0, 0.0, 1.0);
+    c = max(c + (c - 0.5) * u_clarity * midMask * 0.5, vec3(0.0));
+  }
+
+  // --- Dehaze (global contrast + saturation boost) ---
+  if (u_dehaze != 0.0) {
+    c = max(c + (c - 0.5) * u_dehaze * 0.35, vec3(0.0));
+    float l3 = dot(c, LUMA);
+    vec3 ch3 = c - vec3(l3);
+    c = max(l3 + ch3 * (1.0 + u_dehaze * 0.25), vec3(0.0));
+  }
+
+  // --- HSL Color Mixer ---
+  {
+    float h = rgbHue(c);
+    float m0 = hueMask(h, 0.000); // Red
+    float m1 = hueMask(h, 0.069); // Orange
+    float m2 = hueMask(h, 0.167); // Yellow
+    float m3 = hueMask(h, 0.333); // Green
+    float m4 = hueMask(h, 0.500); // Aqua
+    float m5 = hueMask(h, 0.667); // Blue
+    float m6 = hueMask(h, 0.778); // Purple
+    float m7 = hueMask(h, 0.889); // Magenta
+
+    float hAdj = m0*u_hsl_h[0] + m1*u_hsl_h[1] + m2*u_hsl_h[2] + m3*u_hsl_h[3]
+               + m4*u_hsl_h[4] + m5*u_hsl_h[5] + m6*u_hsl_h[6] + m7*u_hsl_h[7];
+    float sAdj = m0*u_hsl_s[0] + m1*u_hsl_s[1] + m2*u_hsl_s[2] + m3*u_hsl_s[3]
+               + m4*u_hsl_s[4] + m5*u_hsl_s[5] + m6*u_hsl_s[6] + m7*u_hsl_s[7];
+    float lAdj = m0*u_hsl_l[0] + m1*u_hsl_l[1] + m2*u_hsl_l[2] + m3*u_hsl_l[3]
+               + m4*u_hsl_l[4] + m5*u_hsl_l[5] + m6*u_hsl_l[6] + m7*u_hsl_l[7];
+
+    // Hue rotation
+    if (abs(hAdj) > 0.001) c = hueRotate(c, hAdj * 0.7);
+    // Saturation
+    if (abs(sAdj) > 0.001) {
+      float gl = dot(c, LUMA);
+      c = max(vec3(gl) + (c - vec3(gl)) * (1.0 + sAdj), vec3(0.0));
+    }
+    // Luminance
+    if (abs(lAdj) > 0.001) c = max(c + lAdj * 0.35, vec3(0.0));
+  }
+
+  // --- Color Grading ---
+  if (u_grad_blend > 0.001) {
+    float lg = dot(c, LUMA);
+    float bal = u_grad_balance * 0.5;
+    float shW = clamp(1.0 - smoothstep(0.15 + bal, 0.45 + bal, lg), 0.0, 1.0);
+    float hlW = clamp(smoothstep(0.55 + bal, 0.85 + bal, lg), 0.0, 1.0);
+    float mdW = clamp(1.0 - shW - hlW, 0.0, 1.0);
+    vec3 shC = hsvToRgb(u_grad_sh_h, u_grad_sh_s);
+    vec3 mdC = hsvToRgb(u_grad_md_h, u_grad_md_s);
+    vec3 hlC = hsvToRgb(u_grad_hl_h, u_grad_hl_s);
+    vec3 tinted = c * shC * shW + c * mdC * mdW + c * hlC * hlW;
+    c = mix(c, tinted, u_grad_blend);
+  }
+
   // --- Gamma (Linear → sRGB) ---
   outColor = vec4(linearToSRGB(c.r), linearToSRGB(c.g), linearToSRGB(c.b), 1.0);
 }`;
@@ -114,6 +236,11 @@ export const PASSES: PassDef[] = [
   { name: "process", fsSource: PROCESS_SHADER, uniforms: [
     "u_temperature", "u_tint", "u_exposure",
     "u_highlights", "u_shadows", "u_whites", "u_blacks",
-    "u_contrast", "u_vibrance", "u_saturation",
+    "u_contrast", "u_vibrance", "u_saturation", "u_clarity", "u_dehaze",
+    "u_hsl_h[0]","u_hsl_h[1]","u_hsl_h[2]","u_hsl_h[3]","u_hsl_h[4]","u_hsl_h[5]","u_hsl_h[6]","u_hsl_h[7]",
+    "u_hsl_s[0]","u_hsl_s[1]","u_hsl_s[2]","u_hsl_s[3]","u_hsl_s[4]","u_hsl_s[5]","u_hsl_s[6]","u_hsl_s[7]",
+    "u_hsl_l[0]","u_hsl_l[1]","u_hsl_l[2]","u_hsl_l[3]","u_hsl_l[4]","u_hsl_l[5]","u_hsl_l[6]","u_hsl_l[7]",
+    "u_grad_sh_h","u_grad_sh_s","u_grad_md_h","u_grad_md_s",
+    "u_grad_hl_h","u_grad_hl_s","u_grad_blend","u_grad_balance",
   ]},
 ];

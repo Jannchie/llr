@@ -11,14 +11,26 @@ export interface EditParams {
   exposure: number; contrast: number; saturation: number;
   temperature: number; tint: number;
   highlights: number; shadows: number; whites: number; blacks: number;
-  vibrance: number;
+  vibrance: number; clarity: number; dehaze: number;
+  // HSL (8 ranges, each [-1, 1])
+  hslH: number[]; hslS: number[]; hslL: number[];
+  // Color Grading (all [-1, 1] except blend [0, 1])
+  gradShH: number; gradShS: number;
+  gradMdH: number; gradMdS: number;
+  gradHlH: number; gradHlS: number;
+  gradBlend: number; gradBalance: number;
 }
+
+const HSL_ZERO = [0, 0, 0, 0, 0, 0, 0, 0];
 
 export const DEFAULT_PARAMS: EditParams = {
   exposure: 0, contrast: 1, saturation: 1,
   temperature: 6500, tint: 0,
   highlights: 0, shadows: 0, whites: 0, blacks: 0,
-  vibrance: 1,
+  vibrance: 1, clarity: 0, dehaze: 0,
+  hslH: [...HSL_ZERO], hslS: [...HSL_ZERO], hslL: [...HSL_ZERO],
+  gradShH: 0, gradShS: 0, gradMdH: 0, gradMdS: 0,
+  gradHlH: 0, gradHlS: 0, gradBlend: 0, gradBalance: 0,
 };
 
 export class PipelineRenderer {
@@ -93,6 +105,19 @@ export class PipelineRenderer {
     s("u_exposure", p.exposure); s("u_highlights", p.highlights);
     s("u_shadows", p.shadows); s("u_whites", p.whites); s("u_blacks", p.blacks);
     s("u_contrast", p.contrast); s("u_vibrance", p.vibrance); s("u_saturation", p.saturation);
+    s("u_clarity", p.clarity / 100);
+    s("u_dehaze", p.dehaze / 100);
+    // HSL
+    for (let i = 0; i < 8; i++) {
+      s(`u_hsl_h[${i}]`, p.hslH?.[i] ?? 0);
+      s(`u_hsl_s[${i}]`, p.hslS?.[i] ?? 0);
+      s(`u_hsl_l[${i}]`, p.hslL?.[i] ?? 0);
+    }
+    // Color Grading
+    s("u_grad_sh_h", p.gradShH ?? 0); s("u_grad_sh_s", p.gradShS ?? 0);
+    s("u_grad_md_h", p.gradMdH ?? 0); s("u_grad_md_s", p.gradMdS ?? 0);
+    s("u_grad_hl_h", p.gradHlH ?? 0); s("u_grad_hl_s", p.gradHlS ?? 0);
+    s("u_grad_blend", p.gradBlend ?? 0); s("u_grad_balance", p.gradBalance ?? 0);
   }
 
   private compileProgram(fsSource: string): WebGLProgram {

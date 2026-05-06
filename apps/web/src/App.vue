@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { PipelineRenderer, type EditParams } from "./rendering/pipeline-renderer";
+import { computeHistogram, renderHistogram } from "./rendering/histogram";
 
 // ── types ──
 
 type Source = { id: string; name: string; size: number; embeddedUrl: string; };
-type RecipeKey = "exposure"|"contrast"|"highlights"|"shadows"|"whites"|"blacks"|"vibrance"|"saturation"|"temperature"|"tint";
+type RecipeKey = "exposure"|"contrast"|"highlights"|"shadows"|"whites"|"blacks"|"vibrance"|"saturation"|"temperature"|"tint"|"clarity"|"dehaze";
 type Recipe = Record<RecipeKey, number>;
 type SliderSpec = { key: RecipeKey; label: string; min: number; max: number; step: number };
 type SliderGroup = { title: string; items: SliderSpec[] };
@@ -15,17 +16,21 @@ const API = (import.meta.env.VITE_API_URL as string | undefined) ?? "/api";
 const defaultRecipe = (): Recipe => ({
   exposure: 0, contrast: 0, highlights: 0, shadows: 0,
   whites: 0, blacks: 0, vibrance: 0, saturation: 0,
-  temperature: 6500, tint: 0,
+  temperature: 6500, tint: 0, clarity: 0, dehaze: 0,
 });
 
 const groups: SliderGroup[] = [
-  { title: "Light", items: [
+  { title: "Tone", items: [
     { key: "exposure", label: "Exposure", min: -5, max: 5, step: 0.1 },
     { key: "contrast", label: "Contrast", min: -100, max: 100, step: 1 },
     { key: "highlights", label: "Highlights", min: -100, max: 100, step: 1 },
     { key: "shadows", label: "Shadows", min: -100, max: 100, step: 1 },
     { key: "whites", label: "Whites", min: -100, max: 100, step: 1 },
     { key: "blacks", label: "Blacks", min: -100, max: 100, step: 1 },
+  ]},
+  { title: "Presence", items: [
+    { key: "clarity", label: "Clarity", min: -100, max: 100, step: 1 },
+    { key: "dehaze", label: "Dehaze", min: -100, max: 100, step: 1 },
   ]},
   { title: "Color", items: [
     { key: "temperature", label: "Temp", min: 2000, max: 12000, step: 50 },
@@ -34,6 +39,12 @@ const groups: SliderGroup[] = [
     { key: "saturation", label: "Saturation", min: -100, max: 100, step: 1 },
   ]},
 ];
+
+const SLIDER_DEFAULTS: Record<string, number> = {
+  exposure: 0, contrast: 0, highlights: 0, shadows: 0,
+  whites: 0, blacks: 0, clarity: 0, dehaze: 0,
+  temperature: 6500, tint: 0, vibrance: 0, saturation: 0,
+};
 
 // ── state ──
 
@@ -52,7 +63,91 @@ let webglRenderer: PipelineRenderer | null = null;
 let rafId = 0;
 let drawPending = false;
 
+// ── Pan / Zoom state ──
+const zoom = ref(0); // 0 = no image, 1 = fit to viewport
+const pan = reactive({ x: 0, y: 0 });
+const fitScale = ref(1);
+const imageW = ref(0);
+const imageH = ref(0);
+const viewportRef = ref<HTMLDivElement | null>(null);
+const isPanning = ref(false);
+let panStartX = 0;
+let panStartY = 0;
+let panStartPanX = 0;
+let panStartPanY = 0;
+let resizeObs: ResizeObserver | null = null;
+
+// ── HSL & Color Grading state ──
+
+const HSL_RANGES = [
+  { name: "Red",     color: "#e04040" },
+  { name: "Orange",  color: "#e08040" },
+  { name: "Yellow",  color: "#c0b030" },
+  { name: "Green",   color: "#40b040" },
+  { name: "Aqua",    color: "#40a0a0" },
+  { name: "Blue",    color: "#4060d0" },
+  { name: "Purple",  color: "#8040c0" },
+  { name: "Magenta", color: "#c04090" },
+];
+
+const hslHue = reactive([0, 0, 0, 0, 0, 0, 0, 0]);
+const hslSat = reactive([0, 0, 0, 0, 0, 0, 0, 0]);
+const hslLum = reactive([0, 0, 0, 0, 0, 0, 0, 0]);
+const hslTab = ref<"hue"|"sat"|"lum">("hue");
+
+const grading = reactive({
+  shH: 0, shS: 0,
+  mdH: 0, mdS: 0,
+  hlH: 0, hlS: 0,
+  blend: 0,
+  balance: 0,
+});
+
+function hslValue(i: number): number {
+  if (hslTab.value === "hue") return hslHue[i];
+  if (hslTab.value === "sat") return hslSat[i];
+  return hslLum[i];
+}
+function setHsl(i: number, v: number): void {
+  if (hslTab.value === "hue") hslHue[i] = v;
+  else if (hslTab.value === "sat") hslSat[i] = v;
+  else hslLum[i] = v;
+}
+function gradingColor(key: string): string {
+  const g = grading as Record<string, number>;
+  const h = g[key + "H"] ?? 0;
+  const s = g[key + "S"] ?? 0;
+  // Convert hue [-180,180] + sat [0,100] to CSS hsl
+  const hueDeg = ((h % 360) + 360) % 360;
+  return `hsl(${hueDeg}, ${s}%, 50%)`;
+}
+function resetHslGrading(): void {
+  for (let i = 0; i < 8; i++) { hslHue[i] = 0; hslSat[i] = 0; hslLum[i] = 0; }
+  grading.shH = 0; grading.shS = 0;
+  grading.mdH = 0; grading.mdS = 0;
+  grading.hlH = 0; grading.hlS = 0;
+  grading.blend = 0;
+  grading.balance = 0;
+}
+
 const activeSource = computed(() => sources.value.find(s => s.id === activeId.value) ?? null);
+
+const displayTransform = computed(() => {
+  if (!imageW.value || !imageH.value) return '';
+  const vp = viewportRef.value;
+  if (!vp) return '';
+  const vw = vp.clientWidth;
+  const vh = vp.clientHeight;
+  const scale = fitScale.value * zoom.value;
+  const tx = (vw - imageW.value * scale) / 2 + pan.x;
+  const ty = (vh - imageH.value * scale) / 2 + pan.y;
+  return `translate(${tx}px, ${ty}px) scale(${scale})`;
+});
+
+const zoomPercent = computed(() => {
+  if (!imageW.value || !imageH.value) return 0;
+  return Math.round(fitScale.value * zoom.value * 100);
+});
 
 // ── WebGL ──
 
@@ -66,15 +161,72 @@ function buildPipelineParams(): Partial<EditParams> {
     whites: recipe.whites / 100,
     blacks: recipe.blacks / 100,
     vibrance: 1 + recipe.vibrance / 100,
+    clarity: recipe.clarity,
+    dehaze: recipe.dehaze,
     temperature: recipe.temperature,
     tint: recipe.tint,
+    hslH: hslHue.map(v => v / 100),
+    hslS: hslSat.map(v => v / 100),
+    hslL: hslLum.map(v => v / 100),
+    gradShH: grading.shH / 180, gradShS: grading.shS / 100,
+    gradMdH: grading.mdH / 180, gradMdS: grading.mdS / 100,
+    gradHlH: grading.hlH / 180, gradHlS: grading.hlS / 100,
+    gradBlend: grading.blend / 100,
+    gradBalance: grading.balance / 100,
   };
+}
+
+// ── Histogram ──
+
+let linearFloatData: Float32Array | null = null;
+const histoCanvasRef = ref<HTMLCanvasElement | null>(null);
+
+function updateHistogram(): void {
+  const canvas = histoCanvasRef.value;
+  if (!canvas || !linearFloatData || !imageW.value || !imageH.value) return;
+  const rect = canvas.getBoundingClientRect();
+  let w = rect.width;
+  let h = rect.height;
+  // If canvas not laid out, try parent dimensions; retry next frame as last resort
+  if (w <= 0 || h <= 0) {
+    const parent = canvas.parentElement;
+    if (parent) { w = parent.clientWidth - 24; h = 80; }
+    if (w <= 0) { requestAnimationFrame(() => updateHistogram()); return; }
+  }
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const params = buildPipelineParams();
+  const bins = computeHistogram(linearFloatData, imageW.value, imageH.value, {
+    exposure: params.exposure ?? 0,
+    contrast: params.contrast ?? 1,
+    saturation: params.saturation ?? 1,
+    temperature: params.temperature ?? 6500,
+    tint: params.tint ?? 0,
+    highlights: params.highlights ?? 0,
+    shadows: params.shadows ?? 0,
+    whites: params.whites ?? 0,
+    blacks: params.blacks ?? 0,
+    vibrance: params.vibrance ?? 1,
+    clarity: params.clarity ?? 0,
+    dehaze: params.dehaze ?? 0,
+  });
+  renderHistogram(ctx, w, h, bins);
+}
+
+function scheduleHistogram(): void {
+  updateHistogram();
+  // Safety net: always retry next frame in case layout hadn't settled
+  requestAnimationFrame(() => updateHistogram());
 }
 
 function scheduleWebGLDraw(): void {
   if (drawPending) return;
   drawPending = true;
-  rafId = requestAnimationFrame(() => { drawPending = false; drawWebGL(); });
+  rafId = requestAnimationFrame(() => { drawPending = false; drawWebGL(); scheduleHistogram(); });
 }
 
 function drawWebGL(): void {
@@ -85,12 +237,104 @@ function drawWebGL(): void {
 function destroyWebGL(): void {
   if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
   drawPending = false;
+  linearFloatData = null;
   if (webglRenderer) { webglRenderer.destroy(); webglRenderer = null; }
+}
+
+// ── Pan / Zoom ──
+
+function startPan(e: MouseEvent): void {
+  if (e.button !== 0) return;
+  isPanning.value = true;
+  panStartX = e.clientX;
+  panStartY = e.clientY;
+  panStartPanX = pan.x;
+  panStartPanY = pan.y;
+}
+
+function doPan(e: MouseEvent): void {
+  if (!isPanning.value) return;
+  pan.x = panStartPanX + (e.clientX - panStartX);
+  pan.y = panStartPanY + (e.clientY - panStartY);
+}
+
+function stopPan(): void {
+  isPanning.value = false;
+}
+
+function applyZoom(newZoom: number, mx: number, my: number): void {
+  if (!viewportRef.value || !imageW.value || !imageH.value) return;
+  const vp = viewportRef.value;
+  const vw = vp.clientWidth;
+  const vh = vp.clientHeight;
+  const oldScale = fitScale.value * zoom.value;
+  const newScale = fitScale.value * newZoom;
+  const oldTx = (vw - imageW.value * oldScale) / 2 + pan.x;
+  const oldTy = (vh - imageH.value * oldScale) / 2 + pan.y;
+  const imgX = (mx - oldTx) / oldScale;
+  const imgY = (my - oldTy) / oldScale;
+  pan.x = (mx - imgX * newScale) - (vw - imageW.value * newScale) / 2;
+  pan.y = (my - imgY * newScale) - (vh - imageH.value * newScale) / 2;
+  zoom.value = newZoom;
+}
+
+function onWheel(e: WheelEvent): void {
+  if (!imageW.value || !imageH.value || !viewportRef.value) return;
+  e.preventDefault();
+  const delta = -e.deltaY;
+  const factor = delta > 0 ? 1.1 : 1 / 1.1;
+  const newZoom = Math.max(0.1, Math.min(50, zoom.value * factor));
+  if (newZoom === zoom.value) return;
+  const vp = viewportRef.value;
+  const rect = vp.getBoundingClientRect();
+  applyZoom(newZoom, e.clientX - rect.left, e.clientY - rect.top);
+}
+
+function zoomIn(): void {
+  const newZoom = Math.min(50, zoom.value * 1.25);
+  const vp = viewportRef.value;
+  if (vp) applyZoom(newZoom, vp.clientWidth / 2, vp.clientHeight / 2);
+}
+
+function zoomOut(): void {
+  const newZoom = Math.max(0.1, zoom.value / 1.25);
+  const vp = viewportRef.value;
+  if (vp) applyZoom(newZoom, vp.clientWidth / 2, vp.clientHeight / 2);
+}
+
+function fitView(): void {
+  zoom.value = 1;
+  pan.x = 0;
+  pan.y = 0;
+}
+
+function onDoubleClick(e: MouseEvent): void {
+  if (!imageW.value || !imageH.value || !viewportRef.value) return;
+  if (zoom.value === 1) {
+    const newZoom = Math.min(50, 1 / fitScale.value);
+    const rect = viewportRef.value.getBoundingClientRect();
+    applyZoom(newZoom, e.clientX - rect.left, e.clientY - rect.top);
+  } else {
+    fitView();
+  }
+}
+
+function onKeyDown(e: KeyboardEvent): void {
+  if (!imageW.value || !imageH.value) return;
+  if (e.ctrlKey || e.metaKey) {
+    switch (e.key) {
+      case '0': e.preventDefault(); fitView(); break;
+      case '=': case '+': e.preventDefault(); zoomIn(); break;
+      case '-': e.preventDefault(); zoomOut(); break;
+    }
+  }
 }
 
 // ── upload ──
 
 watch(recipe, () => scheduleWebGLDraw(), { deep: true });
+watch([hslHue, hslSat, hslLum], () => scheduleWebGLDraw(), { deep: true });
+watch(grading, () => scheduleWebGLDraw(), { deep: true });
 
 // Re-decode when DCP code changes
 let currentSourceId = "";
@@ -118,10 +362,22 @@ watch(dcpCode, async (newCode) => {
   status.value = "idle";
 });
 
-onBeforeUnmount(() => destroyWebGL());
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onKeyDown);
+  resizeObs?.disconnect();
+  destroyWebGL();
+});
 
 // Auto-load sample file on startup
 onMounted(async () => {
+  window.addEventListener('keydown', onKeyDown);
+  resizeObs = new ResizeObserver(() => {
+    if (imageW.value && imageH.value && viewportRef.value) {
+      fitScale.value = Math.min(viewportRef.value.clientWidth / imageW.value, viewportRef.value.clientHeight / imageH.value);
+    }
+  });
+  if (viewportRef.value) resizeObs.observe(viewportRef.value);
+
   try {
     const res = await fetch("/sample.arw");
     if (res.ok) {
@@ -189,6 +445,17 @@ async function uploadFiles(files: File[]): Promise<void> {
       const height = linMeta.height;
       console.log("[upload] bin:", buf.byteLength, "B, float32:", linearFloat.length, "expect:", width*height*3);
       timing.value = Math.round(performance.now() - t0);
+      linearFloatData = linearFloat;
+
+      // Store image dimensions for pan/zoom
+      imageW.value = width;
+      imageH.value = height;
+      if (viewportRef.value) {
+        fitScale.value = Math.min(viewportRef.value.clientWidth / width, viewportRef.value.clientHeight / height);
+      }
+      zoom.value = 1;
+      pan.x = 0;
+      pan.y = 0;
 
       await nextTick();
       if (canvasRef.value) {
@@ -197,6 +464,7 @@ async function uploadFiles(files: File[]): Promise<void> {
           webglRenderer = new PipelineRenderer(canvasRef.value);
           webglRenderer.uploadImage(linearFloat, width, height);
           drawWebGL();
+          scheduleHistogram();
         } catch (err) {
           console.error("[pipeline] init failed:", err);
           status.value = "error";
@@ -213,7 +481,7 @@ async function uploadFiles(files: File[]): Promise<void> {
   status.value = "idle";
 }
 
-function resetRecipe(): void { Object.assign(recipe, defaultRecipe()); }
+function resetRecipe(): void { Object.assign(recipe, defaultRecipe()); resetHslGrading(); }
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1048576) return `${(n/1024).toFixed(0)} KB`;
@@ -237,7 +505,14 @@ function isAbsoluteUrl(u: string): boolean {
     </header>
 
     <main class="center">
-      <div class="viewport">
+      <div class="viewport" ref="viewportRef"
+        @wheel="onWheel"
+        @mousedown="startPan"
+        @mousemove="doPan"
+        @mouseup="stopPan"
+        @mouseleave="stopPan"
+        @dblclick="onDoubleClick"
+        :class="{ 'is-grabbing': isPanning }">
         <div class="dropzone" v-show="!activeSource" @click="pickFiles">
           <div class="dropzone-inner">
             <div class="dropzone-rule" />
@@ -249,23 +524,32 @@ function isAbsoluteUrl(u: string): boolean {
         <div v-show="activeSource && status === 'rendering' && !webglRenderer" class="preview-loading">
           <span>Decoding… {{ timing ? `${timing}ms` : '' }}</span>
         </div>
-        <canvas v-show="webglRenderer != null" ref="canvasRef" class="preview" />
-        <img v-show="activeSource && !webglRenderer && status !== 'rendering'" class="preview" :src="activeSource?.embeddedUrl ? (isAbsoluteUrl(activeSource.embeddedUrl) ? activeSource.embeddedUrl : `${API}${activeSource.embeddedUrl}`) : ''" alt="preview" />
+        <canvas v-show="webglRenderer != null" ref="canvasRef" class="preview" :style="{ transform: displayTransform }" />
+        <img v-show="activeSource && !webglRenderer && status !== 'rendering'" class="preview" :style="{ transform: displayTransform }" :src="activeSource?.embeddedUrl ? (isAbsoluteUrl(activeSource.embeddedUrl) ? activeSource.embeddedUrl : `${API}${activeSource.embeddedUrl}`) : ''" alt="preview" />
       </div>
 
       <footer class="status">
-        <div class="status-cell">
-          <span class="status-label">Status</span>
-          <span class="status-value" :data-state="status">{{ timing ? `Decoded in ${timing}ms` : status }}</span>
+        <div class="status-left">
+          <div class="status-cell">
+            <span class="status-label">Status</span>
+            <span class="status-value" :data-state="status">{{ timing ? `Decoded in ${timing}ms` : status }}</span>
+          </div>
         </div>
-        <div class="status-cell">
-          <span class="status-label">Pipeline</span>
-          <span class="status-value">backend(rawpy) + WebGL</span>
+        <div class="status-right">
+          <div class="status-cell zoom-cell" v-if="activeSource">
+            <button class="zoom-btn" @click="zoomOut" :disabled="zoom <= 0.1">−</button>
+            <span class="zoom-percent">{{ zoomPercent }}%</span>
+            <button class="zoom-btn" @click="zoomIn" :disabled="zoom >= 50">+</button>
+            <button class="zoom-btn" @click="fitView">Fit</button>
+          </div>
         </div>
       </footer>
     </main>
 
     <aside class="right">
+      <div class="histogram-wrap" v-show="activeSource">
+        <canvas ref="histoCanvasRef" class="histogram" />
+      </div>
       <section class="panel">
         <header class="panel-head">
           <span>Settings</span>
@@ -291,9 +575,105 @@ function isAbsoluteUrl(u: string): boolean {
         <header class="panel-head">{{ group.title }}</header>
         <div v-for="spec in group.items" :key="spec.key" class="slider">
           <label :for="`s-${spec.key}`">{{ spec.label }}</label>
-          <input :id="`s-${spec.key}`" v-model.number="recipe[spec.key]" type="range" :min="spec.min" :max="spec.max" :step="spec.step" />
-          <input v-model.number="recipe[spec.key]" class="slider-number" type="number" :min="spec.min" :max="spec.max" :step="spec.step" :aria-label="spec.label" />
+          <input :id="`s-${spec.key}`" v-model.number="recipe[spec.key]" type="range"
+            :min="spec.min" :max="spec.max" :step="spec.step"
+            @dblclick="recipe[spec.key] = SLIDER_DEFAULTS[spec.key]" title="Double-click to reset" />
+          <input v-model.number="recipe[spec.key]" class="slider-number" type="number"
+            :min="spec.min" :max="spec.max" :step="spec.step" :aria-label="spec.label" />
+        </div>
+      </section>
 
+      <section class="panel" v-if="activeSource">
+        <header class="panel-head">
+          <span>HSL / Color</span>
+        </header>
+        <div class="hsl-tabs">
+          <button :class="{ active: hslTab === 'hue' }" @click="hslTab = 'hue'">H</button>
+          <button :class="{ active: hslTab === 'sat' }" @click="hslTab = 'sat'">S</button>
+          <button :class="{ active: hslTab === 'lum' }" @click="hslTab = 'lum'">L</button>
+        </div>
+        <div v-for="(range, i) in HSL_RANGES" :key="range.name" class="hsl-row">
+          <span class="hsl-dot" :style="{ background: range.color }" />
+          <span class="hsl-label">{{ range.name }}</span>
+          <input type="range" min="-100" max="100" step="1"
+            :value="hslValue(i)"
+            @input="setHsl(i, ($event.target as HTMLInputElement).valueAsNumber)"
+            @dblclick="setHsl(i, 0)" title="Double-click to reset" />
+          <input class="hsl-number" type="number" min="-100" max="100" step="1"
+            :value="hslValue(i)"
+            @input="setHsl(i, ($event.target as HTMLInputElement).valueAsNumber)" />
+        </div>
+      </section>
+
+      <section class="panel" v-if="activeSource">
+        <header class="panel-head">
+          <span>Color Grading</span>
+        </header>
+        <div class="grading-group">
+          <div class="grading-header">
+            <span class="grading-dot" :style="{ background: gradingColor('sh') }" />
+            <span>Shadows</span>
+          </div>
+          <div class="grading-row">
+            <label>H</label>
+            <input type="range" min="-180" max="180" step="1" v-model.number="grading.shH"
+              @dblclick="grading.shH = 0" title="Double-click to reset" />
+            <input class="slider-number" type="number" min="-180" max="180" step="1" v-model.number="grading.shH" />
+          </div>
+          <div class="grading-row">
+            <label>S</label>
+            <input type="range" min="0" max="100" step="1" v-model.number="grading.shS"
+              @dblclick="grading.shS = 0" title="Double-click to reset" />
+            <input class="slider-number" type="number" min="0" max="100" step="1" v-model.number="grading.shS" />
+          </div>
+        </div>
+        <div class="grading-group">
+          <div class="grading-header">
+            <span class="grading-dot" :style="{ background: gradingColor('md') }" />
+            <span>Midtones</span>
+          </div>
+          <div class="grading-row">
+            <label>H</label>
+            <input type="range" min="-180" max="180" step="1" v-model.number="grading.mdH"
+              @dblclick="grading.mdH = 0" title="Double-click to reset" />
+            <input class="slider-number" type="number" min="-180" max="180" step="1" v-model.number="grading.mdH" />
+          </div>
+          <div class="grading-row">
+            <label>S</label>
+            <input type="range" min="0" max="100" step="1" v-model.number="grading.mdS"
+              @dblclick="grading.mdS = 0" title="Double-click to reset" />
+            <input class="slider-number" type="number" min="0" max="100" step="1" v-model.number="grading.mdS" />
+          </div>
+        </div>
+        <div class="grading-group">
+          <div class="grading-header">
+            <span class="grading-dot" :style="{ background: gradingColor('hl') }" />
+            <span>Highlights</span>
+          </div>
+          <div class="grading-row">
+            <label>H</label>
+            <input type="range" min="-180" max="180" step="1" v-model.number="grading.hlH"
+              @dblclick="grading.hlH = 0" title="Double-click to reset" />
+            <input class="slider-number" type="number" min="-180" max="180" step="1" v-model.number="grading.hlH" />
+          </div>
+          <div class="grading-row">
+            <label>S</label>
+            <input type="range" min="0" max="100" step="1" v-model.number="grading.hlS"
+              @dblclick="grading.hlS = 0" title="Double-click to reset" />
+            <input class="slider-number" type="number" min="0" max="100" step="1" v-model.number="grading.hlS" />
+          </div>
+        </div>
+        <div class="slider">
+          <label>Blend</label>
+          <input type="range" min="0" max="100" step="1" v-model.number="grading.blend"
+            @dblclick="grading.blend = 0" title="Double-click to reset" />
+          <input class="slider-number" type="number" min="0" max="100" step="1" v-model.number="grading.blend" />
+        </div>
+        <div class="slider">
+          <label>Balance</label>
+          <input type="range" min="-100" max="100" step="1" v-model.number="grading.balance"
+            @dblclick="grading.balance = 0" title="Double-click to reset" />
+          <input class="slider-number" type="number" min="-100" max="100" step="1" v-model.number="grading.balance" />
         </div>
       </section>
     </aside>
