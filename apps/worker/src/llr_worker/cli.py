@@ -55,6 +55,11 @@ class PreparedLinear:
 PREPARED_CACHE: OrderedDict[tuple[Any, ...], PreparedLinear] = OrderedDict()
 PREPARED_CACHE_MAX = 4
 
+# Cache raw-decoded camera RGB data keyed by (sourcePath, halfSize, maxSize).
+# DCP code changes re-apply DCP on cached data instead of re-decoding the RAW file.
+RAW_CAMERA_CACHE: OrderedDict[tuple[Any, ...], tuple[np.ndarray, RawMetadata]] = OrderedDict()
+RAW_CAMERA_CACHE_MAX = 4
+
 
 NEUTRAL_RECIPE: dict[str, Any] = {
     "profileId": "neutral",
@@ -389,6 +394,24 @@ def daemon_render(request: dict[str, Any], root: Path) -> dict[str, Any]:
     }
 
 
+def _linear_cache_key(
+    input_path: Path,
+    half_size: bool,
+    max_size: int | None,
+    dcp_code: str | None,
+) -> tuple[Any, ...]:
+    try:
+        st = input_path.stat()
+        base = (str(input_path), st.st_size, int(st.st_mtime_ns))
+    except OSError:
+        base = (str(input_path),)
+    return base + (bool(half_size), int(max_size or 0), dcp_code or "")
+
+
+_LINEAR_CACHE: OrderedDict[tuple[Any, ...], tuple[np.ndarray, dict[str, Any]]] = OrderedDict()
+_LINEAR_CACHE_MAX = 8
+
+
 def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     """Decode RAW + DCP, return raw float32 linear data (no JPEG)."""
     input_path = resolve_path(root, request["input"])
@@ -402,6 +425,22 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
         max_size = int(max_size) if max_size else None
     dcp_code: str | None = request.get("dcpCode")
 
+    # Check processed sRGB cache first
+    cache_key = _linear_cache_key(input_path, half_size, max_size, dcp_code)
+    if cache_key in _LINEAR_CACHE:
+        linear_arr, color_profile = _LINEAR_CACHE[cache_key]
+        _LINEAR_CACHE.move_to_end(cache_key)
+        linear = linear_arr.tobytes()
+        with open(output_path, "wb") as f:
+            f.write(linear)
+        return {
+            "width": linear_arr.shape[1],
+            "height": linear_arr.shape[0],
+            "output": str(output_path),
+            "colorProfile": color_profile,
+            "bytesWritten": len(linear),
+        }
+
     recipe = merge_recipe(PROFILES[profile_id], {})
     if dcp_code:
         recipe["dcpCode"] = dcp_code
@@ -412,22 +451,22 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
         half_size=half_size, max_size=max_size,
     )
 
-    # Save raw float32 data: RGBRGB... × N pixels
-    linear = prepared.linear.astype(np.float32).tobytes()
-    sys.stderr.write(f"[linear] saving {len(linear)} bytes to {output_path}\n")
-    sys.stderr.flush()
+    # Cache processed sRGB so switching back to this DCP code is instant
+    linear_arr = prepared.linear.astype(np.float32)
+    _LINEAR_CACHE[cache_key] = (linear_arr, prepared.color_profile)
+    while len(_LINEAR_CACHE) > _LINEAR_CACHE_MAX:
+        _LINEAR_CACHE.popitem(last=False)
+
+    linear = linear_arr.tobytes()
     with open(output_path, "wb") as f:
         f.write(linear)
-    file_size = output_path.stat().st_size
-    sys.stderr.write(f"[linear] wrote {file_size} bytes OK\n")
-    sys.stderr.flush()
 
     return {
         "width": prepared.linear.shape[1],
         "height": prepared.linear.shape[0],
         "output": str(output_path),
         "colorProfile": prepared.color_profile,
-        "bytesWritten": file_size,
+        "bytesWritten": len(linear),
     }
 
 
@@ -540,6 +579,14 @@ def render_raw(
     return image, prepared.metadata, auto_tone, prepared.color_profile
 
 
+def _raw_cache_key(input_path: Path, half_size: bool, max_size: int | None) -> tuple[Any, ...]:
+    try:
+        stat = input_path.stat()
+        return (str(input_path), bool(half_size), int(max_size or 0), stat.st_size, int(stat.st_mtime_ns))
+    except OSError:
+        return (str(input_path), bool(half_size), int(max_size or 0))
+
+
 def prepare_linear(
     input_path: Path,
     recipe: dict[str, Any],
@@ -549,6 +596,21 @@ def prepare_linear(
     half_size: bool = False,
     max_size: int | None = None,
 ) -> PreparedLinear:
+    cache_key = _raw_cache_key(input_path, half_size, max_size)
+
+    # Cache hit: re-apply DCP on cached camera RGB without re-decoding RAW
+    if cache_key in RAW_CAMERA_CACHE:
+        camera_rgb, metadata = RAW_CAMERA_CACHE[cache_key]
+        RAW_CAMERA_CACHE.move_to_end(cache_key)
+        dcp_profile, dcp_selection = resolve_dcp_profile(root, dcp_arg, disable_dcp, recipe, metadata)
+        if dcp_profile is not None:
+            linear, dcp_info = apply_dcp_profile(camera_rgb, dcp_profile)
+            color_profile = dcp_info.to_json()
+            color_profile["selection"] = dcp_selection
+            return PreparedLinear(linear=linear, metadata=metadata, color_profile=color_profile)
+        # DCP no longer available; fall through to re-decode
+        RAW_CAMERA_CACHE.pop(cache_key, None)
+
     with rawpy.imread(str(input_path)) as raw:
         metadata = read_raw_metadata(input_path, raw)
         dcp_profile, dcp_selection = resolve_dcp_profile(root, dcp_arg, disable_dcp, recipe, metadata)
@@ -577,6 +639,10 @@ def prepare_linear(
                 raise ValueError("DCP rendering currently supports only three-channel camera RGB data")
             if max_size:
                 camera_rgb = downsample_linear(camera_rgb, max_size)
+            # Cache camera RGB so DCP code changes skip RAW re-decode
+            RAW_CAMERA_CACHE[cache_key] = (camera_rgb, metadata)
+            while len(RAW_CAMERA_CACHE) > RAW_CAMERA_CACHE_MAX:
+                RAW_CAMERA_CACHE.popitem(last=False)
             linear, dcp_info = apply_dcp_profile(camera_rgb, dcp_profile)
             color_profile = dcp_info.to_json()
             color_profile["selection"] = dcp_selection

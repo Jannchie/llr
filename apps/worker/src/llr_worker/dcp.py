@@ -119,7 +119,34 @@ class DcpRenderInfo:
         }
 
 
+# Cache loaded DCP profiles keyed by (path, size, mtime) so switching
+# DCP codes doesn't re-parse the TIFF structure every time.
+_DCP_PROFILE_CACHE: OrderedDict[tuple[Any, ...], DcpProfile] = OrderedDict()
+_DCP_PROFILE_CACHE_MAX = 16
+
+
+def _dcp_cache_key(path: Path) -> tuple[Any, ...]:
+    try:
+        st = path.stat()
+        return (str(path.resolve()), st.st_size, int(st.st_mtime_ns))
+    except OSError:
+        return (str(path.resolve()),)
+
+
 def load_dcp_profile(path: Path) -> DcpProfile:
+    key = _dcp_cache_key(path)
+    if key in _DCP_PROFILE_CACHE:
+        _DCP_PROFILE_CACHE.move_to_end(key)
+        return _DCP_PROFILE_CACHE[key]
+
+    profile = _parse_dcp_file(path)
+    _DCP_PROFILE_CACHE[key] = profile
+    while len(_DCP_PROFILE_CACHE) > _DCP_PROFILE_CACHE_MAX:
+        _DCP_PROFILE_CACHE.popitem(last=False)
+    return profile
+
+
+def _parse_dcp_file(path: Path) -> DcpProfile:
     tags = read_tiff_tags(path.read_bytes())
     color_matrix_1 = matrix_from_tag(tags.get("color_matrix_1"), rows=None)
     color_matrix_2 = matrix_from_tag(tags.get("color_matrix_2"), rows=None)

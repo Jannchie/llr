@@ -219,7 +219,6 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
   }
 
   const outputPath = resolve(sessionDir, "linear.bin");
-  console.log("[api] render-linear output:", outputPath);
   const meta = await daemon.send({
     command: "render-linear",
     input: sourcePath,
@@ -230,16 +229,6 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
     recipe: { autoTone: false },
     dcpCode: body.dcpCode,
   });
-  console.log("[api] daemon returned:", JSON.stringify(meta));
-
-  // Verify file exists and has content
-  const { stat } = await import("node:fs/promises");
-  try {
-    const st = await stat(outputPath);
-    console.log("[api] linear.bin size:", st.size);
-  } catch (e: any) {
-    console.warn("[api] linear.bin missing:", e.message);
-  }
 
   sendJson(response, {
     width: meta.width,
