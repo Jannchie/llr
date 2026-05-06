@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { PipelineRenderer, type EditParams } from "./rendering/pipeline-renderer";
 import { computeHistogram, renderHistogram } from "./rendering/histogram";
+import { curveToLUT, defaultCurve, renderCurve, hitTest, type CurvePoint } from "./rendering/curve";
 
 // ── types ──
 
@@ -99,7 +100,7 @@ const grading = reactive({
   shH: 0, shS: 0,
   mdH: 0, mdS: 0,
   hlH: 0, hlS: 0,
-  blend: 0,
+  blend: 50,
   balance: 0,
 });
 
@@ -126,9 +127,123 @@ function resetHslGrading(): void {
   grading.shH = 0; grading.shS = 0;
   grading.mdH = 0; grading.mdS = 0;
   grading.hlH = 0; grading.hlS = 0;
-  grading.blend = 0;
+  grading.blend = 50;
   grading.balance = 0;
 }
+
+// ── Tone Curve ──
+
+const curvePoints = ref<CurvePoint[]>(defaultCurve());
+const curveActive = ref(-1);
+const curveCanvas = ref<HTMLCanvasElement | null>(null);
+
+function applyCurveLUT(): void {
+  const lut = curveToLUT(curvePoints.value);
+  if (webglRenderer) webglRenderer.uploadCurveLUT(lut);
+  scheduleWebGLDraw();
+}
+
+function resetCurve(): void {
+  curvePoints.value = defaultCurve();
+  curveActive.value = -1;
+  applyCurveLUT();
+}
+
+function renderCurveCanvas(): void {
+  const cvs = curveCanvas.value;
+  if (!cvs) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = cvs.clientWidth;
+  const h = cvs.clientHeight;
+  cvs.width = w * dpr;
+  cvs.height = h * dpr;
+  const ctx = cvs.getContext("2d");
+  if (!ctx) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  renderCurve(ctx, w, h, curvePoints.value, curveActive.value);
+}
+
+function onCurveMouseDown(e: MouseEvent): void {
+  const cvs = curveCanvas.value;
+  if (!cvs) return;
+  const rect = cvs.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+  const dpr = window.devicePixelRatio || 1;
+  const w = rect.width / dpr;
+  const h = rect.height / dpr;
+  const idx = hitTest(curvePoints.value, w, h, mx, my);
+  if (idx >= 0) {
+    curveActive.value = idx;
+  } else {
+    // Add new point
+    const x = clamp(mx / w, 0, 1);
+    const y = clamp(1 - my / h, 0, 1);
+    const pts = [...curvePoints.value, { x, y }];
+    pts.sort((a, b) => a.x - b.x);
+    curvePoints.value = pts;
+    curveActive.value = pts.findIndex(p => p.x === x && p.y === y);
+    applyCurveLUT();
+  }
+  renderCurveCanvas();
+  window.addEventListener("mousemove", onCurveMouseMove);
+  window.addEventListener("mouseup", onCurveMouseUp);
+}
+
+function onCurveMouseMove(e: MouseEvent): void {
+  if (curveActive.value < 0) return;
+  const cvs = curveCanvas.value;
+  if (!cvs) return;
+  const rect = cvs.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+  const dpr2 = window.devicePixelRatio || 1;
+  const cw = rect.width / dpr2;
+  const ch = rect.height / dpr2;
+  const pts = [...curvePoints.value];
+  pts[curveActive.value] = {
+    x: clamp(mx / cw, 0, 1),
+    y: clamp(1 - my / ch, 0, 1),
+  };
+  pts.sort((a, b) => a.x - b.x);
+  curvePoints.value = pts;
+  curveActive.value = pts.findIndex(
+    p => p.x === clamp(mx / cw, 0, 1) && p.y === clamp(1 - my / ch, 0, 1)
+  );
+  applyCurveLUT();
+  renderCurveCanvas();
+}
+
+function onCurveMouseUp(): void {
+  window.removeEventListener("mousemove", onCurveMouseMove);
+  window.removeEventListener("mouseup", onCurveMouseUp);
+}
+
+function onCurveDoubleClick(e: MouseEvent): void {
+  const cvs = curveCanvas.value;
+  if (!cvs) return;
+  const rect = cvs.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+  const dpr = window.devicePixelRatio || 1;
+  const idx = hitTest(curvePoints.value, rect.width / dpr, rect.height / dpr, mx, my);
+  if (idx > 0 && idx < curvePoints.value.length - 1) {
+    // Delete point (keep endpoints)
+    curvePoints.value = curvePoints.value.filter((_, i) => i !== idx);
+    curveActive.value = -1;
+    applyCurveLUT();
+    renderCurveCanvas();
+  }
+}
+
+// Init curve canvas
+watch(curveCanvas, (cvs) => {
+  if (cvs) {
+    // Observe resize to redraw
+    const obs = new ResizeObserver(() => renderCurveCanvas());
+    obs.observe(cvs);
+  }
+});
 
 const activeSource = computed(() => sources.value.find(s => s.id === activeId.value) ?? null);
 
@@ -190,7 +305,7 @@ function updateHistogram(): void {
   // If canvas not laid out, try parent dimensions; retry next frame as last resort
   if (w <= 0 || h <= 0) {
     const parent = canvas.parentElement;
-    if (parent) { w = parent.clientWidth - 24; h = 80; }
+    if (parent) { w = parent.clientWidth - 32; h = 80; }
     if (w <= 0) { requestAnimationFrame(() => updateHistogram()); return; }
   }
   const dpr = window.devicePixelRatio || 1;
@@ -237,7 +352,6 @@ function drawWebGL(): void {
 function destroyWebGL(): void {
   if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
   drawPending = false;
-  linearFloatData = null;
   if (webglRenderer) { webglRenderer.destroy(); webglRenderer = null; }
 }
 
@@ -352,9 +466,17 @@ watch(dcpCode, async (newCode) => {
     const binRes = await fetch(linMeta.linearUrl);
     if (!binRes.ok) throw new Error("Failed to fetch");
     const linearFloat = new Float32Array(await binRes.arrayBuffer());
+    // Update histogram data with new DCP rendering
+    linearFloatData = linearFloat;
+    imageW.value = linMeta.width;
+    imageH.value = linMeta.height;
+    if (viewportRef.value) {
+      fitScale.value = Math.min(viewportRef.value.clientWidth / linMeta.width, viewportRef.value.clientHeight / linMeta.height);
+    }
     if (canvasRef.value && webglRenderer) {
       webglRenderer.uploadImage(linearFloat, linMeta.width, linMeta.height);
       drawWebGL();
+      scheduleHistogram();
     }
   } catch (err) {
     console.warn("DCP reload failed:", err);
@@ -463,6 +585,7 @@ async function uploadFiles(files: File[]): Promise<void> {
         try {
           webglRenderer = new PipelineRenderer(canvasRef.value);
           webglRenderer.uploadImage(linearFloat, width, height);
+          webglRenderer.uploadCurveLUT(curveToLUT(curvePoints.value));
           drawWebGL();
           scheduleHistogram();
         } catch (err) {
@@ -489,6 +612,10 @@ function formatBytes(n: number): string {
 }
 function isAbsoluteUrl(u: string): boolean {
   return u.startsWith("blob:") || u.startsWith("data:") || u.startsWith("http");
+}
+
+function clamp(v: number, lo: number, hi: number): number {
+  return v < lo ? lo : v > hi ? hi : v;
 }
 </script>
 
@@ -666,7 +793,7 @@ function isAbsoluteUrl(u: string): boolean {
         <div class="slider">
           <label>Blend</label>
           <input type="range" min="0" max="100" step="1" v-model.number="grading.blend"
-            @dblclick="grading.blend = 0" title="Double-click to reset" />
+            @dblclick="grading.blend = 50" title="Double-click to reset" />
           <input class="slider-number" type="number" min="0" max="100" step="1" v-model.number="grading.blend" />
         </div>
         <div class="slider">
@@ -675,6 +802,16 @@ function isAbsoluteUrl(u: string): boolean {
             @dblclick="grading.balance = 0" title="Double-click to reset" />
           <input class="slider-number" type="number" min="-100" max="100" step="1" v-model.number="grading.balance" />
         </div>
+      </section>
+
+      <section class="panel" v-if="activeSource">
+        <header class="panel-head">
+          <span>Tone Curve</span>
+          <button class="ghost" type="button" @click="resetCurve">Reset</button>
+        </header>
+        <canvas ref="curveCanvas" class="curve-canvas"
+          @mousedown="onCurveMouseDown"
+          @dblclick="onCurveDoubleClick" />
       </section>
     </aside>
 

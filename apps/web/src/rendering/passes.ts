@@ -46,11 +46,12 @@ uniform float u_grad_hl_h;
 uniform float u_grad_hl_s;
 uniform float u_grad_blend;
 uniform float u_grad_balance;
+// Tone Curve LUT (256×1 texture, R channel = output)
+uniform sampler2D u_curve_lut;
 
 ${LUMA}
 
 const float PIVOT = 0.18;
-const float RADIUS = 0.5;
 
 vec3 kelvinToRGB(float K) {
   float eff = 13000.0 - K;
@@ -131,22 +132,23 @@ void main() {
 
   // --- Tone (Highlights, Shadows, Whites, Blacks) ---
   float lum = dot(c, LUMA);
-  float shadowMask = clamp((0.55 - lum) / 0.55, 0.0, 1.0);
-  c *= 1.0 + u_shadows * 0.45 * shadowMask;
-  float highlightMask = clamp((lum - 0.45) / 0.55, 0.0, 1.0);
-  c *= 1.0 + u_highlights * 0.35 * highlightMask;
-  float whiteMask = clamp((lum - 0.70) / 0.30, 0.0, 1.0);
-  c += u_whites * 0.25 * whiteMask;
-  float blackMask = clamp((0.30 - lum) / 0.30, 0.0, 1.0);
-  c += u_blacks * 0.20 * blackMask;
+  // All masks use smoothstep for natural transitions
+  float sMask = 1.0 - smoothstep(0.05, 0.50, lum);                         // shadows
+  float hMask = smoothstep(0.50, 0.95, lum);                                // highlights
+  float wMask = smoothstep(0.60, 0.92, lum);                                // whites
+  float bMask = 1.0 - smoothstep(0.08, 0.40, lum);                          // blacks
+  // Multiplicative adjustments (industry standard)
+  c *= 1.0 + u_shadows   * 0.50 * sMask;
+  c *= 1.0 + u_highlights * 0.35 * hMask;
+  c *= 1.0 + u_whites    * 0.30 * wMask;
+  c *= 1.0 + u_blacks    * 0.25 * bMask;
   c = max(c, vec3(0.0));
 
-  // --- Contrast ---
+  // --- Contrast (power-law S-curve anchored at 18% gray) ---
   if (u_contrast != 1.0) {
-    vec3 delta = c - vec3(PIVOT);
-    float strength = (u_contrast - 1.0) * 0.3;
-    vec3 falloff = max(vec3(0.0), vec3(1.0) - (delta * delta) / (RADIUS * RADIUS));
-    c = max(vec3(0.0), c + strength * delta * falloff);
+    float contrastAmount = u_contrast - 1.0; // [-1, 1]
+    float gamma = 1.0 + contrastAmount * 0.6;
+    c = PIVOT * pow(c / PIVOT, vec3(gamma));
   }
 
   // --- Vibrance + Saturation ---
@@ -162,11 +164,11 @@ void main() {
   }
   c = max(grey + chroma, vec3(0.0));
 
-  // --- Clarity (mid-tone contrast) ---
+  // --- Clarity (mid-tone contrast, bell-curve mask) ---
   if (u_clarity != 0.0) {
     float lum2 = dot(c, LUMA);
-    float midMask = clamp(1.0 - abs(lum2 - 0.5) * 2.0, 0.0, 1.0);
-    c = max(c + (c - 0.5) * u_clarity * midMask * 0.5, vec3(0.0));
+    float midMask = smoothstep(0.05, 0.45, lum2) * (1.0 - smoothstep(0.55, 0.95, lum2));
+    c = max(c + (c - 0.5) * u_clarity * midMask * 0.45, vec3(0.0));
   }
 
   // --- Dehaze (global contrast + saturation boost) ---
@@ -221,6 +223,11 @@ void main() {
     c = mix(c, tinted, u_grad_blend);
   }
 
+  // --- Tone Curve (LUT, luminance-driven) ---
+  float cl = clamp(dot(c, LUMA), 0.0, 1.0);
+  float cv = texture(u_curve_lut, vec2(cl, 0.5)).r;
+  c = c * (cv / max(cl, 0.0001));
+
   // --- Gamma (Linear → sRGB) ---
   outColor = vec4(linearToSRGB(c.r), linearToSRGB(c.g), linearToSRGB(c.b), 1.0);
 }`;
@@ -242,5 +249,6 @@ export const PASSES: PassDef[] = [
     "u_hsl_l[0]","u_hsl_l[1]","u_hsl_l[2]","u_hsl_l[3]","u_hsl_l[4]","u_hsl_l[5]","u_hsl_l[6]","u_hsl_l[7]",
     "u_grad_sh_h","u_grad_sh_s","u_grad_md_h","u_grad_md_s",
     "u_grad_hl_h","u_grad_hl_s","u_grad_blend","u_grad_balance",
+    "u_curve_lut",
   ]},
 ];

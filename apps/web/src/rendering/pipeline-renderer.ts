@@ -39,6 +39,7 @@ export class PipelineRenderer {
   private uniforms: Record<string, WebGLUniformLocation | null> = {};
   private vao: WebGLVertexArrayObject;
   private sourceTex: WebGLTexture | null = null;
+  private curveLutTex: WebGLTexture | null = null;
   private texWidth = 0;
   private texHeight = 0;
 
@@ -53,7 +54,13 @@ export class PipelineRenderer {
     this.program = this.compileProgram(pass.fsSource);
     for (const name of pass.uniforms) this.uniforms[name] = gl.getUniformLocation(this.program, name);
     this.uniforms["u_input"] = gl.getUniformLocation(this.program, "u_input");
+    this.uniforms["u_curve_lut"] = gl.getUniformLocation(this.program, "u_curve_lut");
     this.vao = this.createFullScreenQuad();
+
+    // Upload identity curve LUT as default
+    const identity = new Float32Array(2048);
+    for (let i = 0; i < 2048; i++) identity[i] = i / 2047;
+    this.uploadCurveLUT(identity);
 
     const info = gl.getExtension("WEBGL_debug_renderer_info");
     if (info) console.log("[pipeline] GPU:", gl.getParameter(info.UNMASKED_RENDERER_WEBGL));
@@ -75,6 +82,23 @@ export class PipelineRenderer {
     this.canvas.width = width; this.canvas.height = height;
   }
 
+  /** Upload a 2048-entry Float32Array as a 1D LUT for the tone curve. */
+  uploadCurveLUT(lut: Float32Array): void {
+    const gl = this.gl;
+    if (this.curveLutTex) gl.deleteTexture(this.curveLutTex);
+    const tex = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, 2048, 1, 0, gl.RED, gl.FLOAT, lut);
+    // Prefer LINEAR for smooth interpolation; fall back to NEAREST if float-linear not available
+    const filter = gl.getExtension("OES_texture_float_linear") ? gl.LINEAR : gl.NEAREST;
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    this.curveLutTex = tex;
+  }
+
   draw(params: Partial<EditParams> = {}): void {
     const gl = this.gl;
     if (!this.sourceTex) return;
@@ -86,6 +110,13 @@ export class PipelineRenderer {
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.sourceTex);
     gl.uniform1i(this.uniforms["u_input"], 0);
+    // Bind curve LUT to texture unit 1
+    if (this.curveLutTex) {
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, this.curveLutTex);
+      gl.uniform1i(this.uniforms["u_curve_lut"], 1);
+      gl.activeTexture(gl.TEXTURE0);
+    }
     this.setUniforms(p);
     gl.bindVertexArray(this.vao);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
@@ -94,6 +125,7 @@ export class PipelineRenderer {
   destroy(): void {
     const gl = this.gl;
     if (this.sourceTex) gl.deleteTexture(this.sourceTex);
+    if (this.curveLutTex) gl.deleteTexture(this.curveLutTex);
     gl.deleteProgram(this.program);
     gl.deleteVertexArray(this.vao);
   }

@@ -10,7 +10,6 @@ const LUMA_R = 0.2126;
 const LUMA_G = 0.7152;
 const LUMA_B = 0.0722;
 const PIVOT = 0.18;
-const RADIUS = 0.5;
 
 export interface HistogramBins {
   r: Uint32Array; // 256 bins
@@ -36,6 +35,11 @@ export interface PipelineParams {
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
+}
+
+function smoothstep(edge0: number, edge1: number, x: number): number {
+  const t = clamp((x - edge0) / (edge1 - edge0), 0, 1);
+  return t * t * (3 - 2 * t);
 }
 
 function kelvinToRGB(K: number): [number, number, number] {
@@ -101,19 +105,19 @@ export function computeHistogram(
   const wbScaleB = wbB * clamp(bAdj, 0.2, 5);
 
   const exposureMul = Math.pow(2, params.exposure);
+  const hStrength = params.highlights * 0.35;
+  const sStrength = params.shadows * 0.50;
+  const wStrength = params.whites * 0.30;
+  const bStrength = params.blacks * 0.25;
 
-  const highlightsStrength = params.highlights * 0.35;
-  const shadowsStrength = params.shadows * 0.45;
-  const whitesStrength = params.whites * 0.25;
-  const blacksStrength = params.blacks * 0.20;
-
-  const contrastStrength = (params.contrast - 1) * 0.3;
-  const useContrast = Math.abs(contrastStrength) > 1e-6;
+  const contrastAmount = params.contrast - 1; /* [-1, 1] */
+  const contrastGamma = 1 + contrastAmount * 0.6;
+  const useContrast = Math.abs(contrastAmount) > 1e-6;
 
   const vibranceStr = params.vibrance - 1;
   const useVibrance = Math.abs(vibranceStr) > 1e-6;
 
-  const clarityStr = (params.clarity / 100) * 0.5;
+  const clarityStr = (params.clarity / 100) * 0.45;
   const dehazeStr = (params.dehaze / 100) * 0.35;
   const dehazeSatBoost = 1 + (params.dehaze / 100) * 0.25;
 
@@ -135,44 +139,38 @@ export function computeHistogram(
       g *= exposureMul;
       b *= exposureMul;
 
-      // --- Tone ---
+      // --- Tone (smoothstep masks, multiplicative) ---
       const lum = r * LUMA_R + g * LUMA_G + b * LUMA_B;
-      const shadowMask = clamp((0.55 - lum) / 0.55, 0, 1);
-      const sMul = 1 + shadowsStrength * shadowMask;
-      r *= sMul; g *= sMul; b *= sMul;
+      const sMask = 1 - smoothstep(0.05, 0.50, lum);
+      const hMask = smoothstep(0.50, 0.95, lum);
+      const wMask_ = smoothstep(0.60, 0.92, lum);
+      const bMask = 1 - smoothstep(0.08, 0.40, lum);
+      r *= 1 + sStrength * sMask;
+      g *= 1 + sStrength * sMask;
+      b *= 1 + sStrength * sMask;
+      r *= 1 + hStrength * hMask;
+      g *= 1 + hStrength * hMask;
+      b *= 1 + hStrength * hMask;
+      r *= 1 + wStrength * wMask_;
+      g *= 1 + wStrength * wMask_;
+      b *= 1 + wStrength * wMask_;
+      r *= 1 + bStrength * bMask;
+      g *= 1 + bStrength * bMask;
+      b *= 1 + bStrength * bMask;
+      r = Math.max(0, r); g = Math.max(0, g); b = Math.max(0, b);
 
-      const highlightMask = clamp((lum - 0.45) / 0.55, 0, 1);
-      const hMul = 1 + highlightsStrength * highlightMask;
-      r *= hMul; g *= hMul; b *= hMul;
-
-      const whiteMask = clamp((lum - 0.70) / 0.30, 0, 1);
-      const wAdd = whitesStrength * whiteMask;
-      r += wAdd; g += wAdd; b += wAdd;
-
-      const blackMask = clamp((0.30 - lum) / 0.30, 0, 1);
-      const blAdd = blacksStrength * blackMask;
-      r += blAdd; g += blAdd; b += blAdd;
-
-      // Clamp negatives
-      r = Math.max(0, r);
-      g = Math.max(0, g);
-      b = Math.max(0, b);
-
-      // --- Contrast ---
+      // --- Contrast (power-law S-curve anchored at 18% gray) ---
       if (useContrast) {
-        const dr = r - PIVOT, dg = g - PIVOT, db = b - PIVOT;
-        const fr = Math.max(0, 1 - (dr * dr) / (RADIUS * RADIUS));
-        const fg = Math.max(0, 1 - (dg * dg) / (RADIUS * RADIUS));
-        const fb = Math.max(0, 1 - (db * db) / (RADIUS * RADIUS));
-        r = Math.max(0, r + contrastStrength * dr * fr);
-        g = Math.max(0, g + contrastStrength * dg * fg);
-        b = Math.max(0, b + contrastStrength * db * fb);
+        r = PIVOT * Math.pow(r / PIVOT, contrastGamma);
+        g = PIVOT * Math.pow(g / PIVOT, contrastGamma);
+        b = PIVOT * Math.pow(b / PIVOT, contrastGamma);
+        r = Math.max(0, r); g = Math.max(0, g); b = Math.max(0, b);
       }
 
-      // --- Clarity (mid-tone contrast) ---
+      // --- Clarity (mid-tone contrast, bell-curve mask) ---
       if (Math.abs(clarityStr) > 1e-6) {
         const lum2 = r * LUMA_R + g * LUMA_G + b * LUMA_B;
-        const midMask = clamp(1 - Math.abs(lum2 - 0.5) * 2, 0, 1);
+        const midMask = smoothstep(0.05, 0.45, lum2) * (1 - smoothstep(0.55, 0.95, lum2));
         r = Math.max(0, r + (r - 0.5) * clarityStr * midMask);
         g = Math.max(0, g + (g - 0.5) * clarityStr * midMask);
         b = Math.max(0, b + (b - 0.5) * clarityStr * midMask);

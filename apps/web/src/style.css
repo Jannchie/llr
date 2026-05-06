@@ -110,7 +110,7 @@ button {
 
 .histogram-wrap {
   border-bottom: 1px solid var(--line);
-  padding: 8px 12px 6px;
+  padding: 8px 16px 6px;
   background: var(--panel);
 }
 
@@ -350,7 +350,7 @@ button {
 
 .hsl-row {
   display: grid;
-  grid-template-columns: 10px 44px 1fr 40px;
+  grid-template-columns: 10px 44px 1fr 48px;
   gap: 7px;
   align-items: center;
   padding: 3px 0;
@@ -576,7 +576,7 @@ button {
 
 .slider {
   display: grid;
-  grid-template-columns: 70px 1fr 48px 28px;
+  grid-template-columns: 70px 1fr 48px;
   gap: 8px;
   align-items: center;
   padding: 4px 0;
@@ -773,6 +773,17 @@ button {
 .fade-enter-active,
 .fade-leave-active {
   transition: opacity 150ms ease;
+}
+
+/* ---------- Tone Curve ---------- */
+
+.curve-canvas {
+  display: block;
+  width: 100%;
+  height: 200px;
+  background: #0a0a0a;
+  cursor: crosshair;
+  border: 1px solid var(--line);
 }
 
 /* ---------- Zoom controls ---------- */
