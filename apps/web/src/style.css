@@ -780,7 +780,7 @@ button {
 .curve-canvas {
   display: block;
   width: 100%;
-  height: 200px;
+  aspect-ratio: 1;
   background: #0a0a0a;
   cursor: crosshair;
   border: 1px solid var(--line);

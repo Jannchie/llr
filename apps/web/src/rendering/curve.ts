@@ -114,39 +114,62 @@ export function hitTest(points: CurvePoint[], w: number, h: number, mx: number, 
 // --- spline internals ---
 
 function evaluateSpline(points: CurvePoint[], t: number): number {
-  if (points.length === 0) return t;
-  if (points.length === 1) return points[0].y;
-  // Clamp t to point range
-  const t0 = points[0].x;
-  const t1 = points[points.length - 1].x;
+  const n = points.length;
+  if (n === 0) return t;
+  if (n === 1) return points[0].y;
+  const t0 = points[0].x, t1 = points[n - 1].x;
   if (t <= t0) return points[0].y;
-  if (t >= t1) return points[points.length - 1].y;
+  if (t >= t1) return points[n - 1].y;
+
+  // Linear for 2 points
+  if (n === 2) {
+    const f = (t - t0) / ((t1 - t0) || 1e-6);
+    return points[0].y + (points[1].y - points[0].y) * f;
+  }
+
+  // --- Fritsch-Carlson monotone cubic Hermite spline ---
+
+  // Secant slopes
+  const sec: number[] = [];
+  for (let i = 0; i < n - 1; i++) {
+    const dx = points[i + 1].x - points[i].x;
+    sec.push(dx > 1e-9 ? (points[i + 1].y - points[i].y) / dx : 0);
+  }
+
+  // Tangent slopes (centered difference with monotonicity constraint)
+  const m: number[] = new Array(n).fill(0);
+  m[0] = sec[0];
+  m[n - 1] = sec[n - 2];
+  for (let i = 1; i < n - 1; i++) {
+    const s0 = sec[i - 1], s1 = sec[i];
+    if (s0 * s1 <= 0) { m[i] = 0; continue; }
+    // Fritsch-Carlson weighted harmonic mean
+    const w0 = 2 * s1 + s0;
+    const w1 = s1 + 2 * s0;
+    const denom = w0 + w1;
+    m[i] = denom > 1e-9 ? (s0 * s1 * (w0 + w1)) / (w0 * s0 + w1 * s1) : 0;
+  }
 
   // Find segment
   let seg = 0;
-  for (let i = 0; i < points.length - 1; i++) {
+  for (let i = 0; i < n - 1; i++) {
     if (t >= points[i].x && t <= points[i + 1].x) { seg = i; break; }
   }
 
-  // Catmull-Rom: need p0..p3
-  const p0 = points[Math.max(seg - 1, 0)];
-  const p1 = points[seg];
-  const p2 = points[seg + 1];
-  const p3 = points[Math.min(seg + 2, points.length - 1)];
+  const x0 = points[seg].x, y0 = points[seg].y;
+  const x1 = points[seg + 1].x, y1 = points[seg + 1].y;
+  const dx = x1 - x0;
+  if (dx < 1e-9) return y0;
 
-  // Normalize t within segment
-  const segT = (t - p1.x) / ((p2.x - p1.x) || 1e-6);
+  const m0 = m[seg] * dx;
+  const m1 = m[seg + 1] * dx;
+  const h = (t - x0) / dx;
+  const h2 = h * h;
+  const h3 = h2 * h;
 
-  return catmullRom(p0.y, p1.y, p2.y, p3.y, segT);
-}
-
-function catmullRom(p0: number, p1: number, p2: number, p3: number, t: number): number {
-  const t2 = t * t;
-  const t3 = t2 * t;
-  return 0.5 * (
-    (2 * p1) +
-    (-p0 + p2) * t +
-    (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
-    (-p0 + 3 * p1 - 3 * p2 + p3) * t3
-  );
+  // Hermite basis
+  return y0 * (2 * h3 - 3 * h2 + 1)
+       + y1 * (-2 * h3 + 3 * h2)
+       + m0 * (h3 - 2 * h2 + h)
+       + m1 * (h3 - h2);
 }

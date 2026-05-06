@@ -146,7 +146,10 @@ function applyCurveLUT(): void {
 function resetCurve(): void {
   curvePoints.value = defaultCurve();
   curveActive.value = -1;
-  applyCurveLUT();
+  renderCurveCanvas();
+  const lut = curveToLUT(curvePoints.value);
+  if (webglRenderer) webglRenderer.uploadCurveLUT(lut);
+  drawWebGL(); // immediate, no RAF-batching for reset
 }
 
 function renderCurveCanvas(): void {
