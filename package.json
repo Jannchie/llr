@@ -1,0 +1,20 @@
+{
+  "name": "llr",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.28.0",
+  "type": "module",
+  "scripts": {
+    "build": "pnpm -r build",
+    "check": "pnpm -r check && uv run --project apps/worker python -m compileall -q apps/worker/src",
+    "dev": "pnpm --parallel --filter @llr/api --filter @llr/web dev",
+    "dev:api": "pnpm --filter @llr/api dev",
+    "dev:web": "pnpm --filter @llr/web dev",
+    "worker": "uv run --project apps/worker llr-worker"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}

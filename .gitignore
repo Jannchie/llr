@@ -1,0 +1,37 @@
+node_modules
+.venv
+dist
+.turbo
+.nuxt
+.output
+tmp
+
+# Python
+__pycache__/
+*.pyc
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# IDE / OS
+.DS_Store
+
+# Third-party vendored dependencies (install via system package manager)
+vendor/exiftool
+
+# Proprietary Adobe DNG Camera Profiles (copy from Adobe DNG Converter / Lightroom install)
+vendor/adobe-camera-profiles
+
+# npm lockfile (project uses pnpm)
+apps/web/package-lock.json
+
+# Large binary sample files
+apps/web/public/*.arw
+apps/web/public/*.dng
+
+# Logs
+*.log
+
+samples
