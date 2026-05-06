@@ -137,11 +137,13 @@ void main() {
   float hMask = smoothstep(0.50, 0.95, lum);                                // highlights
   float wMask = smoothstep(0.60, 0.92, lum);                                // whites
   float bMask = 1.0 - smoothstep(0.08, 0.40, lum);                          // blacks
-  // Multiplicative adjustments (industry standard)
+  // Shadows/Highlights: multiplicative with stops-scaling
   c *= 1.0 + u_shadows   * 0.50 * sMask;
   c *= 1.0 + u_highlights * 0.35 * hMask;
-  c *= 1.0 + u_whites    * 0.30 * wMask;
-  c *= 1.0 + u_blacks    * 0.25 * bMask;
+  // Whites: highlight exposure boost (stops-based, like Lightroom)
+  c = mix(c, c * exp2(u_whites * 1.6), wMask);
+  // Blacks: shadow exposure shift (stops-based, like Lightroom)
+  c = mix(c, c * exp2(-u_blacks * 1.8), bMask);
   c = max(c, vec3(0.0));
 
   // --- Contrast (power-law S-curve anchored at 18% gray) ---

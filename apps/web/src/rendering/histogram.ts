@@ -107,8 +107,8 @@ export function computeHistogram(
   const exposureMul = Math.pow(2, params.exposure);
   const hStrength = params.highlights * 0.35;
   const sStrength = params.shadows * 0.50;
-  const wStrength = params.whites * 0.30;
-  const bStrength = params.blacks * 0.25;
+  const wStrength = params.whites * 1.6;  // stops-based
+  const bStrength = params.blacks * 1.8;  // stops-based
 
   const contrastAmount = params.contrast - 1; /* [-1, 1] */
   const contrastGamma = 1 + contrastAmount * 0.6;
@@ -151,12 +151,16 @@ export function computeHistogram(
       r *= 1 + hStrength * hMask;
       g *= 1 + hStrength * hMask;
       b *= 1 + hStrength * hMask;
-      r *= 1 + wStrength * wMask_;
-      g *= 1 + wStrength * wMask_;
-      b *= 1 + wStrength * wMask_;
-      r *= 1 + bStrength * bMask;
-      g *= 1 + bStrength * bMask;
-      b *= 1 + bStrength * bMask;
+      // Whites: highlight exposure boost
+      const wBoost = Math.pow(2, wStrength);
+      r = r * (1 - wMask_) + r * wBoost * wMask_;
+      g = g * (1 - wMask_) + g * wBoost * wMask_;
+      b = b * (1 - wMask_) + b * wBoost * wMask_;
+      // Blacks: shadow exposure shift
+      const bShift = Math.pow(2, -bStrength);
+      r = r * (1 - bMask) + r * bShift * bMask;
+      g = g * (1 - bMask) + g * bShift * bMask;
+      b = b * (1 - bMask) + b * bShift * bMask;
       r = Math.max(0, r); g = Math.max(0, g); b = Math.max(0, b);
 
       // --- Contrast (power-law S-curve anchored at 18% gray) ---
