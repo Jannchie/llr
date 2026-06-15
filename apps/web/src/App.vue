@@ -2,11 +2,21 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { PipelineRenderer, type EditParams } from "./rendering/pipeline-renderer";
 import { renderHistogram } from "./rendering/histogram";
-import { curveToLUT, defaultCurve, renderCurve, hitTest, type CurvePoint } from "./rendering/curve";
+import {
+  curveToLUT, buildToneCurveLUT, defaultToneCurve, normalizeToneCurve,
+  renderToneCurve, hitTest, hitTestSplit, regionForX,
+  CURVE_PRESETS, type CurvePoint, type ToneCurve, type ToneChannel, type PointChannel,
+} from "./rendering/curve";
+import {
+  loadState, saveState, loadThumbs, saveThumbs, generateThumb,
+  type PersistedEdit, type PersistedState,
+} from "./persistence";
 
 // ── types ──
 
-type Source = { id: string; name: string; size: number; embeddedUrl: string; };
+// `invalid` is frontend-only (set when the server can no longer decode the
+// source, e.g. tmp/sessions was cleared); never persisted.
+type Source = { id: string; name: string; size: number; embeddedUrl: string; invalid?: boolean; };
 type RecipeKey = "exposure"|"contrast"|"highlights"|"shadows"|"whites"|"blacks"|"vibrance"|"saturation"|"temperature"|"tint"|"clarity"|"dehaze";
 type Recipe = Record<RecipeKey, number>;
 type SliderSpec = { key: RecipeKey; label: string; min: number; max: number; step: number };
@@ -60,6 +70,7 @@ const canvasRef = ref<HTMLCanvasElement | null>(null);
 const timing = ref<number | null>(null);
 const dcpCode = ref("");  // empty = auto-detect
 const exporting = ref(false);
+let currentSourceId = "";  // server id of the image currently in the renderer
 
 let webglRenderer: PipelineRenderer | null = null;
 const p3Supported = ref(false);
@@ -136,25 +147,71 @@ function resetHslGrading(): void {
   grading.balance = 0;
 }
 
-// ── Tone Curve ──
+// ── Tone Curve (Lightroom-compatible: parametric + RGB/R/G/B point curves) ──
 
-const curvePoints = ref<CurvePoint[]>(defaultCurve());
+const toneCurve = ref<ToneCurve>(defaultToneCurve());
+const curveChannel = ref<ToneChannel>("rgb");
 const curveActive = ref(-1);
 const curveCanvas = ref<HTMLCanvasElement | null>(null);
 
+const CURVE_TABS: { key: ToneChannel; label: string }[] = [
+  { key: "parametric", label: "Param" },
+  { key: "rgb", label: "RGB" },
+  { key: "red", label: "R" },
+  { key: "green", label: "G" },
+  { key: "blue", label: "B" },
+];
+const PARAM_REGIONS: { key: "highlights" | "lights" | "darks" | "shadows"; label: string }[] = [
+  { key: "highlights", label: "Highlights" },
+  { key: "lights", label: "Lights" },
+  { key: "darks", label: "Darks" },
+  { key: "shadows", label: "Shadows" },
+];
+const REGION_BY_INDEX: ("shadows" | "darks" | "lights" | "highlights")[] = ["shadows", "darks", "lights", "highlights"];
+const presetNames = Object.keys(CURVE_PRESETS);
+
+const isPointChannel = (ch: ToneChannel): ch is PointChannel => ch !== "parametric";
+
 function applyCurveLUT(): void {
-  const lut = curveToLUT(curvePoints.value);
-  if (webglRenderer) webglRenderer.uploadCurveLUT(lut);
+  if (webglRenderer) webglRenderer.uploadCurveLUT(buildToneCurveLUT(toneCurve.value));
   scheduleWebGLDraw();
 }
 
-function resetCurve(): void {
-  curvePoints.value = defaultCurve();
+function setCurveChannel(ch: ToneChannel): void {
+  curveChannel.value = ch;
   curveActive.value = -1;
   renderCurveCanvas();
-  const lut = curveToLUT(curvePoints.value);
-  if (webglRenderer) webglRenderer.uploadCurveLUT(lut);
+}
+
+function resetCurve(): void {
+  toneCurve.value = defaultToneCurve();
+  curveActive.value = -1;
+  renderCurveCanvas();
+  if (webglRenderer) webglRenderer.uploadCurveLUT(buildToneCurveLUT(toneCurve.value));
   drawWebGL(); // immediate, no RAF-batching for reset
+}
+
+function applyCurvePreset(name: string): void {
+  const preset = CURVE_PRESETS[name];
+  if (!preset) return;
+  toneCurve.value = { ...toneCurve.value, rgb: preset.map(p => ({ ...p })) };
+  curveChannel.value = "rgb";
+  curveActive.value = -1;
+  applyCurveLUT();
+  renderCurveCanvas();
+}
+
+// Parametric slider bridge (v-model for the region/split inputs).
+function paramValue(key: keyof ToneCurve["parametric"]): number {
+  return toneCurve.value.parametric[key];
+}
+function setParam(key: keyof ToneCurve["parametric"], v: number): void {
+  toneCurve.value = {
+    ...toneCurve.value,
+    parametric: { ...toneCurve.value.parametric, [key]: v },
+  };
+  applyCurveLUT();
+  renderCurveCanvas();
 }
 
 function renderCurveCanvas(): void {
@@ -168,30 +225,61 @@ function renderCurveCanvas(): void {
   const ctx = cvs.getContext("2d");
   if (!ctx) return;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  renderCurve(ctx, w, h, curvePoints.value, curveActive.value);
+  renderToneCurve(ctx, w, h, toneCurve.value, curveChannel.value, curveActive.value);
+}
+
+// --- pointer interaction ---
+
+type CurveDrag =
+  | { mode: "point"; channel: PointChannel; index: number }
+  | { mode: "split"; index: number }
+  | { mode: "region"; key: "shadows" | "darks" | "lights" | "highlights"; startMy: number; startVal: number; h: number };
+let curveDrag: CurveDrag | null = null;
+
+function curveCoords(e: MouseEvent): { mx: number; my: number; w: number; h: number } | null {
+  const cvs = curveCanvas.value;
+  if (!cvs) return null;
+  const rect = cvs.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  return { mx: e.clientX - rect.left, my: e.clientY - rect.top, w: rect.width / dpr, h: rect.height / dpr };
+}
+
+function setChannelPoints(ch: PointChannel, pts: CurvePoint[]): void {
+  toneCurve.value = { ...toneCurve.value, [ch]: pts };
 }
 
 function onCurveMouseDown(e: MouseEvent): void {
-  const cvs = curveCanvas.value;
-  if (!cvs) return;
-  const rect = cvs.getBoundingClientRect();
-  const mx = e.clientX - rect.left;
-  const my = e.clientY - rect.top;
-  const dpr = window.devicePixelRatio || 1;
-  const w = rect.width / dpr;
-  const h = rect.height / dpr;
-  const idx = hitTest(curvePoints.value, w, h, mx, my);
-  if (idx >= 0) {
-    curveActive.value = idx;
+  const c = curveCoords(e);
+  if (!c) return;
+  const { mx, my, w, h } = c;
+
+  if (curveChannel.value === "parametric") {
+    const param = toneCurve.value.parametric;
+    const split = hitTestSplit(param, w, h, mx, my);
+    if (split >= 0) {
+      curveDrag = { mode: "split", index: split };
+    } else {
+      const region = REGION_BY_INDEX[regionForX(param, clamp(mx / w, 0, 1))];
+      curveDrag = { mode: "region", key: region, startMy: my, startVal: param[region], h };
+    }
   } else {
-    // Add new point
-    const x = clamp(mx / w, 0, 1);
-    const y = clamp(1 - my / h, 0, 1);
-    const pts = [...curvePoints.value, { x, y }];
-    pts.sort((a, b) => a.x - b.x);
-    curvePoints.value = pts;
-    curveActive.value = pts.findIndex(p => p.x === x && p.y === y);
-    applyCurveLUT();
+    const ch = curveChannel.value as PointChannel;
+    const pts = toneCurve.value[ch];
+    const idx = hitTest(pts, w, h, mx, my);
+    if (idx >= 0) {
+      curveActive.value = idx;
+      curveDrag = { mode: "point", channel: ch, index: idx };
+    } else {
+      // Insert a new point, keeping x-order.
+      const x = clamp(mx / w, 0, 1);
+      const y = clamp(1 - my / h, 0, 1);
+      const next = [...pts, { x, y }].sort((a, b) => a.x - b.x);
+      const index = next.findIndex(p => p.x === x && p.y === y);
+      setChannelPoints(ch, next);
+      curveActive.value = index;
+      curveDrag = { mode: "point", channel: ch, index };
+      applyCurveLUT();
+    }
   }
   renderCurveCanvas();
   window.addEventListener("mousemove", onCurveMouseMove);
@@ -199,45 +287,65 @@ function onCurveMouseDown(e: MouseEvent): void {
 }
 
 function onCurveMouseMove(e: MouseEvent): void {
-  if (curveActive.value < 0) return;
-  const cvs = curveCanvas.value;
-  if (!cvs) return;
-  const rect = cvs.getBoundingClientRect();
-  const mx = e.clientX - rect.left;
-  const my = e.clientY - rect.top;
-  const dpr2 = window.devicePixelRatio || 1;
-  const cw = rect.width / dpr2;
-  const ch = rect.height / dpr2;
-  const pts = [...curvePoints.value];
-  pts[curveActive.value] = {
-    x: clamp(mx / cw, 0, 1),
-    y: clamp(1 - my / ch, 0, 1),
-  };
-  pts.sort((a, b) => a.x - b.x);
-  curvePoints.value = pts;
-  curveActive.value = pts.findIndex(
-    p => p.x === clamp(mx / cw, 0, 1) && p.y === clamp(1 - my / ch, 0, 1)
-  );
-  applyCurveLUT();
+  if (!curveDrag) return;
+  const c = curveCoords(e);
+  if (!c) return;
+  const { mx, my, w, h } = c;
+
+  if (curveDrag.mode === "point") {
+    const ch = curveDrag.channel;
+    const pts = [...toneCurve.value[ch]];
+    const i = curveDrag.index;
+    const last = pts.length - 1;
+    let x: number;
+    if (i === 0) x = 0;                       // first endpoint pinned to x=0
+    else if (i === last) x = 1;               // last endpoint pinned to x=1
+    else {
+      const loX = pts[i - 1].x + 1e-3;
+      const hiX = pts[i + 1].x - 1e-3;
+      x = clamp(mx / w, loX, hiX);            // keep order, index stays stable
+    }
+    pts[i] = { x, y: clamp(1 - my / h, 0, 1) };
+    setChannelPoints(ch, pts);
+    applyCurveLUT();
+  } else if (curveDrag.mode === "split") {
+    const p = toneCurve.value.parametric;
+    const keys = ["shadowSplit", "midtoneSplit", "highlightSplit"] as const;
+    const vals = [p.shadowSplit, p.midtoneSplit, p.highlightSplit];
+    const lo = curveDrag.index > 0 ? vals[curveDrag.index - 1] + 4 : 4;
+    const hi = curveDrag.index < 2 ? vals[curveDrag.index + 1] - 4 : 96;
+    setParam(keys[curveDrag.index], Math.round(clamp((mx / w) * 100, lo, hi)));
+    return; // setParam already re-rendered
+  } else {
+    // region: vertical drag adjusts the region slider (full height ≈ 150 units)
+    const delta = ((curveDrag.startMy - my) / curveDrag.h) * 150;
+    setParam(curveDrag.key, Math.round(clamp(curveDrag.startVal + delta, -100, 100)));
+    return;
+  }
   renderCurveCanvas();
 }
 
 function onCurveMouseUp(): void {
+  curveDrag = null;
   window.removeEventListener("mousemove", onCurveMouseMove);
   window.removeEventListener("mouseup", onCurveMouseUp);
 }
 
 function onCurveDoubleClick(e: MouseEvent): void {
-  const cvs = curveCanvas.value;
-  if (!cvs) return;
-  const rect = cvs.getBoundingClientRect();
-  const mx = e.clientX - rect.left;
-  const my = e.clientY - rect.top;
-  const dpr = window.devicePixelRatio || 1;
-  const idx = hitTest(curvePoints.value, rect.width / dpr, rect.height / dpr, mx, my);
-  if (idx > 0 && idx < curvePoints.value.length - 1) {
-    // Delete point (keep endpoints)
-    curvePoints.value = curvePoints.value.filter((_, i) => i !== idx);
+  const c = curveCoords(e);
+  if (!c) return;
+  const { mx, my, w, h } = c;
+  if (curveChannel.value === "parametric") {
+    // Reset the region under the cursor to 0.
+    const region = REGION_BY_INDEX[regionForX(toneCurve.value.parametric, clamp(mx / w, 0, 1))];
+    setParam(region, 0);
+    return;
+  }
+  const ch = curveChannel.value as PointChannel;
+  const pts = toneCurve.value[ch];
+  const idx = hitTest(pts, w, h, mx, my);
+  if (idx > 0 && idx < pts.length - 1) {
+    setChannelPoints(ch, pts.filter((_, i) => i !== idx));
     curveActive.value = -1;
     applyCurveLUT();
     renderCurveCanvas();
@@ -259,7 +367,7 @@ type Snapshot = {
   recipe: Recipe;
   hslHue: number[]; hslSat: number[]; hslLum: number[];
   grading: typeof grading;
-  curve: CurvePoint[];
+  curve: ToneCurve;
   dcp: string;
 };
 
@@ -270,7 +378,22 @@ const history = ref<Snapshot[]>([]);
 const historyIndex = ref(-1);
 const pendingDirty = ref(false);
 let isRestoring = false;
+// When true, the dcpCode watcher skips its re-decode — used while we load a
+// source explicitly (switching images / restoring) to avoid a double decode.
+let suppressDcpReload = false;
 let historyTimer = 0;
+
+function defaultSnapshot(): Snapshot {
+  return {
+    recipe: defaultRecipe(),
+    hslHue: [0, 0, 0, 0, 0, 0, 0, 0],
+    hslSat: [0, 0, 0, 0, 0, 0, 0, 0],
+    hslLum: [0, 0, 0, 0, 0, 0, 0, 0],
+    grading: { shH: 0, shS: 0, mdH: 0, mdS: 0, hlH: 0, hlS: 0, blend: 50, balance: 0 } as typeof grading,
+    curve: defaultToneCurve(),
+    dcp: "",
+  };
+}
 
 const canUndo = computed(() => historyIndex.value > 0 || pendingDirty.value);
 const canRedo = computed(() => historyIndex.value < history.value.length - 1);
@@ -280,7 +403,7 @@ function captureSnapshot(): Snapshot {
     recipe: { ...recipe },
     hslHue: [...hslHue], hslSat: [...hslSat], hslLum: [...hslLum],
     grading: { ...grading },
-    curve: curvePoints.value.map(p => ({ ...p })),
+    curve: normalizeToneCurve(toneCurve.value),
     dcp: dcpCode.value,
   };
 }
@@ -315,16 +438,22 @@ function flushPendingHistory(): void {
   if (pendingDirty.value) commitHistory();
 }
 
-function applySnapshot(s: Snapshot): void {
-  isRestoring = true;
+// Push a snapshot into the live reactive edit state (no draw scheduling — the
+// caller decides whether to redraw or re-decode).
+function setEditState(s: Snapshot): void {
   Object.assign(recipe, s.recipe);
   for (let i = 0; i < 8; i++) { hslHue[i] = s.hslHue[i]; hslSat[i] = s.hslSat[i]; hslLum[i] = s.hslLum[i]; }
   Object.assign(grading, s.grading);
-  curvePoints.value = s.curve.map(p => ({ ...p }));
+  toneCurve.value = normalizeToneCurve(s.curve);
   curveActive.value = -1;
-  dcpCode.value = s.dcp; // triggers re-decode if the DCP style differs
-  if (webglRenderer) webglRenderer.uploadCurveLUT(curveToLUT(curvePoints.value));
+  dcpCode.value = s.dcp;
+  if (webglRenderer) webglRenderer.uploadCurveLUT(buildToneCurveLUT(toneCurve.value));
   renderCurveCanvas();
+}
+
+function applySnapshot(s: Snapshot): void {
+  isRestoring = true;
+  setEditState(s); // setting dcpCode here may trigger a re-decode (intended for undo/redo)
   scheduleWebGLDraw();
   nextTick(() => { isRestoring = false; });
 }
@@ -334,6 +463,7 @@ function undo(): void {
   if (historyIndex.value <= 0) return;
   historyIndex.value--;
   applySnapshot(history.value[historyIndex.value]);
+  nextTick(() => schedulePersist());
 }
 
 function redo(): void {
@@ -341,6 +471,7 @@ function redo(): void {
   if (historyIndex.value >= history.value.length - 1) return;
   historyIndex.value++;
   applySnapshot(history.value[historyIndex.value]);
+  nextTick(() => schedulePersist());
 }
 
 function initHistory(): void {
@@ -349,6 +480,154 @@ function initHistory(): void {
   pendingDirty.value = false;
 }
 initHistory();
+
+// ── Per-image edits + persistence ──
+//
+// Each imported source owns an independent edit (snapshot + undo history). The
+// live reactive state (recipe/hsl/grading/curve/dcp + history) always mirrors
+// the active image; switching images saves the outgoing one here and loads the
+// incoming one back.
+
+type ImageEdit = PersistedEdit<Snapshot>;
+const edits = new Map<string, ImageEdit>();
+
+const thumbs = reactive<Record<string, string>>({});
+
+let persistTimer = 0;
+const PERSIST_DEBOUNCE = 600;
+
+// Copy the current live edit (snapshot + history) into the map under `id`.
+function syncLiveToMap(id: string | null): void {
+  if (!id) return;
+  edits.set(id, {
+    snapshot: captureSnapshot(),
+    history: history.value.slice(),
+    historyIndex: historyIndex.value,
+  });
+}
+
+// Load an image's edit into the live reactive state (defaults if none stored).
+// Does not decode/draw — the caller pairs this with loadSource().
+function loadEditFromMap(id: string): void {
+  const e = edits.get(id);
+  isRestoring = true;
+  suppressDcpReload = true;
+  if (e) {
+    setEditState(e.snapshot);
+    history.value = e.history.map(s => ({ ...s }));
+    historyIndex.value = Math.min(Math.max(0, e.historyIndex), history.value.length - 1);
+  } else {
+    setEditState(defaultSnapshot());
+    history.value = [captureSnapshot()];
+    historyIndex.value = 0;
+  }
+  pendingDirty.value = false;
+  nextTick(() => { isRestoring = false; suppressDcpReload = false; });
+}
+
+function persistNow(): void {
+  syncLiveToMap(activeId.value);
+  const editsObj: Record<string, ImageEdit> = {};
+  for (const [id, e] of edits) editsObj[id] = e;
+  const state: PersistedState<Snapshot, typeof viewSettings> = {
+    version: 1,
+    activeId: activeId.value,
+    viewSettings: { ...viewSettings },
+    sources: sources.value.map(s => ({ id: s.id, name: s.name, size: s.size, embeddedUrl: s.embeddedUrl })),
+    edits: editsObj,
+  };
+  saveState(state);
+}
+
+function schedulePersist(): void {
+  if (isRestoring) return;
+  if (persistTimer) clearTimeout(persistTimer);
+  persistTimer = window.setTimeout(() => { persistTimer = 0; persistNow(); }, PERSIST_DEBOUNCE);
+}
+
+// Resolve a possibly-relative API url to something <img>/fetch can use.
+function resolveUrl(u: string): string { return isAbsoluteUrl(u) ? u : `${API}${u}`; }
+
+// Thumbnail shown in the filmstrip / preview fallback: prefer the locally
+// cached copy (survives server eviction), else the live server preview.
+function thumbSrc(s: Source): string {
+  return thumbs[s.id] ?? (s.embeddedUrl ? resolveUrl(s.embeddedUrl) : "");
+}
+
+async function cacheThumb(s: Source): Promise<void> {
+  if (thumbs[s.id] || !s.embeddedUrl) return;
+  const data = await generateThumb(resolveUrl(s.embeddedUrl));
+  if (data) { thumbs[s.id] = data; saveThumbs({ ...thumbs }); }
+}
+
+function markInvalid(id: string): void {
+  const s = sources.value.find(x => x.id === id);
+  if (s) s.invalid = true;
+  status.value = "error";
+  errorMessage.value = "源文件已失效（服务器缓存可能已被清理），请重新导入这张图片。";
+}
+
+// Decode `id`'s linear data and render it into the (reused) WebGL pipeline.
+// Returns false if the source can no longer be decoded server-side.
+async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promise<boolean> {
+  const src = sources.value.find(s => s.id === id);
+  if (!src) return false;
+  currentSourceId = id;
+  status.value = "rendering";
+  errorMessage.value = null;
+  try {
+    const linRes = await fetch(`${API}/render-linear`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sourceId: id, halfSize: true, maxSize: 1600, dcpCode: dcpCode.value }),
+    });
+    if (linRes.status === 404) { markInvalid(id); return false; }
+    if (!linRes.ok) throw new Error(await linRes.text());
+    const linMeta = await linRes.json() as { width: number; height: number; linearUrl: string; colorProfile?: ColorProfileMeta };
+    const binRes = await fetch(linMeta.linearUrl);
+    if (binRes.status === 404) { markInvalid(id); return false; }
+    if (!binRes.ok) throw new Error("Failed to fetch linear data");
+    const linearFloat = new Float32Array(await binRes.arrayBuffer());
+
+    linearFloatData = linearFloat;
+    profileCurveLUT = buildProfileLUT(linMeta.colorProfile);
+    imageW.value = linMeta.width;
+    imageH.value = linMeta.height;
+    if (viewportRef.value) {
+      fitScale.value = Math.min(viewportRef.value.clientWidth / linMeta.width, viewportRef.value.clientHeight / linMeta.height);
+    }
+    if (opts.resetView) { zoom.value = 1; pan.x = 0; pan.y = 0; }
+
+    await nextTick();
+    if (!canvasRef.value) return false;
+    if (!webglRenderer) {
+      webglRenderer = new PipelineRenderer(canvasRef.value);
+      p3Supported.value = webglRenderer.p3Supported;
+    }
+    webglRenderer.uploadImage(linearFloat, linMeta.width, linMeta.height);
+    webglRenderer.uploadCurveLUT(buildToneCurveLUT(toneCurve.value));
+    webglRenderer.uploadProfileCurveLUT(profileCurveLUT);
+    drawWebGL();
+    scheduleHistogram();
+    src.invalid = false;
+    status.value = "idle";
+    return true;
+  } catch (err) {
+    status.value = "error";
+    errorMessage.value = err instanceof Error ? err.message : String(err);
+    return false;
+  }
+}
+
+// Switch the active image: stash the current edit, load the target's edit + pixels.
+async function selectSource(id: string): Promise<void> {
+  if (id === activeId.value) return;
+  flushPendingHistory();
+  syncLiveToMap(activeId.value);
+  activeId.value = id;
+  loadEditFromMap(id);
+  await loadSource(id, { resetView: true });
+  schedulePersist();
+}
 
 const activeSource = computed(() => sources.value.find(s => s.id === activeId.value) ?? null);
 
@@ -406,10 +685,6 @@ let profileCurveLUT: Float32Array | null = null;
 function buildProfileLUT(cp: ColorProfileMeta | undefined): Float32Array | null {
   const pts = cp?.profileToneCurve;
   return (pts && pts.length >= 2) ? curveToLUT(pts.map(([x, y]) => ({ x, y }))) : null;
-}
-function setProfileCurve(cp: ColorProfileMeta | undefined): void {
-  profileCurveLUT = buildProfileLUT(cp);
-  if (webglRenderer) webglRenderer.uploadProfileCurveLUT(profileCurveLUT);
 }
 
 // ── Histogram ──
@@ -565,59 +840,39 @@ function onKeyDown(e: KeyboardEvent): void {
 
 // ── upload ──
 
-watch(recipe, () => scheduleWebGLDraw(), { deep: true });
-watch([hslHue, hslSat, hslLum], () => scheduleWebGLDraw(), { deep: true });
-watch(grading, () => scheduleWebGLDraw(), { deep: true });
-watch(viewSettings, () => scheduleWebGLDraw(), { deep: true });
+// Auto-redraw on edit. Suppressed during restore/switch so we don't flash the
+// previous image with the new params before loadSource() uploads the pixels.
+watch(recipe, () => { if (!isRestoring) scheduleWebGLDraw(); }, { deep: true });
+watch([hslHue, hslSat, hslLum], () => { if (!isRestoring) scheduleWebGLDraw(); }, { deep: true });
+watch(grading, () => { if (!isRestoring) scheduleWebGLDraw(); }, { deep: true });
+watch(viewSettings, () => { scheduleWebGLDraw(); schedulePersist(); }, { deep: true });
 
 // Record edit changes into undo/redo history (coalesced; suppressed during restore)
-watch([recipe, hslHue, hslSat, hslLum, grading, curvePoints, dcpCode],
-  () => scheduleHistoryCommit(), { deep: true });
+// and persist the session.
+watch([recipe, hslHue, hslSat, hslLum, grading, toneCurve, dcpCode],
+  () => { scheduleHistoryCommit(); schedulePersist(); }, { deep: true });
 
-// Re-decode when DCP code changes
-let currentSourceId = "";
-watch(dcpCode, async (newCode) => {
-  if (!currentSourceId) { console.log("[dcp] skip, no source"); return; }
-  console.log("[dcp] switching to:", newCode);
-  status.value = "rendering";
-  try {
-    const linRes = await fetch(`${API}/render-linear`, {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ sourceId: currentSourceId, halfSize: true, maxSize: 1600, dcpCode: dcpCode.value }),
-    });
-    if (!linRes.ok) throw new Error(await linRes.text());
-    const linMeta = await linRes.json() as { width: number; height: number; linearUrl: string; colorProfile?: ColorProfileMeta };
-    const binRes = await fetch(linMeta.linearUrl);
-    if (!binRes.ok) throw new Error("Failed to fetch");
-    const linearFloat = new Float32Array(await binRes.arrayBuffer());
-    // Update histogram data with new DCP rendering
-    linearFloatData = linearFloat;
-    imageW.value = linMeta.width;
-    imageH.value = linMeta.height;
-    if (viewportRef.value) {
-      fitScale.value = Math.min(viewportRef.value.clientWidth / linMeta.width, viewportRef.value.clientHeight / linMeta.height);
-    }
-    if (canvasRef.value && webglRenderer) {
-      webglRenderer.uploadImage(linearFloat, linMeta.width, linMeta.height);
-      setProfileCurve(linMeta.colorProfile); // new DCP -> new tone curve
-      drawWebGL();
-      scheduleHistogram();
-    }
-  } catch (err) {
-    console.warn("DCP reload failed:", err);
-  }
-  status.value = "idle";
+// Re-decode when the user changes the DCP style (keeps the current view).
+// Suppressed while a source load is already handling the decode.
+watch(dcpCode, async () => {
+  if (suppressDcpReload || !currentSourceId) return;
+  await loadSource(currentSourceId, { resetView: false });
 });
+
+// Flush the latest edit synchronously on tab close (beforeunload won't wait for
+// the debounced persist).
+function persistOnUnload(): void { persistNow(); }
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeyDown);
+  window.removeEventListener('beforeunload', persistOnUnload);
   resizeObs?.disconnect();
   destroyWebGL();
 });
 
-// Auto-load sample file on startup
 onMounted(async () => {
   window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('beforeunload', persistOnUnload);
   resizeObs = new ResizeObserver(() => {
     if (imageW.value && imageH.value && viewportRef.value) {
       fitScale.value = Math.min(viewportRef.value.clientWidth / imageW.value, viewportRef.value.clientHeight / imageH.value);
@@ -625,6 +880,10 @@ onMounted(async () => {
   });
   if (viewportRef.value) resizeObs.observe(viewportRef.value);
 
+  Object.assign(thumbs, loadThumbs());
+
+  // Restore a previous session if one exists; otherwise auto-load the sample.
+  if (await restoreSession()) return;
   try {
     const res = await fetch("/sample.arw");
     if (res.ok) {
@@ -636,6 +895,29 @@ onMounted(async () => {
     console.warn("Auto-load sample failed:", e);
   }
 });
+
+// Rehydrate imported images + their edits from localStorage. Returns false if
+// there's nothing to restore (so the caller falls back to the sample).
+async function restoreSession(): Promise<boolean> {
+  const persisted = loadState<Snapshot, typeof viewSettings>();
+  if (!persisted || !persisted.sources.length) return false;
+
+  sources.value = persisted.sources.map(s => ({ ...s }));
+  if (persisted.viewSettings) Object.assign(viewSettings, persisted.viewSettings);
+  edits.clear();
+  for (const [id, e] of Object.entries(persisted.edits)) edits.set(id, e);
+
+  const targetId = persisted.activeId && sources.value.some(s => s.id === persisted.activeId)
+    ? persisted.activeId
+    : sources.value[0].id;
+  activeId.value = targetId;
+  loadEditFromMap(targetId);
+  await loadSource(targetId, { resetView: true });
+
+  // Backfill any thumbnails missing from the cache (e.g. first run after upgrade).
+  for (const s of sources.value) if (!thumbs[s.id]) void cacheThumb(s);
+  return true;
+}
 
 function pickFiles(): void { fileInput.value?.click(); }
 
@@ -657,79 +939,44 @@ async function uploadFiles(files: File[]): Promise<void> {
   if (!files.length) return;
   status.value = "uploading";
   errorMessage.value = null;
-  destroyWebGL();
 
+  // Preserve the edit of the image we're leaving before importing new ones.
+  flushPendingHistory();
+  syncLiveToMap(activeId.value);
+
+  let lastId: string | null = null;
   for (const file of files) {
-    const t0 = performance.now();
     const formData = new FormData();
     formData.append("file", file);
     try {
-      // Upload
       const res = await fetch(`${API}/sources`, { method: "POST", body: formData });
       if (!res.ok) throw new Error(await res.text());
       const source = await res.json() as Source;
-      currentSourceId = source.id;
       sources.value = [...sources.value, source];
-      activeId.value = source.id;
-      status.value = "rendering";
-      await nextTick();
-
-      // Decode + render linear
-      const linRes = await fetch(`${API}/render-linear`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ sourceId: source.id, halfSize: true, maxSize: 1600, dcpCode: dcpCode.value }),
-      });
-      if (!linRes.ok) throw new Error(await linRes.text());
-      const linMeta = await linRes.json() as { width: number; height: number; linearUrl: string; colorProfile?: ColorProfileMeta };
-
-      // Fetch binary float32
-      const binRes = await fetch(linMeta.linearUrl);
-      if (!binRes.ok) throw new Error("Failed to fetch linear data");
-      const buf = await binRes.arrayBuffer();
-      const linearFloat = new Float32Array(buf);
-      const width = linMeta.width;
-      const height = linMeta.height;
-      console.log("[upload] bin:", buf.byteLength, "B, float32:", linearFloat.length, "expect:", width*height*3);
-      timing.value = Math.round(performance.now() - t0);
-      linearFloatData = linearFloat;
-      profileCurveLUT = buildProfileLUT(linMeta.colorProfile);
-
-      // Store image dimensions for pan/zoom
-      imageW.value = width;
-      imageH.value = height;
-      if (viewportRef.value) {
-        fitScale.value = Math.min(viewportRef.value.clientWidth / width, viewportRef.value.clientHeight / height);
-      }
-      zoom.value = 1;
-      pan.x = 0;
-      pan.y = 0;
-
-      await nextTick();
-      if (canvasRef.value) {
-        destroyWebGL();
-        try {
-          webglRenderer = new PipelineRenderer(canvasRef.value);
-          p3Supported.value = webglRenderer.p3Supported;
-          webglRenderer.uploadImage(linearFloat, width, height);
-          webglRenderer.uploadCurveLUT(curveToLUT(curvePoints.value));
-          webglRenderer.uploadProfileCurveLUT(profileCurveLUT);
-          drawWebGL();
-          scheduleHistogram();
-        } catch (err) {
-          console.error("[pipeline] init failed:", err);
-          status.value = "error";
-          errorMessage.value = err instanceof Error ? err.message : String(err);
-          return;
-        }
-      }
+      // Each new import starts from a fresh, independent edit.
+      const snap = defaultSnapshot();
+      edits.set(source.id, { snapshot: snap, history: [snap], historyIndex: 0 });
+      void cacheThumb(source);
+      lastId = source.id;
     } catch (err) {
       status.value = "error";
       errorMessage.value = err instanceof Error ? err.message : String(err);
       return;
     }
   }
-  status.value = "idle";
+
+  // Make the last imported image active and render it (loadSource sets the
+  // final status to idle/error).
+  if (lastId) {
+    const t0 = performance.now();
+    activeId.value = lastId;
+    loadEditFromMap(lastId);
+    await loadSource(lastId, { resetView: true });
+    timing.value = Math.round(performance.now() - t0);
+  } else {
+    status.value = "idle";
+  }
+  persistNow();
 }
 
 function resetRecipe(): void { Object.assign(recipe, defaultRecipe()); resetHslGrading(); }
@@ -774,7 +1021,7 @@ async function exportImage(): Promise<void> {
     // 2. Render full-res off-screen with the current edit params, read back as JPEG
     renderer = new PipelineRenderer(document.createElement("canvas"));
     renderer.uploadImage(linear, linMeta.width, linMeta.height);
-    renderer.uploadCurveLUT(curveToLUT(curvePoints.value));
+    renderer.uploadCurveLUT(buildToneCurveLUT(toneCurve.value));
     renderer.uploadProfileCurveLUT(buildProfileLUT(linMeta.colorProfile));
     renderer.draw(buildPipelineParams());
     const blob = await renderer.toBlob("image/jpeg", 0.92);
@@ -885,8 +1132,13 @@ function trackFill(value: number, min: number, max: number): string {
         <div v-show="activeSource && status === 'rendering' && !webglRenderer" class="preview-loading">
           <span>Decoding… {{ timing ? `${timing}ms` : '' }}</span>
         </div>
-        <canvas v-show="webglRenderer != null" ref="canvasRef" class="preview" :style="{ transform: displayTransform }" />
-        <img v-show="activeSource && !webglRenderer && status !== 'rendering'" class="preview" :style="{ transform: displayTransform }" :src="activeSource?.embeddedUrl ? (isAbsoluteUrl(activeSource.embeddedUrl) ? activeSource.embeddedUrl : `${API}${activeSource.embeddedUrl}`) : ''" alt="preview" />
+        <canvas v-show="webglRenderer != null && !activeSource?.invalid" ref="canvasRef" class="preview" :style="{ transform: displayTransform }" />
+        <img v-show="activeSource && !activeSource.invalid && !webglRenderer && status !== 'rendering'" class="preview" :style="{ transform: displayTransform }" :src="activeSource ? thumbSrc(activeSource) : ''" alt="preview" />
+        <div v-if="activeSource?.invalid" class="invalid-state">
+          <img v-if="activeSource && thumbSrc(activeSource)" :src="thumbSrc(activeSource)" :alt="activeSource.name" />
+          <p class="invalid-title">源文件已失效</p>
+          <p class="invalid-sub">服务器缓存可能已被清理，请重新导入这张图片</p>
+        </div>
       </div>
 
       <footer class="status" v-show="activeSource">
@@ -1067,9 +1319,50 @@ function trackFill(value: number, min: number, max: number): string {
           <span>Tone Curve</span>
           <button class="ghost" type="button" @click="resetCurve">Reset</button>
         </header>
+        <div class="curve-tabs">
+          <button v-for="tab in CURVE_TABS" :key="tab.key" type="button"
+            :class="['curve-tab', `curve-tab--${tab.key}`, { active: curveChannel === tab.key }]"
+            @click="setCurveChannel(tab.key)">{{ tab.label }}</button>
+        </div>
         <canvas ref="curveCanvas" class="curve-canvas"
           @mousedown="onCurveMouseDown"
           @dblclick="onCurveDoubleClick" />
+
+        <!-- Parametric region + split sliders -->
+        <div v-if="curveChannel === 'parametric'" class="curve-params">
+          <div v-for="r in PARAM_REGIONS" :key="r.key" class="slider">
+            <label>{{ r.label }}</label>
+            <input type="range" min="-100" max="100" step="1"
+              :value="paramValue(r.key)"
+              :style="{ '--track': trackFill(paramValue(r.key), -100, 100) }"
+              @input="setParam(r.key, ($event.target as HTMLInputElement).valueAsNumber)"
+              @dblclick="setParam(r.key, 0)" title="Double-click to reset" />
+            <input class="slider-number" type="number" min="-100" max="100" step="1"
+              :value="paramValue(r.key)"
+              @input="setParam(r.key, ($event.target as HTMLInputElement).valueAsNumber)" />
+          </div>
+          <div class="curve-splits">
+            <span class="curve-splits-label">Range Splits</span>
+            <input type="range" min="4" max="96" step="1"
+              :value="paramValue('shadowSplit')"
+              :style="{ '--track': trackFill(paramValue('shadowSplit'), 0, 100) }"
+              @input="setParam('shadowSplit', Math.min(($event.target as HTMLInputElement).valueAsNumber, paramValue('midtoneSplit') - 4))" />
+            <input type="range" min="4" max="96" step="1"
+              :value="paramValue('midtoneSplit')"
+              :style="{ '--track': trackFill(paramValue('midtoneSplit'), 0, 100) }"
+              @input="setParam('midtoneSplit', Math.min(Math.max(($event.target as HTMLInputElement).valueAsNumber, paramValue('shadowSplit') + 4), paramValue('highlightSplit') - 4))" />
+            <input type="range" min="4" max="96" step="1"
+              :value="paramValue('highlightSplit')"
+              :style="{ '--track': trackFill(paramValue('highlightSplit'), 0, 100) }"
+              @input="setParam('highlightSplit', Math.max(($event.target as HTMLInputElement).valueAsNumber, paramValue('midtoneSplit') + 4))" />
+          </div>
+        </div>
+
+        <!-- Point-curve presets (applied to the RGB master channel) -->
+        <div v-else class="curve-presets">
+          <button v-for="name in presetNames" :key="name" type="button"
+            class="curve-preset" @click="applyCurvePreset(name)">{{ name }}</button>
+        </div>
       </section>
     </aside>
 
@@ -1077,9 +1370,12 @@ function trackFill(value: number, min: number, max: number): string {
       <button class="filmstrip-import" type="button" @click="pickFiles">＋ Import</button>
       <div class="filmstrip-track">
         <button v-for="source in sources" :key="source.id" type="button"
-          class="film-cell" :class="{ 'is-active': source.id === activeId }"
-          @click="activeId = source.id; scheduleWebGLDraw()">
-          <img v-if="source.embeddedUrl" :src="isAbsoluteUrl(source.embeddedUrl) ? source.embeddedUrl : `${API}${source.embeddedUrl}`" :alt="source.name" />
+          class="film-cell" :class="{ 'is-active': source.id === activeId, 'is-invalid': source.invalid }"
+          @click="selectSource(source.id)">
+          <div class="film-thumb">
+            <img v-if="thumbSrc(source)" :src="thumbSrc(source)" :alt="source.name" />
+            <span v-if="source.invalid" class="film-badge" title="源文件已失效，请重新导入">失效</span>
+          </div>
           <span class="film-name">{{ source.name }}</span>
           <span class="film-size">{{ formatBytes(source.size) }}</span>
         </button>
@@ -1088,5 +1384,10 @@ function trackFill(value: number, min: number, max: number): string {
 
     <input ref="fileInput" type="file" accept=".arw,.dng,.cr2,.cr3,.nef,.raf,.rw2,.orf,.tif,.tiff,.jpg,.jpeg,.png" hidden multiple @change="onFileChange" />
     <transition name="fade"><div v-if="isDragging" class="drag-overlay">Drop to import</div></transition>
+    <transition name="fade">
+      <div v-if="errorMessage && !activeSource?.invalid" class="error-toast" @click="errorMessage = null" title="点击关闭">
+        {{ errorMessage }}
+      </div>
+    </transition>
   </div>
 </template>

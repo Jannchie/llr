@@ -571,6 +571,16 @@ def build_crs_attrs(settings: dict[str, Any]) -> "OrderedDict[str, str]":
     attrs["crs:Temperature"] = f"{int(round(_num(recipe, 'temperature', 6500)))}"
     attrs["crs:Tint"] = f"{int(round(_num(recipe, 'tint')))}"
 
+    # Parametric (region) tone curve — Lightroom crs:Parametric* fields.
+    parametric = _curve_settings(settings).get("parametric", {}) or {}
+    attrs["crs:ParametricShadows"] = f"{int(round(_num(parametric, 'shadows')))}"
+    attrs["crs:ParametricDarks"] = f"{int(round(_num(parametric, 'darks')))}"
+    attrs["crs:ParametricLights"] = f"{int(round(_num(parametric, 'lights')))}"
+    attrs["crs:ParametricHighlights"] = f"{int(round(_num(parametric, 'highlights')))}"
+    attrs["crs:ParametricShadowSplit"] = f"{int(round(_num(parametric, 'shadowSplit', 25)))}"
+    attrs["crs:ParametricMidtoneSplit"] = f"{int(round(_num(parametric, 'midtoneSplit', 50)))}"
+    attrs["crs:ParametricHighlightSplit"] = f"{int(round(_num(parametric, 'highlightSplit', 75)))}"
+
     hue = settings.get("hslHue") or []
     sat = settings.get("hslSat") or []
     lum = settings.get("hslLum") or []
@@ -595,16 +605,31 @@ def build_crs_attrs(settings: dict[str, Any]) -> "OrderedDict[str, str]":
     return attrs
 
 
-def build_tone_curve_seq(settings: dict[str, Any]) -> list[str]:
-    points: list[str] = []
-    for point in settings.get("curve", []) or []:
+def _curve_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    """Return the tone curve as a dict, tolerating the legacy flat-list format."""
+    curve = settings.get("curve")
+    if isinstance(curve, list):  # legacy: a bare RGB point list
+        return {"rgb": curve}
+    if isinstance(curve, dict):
+        return curve
+    return {}
+
+
+def _tone_curve_points(points: Any) -> list[str]:
+    """Convert a list of {x,y} (0-1) control points to Lightroom "X, Y" (0-255)."""
+    out: list[str] = []
+    for point in points or []:
         try:
             x = int(round(clamp(float(point["x"]) * 255, 0, 255)))
             y = int(round(clamp(float(point["y"]) * 255, 0, 255)))
         except (KeyError, TypeError, ValueError):
             continue
-        points.append(f"{x}, {y}")
-    return points
+        out.append(f"{x}, {y}")
+    return out
+
+
+def _is_identity_curve(points: list[str]) -> bool:
+    return points in ([], ["0, 0", "255, 255"])
 
 
 def _xml_escape(text: str) -> str:
@@ -615,21 +640,30 @@ def _xml_attr(text: str) -> str:
     return _xml_escape(text).replace('"', "&quot;")
 
 
+def _tone_curve_block(tag: str, points: list[str]) -> str:
+    if not points:
+        return ""
+    items = "\n     ".join(f"<rdf:li>{_xml_escape(point)}</rdf:li>" for point in points)
+    return (
+        f"\n   <crs:{tag}>\n    <rdf:Seq>\n     "
+        + items
+        + f"\n    </rdf:Seq>\n   </crs:{tag}>"
+    )
+
+
 def build_xmp_packet(settings: dict[str, Any]) -> str:
     crs_attrs = build_crs_attrs(settings)
-    tone_curve = build_tone_curve_seq(settings)
+    curve = _curve_settings(settings)
     llr_json = json.dumps(settings, separators=(",", ":"), ensure_ascii=False)
 
     attr_lines = "\n   ".join(f'{key}="{_xml_attr(value)}"' for key, value in crs_attrs.items())
 
-    tone_block = ""
-    if tone_curve:
-        items = "\n     ".join(f"<rdf:li>{_xml_escape(point)}</rdf:li>" for point in tone_curve)
-        tone_block = (
-            "\n   <crs:ToneCurvePV2012>\n    <rdf:Seq>\n     "
-            + items
-            + "\n    </rdf:Seq>\n   </crs:ToneCurvePV2012>"
-        )
+    # RGB master curve is always written; per-channel curves only when non-identity.
+    tone_block = _tone_curve_block("ToneCurvePV2012", _tone_curve_points(curve.get("rgb")))
+    for tag, key in (("ToneCurvePV2012Red", "red"), ("ToneCurvePV2012Green", "green"), ("ToneCurvePV2012Blue", "blue")):
+        pts = _tone_curve_points(curve.get(key))
+        if not _is_identity_curve(pts):
+            tone_block += _tone_curve_block(tag, pts)
 
     return (
         '<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'

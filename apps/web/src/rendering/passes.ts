@@ -45,7 +45,8 @@ uniform float u_grad_hl_h;
 uniform float u_grad_hl_s;
 uniform float u_grad_blend;
 uniform float u_grad_balance;
-// Tone Curve LUT (2048×1 texture, R channel = output) — applied display-referred
+// Tone Curve LUT (2048×1 RGB texture) — per-channel point + parametric curves,
+// applied display-referred. .r/.g/.b hold the baked R/G/B channel curves.
 uniform sampler2D u_curve_lut;
 uniform sampler2D u_profile_lut; // DCP profile tone curve (per-channel), display rendering
 uniform int u_hasProfileCurve;   // 1 if a DCP profile tone curve is available
@@ -211,10 +212,15 @@ void main() {
   // ===== View transform: scene-linear -> display-referred ProPhoto [0,1] =====
   c = viewTransform(c);
 
-  // --- Tone Curve (user Point Curve, display-referred, luminance-driven) ---
-  float cl = clamp(ppLuma(c), 0.0, 1.0);
-  float cv = texture(u_curve_lut, vec2(cl, 0.5)).r;
-  c = c * (cv / max(cl, 0.0001));
+  // --- Tone Curve (parametric + per-channel point curves, display-referred) ---
+  // Lightroom applies the tone curve per channel, so contrast also shifts
+  // saturation. The LUT bakes parametric -> RGB master -> per-channel.
+  c = clamp(c, 0.0, 1.0);
+  c = vec3(
+    texture(u_curve_lut, vec2(c.r, 0.5)).r,
+    texture(u_curve_lut, vec2(c.g, 0.5)).g,
+    texture(u_curve_lut, vec2(c.b, 0.5)).b
+  );
 
   // --- Color Grading (display-referred split-toning) ---
   if (u_grad_blend > 0.001) {

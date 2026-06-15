@@ -77,7 +77,12 @@ export class PipelineRenderer {
     // Upload identity LUTs as defaults (user tone curve + DCP profile curve).
     const identity = new Float32Array(2048);
     for (let i = 0; i < 2048; i++) identity[i] = i / 2047;
-    this.uploadCurveLUT(identity);
+    const identityRGB = new Float32Array(2048 * 3);
+    for (let i = 0; i < 2048; i++) {
+      const v = i / 2047;
+      identityRGB[i * 3] = v; identityRGB[i * 3 + 1] = v; identityRGB[i * 3 + 2] = v;
+    }
+    this.uploadCurveLUT(identityRGB);
     this.profileLutTex = this.makeLutTexture(identity);
 
     const info = gl.getExtension("WEBGL_debug_renderer_info");
@@ -100,12 +105,16 @@ export class PipelineRenderer {
     this.canvas.width = width; this.canvas.height = height;
   }
 
-  private makeLutTexture(lut: Float32Array): WebGLTexture {
+  private makeLutTexture(lut: Float32Array, channels: 1 | 3 = 1): WebGLTexture {
     const gl = this.gl;
     const tex = gl.createTexture()!;
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, 2048, 1, 0, gl.RED, gl.FLOAT, lut);
+    if (channels === 3) {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB32F, 2048, 1, 0, gl.RGB, gl.FLOAT, lut);
+    } else {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, 2048, 1, 0, gl.RED, gl.FLOAT, lut);
+    }
     // Prefer LINEAR for smooth interpolation; fall back to NEAREST if float-linear not available
     const filter = gl.getExtension("OES_texture_float_linear") ? gl.LINEAR : gl.NEAREST;
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
@@ -115,10 +124,10 @@ export class PipelineRenderer {
     return tex;
   }
 
-  /** Upload a 2048-entry Float32Array as the user tone-curve LUT (luminance-driven). */
+  /** Upload an interleaved RGB tone-curve LUT (length 2048*3, per-channel). */
   uploadCurveLUT(lut: Float32Array): void {
     if (this.curveLutTex) this.gl.deleteTexture(this.curveLutTex);
-    this.curveLutTex = this.makeLutTexture(lut);
+    this.curveLutTex = this.makeLutTexture(lut, 3);
   }
 
   /**
