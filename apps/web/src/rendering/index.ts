@@ -4,6 +4,6 @@ export {
   type EditParams,
 } from "./pipeline-renderer";
 
-export { computeHistogram, renderHistogram, type HistogramBins, type PipelineParams as HistogramParams } from "./histogram";
+export { renderHistogram, type HistogramBins } from "./histogram";
 
 export { curveToLUT, defaultCurve, renderCurve, hitTest, type CurvePoint } from "./curve";

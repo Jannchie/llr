@@ -5,6 +5,7 @@ import json
 import math
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import traceback
@@ -308,6 +309,8 @@ def handle_daemon_request(request: dict[str, Any], root: Path) -> dict[str, Any]
         return daemon_linear(request, root)
     if command == "extract-preview":
         return daemon_extract_preview(request, root)
+    if command == "export":
+        return daemon_export(request, root)
     if command == "ping":
         return {"pong": True, "cacheSize": len(PREPARED_CACHE)}
     raise ValueError(f"unknown command: {command}")
@@ -477,6 +480,192 @@ def daemon_extract_preview(request: dict[str, Any], root: Path) -> dict[str, Any
     return {"output": str(output_path)}
 
 
+# ── Export: embed edit settings into the rendered JPEG as XMP ──
+
+LLR_XMP_NS = "http://ns.llr.app/xmp/1.0/"
+CRS_XMP_NS = "http://ns.adobe.com/camera-raw-settings/1.0/"
+HSL_CRS_NAMES = ["Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta"]
+
+
+def daemon_export(request: dict[str, Any], root: Path) -> dict[str, Any]:
+    """Embed the edit recipe into an already-rendered JPEG as XMP metadata.
+
+    The frontend renders the full-resolution image via WebGL and posts the JPEG;
+    here we (best-effort) copy the original camera EXIF for provenance and inject
+    an XMP packet carrying both a lossless LLR JSON blob and Adobe crs fields.
+    """
+    input_path = resolve_path(root, request["input"])
+    target_path = resolve_path(root, request["target"])
+    settings = request.get("settings") or {}
+
+    exif_copied = copy_exif_provenance(input_path, target_path)
+
+    xmp = build_xmp_packet(settings)
+    data = embed_xmp_app1(target_path.read_bytes(), xmp)
+    target_path.write_bytes(data)
+
+    return {"output": str(target_path), "exifCopied": exif_copied, "xmpBytes": len(xmp)}
+
+
+def copy_exif_provenance(original: Path, target: Path) -> bool:
+    """Copy a curated set of camera EXIF tags from the original into the export."""
+    command = detect_exiftool()
+    if command is None:
+        return False
+    try:
+        run_capture(
+            [
+                command,
+                "-overwrite_original",
+                "-tagsFromFile",
+                str(original),
+                "-Make",
+                "-Model",
+                "-LensModel",
+                "-LensInfo",
+                "-DateTimeOriginal",
+                "-CreateDate",
+                "-OffsetTime",
+                "-FNumber",
+                "-ExposureTime",
+                "-ISO",
+                "-FocalLength",
+                "-FocalLengthIn35mmFormat",
+                "-ExposureProgram",
+                "-MeteringMode",
+                "-Flash",
+                "-Orientation#=1",
+                "-Software=LLR",
+                str(target),
+            ],
+            env=exiftool_env(),
+        )
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
+def _num(source: dict[str, Any], key: str, default: float = 0.0) -> float:
+    try:
+        return float(source.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def build_crs_attrs(settings: dict[str, Any]) -> "OrderedDict[str, str]":
+    recipe = settings.get("recipe", {}) or {}
+    attrs: OrderedDict[str, str] = OrderedDict()
+    attrs["crs:Version"] = "15.0"
+    attrs["crs:ProcessVersion"] = "11.0"
+    attrs["crs:Exposure2012"] = f"{_num(recipe, 'exposure'):+.2f}"
+    attrs["crs:Contrast2012"] = f"{int(round(_num(recipe, 'contrast')))}"
+    attrs["crs:Highlights2012"] = f"{int(round(_num(recipe, 'highlights')))}"
+    attrs["crs:Shadows2012"] = f"{int(round(_num(recipe, 'shadows')))}"
+    attrs["crs:Whites2012"] = f"{int(round(_num(recipe, 'whites')))}"
+    attrs["crs:Blacks2012"] = f"{int(round(_num(recipe, 'blacks')))}"
+    attrs["crs:Clarity2012"] = f"{int(round(_num(recipe, 'clarity')))}"
+    attrs["crs:Dehaze"] = f"{int(round(_num(recipe, 'dehaze')))}"
+    attrs["crs:Vibrance"] = f"{int(round(_num(recipe, 'vibrance')))}"
+    attrs["crs:Saturation"] = f"{int(round(_num(recipe, 'saturation')))}"
+    attrs["crs:WhiteBalance"] = "Custom"
+    attrs["crs:Temperature"] = f"{int(round(_num(recipe, 'temperature', 6500)))}"
+    attrs["crs:Tint"] = f"{int(round(_num(recipe, 'tint')))}"
+
+    hue = settings.get("hslHue") or []
+    sat = settings.get("hslSat") or []
+    lum = settings.get("hslLum") or []
+    for i, name in enumerate(HSL_CRS_NAMES):
+        if i < len(hue):
+            attrs[f"crs:HueAdjustment{name}"] = f"{int(round(float(hue[i])))}"
+        if i < len(sat):
+            attrs[f"crs:SaturationAdjustment{name}"] = f"{int(round(float(sat[i])))}"
+        if i < len(lum):
+            attrs[f"crs:LuminanceAdjustment{name}"] = f"{int(round(float(lum[i])))}"
+
+    grading = settings.get("grading", {}) or {}
+
+    def hue360(value: float) -> int:
+        return int(round(((value % 360) + 360) % 360))
+
+    attrs["crs:SplitToningShadowHue"] = f"{hue360(_num(grading, 'shH'))}"
+    attrs["crs:SplitToningShadowSaturation"] = f"{int(round(_num(grading, 'shS')))}"
+    attrs["crs:SplitToningHighlightHue"] = f"{hue360(_num(grading, 'hlH'))}"
+    attrs["crs:SplitToningHighlightSaturation"] = f"{int(round(_num(grading, 'hlS')))}"
+    attrs["crs:SplitToningBalance"] = f"{int(round(_num(grading, 'balance')))}"
+    return attrs
+
+
+def build_tone_curve_seq(settings: dict[str, Any]) -> list[str]:
+    points: list[str] = []
+    for point in settings.get("curve", []) or []:
+        try:
+            x = int(round(clamp(float(point["x"]) * 255, 0, 255)))
+            y = int(round(clamp(float(point["y"]) * 255, 0, 255)))
+        except (KeyError, TypeError, ValueError):
+            continue
+        points.append(f"{x}, {y}")
+    return points
+
+
+def _xml_escape(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _xml_attr(text: str) -> str:
+    return _xml_escape(text).replace('"', "&quot;")
+
+
+def build_xmp_packet(settings: dict[str, Any]) -> str:
+    crs_attrs = build_crs_attrs(settings)
+    tone_curve = build_tone_curve_seq(settings)
+    llr_json = json.dumps(settings, separators=(",", ":"), ensure_ascii=False)
+
+    attr_lines = "\n   ".join(f'{key}="{_xml_attr(value)}"' for key, value in crs_attrs.items())
+
+    tone_block = ""
+    if tone_curve:
+        items = "\n     ".join(f"<rdf:li>{_xml_escape(point)}</rdf:li>" for point in tone_curve)
+        tone_block = (
+            "\n   <crs:ToneCurvePV2012>\n    <rdf:Seq>\n     "
+            + items
+            + "\n    </rdf:Seq>\n   </crs:ToneCurvePV2012>"
+        )
+
+    return (
+        '<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="LLR">\n'
+        ' <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">\n'
+        '  <rdf:Description rdf:about=""\n'
+        f'   xmlns:crs="{CRS_XMP_NS}"\n'
+        f'   xmlns:llr="{LLR_XMP_NS}"\n'
+        f"   {attr_lines}\n"
+        '   llr:Version="1">'
+        f"{tone_block}\n"
+        f"   <llr:Settings>{_xml_escape(llr_json)}</llr:Settings>\n"
+        "  </rdf:Description>\n"
+        " </rdf:RDF>\n"
+        "</x:xmpmeta>\n"
+        '<?xpacket end="w"?>'
+    )
+
+
+def embed_xmp_app1(jpeg: bytes, xmp_packet: str) -> bytes:
+    """Insert an XMP APP1 segment into a JPEG without re-encoding pixels."""
+    if jpeg[:2] != b"\xff\xd8":
+        raise ValueError("export target is not a JPEG file")
+    payload = b"http://ns.adobe.com/xap/1.0/\x00" + xmp_packet.encode("utf-8")
+    if len(payload) + 2 > 0xFFFF:
+        raise ValueError("XMP packet too large for a single APP1 segment")
+    segment = b"\xff\xe1" + struct.pack(">H", len(payload) + 2) + payload
+
+    # Insert after the SOI and any leading APP0/APP1 (JFIF/EXIF) segments.
+    insert_at = 2
+    while jpeg[insert_at : insert_at + 2] in (b"\xff\xe0", b"\xff\xe1"):
+        seg_len = struct.unpack(">H", jpeg[insert_at + 2 : insert_at + 4])[0]
+        insert_at += 2 + seg_len
+    return jpeg[:insert_at] + segment + jpeg[insert_at:]
+
+
 def build_cache_key(
     input_path: Path,
     profile_id: str,
@@ -615,10 +804,14 @@ def prepare_linear(
         metadata = read_raw_metadata(input_path, raw)
         dcp_profile, dcp_selection = resolve_dcp_profile(root, dcp_arg, disable_dcp, recipe, metadata)
         if dcp_profile is None:
+            # Scene-referred fallback: deliver linear ProPhoto (D50) so the browser
+            # edits in the same wide-gamut working space as the DCP path. LibRaw
+            # still normalises the white level, so this path does not carry true
+            # >1.0 highlight headroom (acceptable for a no-profile fallback).
             linear = raw.postprocess(
                 use_camera_wb=True,
                 no_auto_bright=True,
-                output_color=rawpy.ColorSpace.sRGB,
+                output_color=rawpy.ColorSpace.ProPhoto,
                 gamma=(1, 1),
                 output_bps=16,
                 half_size=half_size,
@@ -936,8 +1129,10 @@ def is_dcp_color_profile(color_profile: dict[str, Any] | None) -> bool:
 def libraw_color_profile_info() -> dict[str, Any]:
     return {
         "kind": "libraw-matrix",
-        "matrix": "rawpy/LibRaw camera to sRGB",
+        "matrix": "rawpy/LibRaw camera to linear ProPhoto",
         "toneCurveSamples": 0,
+        "workingSpace": "linear-prophoto-d50",
+        "profileToneCurve": None,
         "note": "No DCP profile supplied; this is a matrix fallback, not a calibrated camera profile.",
     }
 

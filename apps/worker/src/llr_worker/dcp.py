@@ -106,6 +106,8 @@ class DcpRenderInfo:
     hue_sat_map: dict[str, Any] | None
     look_table: dict[str, Any] | None
     limitations: list[str]
+    working_space: str = "linear-prophoto-d50"
+    profile_tone_curve: list[list[float]] | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -117,6 +119,8 @@ class DcpRenderInfo:
             "profileHueSatMap": self.hue_sat_map,
             "profileLookTable": self.look_table,
             "limitations": self.limitations,
+            "workingSpace": self.working_space,
+            "profileToneCurve": self.profile_tone_curve,
         }
 
 
@@ -195,14 +199,18 @@ def apply_dcp_profile(camera_rgb: np.ndarray, profile: DcpProfile) -> tuple[np.n
         linear_prophoto = apply_hsv_table(linear_prophoto, profile.look_table, profile.look_table_encoding)
         look_table_info = table_info(profile.look_table, profile.look_table_encoding)
 
-    if profile.tone_curve is not None:
-        linear_prophoto = apply_profile_tone_curve(linear_prophoto, profile.tone_curve)
+    # Scene-referred pipeline: do NOT bake the profile tone curve here and do NOT
+    # convert to display sRGB. Deliver linear ProPhoto (D50) so the browser edits
+    # in a wide-gamut scene-linear space and applies its own view transform. The
+    # profile tone curve is passed through for the front end to consume as part of
+    # the view transform if desired.
+    tone_curve_pts = (
+        [[float(x), float(y)] for x, y in profile.tone_curve.tolist()]
+        if profile.tone_curve is not None
+        else None
+    )
 
-    xyz_d50 = linear_prophoto @ PROPHOTO_TO_XYZ_D50.T
-    xyz_d65 = xyz_d50 @ D50_TO_D65.T
-    linear_srgb = np.clip(xyz_d65 @ XYZ_D65_TO_SRGB.T, 0, None)
-
-    return linear_srgb, DcpRenderInfo(
+    return linear_prophoto, DcpRenderInfo(
         path=str(profile.path),
         name=profile.name,
         matrix=matrix_name,
@@ -210,6 +218,7 @@ def apply_dcp_profile(camera_rgb: np.ndarray, profile: DcpProfile) -> tuple[np.n
         hue_sat_map=hue_sat_map_info,
         look_table=look_table_info,
         limitations=limitations,
+        profile_tone_curve=tone_curve_pts,
     )
 
 
@@ -246,7 +255,12 @@ def apply_hsv_table(rgb: np.ndarray, table: DcpHueSatMap, encoding: int) -> np.n
 
 
 def apply_hsv_table_chunk(rgb: np.ndarray, table: DcpHueSatMap, encoding: int) -> np.ndarray:
-    working = np.clip(np.nan_to_num(rgb, nan=0.0, posinf=1.0, neginf=0.0), 0, 1)
+    nonneg = np.maximum(np.nan_to_num(rgb, nan=0.0, posinf=1.0, neginf=0.0), 0.0)
+    # Scene-linear values can exceed 1.0 (highlight headroom). The HueSatMap is
+    # defined on [0, 1], so look it up on clamped values but restore the headroom
+    # afterwards so highlights are not crushed to white.
+    value_in = nonneg.max(axis=1)
+    working = np.clip(nonneg, 0, 1)
     if encoding == ENCODING_SRGB:
         working = srgb_encode_float(working)
 
@@ -259,6 +273,9 @@ def apply_hsv_table_chunk(rgb: np.ndarray, table: DcpHueSatMap, encoding: int) -
     mapped = hsv_to_rgb(hsv)
     if encoding == ENCODING_SRGB:
         mapped = srgb_decode_float(mapped)
+    # Pixels with value <= 1 are unchanged (scale == 1); only headroom is restored.
+    scale = np.maximum(value_in, 1.0)
+    mapped = mapped * scale[:, None]
     return mapped.astype(np.float32)
 
 

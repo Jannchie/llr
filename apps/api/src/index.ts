@@ -115,6 +115,11 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
     return;
   }
 
+  if (method === "POST" && pathname === "/export") {
+    await handleExport(request, response);
+    return;
+  }
+
   const linearMatch = pathname.match(/^\/sources\/([\w-]+)\/linear\.bin$/);
   if (method === "GET" && linearMatch) {
     streamBinary(response, resolve(sessionsRoot, linearMatch[1], "linear.bin"));
@@ -236,6 +241,47 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
     linearUrl: `/api/sources/${body.sourceId}/linear.bin`,
     colorProfile: meta.colorProfile ?? null,
   });
+}
+
+async function handleExport(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const form = await readFormData(request);
+  const file = form.get("file");
+  const metaRaw = form.get("meta");
+  if (!(file instanceof File)) {
+    sendJson(response, { error: "Missing file field" }, 400);
+    return;
+  }
+
+  let meta: { sourceId?: string; settings?: unknown };
+  try {
+    meta = JSON.parse(typeof metaRaw === "string" ? metaRaw : "{}") as { sourceId?: string; settings?: unknown };
+  } catch {
+    sendJson(response, { error: "Invalid meta field" }, 400);
+    return;
+  }
+  if (!meta.sourceId) {
+    sendJson(response, { error: "Missing sourceId" }, 400);
+    return;
+  }
+
+  const sessionDir = resolve(sessionsRoot, meta.sourceId);
+  const sourcePath = await findSource(sessionDir);
+  if (!sourcePath) {
+    sendJson(response, { error: "Unknown sourceId" }, 404);
+    return;
+  }
+
+  const exportPath = resolve(sessionDir, "export.jpg");
+  await writeFile(exportPath, Buffer.from(await file.arrayBuffer()));
+
+  await daemon.send({
+    command: "export",
+    input: sourcePath,
+    target: exportPath,
+    settings: meta.settings ?? {}
+  });
+
+  streamFile(response, exportPath);
 }
 
 async function findSource(sessionDir: string): Promise<string | null> {

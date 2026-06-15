@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { PipelineRenderer, type EditParams } from "./rendering/pipeline-renderer";
-import { computeHistogram, renderHistogram } from "./rendering/histogram";
+import { renderHistogram } from "./rendering/histogram";
 import { curveToLUT, defaultCurve, renderCurve, hitTest, type CurvePoint } from "./rendering/curve";
 
 // ── types ──
@@ -59,8 +59,10 @@ const fileInput = ref<HTMLInputElement | null>(null);
 const canvasRef = ref<HTMLCanvasElement | null>(null);
 const timing = ref<number | null>(null);
 const dcpCode = ref("");  // empty = auto-detect
+const exporting = ref(false);
 
 let webglRenderer: PipelineRenderer | null = null;
+const p3Supported = ref(false);
 let rafId = 0;
 let drawPending = false;
 
@@ -103,6 +105,9 @@ const grading = reactive({
   blend: 50,
   balance: 0,
 });
+
+// View settings (not part of the per-image recipe): tone-mapping look + display gamut.
+const viewSettings = reactive({ viewTransform: 0, displayGamut: 0 });
 
 function hslValue(i: number): number {
   if (hslTab.value === "hue") return hslHue[i];
@@ -248,6 +253,103 @@ watch(curveCanvas, (cvs) => {
   }
 });
 
+// ── History (undo / redo) ──
+
+type Snapshot = {
+  recipe: Recipe;
+  hslHue: number[]; hslSat: number[]; hslLum: number[];
+  grading: typeof grading;
+  curve: CurvePoint[];
+  dcp: string;
+};
+
+const MAX_HISTORY = 100;
+const HISTORY_DEBOUNCE = 300;
+
+const history = ref<Snapshot[]>([]);
+const historyIndex = ref(-1);
+const pendingDirty = ref(false);
+let isRestoring = false;
+let historyTimer = 0;
+
+const canUndo = computed(() => historyIndex.value > 0 || pendingDirty.value);
+const canRedo = computed(() => historyIndex.value < history.value.length - 1);
+
+function captureSnapshot(): Snapshot {
+  return {
+    recipe: { ...recipe },
+    hslHue: [...hslHue], hslSat: [...hslSat], hslLum: [...hslLum],
+    grading: { ...grading },
+    curve: curvePoints.value.map(p => ({ ...p })),
+    dcp: dcpCode.value,
+  };
+}
+
+function snapshotsEqual(a: Snapshot, b: Snapshot): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+// Commit the current edit state as a new history entry, dropping any redo branch.
+function commitHistory(): void {
+  pendingDirty.value = false;
+  const snap = captureSnapshot();
+  const cur = history.value[historyIndex.value];
+  if (cur && snapshotsEqual(cur, snap)) return;
+  const next = history.value.slice(0, historyIndex.value + 1);
+  next.push(snap);
+  if (next.length > MAX_HISTORY) next.shift();
+  history.value = next;
+  historyIndex.value = next.length - 1;
+}
+
+// Coalesce rapid edits (slider/curve drags) into one entry, committed after a quiet period.
+function scheduleHistoryCommit(): void {
+  if (isRestoring) return;
+  pendingDirty.value = true;
+  if (historyTimer) clearTimeout(historyTimer);
+  historyTimer = window.setTimeout(() => { historyTimer = 0; commitHistory(); }, HISTORY_DEBOUNCE);
+}
+
+function flushPendingHistory(): void {
+  if (historyTimer) { clearTimeout(historyTimer); historyTimer = 0; }
+  if (pendingDirty.value) commitHistory();
+}
+
+function applySnapshot(s: Snapshot): void {
+  isRestoring = true;
+  Object.assign(recipe, s.recipe);
+  for (let i = 0; i < 8; i++) { hslHue[i] = s.hslHue[i]; hslSat[i] = s.hslSat[i]; hslLum[i] = s.hslLum[i]; }
+  Object.assign(grading, s.grading);
+  curvePoints.value = s.curve.map(p => ({ ...p }));
+  curveActive.value = -1;
+  dcpCode.value = s.dcp; // triggers re-decode if the DCP style differs
+  if (webglRenderer) webglRenderer.uploadCurveLUT(curveToLUT(curvePoints.value));
+  renderCurveCanvas();
+  scheduleWebGLDraw();
+  nextTick(() => { isRestoring = false; });
+}
+
+function undo(): void {
+  flushPendingHistory();
+  if (historyIndex.value <= 0) return;
+  historyIndex.value--;
+  applySnapshot(history.value[historyIndex.value]);
+}
+
+function redo(): void {
+  flushPendingHistory();
+  if (historyIndex.value >= history.value.length - 1) return;
+  historyIndex.value++;
+  applySnapshot(history.value[historyIndex.value]);
+}
+
+function initHistory(): void {
+  history.value = [captureSnapshot()];
+  historyIndex.value = 0;
+  pendingDirty.value = false;
+}
+initHistory();
+
 const activeSource = computed(() => sources.value.find(s => s.id === activeId.value) ?? null);
 
 const displayTransform = computed(() => {
@@ -291,7 +393,23 @@ function buildPipelineParams(): Partial<EditParams> {
     gradHlH: grading.hlH / 180, gradHlS: grading.hlS / 100,
     gradBlend: grading.blend / 100,
     gradBalance: grading.balance / 100,
+    viewTransform: viewSettings.viewTransform,
+    displayGamut: viewSettings.displayGamut,
   };
+}
+
+// ── DCP profile tone curve (camera display rendering, applied in the view transform) ──
+
+type ColorProfileMeta = { profileToneCurve?: [number, number][] | null };
+let profileCurveLUT: Float32Array | null = null;
+
+function buildProfileLUT(cp: ColorProfileMeta | undefined): Float32Array | null {
+  const pts = cp?.profileToneCurve;
+  return (pts && pts.length >= 2) ? curveToLUT(pts.map(([x, y]) => ({ x, y }))) : null;
+}
+function setProfileCurve(cp: ColorProfileMeta | undefined): void {
+  profileCurveLUT = buildProfileLUT(cp);
+  if (webglRenderer) webglRenderer.uploadProfileCurveLUT(profileCurveLUT);
 }
 
 // ── Histogram ──
@@ -317,21 +435,8 @@ function updateHistogram(): void {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  const params = buildPipelineParams();
-  const bins = computeHistogram(linearFloatData, imageW.value, imageH.value, {
-    exposure: params.exposure ?? 0,
-    contrast: params.contrast ?? 1,
-    saturation: params.saturation ?? 1,
-    temperature: params.temperature ?? 6500,
-    tint: params.tint ?? 0,
-    highlights: params.highlights ?? 0,
-    shadows: params.shadows ?? 0,
-    whites: params.whites ?? 0,
-    blacks: params.blacks ?? 0,
-    vibrance: params.vibrance ?? 1,
-    clarity: params.clarity ?? 0,
-    dehaze: params.dehaze ?? 0,
-  });
+  if (!webglRenderer) return;
+  const bins = webglRenderer.readHistogram();
   renderHistogram(ctx, w, h, bins);
 }
 
@@ -437,6 +542,17 @@ function onDoubleClick(e: MouseEvent): void {
 }
 
 function onKeyDown(e: KeyboardEvent): void {
+  const ae = document.activeElement as HTMLElement | null;
+  const inEditableText = !!ae && (ae.tagName === "TEXTAREA" ||
+    (ae.tagName === "INPUT" && !["range", "checkbox", "radio", "button", "submit"].includes((ae as HTMLInputElement).type)));
+
+  // Undo / redo — work regardless of whether an image is loaded
+  if ((e.ctrlKey || e.metaKey) && !inEditableText) {
+    const k = e.key.toLowerCase();
+    if (k === "z") { e.preventDefault(); if (e.shiftKey) redo(); else undo(); return; }
+    if (k === "y") { e.preventDefault(); redo(); return; }
+  }
+
   if (!imageW.value || !imageH.value) return;
   if (e.ctrlKey || e.metaKey) {
     switch (e.key) {
@@ -452,6 +568,11 @@ function onKeyDown(e: KeyboardEvent): void {
 watch(recipe, () => scheduleWebGLDraw(), { deep: true });
 watch([hslHue, hslSat, hslLum], () => scheduleWebGLDraw(), { deep: true });
 watch(grading, () => scheduleWebGLDraw(), { deep: true });
+watch(viewSettings, () => scheduleWebGLDraw(), { deep: true });
+
+// Record edit changes into undo/redo history (coalesced; suppressed during restore)
+watch([recipe, hslHue, hslSat, hslLum, grading, curvePoints, dcpCode],
+  () => scheduleHistoryCommit(), { deep: true });
 
 // Re-decode when DCP code changes
 let currentSourceId = "";
@@ -465,7 +586,7 @@ watch(dcpCode, async (newCode) => {
       body: JSON.stringify({ sourceId: currentSourceId, halfSize: true, maxSize: 1600, dcpCode: dcpCode.value }),
     });
     if (!linRes.ok) throw new Error(await linRes.text());
-    const linMeta = await linRes.json() as { width: number; height: number; linearUrl: string };
+    const linMeta = await linRes.json() as { width: number; height: number; linearUrl: string; colorProfile?: ColorProfileMeta };
     const binRes = await fetch(linMeta.linearUrl);
     if (!binRes.ok) throw new Error("Failed to fetch");
     const linearFloat = new Float32Array(await binRes.arrayBuffer());
@@ -478,6 +599,7 @@ watch(dcpCode, async (newCode) => {
     }
     if (canvasRef.value && webglRenderer) {
       webglRenderer.uploadImage(linearFloat, linMeta.width, linMeta.height);
+      setProfileCurve(linMeta.colorProfile); // new DCP -> new tone curve
       drawWebGL();
       scheduleHistogram();
     }
@@ -559,7 +681,7 @@ async function uploadFiles(files: File[]): Promise<void> {
         body: JSON.stringify({ sourceId: source.id, halfSize: true, maxSize: 1600, dcpCode: dcpCode.value }),
       });
       if (!linRes.ok) throw new Error(await linRes.text());
-      const linMeta = await linRes.json() as { width: number; height: number; linearUrl: string };
+      const linMeta = await linRes.json() as { width: number; height: number; linearUrl: string; colorProfile?: ColorProfileMeta };
 
       // Fetch binary float32
       const binRes = await fetch(linMeta.linearUrl);
@@ -571,6 +693,7 @@ async function uploadFiles(files: File[]): Promise<void> {
       console.log("[upload] bin:", buf.byteLength, "B, float32:", linearFloat.length, "expect:", width*height*3);
       timing.value = Math.round(performance.now() - t0);
       linearFloatData = linearFloat;
+      profileCurveLUT = buildProfileLUT(linMeta.colorProfile);
 
       // Store image dimensions for pan/zoom
       imageW.value = width;
@@ -587,8 +710,10 @@ async function uploadFiles(files: File[]): Promise<void> {
         destroyWebGL();
         try {
           webglRenderer = new PipelineRenderer(canvasRef.value);
+          p3Supported.value = webglRenderer.p3Supported;
           webglRenderer.uploadImage(linearFloat, width, height);
           webglRenderer.uploadCurveLUT(curveToLUT(curvePoints.value));
+          webglRenderer.uploadProfileCurveLUT(profileCurveLUT);
           drawWebGL();
           scheduleHistogram();
         } catch (err) {
@@ -608,6 +733,71 @@ async function uploadFiles(files: File[]): Promise<void> {
 }
 
 function resetRecipe(): void { Object.assign(recipe, defaultRecipe()); resetHslGrading(); }
+
+// ── Export ──
+
+function exportFilename(): string {
+  const name = activeSource.value?.name ?? "export";
+  return `${name.replace(/\.[^.]+$/, "")}.jpg`;
+}
+
+function downloadBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+
+// Re-render at full resolution, read pixels back, embed edit settings as XMP, download.
+async function exportImage(): Promise<void> {
+  if (!currentSourceId || !activeSource.value || exporting.value) return;
+  exporting.value = true;
+  errorMessage.value = null;
+  status.value = "rendering";
+  let renderer: PipelineRenderer | null = null;
+  try {
+    // 1. Decode full-resolution linear data (no half-size / no max-size cap)
+    const linRes = await fetch(`${API}/render-linear`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sourceId: currentSourceId, halfSize: false, maxSize: 0, dcpCode: dcpCode.value }),
+    });
+    if (!linRes.ok) throw new Error(await linRes.text());
+    const linMeta = await linRes.json() as { width: number; height: number; linearUrl: string; colorProfile?: ColorProfileMeta };
+    const binRes = await fetch(linMeta.linearUrl);
+    if (!binRes.ok) throw new Error("Failed to fetch full-resolution data");
+    const linear = new Float32Array(await binRes.arrayBuffer());
+
+    // 2. Render full-res off-screen with the current edit params, read back as JPEG
+    renderer = new PipelineRenderer(document.createElement("canvas"));
+    renderer.uploadImage(linear, linMeta.width, linMeta.height);
+    renderer.uploadCurveLUT(curveToLUT(curvePoints.value));
+    renderer.uploadProfileCurveLUT(buildProfileLUT(linMeta.colorProfile));
+    renderer.draw(buildPipelineParams());
+    const blob = await renderer.toBlob("image/jpeg", 0.92);
+
+    // 3. Embed edit settings (LLR JSON + Adobe crs) into the JPEG server-side
+    const fd = new FormData();
+    fd.append("file", blob, "export.jpg");
+    fd.append("meta", JSON.stringify({ sourceId: currentSourceId, settings: captureSnapshot() }));
+    const exRes = await fetch(`${API}/export`, { method: "POST", body: fd });
+    if (!exRes.ok) throw new Error(await exRes.text());
+
+    // 4. Download the finished file
+    downloadBlob(await exRes.blob(), exportFilename());
+    status.value = "idle";
+  } catch (err) {
+    status.value = "error";
+    errorMessage.value = err instanceof Error ? err.message : String(err);
+    console.error("[export] failed:", err);
+  } finally {
+    renderer?.destroy();
+    exporting.value = false;
+  }
+}
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1048576) return `${(n/1024).toFixed(0)} KB`;
@@ -620,6 +810,16 @@ function isAbsoluteUrl(u: string): boolean {
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
 }
+
+// Build a filled-track gradient for a range input. Bipolar sliders (min<0<max)
+// fill from the center toward the thumb; unipolar fill from the left.
+function trackFill(value: number, min: number, max: number): string {
+  const p = clamp((value - min) / (max - min), 0, 1) * 100;
+  const z = min < 0 && max > 0 ? (-min) / (max - min) * 100 : 0;
+  const a = Math.min(p, z);
+  const b = Math.max(p, z);
+  return `linear-gradient(to right, var(--track-bg) ${a}%, var(--accent) ${a}%, var(--accent) ${b}%, var(--track-bg) ${b}%)`;
+}
 </script>
 
 <template>
@@ -628,10 +828,37 @@ function clamp(v: number, lo: number, hi: number): number {
     @dragleave.prevent="isDragging = false"
     @drop="onDrop">
     <header class="topbar">
-      <div class="brand">LLR</div>
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true" />
+        <span class="brand-name">LLR</span>
+      </div>
+      <div class="topbar-actions">
+        <button class="icon-btn" :disabled="!canUndo" @click="undo" title="Undo (Ctrl+Z)" aria-label="Undo">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 9h11a5 5 0 0 1 0 10H8" />
+            <path d="M7 5L3 9l4 4" />
+          </svg>
+        </button>
+        <button class="icon-btn" :disabled="!canRedo" @click="redo" title="Redo (Ctrl+Shift+Z)" aria-label="Redo">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 9H10a5 5 0 0 0 0 10h6" />
+            <path d="M17 5l4 4-4 4" />
+          </svg>
+        </button>
+      </div>
       <div class="meta-summary">
         <span v-if="activeSource">{{ activeSource.name }}</span>
+        <span v-else class="meta-empty">No image loaded</span>
       </div>
+      <button class="export-btn" type="button" :disabled="!activeSource || exporting" @click="exportImage">
+        <svg v-if="!exporting" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 3v12" />
+          <path d="M8 11l4 4 4-4" />
+          <path d="M5 21h14" />
+        </svg>
+        <span class="export-spinner" v-else aria-hidden="true" />
+        <span>{{ exporting ? 'Exporting…' : 'Export' }}</span>
+      </button>
     </header>
 
     <main class="center">
@@ -645,10 +872,14 @@ function clamp(v: number, lo: number, hi: number): number {
         :class="{ 'is-grabbing': isPanning }">
         <div class="dropzone" v-show="!activeSource" @click="pickFiles">
           <div class="dropzone-inner">
-            <div class="dropzone-rule" />
-            <p class="dropzone-title">Drop a RAW file or click to import</p>
-            <p class="dropzone-hint">.ARW · .DNG · .CR3 · .NEF · .RAF · .RW2 · .ORF</p>
-            <div class="dropzone-rule" />
+            <svg class="dropzone-icon" viewBox="0 0 48 48" fill="none" aria-hidden="true">
+              <rect x="6" y="10" width="36" height="28" rx="4" stroke="currentColor" stroke-width="2" />
+              <circle cx="17" cy="20" r="3.5" stroke="currentColor" stroke-width="2" />
+              <path d="M9 33l9-9 6 6 8-8 7 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            <p class="dropzone-title">Drop a RAW file to start</p>
+            <p class="dropzone-sub">or click anywhere to browse</p>
+            <p class="dropzone-hint">ARW · DNG · CR3 · NEF · RAF · RW2 · ORF</p>
           </div>
         </div>
         <div v-show="activeSource && status === 'rendering' && !webglRenderer" class="preview-loading">
@@ -658,7 +889,7 @@ function clamp(v: number, lo: number, hi: number): number {
         <img v-show="activeSource && !webglRenderer && status !== 'rendering'" class="preview" :style="{ transform: displayTransform }" :src="activeSource?.embeddedUrl ? (isAbsoluteUrl(activeSource.embeddedUrl) ? activeSource.embeddedUrl : `${API}${activeSource.embeddedUrl}`) : ''" alt="preview" />
       </div>
 
-      <footer class="status">
+      <footer class="status" v-show="activeSource">
         <div class="status-left">
           <div class="status-cell">
             <span class="status-label">Status</span>
@@ -700,6 +931,20 @@ function clamp(v: number, lo: number, hi: number): number {
             <option value="BW">Black & White</option>
           </select>
         </div>
+        <div class="control-row" v-if="activeSource">
+          <label class="control-label">Look</label>
+          <select v-model.number="viewSettings.viewTransform" class="control-select">
+            <option :value="0">Lightroom-style</option>
+            <option :value="1">AgX (filmic)</option>
+          </select>
+        </div>
+        <div class="control-row" v-if="activeSource && p3Supported">
+          <label class="control-label">Display</label>
+          <select v-model.number="viewSettings.displayGamut" class="control-select">
+            <option :value="0">sRGB</option>
+            <option :value="1">Display-P3 (wide)</option>
+          </select>
+        </div>
       </section>
       <section v-for="group in groups" :key="group.title" class="panel">
         <header class="panel-head">{{ group.title }}</header>
@@ -707,6 +952,7 @@ function clamp(v: number, lo: number, hi: number): number {
           <label :for="`s-${spec.key}`">{{ spec.label }}</label>
           <input :id="`s-${spec.key}`" v-model.number="recipe[spec.key]" type="range"
             :min="spec.min" :max="spec.max" :step="spec.step"
+            :style="{ '--track': trackFill(recipe[spec.key], spec.min, spec.max) }"
             @dblclick="recipe[spec.key] = SLIDER_DEFAULTS[spec.key]" title="Double-click to reset" />
           <input v-model.number="recipe[spec.key]" class="slider-number" type="number"
             :min="spec.min" :max="spec.max" :step="spec.step" :aria-label="spec.label" />
@@ -727,6 +973,7 @@ function clamp(v: number, lo: number, hi: number): number {
           <span class="hsl-label">{{ range.name }}</span>
           <input type="range" min="-100" max="100" step="1"
             :value="hslValue(i)"
+            :style="{ '--track': trackFill(hslValue(i), -100, 100) }"
             @input="setHsl(i, ($event.target as HTMLInputElement).valueAsNumber)"
             @dblclick="setHsl(i, 0)" title="Double-click to reset" />
           <input class="hsl-number" type="number" min="-100" max="100" step="1"
@@ -747,12 +994,14 @@ function clamp(v: number, lo: number, hi: number): number {
           <div class="grading-row">
             <label>H</label>
             <input type="range" min="-180" max="180" step="1" v-model.number="grading.shH"
+              :style="{ '--track': trackFill(grading.shH, -180, 180) }"
               @dblclick="grading.shH = 0" title="Double-click to reset" />
             <input class="slider-number" type="number" min="-180" max="180" step="1" v-model.number="grading.shH" />
           </div>
           <div class="grading-row">
             <label>S</label>
             <input type="range" min="0" max="100" step="1" v-model.number="grading.shS"
+              :style="{ '--track': trackFill(grading.shS, 0, 100) }"
               @dblclick="grading.shS = 0" title="Double-click to reset" />
             <input class="slider-number" type="number" min="0" max="100" step="1" v-model.number="grading.shS" />
           </div>
@@ -765,12 +1014,14 @@ function clamp(v: number, lo: number, hi: number): number {
           <div class="grading-row">
             <label>H</label>
             <input type="range" min="-180" max="180" step="1" v-model.number="grading.mdH"
+              :style="{ '--track': trackFill(grading.mdH, -180, 180) }"
               @dblclick="grading.mdH = 0" title="Double-click to reset" />
             <input class="slider-number" type="number" min="-180" max="180" step="1" v-model.number="grading.mdH" />
           </div>
           <div class="grading-row">
             <label>S</label>
             <input type="range" min="0" max="100" step="1" v-model.number="grading.mdS"
+              :style="{ '--track': trackFill(grading.mdS, 0, 100) }"
               @dblclick="grading.mdS = 0" title="Double-click to reset" />
             <input class="slider-number" type="number" min="0" max="100" step="1" v-model.number="grading.mdS" />
           </div>
@@ -783,12 +1034,14 @@ function clamp(v: number, lo: number, hi: number): number {
           <div class="grading-row">
             <label>H</label>
             <input type="range" min="-180" max="180" step="1" v-model.number="grading.hlH"
+              :style="{ '--track': trackFill(grading.hlH, -180, 180) }"
               @dblclick="grading.hlH = 0" title="Double-click to reset" />
             <input class="slider-number" type="number" min="-180" max="180" step="1" v-model.number="grading.hlH" />
           </div>
           <div class="grading-row">
             <label>S</label>
             <input type="range" min="0" max="100" step="1" v-model.number="grading.hlS"
+              :style="{ '--track': trackFill(grading.hlS, 0, 100) }"
               @dblclick="grading.hlS = 0" title="Double-click to reset" />
             <input class="slider-number" type="number" min="0" max="100" step="1" v-model.number="grading.hlS" />
           </div>
@@ -796,12 +1049,14 @@ function clamp(v: number, lo: number, hi: number): number {
         <div class="slider">
           <label>Blend</label>
           <input type="range" min="0" max="100" step="1" v-model.number="grading.blend"
+            :style="{ '--track': trackFill(grading.blend, 0, 100) }"
             @dblclick="grading.blend = 50" title="Double-click to reset" />
           <input class="slider-number" type="number" min="0" max="100" step="1" v-model.number="grading.blend" />
         </div>
         <div class="slider">
           <label>Balance</label>
           <input type="range" min="-100" max="100" step="1" v-model.number="grading.balance"
+            :style="{ '--track': trackFill(grading.balance, -100, 100) }"
             @dblclick="grading.balance = 0" title="Double-click to reset" />
           <input class="slider-number" type="number" min="-100" max="100" step="1" v-model.number="grading.balance" />
         </div>

@@ -5,6 +5,8 @@
  * are fused into one shader to eliminate FBO ping-pong overhead.
  */
 
+import { COLOR_GLSL } from "./color-spaces";
+
 export const VERTEX_SHADER = `#version 300 es
 precision highp float;
 in vec2 a_position;
@@ -14,15 +16,12 @@ void main() {
   gl_Position = vec4(a_position, 0.0, 1.0);
 }`;
 
-const LUMA = "const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);";
-
 export const PROCESS_SHADER = `#version 300 es
 precision highp float;
 in vec2 v_texCoord;
 out vec4 outColor;
 uniform sampler2D u_input;
-uniform float u_temperature;
-uniform float u_tint;
+uniform vec3 u_wbGain;          // relative white-balance gain (linear ProPhoto)
 uniform float u_exposure;
 uniform float u_highlights;
 uniform float u_shadows;
@@ -46,61 +45,71 @@ uniform float u_grad_hl_h;
 uniform float u_grad_hl_s;
 uniform float u_grad_blend;
 uniform float u_grad_balance;
-// Tone Curve LUT (256×1 texture, R channel = output)
+// Tone Curve LUT (2048×1 texture, R channel = output) — applied display-referred
 uniform sampler2D u_curve_lut;
+uniform sampler2D u_profile_lut; // DCP profile tone curve (per-channel), display rendering
+uniform int u_hasProfileCurve;   // 1 if a DCP profile tone curve is available
+uniform int u_viewTransform;    // 0 = Lightroom-style, 1 = AgX
+uniform int u_displayGamut;     // 0 = sRGB, 1 = Display-P3
 
-${LUMA}
+${COLOR_GLSL}
 
-const float PIVOT = 0.18;
+// ===== View transforms: scene-linear ProPhoto -> display-linear ProPhoto [0,1] =====
 
-vec3 kelvinToRGB(float K) {
-  float eff = 13000.0 - K;
-  float r = eff < 6500.0
-    ? 1.0 + (6500.0 - eff) / 6500.0 * 0.82
-    : 1.0 - (eff - 6500.0) / 5500.0 * 0.42;
-  float b = eff < 6500.0
-    ? 1.0 - (6500.0 - eff) / 6500.0 * 0.72
-    : 1.0 + (eff - 6500.0) / 5500.0 * 0.92;
-  return vec3(clamp(r, 0.2, 5.0), 1.0, clamp(b, 0.2, 5.0));
+// (a) Lightroom-style: hue-stable luminance shoulder + highlight desaturation.
+vec3 viewTransformLR(vec3 c) {
+  c = max(c, 0.0);
+  if (u_hasProfileCurve == 1) {
+    // The DCP profile tone curve IS the camera's display rendering — apply it per
+    // channel (as Adobe/ACR do). This matches the camera/"official" look closely.
+    return vec3(
+      texture(u_profile_lut, vec2(clamp(c.r, 0.0, 1.0), 0.5)).r,
+      texture(u_profile_lut, vec2(clamp(c.g, 0.0, 1.0), 0.5)).r,
+      texture(u_profile_lut, vec2(clamp(c.b, 0.0, 1.0), 0.5)).r
+    );
+  }
+  // Fallback (no profile curve): identity here; the display sRGB encode supplies the
+  // gamma so mid gray (0.18) lands at ~0.46 and white reaches white.
+  return c;
 }
 
-float linearToSRGB(float c) {
-  return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+// (b) AgX (Troy Sobotka / Blender 4.0): per-channel sigmoid in an inset basis.
+const float AGX_MIN_EV = -12.47393;
+const float AGX_MAX_EV = 4.026069;
+vec3 agxContrast(vec3 x) {
+  vec3 x2 = x * x;
+  vec3 x4 = x2 * x2;
+  return 15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4
+       - 6.868 * x2 * x + 0.4298 * x2 + 0.1191 * x - 0.00232;
+}
+vec3 viewTransformAgX(vec3 c) {
+  vec3 v = AGX_INSET_FROM_PROPHOTO * max(c, 0.0);
+  v = clamp((log2(max(v, 1e-10)) - AGX_MIN_EV) / (AGX_MAX_EV - AGX_MIN_EV), 0.0, 1.0);
+  v = agxContrast(v);
+  vec3 rec709 = pow(max(AGX_OUTSET * v, 0.0), vec3(2.2));  // -> display-linear Rec.709
+  return SRGB_TO_PROPHOTO * rec709;                        // -> display-linear ProPhoto
 }
 
-// --- HSL / Color Grading helpers ---
-
-float rgbHue(vec3 c) {
-  float mx = max(max(c.r, c.g), c.b);
-  float mn = min(min(c.r, c.g), c.b);
-  float ch = mx - mn;
-  if (ch < 1e-5) return 0.0;
-  float h;
-  if (c.r >= mx)      h = (c.g - c.b) / ch;
-  else if (c.g >= mx) h = 2.0 + (c.b - c.r) / ch;
-  else                h = 4.0 + (c.r - c.g) / ch;
-  return fract(h / 6.0);
+vec3 viewTransform(vec3 c) {
+  return (u_viewTransform == 1) ? viewTransformAgX(c) : viewTransformLR(c);
 }
 
-float hueMask(float h, float center) {
-  float d = abs(h - center);
-  d = min(d, 1.0 - d);
-  return clamp(1.0 - d / 0.07, 0.0, 1.0);
+// Gamut compression: bring out-of-gamut display-linear RGB back inside [0,1]^3
+// by desaturating toward the equal-luminance gray. Preserves luminance and keeps
+// hue far more stable than a per-channel clamp.
+vec3 gamutMap(vec3 c) {
+  float lo = min(min(c.r, c.g), c.b);
+  float hi = max(max(c.r, c.g), c.b);
+  if (lo >= 0.0 && hi <= 1.0) return c;
+  float l = clamp(dot(c, vec3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
+  float s = 1.0;
+  if (lo < 0.0) s = min(s, (0.0 - l) / (lo - l));
+  if (hi > 1.0) s = min(s, (1.0 - l) / (hi - l));
+  s = clamp(s, 0.0, 1.0);
+  return clamp(mix(vec3(l), c, s), 0.0, 1.0);
 }
 
-// Rodrigues rotation around the luminance axis (1,1,1)
-vec3 hueRotate(vec3 c, float theta) {
-  if (abs(theta) < 1e-5) return c;
-  float co = cos(theta);
-  float si = sin(theta);
-  float a = (1.0 - co) / 3.0;
-  float b = si / 1.7320508; // sqrt(3)
-  return vec3(
-    c.r * (co + a) + c.g * (a - b) + c.b * (a + b),
-    c.r * (a + b) + c.g * (co + a) + c.b * (a - b),
-    c.r * (a - b) + c.g * (a + b) + c.b * (co + a)
-  );
-}
+// --- Color Grading helper ---
 
 vec3 hsvToRgb(float h, float s) {
   h = fract(h) * 6.0;
@@ -117,103 +126,99 @@ vec3 hsvToRgb(float h, float s) {
 }
 
 void main() {
-  vec3 c = texture(u_input, v_texCoord).rgb;
+  // Input is scene-linear ProPhoto (D50). Edit here in wide-gamut scene-linear.
+  vec3 c = max(texture(u_input, v_texCoord).rgb, 0.0);
 
-  // --- White Balance ---
-  vec3 wb = kelvinToRGB(u_temperature);
-  float tintFactor = u_tint / 100.0;
-  float rAdj = 1.0 + tintFactor * 0.35;
-  float bAdj = 1.0 + tintFactor * 0.35;
-  float gAdj = 1.0 - abs(tintFactor) * 0.35;
-  c *= vec3(wb.r * clamp(rAdj, 0.2, 5.0), wb.g * clamp(gAdj, 0.2, 5.0), wb.b * clamp(bAdj, 0.2, 5.0));
+  // --- White Balance (relative gain, unit at temp=6500 / tint=0) ---
+  c *= u_wbGain;
 
   // --- Exposure ---
-  c *= pow(2.0, u_exposure);
+  c *= exp2(u_exposure);
 
-  // --- Tone (Highlights, Shadows, Whites, Blacks) ---
-  float lum = dot(c, LUMA);
-  // All masks use smoothstep for natural transitions
-  float sMask = 1.0 - smoothstep(0.05, 0.50, lum);                         // shadows
-  float hMask = smoothstep(0.50, 0.95, lum);                                // highlights
-  float wMask = smoothstep(0.60, 0.92, lum);                                // whites
-  float bMask = 1.0 - smoothstep(0.08, 0.40, lum);                          // blacks
-  // Shadows/Highlights: multiplicative with stops-scaling
-  c *= 1.0 + u_shadows   * 0.50 * sMask;
-  c *= 1.0 + u_highlights * 0.35 * hMask;
-  // Whites: highlight exposure boost (stops-based, like Lightroom)
-  c = mix(c, c * exp2(u_whites * 1.6), wMask);
-  // Blacks: shadow exposure shift (stops-based, like Lightroom)
-  c = mix(c, c * exp2(-u_blacks * 1.8), bMask);
-  c = max(c, vec3(0.0));
+  // === Tonal region adjustments on scene luminance (log-luminance masks) ===
+  float Y0 = ppLuma(c);
+  float Y = max(Y0, 1e-6);
+  float lx = log2(Y / 0.18);                          // stops from middle gray
+  float wHi = smoothstep(0.0, 3.5, lx);               // highlights
+  float wSh = 1.0 - smoothstep(-3.5, 0.0, lx);        // shadows
+  float wWh = smoothstep(1.5, 4.5, lx);               // whites (extreme highs)
+  float wBl = 1.0 - smoothstep(-5.0, -1.5, lx);       // blacks (extreme lows)
+  float gain = 0.0;
+  gain += (u_highlights >= 0.0 ? 0.45 : 0.75) * u_highlights * wHi;
+  gain += (u_shadows    >= 0.0 ? 0.80 : 0.55) * u_shadows    * wSh;
+  gain += (u_whites     >= 0.0 ? 0.50 : 0.60) * u_whites     * wWh;
+  gain += (u_blacks     <= 0.0 ? 0.60 : 0.50) * u_blacks     * wBl;
+  Y *= exp2(gain);
 
-  // --- Contrast (power-law S-curve anchored at 18% gray) ---
-  if (u_contrast != 1.0) {
-    float contrastAmount = u_contrast - 1.0; // [-1, 1]
-    float gamma = 1.0 + contrastAmount * 0.6;
-    c = PIVOT * pow(c / PIVOT, vec3(gamma));
-  }
+  // -- Contrast: power curve pivoting at middle gray (scene-linear) --
+  float contrastPow = 1.0 + (u_contrast - 1.0) * 0.6; // u_contrast = 1 + slider/100
+  Y = 0.18 * pow(max(Y / 0.18, 1e-6), contrastPow);
 
-  // --- Vibrance + Saturation ---
-  float grey = dot(c, LUMA);
-  vec3 chroma = c - vec3(grey);
-  if (u_vibrance != 1.0) {
-    float maxChroma = max(max(abs(chroma.r), abs(chroma.g)), abs(chroma.b));
-    float mutedMask = clamp(1.0 - maxChroma * 2.5, 0.0, 1.0);
-    chroma *= 1.0 + (u_vibrance - 1.0) * mutedMask;
-  }
-  if (u_saturation != 1.0) {
-    chroma *= u_saturation;
-  }
-  c = max(grey + chroma, vec3(0.0));
+  // Apply the luminance change to RGB, hue-preserving in ProPhoto.
+  c *= Y / max(Y0, 1e-6);
 
-  // --- Clarity (mid-tone contrast, bell-curve mask) ---
+  // --- Clarity (local mid-tone contrast, scene-linear around mid gray) ---
   if (u_clarity != 0.0) {
-    float lum2 = dot(c, LUMA);
-    float midMask = smoothstep(0.05, 0.45, lum2) * (1.0 - smoothstep(0.55, 0.95, lum2));
-    c = max(c + (c - 0.5) * u_clarity * midMask * 0.45, vec3(0.0));
+    float lm = ppLuma(c); lm = lm / (lm + 0.18);      // display-ish proxy for masking
+    float midMask = smoothstep(0.05, 0.45, lm) * (1.0 - smoothstep(0.55, 0.95, lm));
+    c = max(c + (c - 0.18) * u_clarity * midMask * 0.6, vec3(0.0));
   }
 
   // --- Dehaze (global contrast + saturation boost) ---
   if (u_dehaze != 0.0) {
-    c = max(c + (c - 0.5) * u_dehaze * 0.35, vec3(0.0));
-    float l3 = dot(c, LUMA);
+    c = max(c + (c - 0.18) * u_dehaze * 0.5, vec3(0.0));
+    float l3 = ppLuma(c);
     vec3 ch3 = c - vec3(l3);
     c = max(l3 + ch3 * (1.0 + u_dehaze * 0.25), vec3(0.0));
   }
 
-  // --- HSL Color Mixer ---
-  {
-    float h = rgbHue(c);
-    float m0 = hueMask(h, 0.000); // Red
-    float m1 = hueMask(h, 0.069); // Orange
-    float m2 = hueMask(h, 0.167); // Yellow
-    float m3 = hueMask(h, 0.333); // Green
-    float m4 = hueMask(h, 0.500); // Aqua
-    float m5 = hueMask(h, 0.667); // Blue
-    float m6 = hueMask(h, 0.778); // Purple
-    float m7 = hueMask(h, 0.889); // Magenta
-
-    float hAdj = m0*u_hsl_h[0] + m1*u_hsl_h[1] + m2*u_hsl_h[2] + m3*u_hsl_h[3]
-               + m4*u_hsl_h[4] + m5*u_hsl_h[5] + m6*u_hsl_h[6] + m7*u_hsl_h[7];
-    float sAdj = m0*u_hsl_s[0] + m1*u_hsl_s[1] + m2*u_hsl_s[2] + m3*u_hsl_s[3]
-               + m4*u_hsl_s[4] + m5*u_hsl_s[5] + m6*u_hsl_s[6] + m7*u_hsl_s[7];
-    float lAdj = m0*u_hsl_l[0] + m1*u_hsl_l[1] + m2*u_hsl_l[2] + m3*u_hsl_l[3]
-               + m4*u_hsl_l[4] + m5*u_hsl_l[5] + m6*u_hsl_l[6] + m7*u_hsl_l[7];
-
-    // Hue rotation
-    if (abs(hAdj) > 0.001) c = hueRotate(c, hAdj * 0.7);
-    // Saturation
-    if (abs(sAdj) > 0.001) {
-      float gl = dot(c, LUMA);
-      c = max(vec3(gl) + (c - vec3(gl)) * (1.0 + sAdj), vec3(0.0));
-    }
-    // Luminance
-    if (abs(lAdj) > 0.001) c = max(c + lAdj * 0.35, vec3(0.0));
+  // --- Vibrance + Saturation (Oklab chroma — hue-stable, no skew) ---
+  if (u_vibrance != 1.0 || u_saturation != 1.0) {
+    vec3 lab = proPhotoToOklab(c);
+    float C = length(lab.yz);
+    float w = 1.0 - smoothstep(0.0, 0.35, C);          // boost low-chroma (vibrance) more
+    float scale = u_saturation * (1.0 + (u_vibrance - 1.0) * w);
+    lab.yz *= scale;
+    c = max(oklabToProPhoto(lab), 0.0);
   }
 
-  // --- Color Grading ---
+  // --- HSL Color Mixer (OkLCh per-band, hue-stable) ---
+  {
+    vec3 lab = proPhotoToOklab(c);
+    float C = length(lab.yz);
+    if (C > 1e-4) {
+      float h = atan(lab.z, lab.y);                    // Oklab hue, radians
+      // Band hue centres (Oklab): Red, Orange, Yellow, Green, Aqua, Blue, Purple, Magenta
+      float centers[8] = float[8](0.5101, 0.9210, 1.9160, 2.4873, -2.8833, -1.6745, -1.1558, -0.5523);
+      float hAdj = 0.0, sAdj = 0.0, lAdj = 0.0;
+      for (int k = 0; k < 8; k++) {
+        float d = h - centers[k];
+        d = atan(sin(d), cos(d));                      // wrap to [-pi, pi]
+        float m = max(0.0, 1.0 - abs(d) / 0.7);        // ~40deg half-width, linear falloff
+        hAdj += m * u_hsl_h[k];
+        sAdj += m * u_hsl_s[k];
+        lAdj += m * u_hsl_l[k];
+      }
+      float newH = h + hAdj * 0.5;                     // hue rotation (radians)
+      float newC = C * (1.0 + sAdj);                   // per-band saturation
+      lab.x = max(lab.x + lAdj * 0.15, 0.0);           // per-band luminance
+      lab.y = newC * cos(newH);
+      lab.z = newC * sin(newH);
+      c = max(oklabToProPhoto(lab), 0.0);
+    }
+  }
+
+  // ===== View transform: scene-linear -> display-referred ProPhoto [0,1] =====
+  c = viewTransform(c);
+
+  // --- Tone Curve (user Point Curve, display-referred, luminance-driven) ---
+  float cl = clamp(ppLuma(c), 0.0, 1.0);
+  float cv = texture(u_curve_lut, vec2(cl, 0.5)).r;
+  c = c * (cv / max(cl, 0.0001));
+
+  // --- Color Grading (display-referred split-toning) ---
   if (u_grad_blend > 0.001) {
-    float lg = dot(c, LUMA);
+    float lg = ppLuma(c);
     float bal = u_grad_balance * 0.5;
     float shW = clamp(1.0 - smoothstep(0.15 + bal, 0.45 + bal, lg), 0.0, 1.0);
     float hlW = clamp(smoothstep(0.55 + bal, 0.85 + bal, lg), 0.0, 1.0);
@@ -225,13 +230,10 @@ void main() {
     c = mix(c, tinted, u_grad_blend);
   }
 
-  // --- Tone Curve (LUT, luminance-driven) ---
-  float cl = clamp(dot(c, LUMA), 0.0, 1.0);
-  float cv = texture(u_curve_lut, vec2(cl, 0.5)).r;
-  c = c * (cv / max(cl, 0.0001));
-
-  // --- Gamma (Linear → sRGB) ---
-  outColor = vec4(linearToSRGB(c.r), linearToSRGB(c.g), linearToSRGB(c.b), 1.0);
+  // ===== Display: ProPhoto -> target gamut -> compress -> encode =====
+  vec3 disp = (u_displayGamut == 1) ? (PROPHOTO_TO_P3 * c) : (PROPHOTO_TO_SRGB * c);
+  disp = gamutMap(disp);
+  outColor = vec4(srgbEncode(disp), 1.0); // sRGB transfer (Display-P3 shares it)
 }`;
 
 export interface PassDef {
@@ -243,7 +245,7 @@ export interface PassDef {
 /** Single pass — all operations fused. */
 export const PASSES: PassDef[] = [
   { name: "process", fsSource: PROCESS_SHADER, uniforms: [
-    "u_temperature", "u_tint", "u_exposure",
+    "u_wbGain", "u_exposure", "u_viewTransform", "u_displayGamut",
     "u_highlights", "u_shadows", "u_whites", "u_blacks",
     "u_contrast", "u_vibrance", "u_saturation", "u_clarity", "u_dehaze",
     "u_hsl_h[0]","u_hsl_h[1]","u_hsl_h[2]","u_hsl_h[3]","u_hsl_h[4]","u_hsl_h[5]","u_hsl_h[6]","u_hsl_h[7]",
@@ -251,6 +253,6 @@ export const PASSES: PassDef[] = [
     "u_hsl_l[0]","u_hsl_l[1]","u_hsl_l[2]","u_hsl_l[3]","u_hsl_l[4]","u_hsl_l[5]","u_hsl_l[6]","u_hsl_l[7]",
     "u_grad_sh_h","u_grad_sh_s","u_grad_md_h","u_grad_md_s",
     "u_grad_hl_h","u_grad_hl_s","u_grad_blend","u_grad_balance",
-    "u_curve_lut",
+    "u_curve_lut", "u_hasProfileCurve",
   ]},
 ];
