@@ -62,18 +62,25 @@ def unpack_bayer(planes: np.ndarray) -> np.ndarray:
     return out
 
 
-def _plane_black_levels(raw: Any) -> np.ndarray:
+def _plane_black_levels(raw: Any, row_phase: int = 0, col_phase: int = 0) -> np.ndarray:
     """Black level for each of the 4 packed phases, ordered TL, TR, BL, BR.
 
     ``black_level_per_channel`` is indexed by CFA colour index; ``raw_pattern``
     (row-major) maps phase position -> colour index, so we gather through it.
+
+    ``raw_pattern`` describes the full ``raw_image`` from (0, 0), but we pack the
+    *visible* crop, whose origin can sit at an odd margin. ``row_phase`` /
+    ``col_phase`` are that origin's parity; rolling the pattern by them keeps each
+    packed plane aligned to its true CFA colour — otherwise an odd margin would
+    swap the per-phase black levels and tint the denoised result.
     """
-    pattern = np.asarray(raw.raw_pattern).reshape(-1)  # [TL, TR, BL, BR]
+    pattern = np.asarray(raw.raw_pattern)
     black = np.asarray(raw.black_level_per_channel, dtype=np.float32)
-    if pattern.size != 4 or black.size < 4:
+    if pattern.shape != (2, 2) or black.size < 4:
         # Non-2x2 CFA (X-Trans etc.) is unsupported; fall back to a scalar.
         return np.full(4, float(black.reshape(-1)[0]), dtype=np.float32)
-    return black[pattern].astype(np.float32)
+    pattern = np.roll(pattern, shift=(-(row_phase % 2), -(col_phase % 2)), axis=(0, 1))
+    return black[pattern.reshape(-1)].astype(np.float32)
 
 
 # ── Denoiser backends ──────────────────────────────────────────────────────
@@ -174,7 +181,14 @@ def denoise_raw_inplace(
     mosaic = np.ascontiguousarray(visible[:he, :we])
     planes = pack_bayer(mosaic).astype(np.float32)
 
-    black = _plane_black_levels(raw)  # (4,)
+    # The visible crop can start at an odd margin, shifting the CFA phase of its
+    # origin relative to raw_image; pass that parity so black levels stay aligned.
+    sizes = raw.sizes
+    black = _plane_black_levels(
+        raw,
+        int(getattr(sizes, "top_margin", 0) or 0),
+        int(getattr(sizes, "left_margin", 0) or 0),
+    )  # (4,)
     white = float(raw.white_level)
     scale = np.maximum(white - black, 1.0)
 
