@@ -505,8 +505,10 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     prepared.color_profile["fullWidth"] = prepared.metadata.full_width
     prepared.color_profile["fullHeight"] = prepared.metadata.full_height
 
-    # Cache processed sRGB so switching back to this DCP code is instant
-    linear_arr = prepared.linear.astype(np.float32)
+    # Cache processed sRGB so switching back to this DCP code is instant. The
+    # decode/DCP/downsample paths already yield C-contiguous float32, so this is a
+    # no-op there (avoids a full ~tens-of-MB copy) and only copies when it must.
+    linear_arr = np.ascontiguousarray(prepared.linear, dtype=np.float32)
     _LINEAR_CACHE[cache_key] = (linear_arr, prepared.color_profile)
     while len(_LINEAR_CACHE) > _LINEAR_CACHE_MAX:
         _LINEAR_CACHE.popitem(last=False)
