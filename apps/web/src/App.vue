@@ -850,8 +850,21 @@ function baselineParams(): Partial<EditParams> {
   return { viewTransform: viewSettings.viewTransform, displayGamut: viewSettings.displayGamut };
 }
 
+// On-screen device-pixel footprint of the preview, as a fraction of the image's
+// logical (decoded-preview) resolution. The canvas is rendered at this scale and
+// CSS-upscaled to fit, so the GPU shades ~one fragment per visible device pixel
+// instead of the full decoded frame on every edit. Capped at 1 (never supersample
+// past the decoded source); the guard keeps full res until the fit is measured.
+function computePreviewScale(): number {
+  const displayScale = fitScale.value * zoom.value; // decoded-preview px → screen CSS px
+  if (!displayScale || !Number.isFinite(displayScale)) return 1;
+  const dpr = window.devicePixelRatio || 1;
+  return Math.min(1, displayScale * dpr);
+}
+
 function drawWebGL(): void {
   if (!webglRenderer) return;
+  webglRenderer.setPreviewScale(computePreviewScale());
   webglRenderer.draw(showOriginal.value ? baselineParams() : buildPipelineParams());
 }
 
@@ -1296,6 +1309,11 @@ watch([hslHue, hslSat, hslLum], () => { if (!isRestoring) scheduleWebGLDraw(); }
 watch(grading, () => { if (!isRestoring) scheduleWebGLDraw(); }, { deep: true });
 watch(viewSettings, () => { scheduleWebGLDraw(); schedulePersist(); }, { deep: true });
 
+// Zoom/fit only move CSS pixels; the drawing buffer is rendered at the on-screen
+// scale, so re-rasterise when it changes to stay crisp (zoom in) or shed fragments
+// (zoom out / resize). rAF-batched, so wheel and resize bursts collapse to one draw.
+watch([zoom, fitScale], () => { if (webglRenderer) scheduleWebGLDraw(); });
+
 // Crop changes resize the output, so they re-render (not just redraw) the editor
 // or the committed view.
 watch(crop, () => { if (!isRestoring) applyCropRender(); }, { deep: true });
@@ -1624,7 +1642,7 @@ function trackFill(value: number, min: number, max: number): string {
           <span class="spinner spinner-lg" aria-hidden="true" />
           <span>Importing…</span>
         </div>
-        <canvas v-show="webglRenderer != null && !activeSource?.invalid" ref="canvasRef" class="preview" :style="{ transform: displayTransform }" />
+        <canvas v-show="webglRenderer != null && !activeSource?.invalid" ref="canvasRef" class="preview" :style="{ transform: displayTransform, width: imageW + 'px', height: imageH + 'px' }" />
         <div v-show="activeSource && webglRenderer && (status === 'rendering' || status === 'uploading')"
           class="viewport-busy" aria-live="polite">
           <span class="spinner" aria-hidden="true" />

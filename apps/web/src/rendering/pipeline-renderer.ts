@@ -61,6 +61,10 @@ export class PipelineRenderer {
   // un-cropped frame, but the crop box / straighten bbox otherwise.
   private outWidth = 0;
   private outHeight = 0;
+  // Preview render scale (0–1): the canvas drawing buffer is rendered at this
+  // fraction of the logical output size and CSS-upscaled to fit. 1 = full res;
+  // off-screen / export renderers never shrink it.
+  private previewScale = 1;
   // Affine output→source-texcoord map (crop / straighten / flip / rotate) and
   // the workspace fill used for out-of-image areas in the crop editor.
   private texXform: Float32Array = new Float32Array([1, 0, 0, 0, -1, 0, 0, 1, 1]); // identity (full frame)
@@ -159,6 +163,17 @@ export class PipelineRenderer {
     this.canvas.height = this.outHeight;
   }
 
+  /**
+   * Set the preview render scale (0–1): the fraction of the logical output
+   * resolution the canvas drawing buffer is rendered at. The caller sizes this to
+   * the preview's on-screen device-pixel footprint so the GPU never shades more
+   * fragments than are displayed. Applied on the next draw(). Does not affect the
+   * histogram (binned from a separate source downscale) or export (a 1.0 renderer).
+   */
+  setPreviewScale(scale: number): void {
+    this.previewScale = Math.min(1, Math.max(0.05, scale));
+  }
+
   private makeLutTexture(lut: Float32Array, channels: 1 | 3 = 1): WebGLTexture {
     const gl = this.gl;
     const tex = gl.createTexture()!;
@@ -206,7 +221,16 @@ export class PipelineRenderer {
     // Declare what gamut the drawing buffer holds so the browser colour-manages it.
     const gl = this.gl as WebGL2RenderingContext & { drawingBufferColorSpace?: string };
     if (this.p3Supported) gl.drawingBufferColorSpace = p.displayGamut === 1 ? "display-p3" : "srgb";
-    this.renderPass(null, this.outWidth, this.outHeight, p);
+    // Render the drawing buffer at preview resolution (≤ logical output). The image
+    // is shown fit-to-viewport, so shading the full decoded frame every time a
+    // slider moves wastes fragments that are never seen. Histogram/export stay
+    // full-res (they don't read the canvas / run at scale 1). Only assign
+    // canvas.width when it changes — the assignment reallocates and clears it.
+    const cw = Math.max(1, Math.round(this.outWidth * this.previewScale));
+    const ch = Math.max(1, Math.round(this.outHeight * this.previewScale));
+    if (this.canvas.width !== cw) this.canvas.width = cw;
+    if (this.canvas.height !== ch) this.canvas.height = ch;
+    this.renderPass(null, cw, ch, p);
   }
 
   /** Render the current source + params into `fbo` (null = canvas) at w×h. */
@@ -437,8 +461,10 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
    */
   async toBlob(type = "image/jpeg", quality = 0.92): Promise<Blob> {
     const gl = this.gl;
-    const w = this.outWidth;
-    const h = this.outHeight;
+    // Read the actual drawing-buffer size (= outWidth/outHeight for a 1.0-scale
+    // export renderer; smaller for a downscaled preview).
+    const w = this.canvas.width;
+    const h = this.canvas.height;
     if (!w || !h) throw new Error("nothing to read back");
     // The back buffer holds values in the gamut chosen for the last draw(); tag the
     // read-back canvas with the same colour space so the export matches the preview.
