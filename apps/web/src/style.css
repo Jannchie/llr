@@ -119,11 +119,9 @@ button {
 }
 
 .brand-mark {
-  width: 16px;
-  height: 16px;
-  border-radius: 5px;
-  background: linear-gradient(135deg, var(--accent-strong), var(--accent));
-  box-shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.12) inset;
+  width: 18px;
+  height: 18px;
+  background: url(/logo-mark.svg) center / contain no-repeat;
 }
 
 .brand-name {

@@ -1,0 +1,66 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="LLR">
+  <defs>
+    <!-- App-icon background: graphite gradient -->
+    <linearGradient id="bg" x1="256" y1="0" x2="256" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2B2B30"/>
+      <stop offset="1" stop-color="#131316"/>
+    </linearGradient>
+    <!-- Top specular highlight -->
+    <linearGradient id="spec" x1="256" y1="0" x2="256" y2="220" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <!-- Curve stroke gradient: cyan -> system blue -->
+    <linearGradient id="curve" x1="140" y1="372" x2="372" y2="140" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0A84FF"/>
+      <stop offset="1" stop-color="#64D2FF"/>
+    </linearGradient>
+    <!-- Histogram fill -->
+    <linearGradient id="hist" x1="256" y1="248" x2="256" y2="372" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0A84FF" stop-opacity="0.30"/>
+      <stop offset="1" stop-color="#0A84FF" stop-opacity="0"/>
+    </linearGradient>
+    <!-- Soft glow for the curve -->
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="9" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <clipPath id="squircle">
+      <rect x="0" y="0" width="512" height="512" rx="114" ry="114"/>
+    </clipPath>
+  </defs>
+
+  <!-- Background -->
+  <rect x="0" y="0" width="512" height="512" rx="114" ry="114" fill="url(#bg)"/>
+
+  <g clip-path="url(#squircle)">
+    <rect x="0" y="0" width="512" height="220" fill="url(#spec)"/>
+
+    <!-- Histogram distribution (faint photo-data hint) -->
+    <path d="M140 372
+             C 176 372 184 300 212 290
+             C 240 280 244 248 264 248
+             C 286 248 292 286 320 296
+             C 348 306 352 372 372 372 Z"
+          fill="url(#hist)"/>
+
+    <!-- Diagonal reference line -->
+    <line x1="140" y1="372" x2="372" y2="140" stroke="#FFFFFF" stroke-opacity="0.12" stroke-width="3" stroke-dasharray="6 10" stroke-linecap="round"/>
+
+    <!-- Tone S-curve -->
+    <path d="M140 372 C 214 372 222 300 256 256 C 290 212 298 140 372 140"
+          fill="none" stroke="url(#curve)" stroke-width="26" stroke-linecap="round" filter="url(#glow)"/>
+
+    <!-- Control nodes -->
+    <circle cx="140" cy="372" r="13" fill="#0A84FF" stroke="#FFFFFF" stroke-width="6"/>
+    <circle cx="372" cy="140" r="13" fill="#64D2FF" stroke="#FFFFFF" stroke-width="6"/>
+    <circle cx="256" cy="256" r="16" fill="#FFFFFF"/>
+    <circle cx="256" cy="256" r="7" fill="#0A84FF"/>
+  </g>
+
+  <!-- Inner hairline for crisp edge -->
+  <rect x="0.5" y="0.5" width="511" height="511" rx="113.5" ry="113.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.08"/>
+</svg>
