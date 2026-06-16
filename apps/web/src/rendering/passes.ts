@@ -140,14 +140,18 @@ void main() {
   float Y0 = ppLuma(c);
   float Y = max(Y0, 1e-6);
   float lx = log2(Y / 0.18);                          // stops from middle gray
-  float wHi = smoothstep(0.0, 3.5, lx);               // highlights
+  // Lightroom model: Highlights/Shadows are *bumps* that taper at the extremes
+  // (recover the bright/dark region without moving the clip points), while
+  // Whites/Blacks are *broad ramps* pivoted at the opposite endpoint (scale a
+  // wide range and set where white/black clip).
+  float wHi = clamp(smoothstep(0.0, 2.0, lx) - smoothstep(3.0, 5.5, lx), 0.0, 1.0); // bright bump, white-point protected
   float wSh = 1.0 - smoothstep(-3.5, 0.0, lx);        // shadows
-  float wWh = smoothstep(1.5, 4.5, lx);               // whites (extreme highs)
+  float wWh = smoothstep(-2.0, 3.5, lx);              // whites: pivots at black -> broad, reaches mids, max at white
   float wBl = 1.0 - smoothstep(-5.0, -1.5, lx);       // blacks (extreme lows)
   float gain = 0.0;
-  gain += (u_highlights >= 0.0 ? 0.45 : 0.75) * u_highlights * wHi;
+  gain += (u_highlights >= 0.0 ? 0.70 : 0.90) * u_highlights * wHi;
   gain += (u_shadows    >= 0.0 ? 0.80 : 0.55) * u_shadows    * wSh;
-  gain += (u_whites     >= 0.0 ? 0.50 : 0.60) * u_whites     * wWh;
+  gain += (u_whites     >= 0.0 ? 0.70 : 0.80) * u_whites     * wWh;
   gain += (u_blacks     <= 0.0 ? 0.60 : 0.50) * u_blacks     * wBl;
   Y *= exp2(gain);
 
