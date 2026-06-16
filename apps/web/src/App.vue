@@ -204,8 +204,9 @@ function resetHslGrading(): void {
 // ── Tone Curve (Lightroom-compatible: parametric + RGB/R/G/B point curves) ──
 
 const toneCurve = ref<ToneCurve>(defaultToneCurve());
-const curveChannel = ref<ToneChannel>("rgb");
+const curveChannel = ref<ToneChannel>("parametric");
 const curveActive = ref(-1);
+const curveHover = ref(-1); // hovered parametric region (0=shadows..3=highlights), -1 = none
 const curveCanvas = ref<HTMLCanvasElement | null>(null);
 
 const CURVE_TABS: { key: ToneChannel; label: string }[] = [
@@ -234,6 +235,7 @@ function applyCurveLUT(): void {
 function setCurveChannel(ch: ToneChannel): void {
   curveChannel.value = ch;
   curveActive.value = -1;
+  curveHover.value = -1;
   renderCurveCanvas();
 }
 
@@ -279,7 +281,7 @@ function renderCurveCanvas(): void {
   const ctx = cvs.getContext("2d");
   if (!ctx) return;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  renderToneCurve(ctx, w, h, toneCurve.value, curveChannel.value, curveActive.value);
+  renderToneCurve(ctx, w, h, toneCurve.value, curveChannel.value, curveActive.value, curveHover.value);
 }
 
 // --- pointer interaction ---
@@ -404,6 +406,25 @@ function onCurveDoubleClick(e: MouseEvent): void {
     applyCurveLUT();
     renderCurveCanvas();
   }
+}
+
+// Hover (parametric only): highlight the tonal range under the cursor that a drag
+// would adjust, mirroring Lightroom's region preview.
+function onCurveHover(e: MouseEvent): void {
+  if (curveDrag) return; // during a drag the affected region is fixed; don't re-pick it
+  if (curveChannel.value !== "parametric") {
+    if (curveHover.value !== -1) { curveHover.value = -1; renderCurveCanvas(); }
+    return;
+  }
+  const c = curveCoords(e);
+  if (!c) return;
+  const region = regionForX(toneCurve.value.parametric, clamp(c.mx / c.w, 0, 1));
+  if (region !== curveHover.value) { curveHover.value = region; renderCurveCanvas(); }
+}
+
+function onCurveLeave(): void {
+  if (curveDrag) return; // keep the band while a region drag is in flight (cursor may exit)
+  if (curveHover.value !== -1) { curveHover.value = -1; renderCurveCanvas(); }
 }
 
 // Init curve canvas
@@ -1904,6 +1925,8 @@ function trackFill(value: number, min: number, max: number): string {
         </div>
         <canvas ref="curveCanvas" class="curve-canvas"
           @mousedown="onCurveMouseDown"
+          @mousemove="onCurveHover"
+          @mouseleave="onCurveLeave"
           @dblclick="onCurveDoubleClick" />
 
         <!-- Parametric region + split sliders -->

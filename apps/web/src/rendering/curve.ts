@@ -212,12 +212,6 @@ export function buildToneCurveLUT(tc: ToneCurve): Float32Array {
   return out;
 }
 
-/** Evaluate a single channel curve at x (for canvas rendering). */
-export function evalToneChannel(tc: ToneCurve, ch: ToneChannel, x: number): number {
-  if (ch === "parametric") return sampleLUT(parametricToLUT(tc.parametric), x);
-  return sampleLUT(curveToLUT(tc[ch]), x);
-}
-
 // --- rendering ---
 
 const GRID_COLOR = "#1f1f1f";
@@ -239,6 +233,7 @@ export function renderToneCurve(
   tc: ToneCurve,
   channel: ToneChannel,
   activeIndex = -1,
+  hoverRegion = -1,
 ): void {
   ctx.clearRect(0, 0, w, h);
   ctx.fillStyle = "#0a0a0a";
@@ -260,13 +255,54 @@ export function renderToneCurve(
   const toY = (v: number) => (1 - v) * h;
   const color = CHANNEL_COLOR[channel];
 
-  // The curve line
+  // Parametric hover: shade the envelope between the hovered region's slider at its
+  // max (+100) and min (-100), every other region left as-is — i.e. the full range
+  // that region can move the curve, the way Lightroom previews it on hover.
+  if (channel === "parametric" && hoverRegion >= 0) {
+    const key = REGION_KEYS[Math.max(0, Math.min(3, hoverRegion))];
+    const pMax: ParametricCurve = { ...tc.parametric };
+    const pMin: ParametricCurve = { ...tc.parametric };
+    pMax[key] = 100;
+    pMin[key] = -100;
+    const lutMax = parametricToLUT(pMax);
+    const lutMin = parametricToLUT(pMin);
+    // Fill between the bounding curves (max forward, min back).
+    ctx.beginPath();
+    for (let i = 0; i <= 128; i++) {
+      const t = i / 128, x = toX(t), y = toY(sampleLUT(lutMax, t));
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    for (let i = 128; i >= 0; i--) {
+      const t = i / 128;
+      ctx.lineTo(toX(t), toY(sampleLUT(lutMin, t)));
+    }
+    ctx.closePath();
+    ctx.fillStyle = "rgba(94,148,255,0.16)";
+    ctx.fill();
+    // Faint min/max boundary curves.
+    ctx.strokeStyle = "rgba(120,170,255,0.40)";
+    ctx.lineWidth = 1;
+    for (const lut of [lutMax, lutMin]) {
+      ctx.beginPath();
+      for (let i = 0; i <= 128; i++) {
+        const t = i / 128, x = toX(t), y = toY(sampleLUT(lut, t));
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+  }
+
+  // The curve line. Build the channel LUT once, then sample it per point: building
+  // a fresh LUT per sample would rebuild the entire 2048-entry table 129× per
+  // repaint (and re-run the parametric Gaussians/monotone pass each time), which
+  // is pure waste during a drag.
   ctx.strokeStyle = color;
   ctx.lineWidth = 1.5;
   ctx.beginPath();
+  const lineLUT = channel === "parametric" ? parametricToLUT(tc.parametric) : curveToLUT(tc[channel]);
   for (let i = 0; i <= 128; i++) {
     const t = i / 128;
-    const y = evalToneChannel(tc, channel, t);
+    const y = sampleLUT(lineLUT, t);
     if (i === 0) ctx.moveTo(toX(t), toY(y)); else ctx.lineTo(toX(t), toY(y));
   }
   ctx.stroke();
@@ -345,6 +381,9 @@ export function regionForX(p: ParametricCurve, x: number): number {
   if (x < b23) return 2;
   return 3;
 }
+
+/** Parametric region index (0..3) -> ParametricCurve amplitude key. */
+const REGION_KEYS = ["shadows", "darks", "lights", "highlights"] as const;
 
 // --- spline internals ---
 
