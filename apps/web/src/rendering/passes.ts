@@ -38,6 +38,8 @@ uniform float u_vibrance;
 uniform float u_saturation;
 uniform float u_clarity;
 uniform float u_dehaze;
+uniform int u_tonalActive;      // 1 if any highlights/shadows/whites/blacks is non-zero
+uniform int u_hslActive;        // 1 if any HSL band adjustment is non-zero
 // HSL Color Mixer (8 ranges × 3 adjustments)
 uniform float u_hsl_h[8];
 uniform float u_hsl_s[8];
@@ -151,30 +153,38 @@ void main() {
   c *= exp2(u_exposure);
 
   // === Tonal region adjustments on scene luminance (log-luminance masks) ===
-  float Y0 = ppLuma(c);
-  float Y = max(Y0, 1e-6);
-  float lx = log2(Y / 0.18);                          // stops from middle gray
-  // Lightroom model: Highlights/Shadows are *bumps* that taper at the extremes
-  // (recover the bright/dark region without moving the clip points), while
-  // Whites/Blacks are *broad ramps* pivoted at the opposite endpoint (scale a
-  // wide range and set where white/black clip).
-  float wHi = clamp(smoothstep(0.0, 2.0, lx) - smoothstep(3.0, 5.5, lx), 0.0, 1.0); // bright bump, white-point protected
-  float wSh = 1.0 - smoothstep(-3.5, 0.0, lx);        // shadows
-  float wWh = smoothstep(-2.0, 3.5, lx);              // whites: pivots at black -> broad, reaches mids, max at white
-  float wBl = 1.0 - smoothstep(-5.0, -1.5, lx);       // blacks (extreme lows)
-  float gain = 0.0;
-  gain += (u_highlights >= 0.0 ? 0.70 : 0.90) * u_highlights * wHi;
-  gain += (u_shadows    >= 0.0 ? 0.80 : 0.55) * u_shadows    * wSh;
-  gain += (u_whites     >= 0.0 ? 0.70 : 0.80) * u_whites     * wWh;
-  gain += (u_blacks     <= 0.0 ? 0.60 : 0.50) * u_blacks     * wBl;
-  Y *= exp2(gain);
-
-  // -- Contrast: power curve pivoting at middle gray (scene-linear) --
-  float contrastPow = 1.0 + (u_contrast - 1.0) * 0.6; // u_contrast = 1 + slider/100
-  Y = 0.18 * pow(max(Y / 0.18, 1e-6), contrastPow);
-
-  // Apply the luminance change to RGB, hue-preserving in ProPhoto.
-  c *= Y / max(Y0, 1e-6);
+  // Region gains and contrast both act purely on luminance; with neither engaged
+  // (the default) the block is an identity multiply, so skip it. The branch is on
+  // uniforms — coherent across every pixel, so the GPU takes one side with no
+  // divergence — and it also avoids a needless luma round-trip on untouched frames.
+  if (u_tonalActive == 1 || u_contrast != 1.0) {
+    float Y0 = ppLuma(c);
+    float Y = max(Y0, 1e-6);
+    if (u_tonalActive == 1) {
+      float lx = log2(Y / 0.18);                          // stops from middle gray
+      // Lightroom model: Highlights/Shadows are *bumps* that taper at the extremes
+      // (recover the bright/dark region without moving the clip points), while
+      // Whites/Blacks are *broad ramps* pivoted at the opposite endpoint (scale a
+      // wide range and set where white/black clip).
+      float wHi = clamp(smoothstep(0.0, 2.0, lx) - smoothstep(3.0, 5.5, lx), 0.0, 1.0); // bright bump, white-point protected
+      float wSh = 1.0 - smoothstep(-3.5, 0.0, lx);        // shadows
+      float wWh = smoothstep(-2.0, 3.5, lx);              // whites: pivots at black -> broad, reaches mids, max at white
+      float wBl = 1.0 - smoothstep(-5.0, -1.5, lx);       // blacks (extreme lows)
+      float gain = 0.0;
+      gain += (u_highlights >= 0.0 ? 0.70 : 0.90) * u_highlights * wHi;
+      gain += (u_shadows    >= 0.0 ? 0.80 : 0.55) * u_shadows    * wSh;
+      gain += (u_whites     >= 0.0 ? 0.70 : 0.80) * u_whites     * wWh;
+      gain += (u_blacks     <= 0.0 ? 0.60 : 0.50) * u_blacks     * wBl;
+      Y *= exp2(gain);
+    }
+    if (u_contrast != 1.0) {
+      // -- Contrast: power curve pivoting at middle gray (scene-linear) --
+      float contrastPow = 1.0 + (u_contrast - 1.0) * 0.6; // u_contrast = 1 + slider/100
+      Y = 0.18 * pow(max(Y / 0.18, 1e-6), contrastPow);
+    }
+    // Apply the luminance change to RGB, hue-preserving in ProPhoto.
+    c *= Y / max(Y0, 1e-6);
+  }
 
   // --- Clarity (local mid-tone contrast, scene-linear around mid gray) ---
   if (u_clarity != 0.0) {
@@ -202,7 +212,11 @@ void main() {
   }
 
   // --- HSL Color Mixer (OkLCh per-band, hue-stable) ---
-  {
+  // Skip the Oklab round-trip + 8-band hue loop entirely when no band is touched
+  // (the default). This is the shader's most expensive block, and like the
+  // vibrance/saturation guard above it must not run an identity round-trip per
+  // pixel every frame. Branch is on a uniform, so it is coherent across the draw.
+  if (u_hslActive == 1) {
     vec3 lab = proPhotoToOklab(c);
     float C = length(lab.yz);
     if (C > 1e-4) {
@@ -273,6 +287,7 @@ export const PASSES: PassDef[] = [
     "u_wbGain", "u_exposure", "u_viewTransform", "u_displayGamut",
     "u_highlights", "u_shadows", "u_whites", "u_blacks",
     "u_contrast", "u_vibrance", "u_saturation", "u_clarity", "u_dehaze",
+    "u_tonalActive", "u_hslActive",
     "u_hsl_h[0]","u_hsl_h[1]","u_hsl_h[2]","u_hsl_h[3]","u_hsl_h[4]","u_hsl_h[5]","u_hsl_h[6]","u_hsl_h[7]",
     "u_hsl_s[0]","u_hsl_s[1]","u_hsl_s[2]","u_hsl_s[3]","u_hsl_s[4]","u_hsl_s[5]","u_hsl_s[6]","u_hsl_s[7]",
     "u_hsl_l[0]","u_hsl_l[1]","u_hsl_l[2]","u_hsl_l[3]","u_hsl_l[4]","u_hsl_l[5]","u_hsl_l[6]","u_hsl_l[7]",

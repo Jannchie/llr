@@ -494,6 +494,14 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     s("u_contrast", p.contrast); s("u_vibrance", p.vibrance); s("u_saturation", p.saturation);
     s("u_clarity", p.clarity / 100);
     s("u_dehaze", p.dehaze / 100);
+    // Activity flags let the shader skip its two costliest blocks (luma region/
+    // contrast and the Oklab HSL mixer) when they are at their identity defaults.
+    const tonalActive = p.highlights !== 0 || p.shadows !== 0 || p.whites !== 0 || p.blacks !== 0;
+    const hslActive = (p.hslH?.some((v) => v !== 0) ?? false)
+      || (p.hslS?.some((v) => v !== 0) ?? false)
+      || (p.hslL?.some((v) => v !== 0) ?? false);
+    i("u_tonalActive", tonalActive ? 1 : 0);
+    i("u_hslActive", hslActive ? 1 : 0);
     // HSL
     for (let i = 0; i < 8; i++) {
       s(`u_hsl_h[${i}]`, p.hslH?.[i] ?? 0);
