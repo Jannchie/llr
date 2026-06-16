@@ -236,11 +236,6 @@ def camera_to_xyz_matrix(profile: DcpProfile) -> tuple[str, np.ndarray]:
     raise ValueError(f"{profile.path} does not contain a usable DCP color matrix")
 
 
-def apply_profile_tone_curve(rgb: np.ndarray, tone_curve: np.ndarray) -> np.ndarray:
-    values = np.clip(rgb, 0, 1)
-    return np.interp(values, tone_curve[:, 0], tone_curve[:, 1]).astype(np.float32)
-
-
 def select_hue_sat_map(profile: DcpProfile) -> DcpHueSatMap | None:
     return profile.hue_sat_map_1
 

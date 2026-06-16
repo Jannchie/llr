@@ -503,10 +503,10 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     i("u_tonalActive", tonalActive ? 1 : 0);
     i("u_hslActive", hslActive ? 1 : 0);
     // HSL
-    for (let i = 0; i < 8; i++) {
-      s(`u_hsl_h[${i}]`, p.hslH?.[i] ?? 0);
-      s(`u_hsl_s[${i}]`, p.hslS?.[i] ?? 0);
-      s(`u_hsl_l[${i}]`, p.hslL?.[i] ?? 0);
+    for (let band = 0; band < 8; band++) {
+      s(`u_hsl_h[${band}]`, p.hslH?.[band] ?? 0);
+      s(`u_hsl_s[${band}]`, p.hslS?.[band] ?? 0);
+      s(`u_hsl_l[${band}]`, p.hslL?.[band] ?? 0);
     }
     // Color Grading
     s("u_grad_sh_h", p.gradShH ?? 0); s("u_grad_sh_s", p.gradShS ?? 0);

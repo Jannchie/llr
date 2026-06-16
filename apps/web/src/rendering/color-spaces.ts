@@ -63,12 +63,6 @@ export const SRGB_TO_PROPHOTO: Mat3 = [
   [0.09837427, 0.87346103, 0.02816463],
   [0.01688318, 0.11767249, 0.86544430],
 ];
-// Rec.709 display-linear -> Display-P3 display-linear (for AgX P3 output)
-export const REC709_TO_P3: Mat3 = [
-  [0.82259286, 0.17753392, -0.00000003],
-  [0.03319948, 0.96678351, 0.00000002],
-  [0.01708534, 0.07239575, 0.91030142],
-];
 // ProPhoto(D50) luminance weights (Y row of ProPhoto->XYZ-D50)
 export const PROPHOTO_Y: readonly [number, number, number] = [0.28804020, 0.71187410, 0.00008570];
 
@@ -155,7 +149,6 @@ const MATRICES: ReadonlyArray<readonly [string, Mat3]> = [
   ["SRGB_TO_PROPHOTO", SRGB_TO_PROPHOTO],
   ["AGX_INSET_FROM_PROPHOTO", AGX_INSET_FROM_PROPHOTO],
   ["AGX_OUTSET", AGX_OUTSET],
-  ["REC709_TO_P3", REC709_TO_P3],
 ];
 
 /**
