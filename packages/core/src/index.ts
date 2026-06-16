@@ -15,8 +15,20 @@ export type EditRecipe = {
   dehaze: number;
   sharpen: number;
   noiseReduction: number;
+  denoise: DenoiseRecipe;
   hsl: HslRecipe;
   toneCurve: TonePoint[];
+};
+
+// AI RAW-domain denoise. Applied in the Python worker on the Bayer mosaic before
+// demosaic (not in the WebGL pipeline), so it parameterises render-linear rather
+// than the edit shader. `amount` is 0..100 (UI scale); the web normalises to
+// 0..1 when calling the API. `model` selects the backend ("wavelet" classical
+// default; neural backends added later).
+export type DenoiseRecipe = {
+  enabled: boolean;
+  model: string;
+  amount: number;
 };
 
 export type HslRecipe = {
@@ -76,6 +88,7 @@ export const neutralRecipe: EditRecipe = {
   dehaze: 0,
   sharpen: 0,
   noiseReduction: 0,
+  denoise: { enabled: false, model: "wavelet", amount: 100 },
   hsl: neutralHsl,
   toneCurve: [
     { x: 0, y: 0 },
@@ -90,6 +103,10 @@ export function mergeRecipe(base: EditRecipe, override: Partial<EditRecipe>): Ed
     hsl: {
       ...base.hsl,
       ...override.hsl
+    },
+    denoise: {
+      ...base.denoise,
+      ...override.denoise
     },
     toneCurve: override.toneCurve ?? base.toneCurve
   };

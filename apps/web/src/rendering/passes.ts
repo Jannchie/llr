@@ -11,8 +11,14 @@ export const VERTEX_SHADER = `#version 300 es
 precision highp float;
 in vec2 a_position;
 out vec2 v_texCoord;
+// Affine map output-quad -> source texcoords (crop / straighten / flip / rotate).
+// Identity for an un-cropped frame; built on the CPU in crop.ts.
+uniform mat3 u_texXform;
 void main() {
-  v_texCoord = a_position * 0.5 + 0.5;
+  vec2 uv = a_position * 0.5 + 0.5;
+  vec2 p = vec2(uv.x, 1.0 - uv.y);          // output-frame coord, y-down
+  vec3 t = u_texXform * vec3(p, 1.0);
+  v_texCoord = t.xy;
   gl_Position = vec4(a_position, 0.0, 1.0);
 }`;
 
@@ -52,6 +58,7 @@ uniform sampler2D u_profile_lut; // DCP profile tone curve (per-channel), displa
 uniform int u_hasProfileCurve;   // 1 if a DCP profile tone curve is available
 uniform int u_viewTransform;    // 0 = Lightroom-style, 1 = AgX
 uniform int u_displayGamut;     // 0 = sRGB, 1 = Display-P3
+uniform vec3 u_bgColor;         // display-encoded fill for areas outside the image (crop editor)
 
 ${COLOR_GLSL}
 
@@ -127,6 +134,13 @@ vec3 hsvToRgb(float h, float s) {
 }
 
 void main() {
+  // Outside the source image (rotated/straightened corners in the crop editor):
+  // paint the workspace background instead of smearing edge texels.
+  if (v_texCoord.x < 0.0 || v_texCoord.x > 1.0 || v_texCoord.y < 0.0 || v_texCoord.y > 1.0) {
+    outColor = vec4(u_bgColor, 1.0);
+    return;
+  }
+
   // Input is scene-linear ProPhoto (D50). Edit here in wide-gamut scene-linear.
   vec3 c = max(texture(u_input, v_texCoord).rgb, 0.0);
 
@@ -255,6 +269,7 @@ export interface PassDef {
 /** Single pass — all operations fused. */
 export const PASSES: PassDef[] = [
   { name: "process", fsSource: PROCESS_SHADER, uniforms: [
+    "u_texXform", "u_bgColor",
     "u_wbGain", "u_exposure", "u_viewTransform", "u_displayGamut",
     "u_highlights", "u_shadows", "u_whites", "u_blacks",
     "u_contrast", "u_vibrance", "u_saturation", "u_clarity", "u_dehaze",

@@ -8,6 +8,12 @@ import {
   CURVE_PRESETS, type CurvePoint, type ToneCurve, type ToneChannel, type PointChannel,
 } from "./rendering/curve";
 import {
+  defaultCrop, cloneCrop, isDefaultCrop, imageDims, buildCropTransform,
+  cropOutputRect, cropOutputSize, straightenedBBox, constrainCrop,
+  applyAspectRatio, resolveAspectRatio, rotate90, cornersInsideImage,
+  ASPECT_PRESETS, type CropState, type Rect,
+} from "./rendering/crop";
+import {
   loadState, saveState, loadThumbs, saveThumbs, generateThumb,
   type PersistedEdit, type PersistedState,
 } from "./persistence";
@@ -69,20 +75,45 @@ const fileInput = ref<HTMLInputElement | null>(null);
 const canvasRef = ref<HTMLCanvasElement | null>(null);
 const timing = ref<number | null>(null);
 const dcpCode = ref("");  // empty = auto-detect
+// AI RAW denoise. Applied in the worker on the Bayer mosaic before demosaic, so
+// changing it re-decodes linear.bin (like dcpCode) rather than re-running the
+// WebGL shader. amount is 0..100 (normalised to 0..1 for the API).
+const denoise = reactive({ enabled: false, model: "wavelet", amount: 100 });
+const denoiseBusy = ref(false);
 const exporting = ref(false);
+// Hold-to-compare: while true we draw the unedited original (baseline params +
+// identity tone curve) so the before/after is easy to eyeball; release restores
+// the live edit. crop/denoise/DCP are baked into linear.bin, so they stay applied.
+const showOriginal = ref(false);
 let currentSourceId = "";  // server id of the image currently in the renderer
 
 let webglRenderer: PipelineRenderer | null = null;
 const p3Supported = ref(false);
 let rafId = 0;
 let drawPending = false;
+// Histogram updates are throttled and always deferred off the synchronous
+// draw/decode path: the read-back stalls the main thread, and at 60fps it would
+// recompute far more often than anyone can read. ~11 Hz with a trailing update
+// keeps it responsive without taxing slider drags or inflating decode timing.
+let histoTimer = 0;
+let histoLast = 0;
+const HISTO_MIN_MS = 90;
 
 // ── Pan / Zoom state ──
 const zoom = ref(0); // 0 = no image, 1 = fit to viewport
 const pan = reactive({ x: 0, y: 0 });
 const fitScale = ref(1);
+// imageW/imageH are the *displayed output* dims (the crop result in normal mode,
+// or the straighten bounding box in the crop editor). srcW/srcH are the decoded
+// source texture dims that the crop transform maps from.
 const imageW = ref(0);
 const imageH = ref(0);
+const srcW = ref(0);
+const srcH = ref(0);
+// Full-resolution source dims (before the preview's half-size/max-size
+// downscale), reported by the worker so zoom % can be relative to the original.
+const srcFullW = ref(0);
+const srcFullH = ref(0);
 const viewportRef = ref<HTMLDivElement | null>(null);
 const isPanning = ref(false);
 let panStartX = 0;
@@ -119,6 +150,29 @@ const grading = reactive({
 
 // View settings (not part of the per-image recipe): tone-mapping look + display gamut.
 const viewSettings = reactive({ viewTransform: 0, displayGamut: 0 });
+
+// ── Crop & Straighten ──
+//
+// Part of the per-image edit (snapshot/history/persistence). The crop editor
+// renders the full straightened image with an overlay; committing just switches
+// the display back to the cropped output. All geometry lives in crop.ts.
+const crop = reactive<CropState>(defaultCrop());
+const cropMode = ref(false);
+const cropAspect = ref<string>("free");
+// Crop-editor render window (output-frame px) + the canvas scale used to draw it,
+// kept so the overlay can map between screen, output-frame and crop-box space.
+const cropBBox = reactive<Rect>({ x: 0, y: 0, w: 1, h: 1 });
+const cropRenderScale = ref(1);
+const cropOverlayRef = ref<SVGSVGElement | null>(null);
+const WORKSPACE_BG: [number, number, number] = [0.07, 0.07, 0.08];
+const CROP_EDITOR_MAX = 1800; // cap the editor preview's long edge (px)
+
+function setCrop(patch: Partial<CropState>): void {
+  Object.assign(crop, patch);
+}
+function currentImageDims(): [number, number] {
+  return imageDims(srcW.value, srcH.value, crop.orientation);
+}
 
 function hslValue(i: number): number {
   if (hslTab.value === "hue") return hslHue[i];
@@ -368,8 +422,12 @@ type Snapshot = {
   hslHue: number[]; hslSat: number[]; hslLum: number[];
   grading: typeof grading;
   curve: ToneCurve;
+  crop: CropState;
   dcp: string;
+  denoise?: typeof denoise;  // optional: absent in pre-denoise persisted sessions
 };
+
+const defaultDenoise = (): typeof denoise => ({ enabled: false, model: "wavelet", amount: 100 });
 
 const MAX_HISTORY = 100;
 const HISTORY_DEBOUNCE = 300;
@@ -391,7 +449,9 @@ function defaultSnapshot(): Snapshot {
     hslLum: [0, 0, 0, 0, 0, 0, 0, 0],
     grading: { shH: 0, shS: 0, mdH: 0, mdS: 0, hlH: 0, hlS: 0, blend: 50, balance: 0 } as typeof grading,
     curve: defaultToneCurve(),
+    crop: defaultCrop(),
     dcp: "",
+    denoise: defaultDenoise(),
   };
 }
 
@@ -404,7 +464,9 @@ function captureSnapshot(): Snapshot {
     hslHue: [...hslHue], hslSat: [...hslSat], hslLum: [...hslLum],
     grading: { ...grading },
     curve: normalizeToneCurve(toneCurve.value),
+    crop: cloneCrop(crop),
     dcp: dcpCode.value,
+    denoise: { ...denoise },
   };
 }
 
@@ -446,6 +508,9 @@ function setEditState(s: Snapshot): void {
   Object.assign(grading, s.grading);
   toneCurve.value = normalizeToneCurve(s.curve);
   curveActive.value = -1;
+  Object.assign(crop, s.crop ? cloneCrop(s.crop) : defaultCrop());
+  cropAspect.value = "free";
+  Object.assign(denoise, s.denoise ?? defaultDenoise());
   dcpCode.value = s.dcp;
   if (webglRenderer) webglRenderer.uploadCurveLUT(buildToneCurveLUT(toneCurve.value));
   renderCurveCanvas();
@@ -567,6 +632,12 @@ function markInvalid(id: string): void {
   errorMessage.value = "源文件已失效（服务器缓存可能已被清理），请重新导入这张图片。";
 }
 
+// Denoise params for the render-linear request. amount is normalised to 0..1;
+// disabled (or amount 0) tells the worker to skip inference entirely.
+function denoisePayload(): { enabled: boolean; model: string; amount: number } {
+  return { enabled: denoise.enabled, model: denoise.model, amount: denoise.amount / 100 };
+}
+
 // Decode `id`'s linear data and render it into the (reused) WebGL pipeline.
 // Returns false if the source can no longer be decoded server-side.
 async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promise<boolean> {
@@ -578,11 +649,11 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
   try {
     const linRes = await fetch(`${API}/render-linear`, {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ sourceId: id, halfSize: true, maxSize: 1600, dcpCode: dcpCode.value }),
+      body: JSON.stringify({ sourceId: id, halfSize: false, maxSize: 2560, dcpCode: dcpCode.value, denoise: denoisePayload() }),
     });
     if (linRes.status === 404) { markInvalid(id); return false; }
     if (!linRes.ok) throw new Error(await linRes.text());
-    const linMeta = await linRes.json() as { width: number; height: number; linearUrl: string; colorProfile?: ColorProfileMeta };
+    const linMeta = await linRes.json() as { width: number; height: number; fullWidth?: number; fullHeight?: number; linearUrl: string; colorProfile?: ColorProfileMeta };
     const binRes = await fetch(linMeta.linearUrl);
     if (binRes.status === 404) { markInvalid(id); return false; }
     if (!binRes.ok) throw new Error("Failed to fetch linear data");
@@ -590,11 +661,10 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
 
     linearFloatData = linearFloat;
     profileCurveLUT = buildProfileLUT(linMeta.colorProfile);
-    imageW.value = linMeta.width;
-    imageH.value = linMeta.height;
-    if (viewportRef.value) {
-      fitScale.value = Math.min(viewportRef.value.clientWidth / linMeta.width, viewportRef.value.clientHeight / linMeta.height);
-    }
+    srcW.value = linMeta.width;
+    srcH.value = linMeta.height;
+    srcFullW.value = linMeta.fullWidth ?? linMeta.width;
+    srcFullH.value = linMeta.fullHeight ?? linMeta.height;
     if (opts.resetView) { zoom.value = 1; pan.x = 0; pan.y = 0; }
 
     await nextTick();
@@ -606,8 +676,8 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     webglRenderer.uploadImage(linearFloat, linMeta.width, linMeta.height);
     webglRenderer.uploadCurveLUT(buildToneCurveLUT(toneCurve.value));
     webglRenderer.uploadProfileCurveLUT(profileCurveLUT);
-    drawWebGL();
-    scheduleHistogram();
+    // Apply the current crop/straighten (sets output dims, fit, draws, histogram).
+    applyCropRender();
     src.invalid = false;
     status.value = "idle";
     return true;
@@ -622,6 +692,7 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
 async function selectSource(id: string): Promise<void> {
   if (id === activeId.value) return;
   flushPendingHistory();
+  cropMode.value = false; // leave the crop editor when switching images
   syncLiveToMap(activeId.value);
   activeId.value = id;
   loadEditFromMap(id);
@@ -643,9 +714,28 @@ const displayTransform = computed(() => {
   return `translate(${tx}px, ${ty}px) scale(${scale})`;
 });
 
+// Ratio that rescales preview px → original full-res px (≤1; 1 when the preview
+// is already full resolution). Lets us report/zoom relative to the original.
+const previewToFull = computed(() => {
+  const previewLong = Math.max(srcW.value, srcH.value);
+  const fullLong = Math.max(srcFullW.value, srcFullH.value);
+  return previewLong > 0 && fullLong > 0 ? previewLong / fullLong : 1;
+});
+
+// Zoom % is reported relative to the original full-resolution image (100% =
+// one original pixel per CSS pixel), not the downscaled preview: `scale` maps
+// preview px → screen px, and `previewToFull` rescales that to original px.
 const zoomPercent = computed(() => {
   if (!imageW.value || !imageH.value) return 0;
-  return Math.round(fitScale.value * zoom.value * 100);
+  return Math.round(fitScale.value * zoom.value * previewToFull.value * 100);
+});
+
+// Internal zoom factor (1 = fit) that displays the original image at 100%
+// (1:1 original px per CSS px), clamped to the allowed zoom range.
+const fullResZoom = computed(() => {
+  const z = fitScale.value > 0 && previewToFull.value > 0
+    ? 1 / (fitScale.value * previewToFull.value) : 1;
+  return Math.min(50, Math.max(0.1, z));
 });
 
 // ── WebGL ──
@@ -716,9 +806,13 @@ function updateHistogram(): void {
 }
 
 function scheduleHistogram(): void {
-  updateHistogram();
-  // Safety net: always retry next frame in case layout hadn't settled
-  requestAnimationFrame(() => updateHistogram());
+  if (histoTimer) return; // a trailing update is already pending
+  const wait = Math.max(0, HISTO_MIN_MS - (performance.now() - histoLast));
+  histoTimer = window.setTimeout(() => {
+    histoTimer = 0;
+    histoLast = performance.now();
+    updateHistogram();
+  }, wait);
 }
 
 function scheduleWebGLDraw(): void {
@@ -727,21 +821,321 @@ function scheduleWebGLDraw(): void {
   rafId = requestAnimationFrame(() => { drawPending = false; drawWebGL(); scheduleHistogram(); });
 }
 
+// Edit-free baseline for hold-to-compare: keep view-only settings (look / display
+// gamut) but drop every per-image adjustment. The matching identity tone curve is
+// swapped in by the showOriginal watcher (the curve lives in a GPU LUT, not params).
+const IDENTITY_CURVE_LUT = buildToneCurveLUT(defaultToneCurve());
+function baselineParams(): Partial<EditParams> {
+  return { viewTransform: viewSettings.viewTransform, displayGamut: viewSettings.displayGamut };
+}
+
 function drawWebGL(): void {
   if (!webglRenderer) return;
-  webglRenderer.draw(buildPipelineParams());
+  webglRenderer.draw(showOriginal.value ? baselineParams() : buildPipelineParams());
 }
+
+function startCompare(): void { if (activeSource.value && !cropMode.value) showOriginal.value = true; }
+function endCompare(): void { showOriginal.value = false; }
 
 function destroyWebGL(): void {
   if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
+  if (histoTimer) { clearTimeout(histoTimer); histoTimer = 0; }
   drawPending = false;
   if (webglRenderer) { webglRenderer.destroy(); webglRenderer = null; }
+}
+
+// ── Crop rendering ──
+//
+// Normal view: render the crop box region (cropped output dims). Crop editor:
+// render the full straightened image's bounding box so the user sees beyond the
+// crop, with the overlay drawn on top.
+
+function recomputeFit(): void {
+  const vp = viewportRef.value;
+  if (!vp || !imageW.value || !imageH.value) return;
+  const margin = cropMode.value ? 0.86 : 1; // leave room for crop handles
+  fitScale.value = Math.min(vp.clientWidth / imageW.value, vp.clientHeight / imageH.value) * margin;
+}
+
+function renderNormal(): void {
+  if (!webglRenderer || !srcW.value || !srcH.value) return;
+  const [iw, ih] = currentImageDims();
+  const rect = cropOutputRect(crop, iw, ih);
+  const [ow, oh] = cropOutputSize(crop, srcW.value, srcH.value);
+  webglRenderer.setOutput(ow, oh, buildCropTransform(crop, srcW.value, srcH.value, rect), WORKSPACE_BG);
+  imageW.value = ow;
+  imageH.value = oh;
+  recomputeFit();
+  drawWebGL();
+  scheduleHistogram();
+}
+
+function renderCropEditor(): void {
+  if (!webglRenderer || !srcW.value || !srcH.value) return;
+  const [iw, ih] = currentImageDims();
+  const bbox = straightenedBBox(crop, iw, ih);
+  Object.assign(cropBBox, bbox);
+  const long = Math.max(bbox.w, bbox.h) || 1;
+  const rs = Math.min(1, CROP_EDITOR_MAX / long);
+  cropRenderScale.value = rs;
+  const cw = Math.max(1, Math.round(bbox.w * rs));
+  const ch = Math.max(1, Math.round(bbox.h * rs));
+  webglRenderer.setOutput(cw, ch, buildCropTransform(crop, srcW.value, srcH.value, bbox), WORKSPACE_BG);
+  imageW.value = cw;
+  imageH.value = ch;
+  recomputeFit();
+  drawWebGL();
+  scheduleHistogram();
+}
+
+function applyCropRender(): void {
+  if (cropMode.value) renderCropEditor(); else renderNormal();
+}
+
+function enterCropMode(): void {
+  if (!activeSource.value || cropMode.value) return;
+  flushPendingHistory();
+  cropMode.value = true;
+  zoom.value = 1; pan.x = 0; pan.y = 0;
+  nextTick(renderCropEditor);
+}
+
+function exitCropMode(): void {
+  if (!cropMode.value) return;
+  flushPendingHistory();
+  cropMode.value = false;
+  zoom.value = 1; pan.x = 0; pan.y = 0;
+  nextTick(renderNormal);
+}
+
+function toggleCropMode(): void {
+  if (cropMode.value) exitCropMode(); else enterCropMode();
+}
+
+function resetCrop(): void {
+  Object.assign(crop, defaultCrop());
+  cropAspect.value = "free";
+}
+
+// ── Crop controls (aspect / straighten / rotate / flip) ──
+
+const lockedRatio = computed(() => resolveAspectRatio(cropAspect.value, srcW.value, srcH.value, crop.orientation));
+
+function selectAspect(key: string): void {
+  cropAspect.value = key;
+  const ratio = resolveAspectRatio(key, srcW.value, srcH.value, crop.orientation);
+  if (ratio != null) Object.assign(crop, applyAspectRatio(crop, ratio, srcW.value, srcH.value));
+}
+
+const ASPECT_SWAP: Record<string, string> = {
+  "2:3": "3:2", "3:2": "2:3", "4:5": "5:4", "5:4": "4:5", "3:4": "4:3",
+  "4:3": "3:4", "5:7": "7:5", "7:5": "5:7", "9:16": "16:9", "16:9": "9:16",
+};
+
+function swapAspect(): void {
+  const k = cropAspect.value;
+  if (ASPECT_SWAP[k]) { selectAspect(ASPECT_SWAP[k]); return; }
+  if (k === "orig" || k === "1:1") return;
+  // Free aspect: swap the current box's pixel dimensions.
+  const [iw, ih] = currentImageDims();
+  const next = constrainCrop({ ...crop, w: (crop.h * ih) / iw, h: (crop.w * iw) / ih }, srcW.value, srcH.value);
+  Object.assign(crop, next);
+}
+
+function setAngle(v: number): void {
+  const angle = clamp(v, -45, 45);
+  Object.assign(crop, constrainCrop({ ...crop, angle }, srcW.value, srcH.value));
+}
+
+function rotateCrop(dir: 1 | -1): void {
+  Object.assign(crop, constrainCrop(rotate90(crop, dir), srcW.value, srcH.value));
+}
+
+function flipCropH(): void {
+  Object.assign(crop, constrainCrop({ ...crop, flipH: !crop.flipH, cx: 1 - crop.cx, angle: -crop.angle }, srcW.value, srcH.value));
+}
+function flipCropV(): void {
+  Object.assign(crop, constrainCrop({ ...crop, flipV: !crop.flipV, cy: 1 - crop.cy, angle: -crop.angle }, srcW.value, srcH.value));
+}
+
+// ── Crop overlay (output-frame coordinate space, matches the SVG viewBox) ──
+
+type CropHandle = "l" | "r" | "t" | "b" | "tl" | "tr" | "bl" | "br";
+
+const cropBoxRect = computed<Rect>(() => {
+  const [iw, ih] = currentImageDims();
+  const Wc = crop.w * iw, Hc = crop.h * ih;
+  return { x: crop.cx * iw - Wc / 2, y: crop.cy * ih - Hc / 2, w: Wc, h: Hc };
+});
+
+// Thirds grid lines inside the crop box, in output-frame coords.
+const cropThirds = computed(() => {
+  const r = cropBoxRect.value;
+  return {
+    v: [r.x + r.w / 3, r.x + (2 * r.w) / 3],
+    h: [r.y + r.h / 3, r.y + (2 * r.h) / 3],
+  };
+});
+
+const CROP_HANDLES: { key: CropHandle; fx: number; fy: number; cursor: string }[] = [
+  { key: "tl", fx: 0, fy: 0, cursor: "nwse-resize" }, { key: "t", fx: 0.5, fy: 0, cursor: "ns-resize" }, { key: "tr", fx: 1, fy: 0, cursor: "nesw-resize" },
+  { key: "l", fx: 0, fy: 0.5, cursor: "ew-resize" }, { key: "r", fx: 1, fy: 0.5, cursor: "ew-resize" },
+  { key: "bl", fx: 0, fy: 1, cursor: "nesw-resize" }, { key: "b", fx: 0.5, fy: 1, cursor: "ns-resize" }, { key: "br", fx: 1, fy: 1, cursor: "nwse-resize" },
+];
+
+// Output-frame units per on-screen pixel — keeps overlay strokes/handles a
+// constant size regardless of the editor's fit scale.
+const ofPerScreen = computed(() => {
+  const s = cropRenderScale.value * fitScale.value;
+  return s > 0 ? 1 / s : 1;
+});
+
+// SVG viewBox for the overlay (output-frame coords, matching the rendered bbox).
+const cropViewBox = computed(() => `${cropBBox.x} ${cropBBox.y} ${cropBBox.w} ${cropBBox.h}`);
+
+// Dim everything outside the crop box: full-bbox rect with the crop box punched
+// out via the evenodd fill rule.
+const cropDimPath = computed(() => {
+  const B = cropBBox, r = cropBoxRect.value;
+  return `M${B.x},${B.y}H${B.x + B.w}V${B.y + B.h}H${B.x}Z`
+       + `M${r.x},${r.y}V${r.y + r.h}H${r.x + r.w}V${r.y}Z`;
+});
+
+function cropHandlePos(h: { fx: number; fy: number }): { x: number; y: number } {
+  const r = cropBoxRect.value;
+  return { x: r.x + h.fx * r.w, y: r.y + h.fy * r.h };
+}
+
+type CropDrag =
+  | { mode: "move"; startX: number; startY: number; cx: number; cy: number }
+  | { mode: "resize"; handle: CropHandle; l: number; t: number; r: number; b: number }
+  | { mode: "rotate"; startPointerDeg: number; startAngle: number };
+let cropDrag: CropDrag | null = null;
+
+function overlayPoint(e: MouseEvent): { x: number; y: number } {
+  const svg = cropOverlayRef.value;
+  if (!svg) return { x: 0, y: 0 };
+  const r = svg.getBoundingClientRect();
+  const fx = (e.clientX - r.left) / r.width;
+  const fy = (e.clientY - r.top) / r.height;
+  return { x: cropBBox.x + fx * cropBBox.w, y: cropBBox.y + fy * cropBBox.h };
+}
+
+function overlayPxPerScreen(): number {
+  const svg = cropOverlayRef.value;
+  if (!svg) return 1;
+  const r = svg.getBoundingClientRect();
+  return r.width ? cropBBox.w / r.width : 1; // output-frame px per screen px
+}
+
+function onCropHandleDown(e: MouseEvent, handle: CropHandle): void {
+  e.preventDefault();
+  e.stopPropagation();
+  const r = cropBoxRect.value;
+  cropDrag = { mode: "resize", handle, l: r.x, t: r.y, r: r.x + r.w, b: r.y + r.h };
+  attachCropDrag();
+}
+
+function onCropOverlayDown(e: MouseEvent): void {
+  if (e.button !== 0) return;
+  const p = overlayPoint(e);
+  const r = cropBoxRect.value;
+  const inside = p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+  if (inside) {
+    cropDrag = { mode: "move", startX: p.x, startY: p.y, cx: crop.cx, cy: crop.cy };
+  } else {
+    // Drag in the margin to straighten (rotate the image), Lightroom-style.
+    const [iw, ih] = currentImageDims();
+    const deg = (Math.atan2(p.y - crop.cy * ih, p.x - crop.cx * iw) * 180) / Math.PI;
+    cropDrag = { mode: "rotate", startPointerDeg: deg, startAngle: crop.angle };
+  }
+  attachCropDrag();
+}
+
+function attachCropDrag(): void {
+  window.addEventListener("mousemove", onCropDragMove);
+  window.addEventListener("mouseup", onCropDragUp);
+}
+
+function onCropDragMove(e: MouseEvent): void {
+  if (!cropDrag) return;
+  const p = overlayPoint(e);
+  const [iw, ih] = currentImageDims();
+
+  if (cropDrag.mode === "move") {
+    const dx = (p.x - cropDrag.startX) / iw;
+    const dy = (p.y - cropDrag.startY) / ih;
+    moveCropTo(cropDrag.cx + dx, cropDrag.cy + dy);
+  } else if (cropDrag.mode === "rotate") {
+    const deg = (Math.atan2(p.y - crop.cy * ih, p.x - crop.cx * iw) * 180) / Math.PI;
+    setAngle(cropDrag.startAngle + (deg - cropDrag.startPointerDeg));
+  } else {
+    resizeCropTo(p.x, p.y, cropDrag);
+  }
+}
+
+function onCropDragUp(): void {
+  cropDrag = null;
+  window.removeEventListener("mousemove", onCropDragMove);
+  window.removeEventListener("mouseup", onCropDragUp);
+  flushPendingHistory();
+}
+
+// Best-effort axis-clamped move that lets the box slide along an image edge.
+function moveCropTo(ncx: number, ncy: number): void {
+  const [iw, ih] = currentImageDims();
+  const ok = (cx: number, cy: number): boolean => cornersInsideImage({ ...crop, cx, cy }, iw, ih);
+  const solve = (from: number, to: number, test: (v: number) => boolean): number => {
+    if (test(to)) return to;
+    let lo = from, hi = to;
+    for (let i = 0; i < 20; i++) { const m = (lo + hi) / 2; if (test(m)) lo = m; else hi = m; }
+    return lo;
+  };
+  let x = ncx, y = ncy;
+  if (!ok(x, crop.cy)) x = solve(crop.cx, x, (v) => ok(v, crop.cy));
+  if (!ok(x, y)) y = solve(crop.cy, y, (v) => ok(x, v));
+  setCrop({ cx: x, cy: y });
+}
+
+function resizeCropTo(qx: number, qy: number, d: { handle: CropHandle; l: number; t: number; r: number; b: number }): void {
+  const [iw, ih] = currentImageDims();
+  const MIN = Math.max(24, 0.05 * Math.min(iw, ih));
+  let { l, t, r, b } = d;
+  const hasL = d.handle.includes("l"), hasR = d.handle.includes("r");
+  const hasT = d.handle.includes("t"), hasB = d.handle.includes("b");
+  if (hasL) l = Math.min(qx, r - MIN);
+  if (hasR) r = Math.max(qx, l + MIN);
+  if (hasT) t = Math.min(qy, b - MIN);
+  if (hasB) b = Math.max(qy, t + MIN);
+
+  const ratio = lockedRatio.value;
+  if (ratio != null) {
+    const corner = (hasL || hasR) && (hasT || hasB);
+    if (corner) {
+      const h = (r - l) / ratio;
+      if (hasT) t = b - h; else b = t + h;
+    } else if (hasL || hasR) {
+      const h = (r - l) / ratio, cy = (t + b) / 2;
+      t = cy - h / 2; b = cy + h / 2;
+    } else {
+      const w = (b - t) * ratio, cx = (l + r) / 2;
+      l = cx - w / 2; r = cx + w / 2;
+    }
+  }
+
+  // Constrain to the image. At angle 0 clamp edges exactly; otherwise reject if
+  // the rotated box would leave the image (the handle stops at the boundary).
+  if (Math.abs(crop.angle) < 1e-3 && ratio == null) {
+    l = Math.max(0, l); t = Math.max(0, t); r = Math.min(iw, r); b = Math.min(ih, b);
+  }
+  const cand: CropState = { ...crop, cx: (l + r) / 2 / iw, cy: (t + b) / 2 / ih, w: (r - l) / iw, h: (b - t) / ih };
+  if (cornersInsideImage(cand, iw, ih)) Object.assign(crop, cand);
 }
 
 // ── Pan / Zoom ──
 
 function startPan(e: MouseEvent): void {
-  if (e.button !== 0) return;
+  if (e.button !== 0 || cropMode.value) return;
   isPanning.value = true;
   panStartX = e.clientX;
   panStartY = e.clientY;
@@ -776,7 +1170,7 @@ function applyZoom(newZoom: number, mx: number, my: number): void {
 }
 
 function onWheel(e: WheelEvent): void {
-  if (!imageW.value || !imageH.value || !viewportRef.value) return;
+  if (cropMode.value || !imageW.value || !imageH.value || !viewportRef.value) return;
   e.preventDefault();
   const delta = -e.deltaY;
   const factor = delta > 0 ? 1.1 : 1 / 1.1;
@@ -805,12 +1199,19 @@ function fitView(): void {
   pan.y = 0;
 }
 
+// Zoom to 100% (original 1:1), anchored at the viewport center.
+function zoomToFull(): void {
+  const vp = viewportRef.value;
+  if (vp) applyZoom(fullResZoom.value, vp.clientWidth / 2, vp.clientHeight / 2);
+}
+
+// Toggle between Fit and 100% (original 1:1). From Fit, zoom to 100% anchored at
+// the cursor; from any other zoom, return to a centered Fit.
 function onDoubleClick(e: MouseEvent): void {
-  if (!imageW.value || !imageH.value || !viewportRef.value) return;
-  if (zoom.value === 1) {
-    const newZoom = Math.min(50, 1 / fitScale.value);
+  if (cropMode.value || !imageW.value || !imageH.value || !viewportRef.value) return;
+  if (Math.abs(zoom.value - 1) < 1e-3) {
     const rect = viewportRef.value.getBoundingClientRect();
-    applyZoom(newZoom, e.clientX - rect.left, e.clientY - rect.top);
+    applyZoom(fullResZoom.value, e.clientX - rect.left, e.clientY - rect.top);
   } else {
     fitView();
   }
@@ -828,28 +1229,59 @@ function onKeyDown(e: KeyboardEvent): void {
     if (k === "y") { e.preventDefault(); redo(); return; }
   }
 
+  // Crop tool: R toggles, Esc / Enter commit & exit (Lightroom-style).
+  if (!inEditableText && activeSource.value && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    if (e.key === "r" || e.key === "R") { e.preventDefault(); toggleCropMode(); return; }
+    if (cropMode.value && (e.key === "Escape" || e.key === "Enter")) { e.preventDefault(); exitCropMode(); return; }
+  }
+
+  // Backslash holds the "before" view; release (onKeyUp) restores the edit.
+  if (!inEditableText && e.key === "\\" && activeSource.value && !cropMode.value) {
+    e.preventDefault();
+    showOriginal.value = true; // watcher guards against redundant redraws on repeat
+    return;
+  }
+
   if (!imageW.value || !imageH.value) return;
+  if (cropMode.value) return; // crop editor owns the view; no pan/zoom shortcuts
   if (e.ctrlKey || e.metaKey) {
     switch (e.key) {
       case '0': e.preventDefault(); fitView(); break;
+      case '1': e.preventDefault(); zoomToFull(); break;
       case '=': case '+': e.preventDefault(); zoomIn(); break;
       case '-': e.preventDefault(); zoomOut(); break;
     }
   }
 }
 
+function onKeyUp(e: KeyboardEvent): void {
+  if (e.key === "\\") showOriginal.value = false; // release the hold-to-compare view
+}
+
 // ── upload ──
 
 // Auto-redraw on edit. Suppressed during restore/switch so we don't flash the
 // previous image with the new params before loadSource() uploads the pixels.
+// Hold-to-compare swaps the tone-curve LUT (a GPU texture, not a draw param) for
+// identity while previewing the original, restoring the live curve on release.
+watch(showOriginal, (v) => {
+  if (!webglRenderer) return;
+  webglRenderer.uploadCurveLUT(v ? IDENTITY_CURVE_LUT : buildToneCurveLUT(toneCurve.value));
+  scheduleWebGLDraw();
+});
+
 watch(recipe, () => { if (!isRestoring) scheduleWebGLDraw(); }, { deep: true });
 watch([hslHue, hslSat, hslLum], () => { if (!isRestoring) scheduleWebGLDraw(); }, { deep: true });
 watch(grading, () => { if (!isRestoring) scheduleWebGLDraw(); }, { deep: true });
 watch(viewSettings, () => { scheduleWebGLDraw(); schedulePersist(); }, { deep: true });
 
+// Crop changes resize the output, so they re-render (not just redraw) the editor
+// or the committed view.
+watch(crop, () => { if (!isRestoring) applyCropRender(); }, { deep: true });
+
 // Record edit changes into undo/redo history (coalesced; suppressed during restore)
 // and persist the session.
-watch([recipe, hslHue, hslSat, hslLum, grading, toneCurve, dcpCode],
+watch([recipe, hslHue, hslSat, hslLum, grading, toneCurve, dcpCode, crop, denoise],
   () => { scheduleHistoryCommit(); schedulePersist(); }, { deep: true });
 
 // Re-decode when the user changes the DCP style (keeps the current view).
@@ -859,12 +1291,28 @@ watch(dcpCode, async () => {
   await loadSource(currentSourceId, { resetView: false });
 });
 
+// Denoise is baked into linear.bin, so changes re-decode like dcpCode. Debounced
+// because amount is a slider (the first decode runs inference; later ones hit the
+// worker's cache and only re-blend). The amount slider is hidden while disabled,
+// so a change here always alters the effective output.
+let denoiseReloadTimer = 0;
+watch(denoise, () => {
+  if (suppressDcpReload || !currentSourceId) return;
+  if (denoiseReloadTimer) clearTimeout(denoiseReloadTimer);
+  denoiseReloadTimer = window.setTimeout(() => {
+    denoiseReloadTimer = 0;
+    denoiseBusy.value = true;
+    void loadSource(currentSourceId, { resetView: false }).finally(() => { denoiseBusy.value = false; });
+  }, 250);
+}, { deep: true });
+
 // Flush the latest edit synchronously on tab close (beforeunload won't wait for
 // the debounced persist).
 function persistOnUnload(): void { persistNow(); }
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeyDown);
+  window.removeEventListener('keyup', onKeyUp);
   window.removeEventListener('beforeunload', persistOnUnload);
   resizeObs?.disconnect();
   destroyWebGL();
@@ -872,12 +1320,9 @@ onBeforeUnmount(() => {
 
 onMounted(async () => {
   window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('keyup', onKeyUp);
   window.addEventListener('beforeunload', persistOnUnload);
-  resizeObs = new ResizeObserver(() => {
-    if (imageW.value && imageH.value && viewportRef.value) {
-      fitScale.value = Math.min(viewportRef.value.clientWidth / imageW.value, viewportRef.value.clientHeight / imageH.value);
-    }
-  });
+  resizeObs = new ResizeObserver(() => recomputeFit());
   if (viewportRef.value) resizeObs.observe(viewportRef.value);
 
   Object.assign(thumbs, loadThumbs());
@@ -942,6 +1387,7 @@ async function uploadFiles(files: File[]): Promise<void> {
 
   // Preserve the edit of the image we're leaving before importing new ones.
   flushPendingHistory();
+  cropMode.value = false; // leave the crop editor when importing
   syncLiveToMap(activeId.value);
 
   let lastId: string | null = null;
@@ -1010,7 +1456,7 @@ async function exportImage(): Promise<void> {
     // 1. Decode full-resolution linear data (no half-size / no max-size cap)
     const linRes = await fetch(`${API}/render-linear`, {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ sourceId: currentSourceId, halfSize: false, maxSize: 0, dcpCode: dcpCode.value }),
+      body: JSON.stringify({ sourceId: currentSourceId, halfSize: false, maxSize: 0, dcpCode: dcpCode.value, denoise: denoisePayload() }),
     });
     if (!linRes.ok) throw new Error(await linRes.text());
     const linMeta = await linRes.json() as { width: number; height: number; linearUrl: string; colorProfile?: ColorProfileMeta };
@@ -1018,11 +1464,15 @@ async function exportImage(): Promise<void> {
     if (!binRes.ok) throw new Error("Failed to fetch full-resolution data");
     const linear = new Float32Array(await binRes.arrayBuffer());
 
-    // 2. Render full-res off-screen with the current edit params, read back as JPEG
+    // 2. Render full-res off-screen with the current edit params + crop, read back as JPEG
     renderer = new PipelineRenderer(document.createElement("canvas"));
     renderer.uploadImage(linear, linMeta.width, linMeta.height);
     renderer.uploadCurveLUT(buildToneCurveLUT(toneCurve.value));
     renderer.uploadProfileCurveLUT(buildProfileLUT(linMeta.colorProfile));
+    const [iw, ih] = imageDims(linMeta.width, linMeta.height, crop.orientation);
+    const rect = cropOutputRect(crop, iw, ih);
+    const [ow, oh] = cropOutputSize(crop, linMeta.width, linMeta.height);
+    renderer.setOutput(ow, oh, buildCropTransform(crop, linMeta.width, linMeta.height, rect), WORKSPACE_BG);
     renderer.draw(buildPipelineParams());
     const blob = await renderer.toBlob("image/jpeg", 0.92);
 
@@ -1092,6 +1542,22 @@ function trackFill(value: number, min: number, max: number): string {
             <path d="M17 5l4 4-4 4" />
           </svg>
         </button>
+        <button class="icon-btn" :class="{ 'is-on': cropMode }" :disabled="!activeSource" @click="toggleCropMode"
+          title="Crop & Straighten (R)" aria-label="Crop">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M6 2v14a2 2 0 0 0 2 2h14" />
+            <path d="M2 6h14a2 2 0 0 1 2 2v14" />
+          </svg>
+        </button>
+        <button class="icon-btn" :class="{ 'is-on': showOriginal }" :disabled="!activeSource || cropMode"
+          @mousedown="startCompare" @mouseup="endCompare" @mouseleave="endCompare"
+          @touchstart.prevent="startCompare" @touchend.prevent="endCompare" @touchcancel="endCompare"
+          title="Hold to compare original ( \ )" aria-label="Compare with original">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="5" width="18" height="14" rx="2" />
+            <path d="M12 5v14" />
+          </svg>
+        </button>
       </div>
       <div class="meta-summary">
         <span v-if="activeSource">{{ activeSource.name }}</span>
@@ -1130,9 +1596,41 @@ function trackFill(value: number, min: number, max: number): string {
           </div>
         </div>
         <div v-show="activeSource && status === 'rendering' && !webglRenderer" class="preview-loading">
-          <span>Decoding… {{ timing ? `${timing}ms` : '' }}</span>
+          <span class="spinner spinner-lg" aria-hidden="true" />
+          <span>Decoding…</span>
+        </div>
+        <div v-show="status === 'uploading' && !activeSource" class="preview-loading">
+          <span class="spinner spinner-lg" aria-hidden="true" />
+          <span>Importing…</span>
         </div>
         <canvas v-show="webglRenderer != null && !activeSource?.invalid" ref="canvasRef" class="preview" :style="{ transform: displayTransform }" />
+        <div v-show="activeSource && webglRenderer && (status === 'rendering' || status === 'uploading')"
+          class="viewport-busy" aria-live="polite">
+          <span class="spinner" aria-hidden="true" />
+          <span>{{ status === 'uploading' ? 'Importing…' : 'Decoding…' }}</span>
+        </div>
+        <svg v-show="cropMode && webglRenderer != null" ref="cropOverlayRef" class="crop-overlay"
+          :style="{ transform: displayTransform, width: imageW + 'px', height: imageH + 'px' }"
+          :viewBox="cropViewBox" preserveAspectRatio="none"
+          @mousedown="onCropOverlayDown">
+          <!-- transparent catcher for move/rotate drags -->
+          <rect class="crop-catch" :x="cropBBox.x" :y="cropBBox.y" :width="cropBBox.w" :height="cropBBox.h" />
+          <!-- dim outside the crop -->
+          <path class="crop-dim" :d="cropDimPath" fill-rule="evenodd" />
+          <!-- rule-of-thirds grid -->
+          <g class="crop-grid" :stroke-width="1 * ofPerScreen">
+            <line v-for="(x, i) in cropThirds.v" :key="'v'+i" :x1="x" :y1="cropBoxRect.y" :x2="x" :y2="cropBoxRect.y + cropBoxRect.h" />
+            <line v-for="(y, i) in cropThirds.h" :key="'h'+i" :x1="cropBoxRect.x" :y1="y" :x2="cropBoxRect.x + cropBoxRect.w" :y2="y" />
+          </g>
+          <!-- crop box border -->
+          <rect class="crop-frame" :x="cropBoxRect.x" :y="cropBoxRect.y" :width="cropBoxRect.w" :height="cropBoxRect.h" :stroke-width="1.5 * ofPerScreen" />
+          <!-- handles -->
+          <rect v-for="h in CROP_HANDLES" :key="h.key" class="crop-handle"
+            :x="cropHandlePos(h).x - 5.5 * ofPerScreen" :y="cropHandlePos(h).y - 5.5 * ofPerScreen"
+            :width="11 * ofPerScreen" :height="11 * ofPerScreen"
+            :style="{ cursor: h.cursor }"
+            @mousedown="onCropHandleDown($event, h.key)" />
+        </svg>
         <img v-show="activeSource && !activeSource.invalid && !webglRenderer && status !== 'rendering'" class="preview" :style="{ transform: displayTransform }" :src="activeSource ? thumbSrc(activeSource) : ''" alt="preview" />
         <div v-if="activeSource?.invalid" class="invalid-state">
           <img v-if="activeSource && thumbSrc(activeSource)" :src="thumbSrc(activeSource)" :alt="activeSource.name" />
@@ -1163,7 +1661,64 @@ function trackFill(value: number, min: number, max: number): string {
       <div class="histogram-wrap" v-show="activeSource">
         <canvas ref="histoCanvasRef" class="histogram" />
       </div>
-      <section class="panel">
+
+      <section class="panel crop-panel" v-if="activeSource && cropMode">
+        <header class="panel-head">
+          <span>Crop &amp; Straighten</span>
+          <button class="ghost" type="button" @click="resetCrop">Reset</button>
+        </header>
+        <div class="control-row">
+          <label class="control-label">Aspect</label>
+          <div class="crop-aspect">
+            <select class="control-select" :value="cropAspect"
+              @change="selectAspect(($event.target as HTMLSelectElement).value)">
+              <option v-for="a in ASPECT_PRESETS" :key="a.key" :value="a.key">{{ a.label }}</option>
+            </select>
+            <button class="icon-mini" type="button" title="Swap orientation" @click="swapAspect" aria-label="Swap aspect">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M16 3l4 4-4 4" /><path d="M20 7H8a4 4 0 0 0-4 4" />
+                <path d="M8 21l-4-4 4-4" /><path d="M4 17h12a4 4 0 0 0 4-4" />
+              </svg>
+            </button>
+          </div>
+        </div>
+        <div class="slider">
+          <label>Angle</label>
+          <input type="range" min="-45" max="45" step="0.1"
+            :value="crop.angle"
+            :style="{ '--track': trackFill(crop.angle, -45, 45) }"
+            @input="setAngle(($event.target as HTMLInputElement).valueAsNumber)"
+            @dblclick="setAngle(0)" title="Double-click to reset" />
+          <input class="slider-number" type="number" min="-45" max="45" step="0.1"
+            :value="Number(crop.angle.toFixed(1))"
+            @input="setAngle(($event.target as HTMLInputElement).valueAsNumber)" />
+        </div>
+        <div class="crop-buttons">
+          <button type="button" class="crop-tool" title="Rotate left 90°" @click="rotateCrop(-1)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5" />
+            </svg>
+          </button>
+          <button type="button" class="crop-tool" title="Rotate right 90°" @click="rotateCrop(1)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 12a9 9 0 1 1-3-6.7L21 8" /><path d="M21 3v5h-5" />
+            </svg>
+          </button>
+          <button type="button" class="crop-tool" :class="{ 'is-on': crop.flipH }" title="Flip horizontal" @click="flipCropH">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 3v18" /><path d="M8 7l-4 5 4 5" /><path d="M16 7l4 5-4 5" />
+            </svg>
+          </button>
+          <button type="button" class="crop-tool" :class="{ 'is-on': crop.flipV }" title="Flip vertical" @click="flipCropV">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 12h18" /><path d="M7 8l5-4 5 4" /><path d="M7 16l5 4 5-4" />
+            </svg>
+          </button>
+        </div>
+        <button type="button" class="crop-done" @click="exitCropMode">Done</button>
+      </section>
+
+      <section class="panel" v-show="!cropMode">
         <header class="panel-head">
           <span>Settings</span>
           <button class="ghost" type="button" @click="resetRecipe">Reset</button>
@@ -1198,7 +1753,7 @@ function trackFill(value: number, min: number, max: number): string {
           </select>
         </div>
       </section>
-      <section v-for="group in groups" :key="group.title" class="panel">
+      <section v-for="group in groups" :key="group.title" class="panel" v-show="!cropMode">
         <header class="panel-head">{{ group.title }}</header>
         <div v-for="spec in group.items" :key="spec.key" class="slider">
           <label :for="`s-${spec.key}`">{{ spec.label }}</label>
@@ -1211,7 +1766,30 @@ function trackFill(value: number, min: number, max: number): string {
         </div>
       </section>
 
-      <section class="panel" v-if="activeSource">
+      <section class="panel" v-if="activeSource && !cropMode">
+        <header class="panel-head">
+          <span>Detail</span>
+          <span v-if="denoiseBusy" class="panel-hint">Denoising…</span>
+        </header>
+        <div class="control-row">
+          <label class="control-label" for="denoise-on">AI Denoise</label>
+          <label class="switch">
+            <input id="denoise-on" type="checkbox" v-model="denoise.enabled" />
+            <span class="switch-track"><span class="switch-thumb" /></span>
+          </label>
+        </div>
+        <div v-show="denoise.enabled" class="slider" style="margin-top: 12px;">
+          <label for="denoise-amount">Amount</label>
+          <input id="denoise-amount" type="range" min="0" max="100" step="1"
+            v-model.number="denoise.amount"
+            :style="{ '--track': trackFill(denoise.amount, 0, 100) }"
+            @dblclick="denoise.amount = 100" title="Double-click to reset" />
+          <input v-model.number="denoise.amount" class="slider-number" type="number"
+            min="0" max="100" step="1" aria-label="Denoise amount" />
+        </div>
+      </section>
+
+      <section class="panel" v-if="activeSource && !cropMode">
         <header class="panel-head">
           <span>HSL / Color</span>
         </header>
@@ -1234,7 +1812,7 @@ function trackFill(value: number, min: number, max: number): string {
         </div>
       </section>
 
-      <section class="panel" v-if="activeSource">
+      <section class="panel" v-if="activeSource && !cropMode">
         <header class="panel-head">
           <span>Color Grading</span>
         </header>
@@ -1314,7 +1892,7 @@ function trackFill(value: number, min: number, max: number): string {
         </div>
       </section>
 
-      <section class="panel" v-if="activeSource">
+      <section class="panel" v-if="activeSource && !cropMode">
         <header class="panel-head">
           <span>Tone Curve</span>
           <button class="ghost" type="button" @click="resetCurve">Reset</button>
@@ -1374,6 +1952,10 @@ function trackFill(value: number, min: number, max: number): string {
           @click="selectSource(source.id)">
           <div class="film-thumb">
             <img v-if="thumbSrc(source)" :src="thumbSrc(source)" :alt="source.name" />
+            <div v-else class="thumb-skeleton" aria-hidden="true" />
+            <span v-if="source.id === activeId && status === 'rendering'" class="thumb-loading" aria-hidden="true">
+              <span class="spinner" />
+            </span>
             <span v-if="source.invalid" class="film-badge" title="源文件已失效，请重新导入">失效</span>
           </div>
           <span class="film-name">{{ source.name }}</span>

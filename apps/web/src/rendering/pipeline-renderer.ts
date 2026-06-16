@@ -27,6 +27,14 @@ export interface EditParams {
 
 const HSL_ZERO = [0, 0, 0, 0, 0, 0, 0, 0];
 
+// Long-edge cap for the processed image the histogram is binned from. Each
+// update re-runs the full pipeline shader at this size, so the cap trades bin
+// smoothness/clipping accuracy against per-update GPU cost. The GPU path scatters
+// on-device (16 KB read-back regardless of size) so it can afford a denser sample
+// than the CPU path (which loops over every pixel in JS after a full read-back).
+const HISTO_LONG_GPU = 512;
+const HISTO_LONG_CPU = 256;
+
 export const DEFAULT_PARAMS: EditParams = {
   exposure: 0, contrast: 1, saturation: 1,
   temperature: 6500, tint: 0,
@@ -49,12 +57,33 @@ export class PipelineRenderer {
   private hasProfileCurve = false;
   private texWidth = 0;
   private texHeight = 0;
+  // Output (canvas / render) dimensions — equal to the texture dims for an
+  // un-cropped frame, but the crop box / straighten bbox otherwise.
+  private outWidth = 0;
+  private outHeight = 0;
+  // Affine output→source-texcoord map (crop / straighten / flip / rotate) and
+  // the workspace fill used for out-of-image areas in the crop editor.
+  private texXform: Float32Array = new Float32Array([1, 0, 0, 0, -1, 0, 0, 1, 1]); // identity (full frame)
+  private bgColor: [number, number, number] = [0.08, 0.08, 0.09];
   private lastParams: EditParams = DEFAULT_PARAMS;
-  // Small offscreen target for histogram read-back (display-encoded pixels).
+  // Offscreen target holding the processed, display-encoded image the histogram
+  // is computed from (RGBA8).
   private histoFbo: WebGLFramebuffer | null = null;
   private histoTex: WebGLTexture | null = null;
   private histoW = 0;
   private histoH = 0;
+  // GPU histogram: a 256×4 float accumulation target (rows = R,G,B,L) plus the
+  // scatter program that bins every pixel into it. Built lazily on first use.
+  private histoBinFbo: WebGLFramebuffer | null = null;
+  private histoBinTex: WebGLTexture | null = null;
+  private histoProgram: WebGLProgram | null = null;
+  private histoVao: WebGLVertexArrayObject | null = null;
+  private histoUniforms: {
+    u_src: WebGLUniformLocation | null;
+    u_srcW: WebGLUniformLocation | null;
+  } | null = null;
+  /** Whether a float render target we can additively blend into is available. */
+  private histoGpuSupported = false;
   /** Whether the browser exposes a wide-gamut drawing buffer. */
   readonly p3Supported: boolean = false;
 
@@ -65,6 +94,12 @@ export class PipelineRenderer {
     if (!gl) throw new Error("WebGL2 not available");
     this.gl = gl;
     this.p3Supported = "drawingBufferColorSpace" in gl;
+    // Full-image GPU histogram needs a float colour buffer we can additively
+    // blend into. Calling getExtension also enables it. Where unavailable,
+    // readHistogram() falls back to the CPU read-back path.
+    this.histoGpuSupported = !!(
+      gl.getExtension("EXT_color_buffer_float") && gl.getExtension("EXT_float_blend")
+    );
 
     const pass = PASSES[0];
     this.program = this.compileProgram(pass.fsSource);
@@ -97,12 +132,31 @@ export class PipelineRenderer {
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB32F, width, height, 0, gl.RGB, gl.FLOAT, pixels);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    // LINEAR for smooth straighten/crop resampling (NEAREST is identical at 1:1).
+    const filter = gl.getExtension("OES_texture_float_linear") ? gl.LINEAR : gl.NEAREST;
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     this.sourceTex = tex;
+    // Default to a 1:1, un-cropped output; callers override via setOutput().
+    this.outWidth = width; this.outHeight = height;
+    this.texXform = new Float32Array([1, 0, 0, 0, -1, 0, 0, 1, 1]);
     this.canvas.width = width; this.canvas.height = height;
+  }
+
+  /**
+   * Set the rendered output window: canvas dims, the affine output→source-texcoord
+   * map (built in crop.ts), and the workspace fill colour for out-of-image areas.
+   * Pass identity dims/transform to render the full frame 1:1.
+   */
+  setOutput(width: number, height: number, texXform: Float32Array, bg?: [number, number, number]): void {
+    this.outWidth = Math.max(1, Math.round(width));
+    this.outHeight = Math.max(1, Math.round(height));
+    this.texXform = texXform;
+    if (bg) this.bgColor = bg;
+    this.canvas.width = this.outWidth;
+    this.canvas.height = this.outHeight;
   }
 
   private makeLutTexture(lut: Float32Array, channels: 1 | 3 = 1): WebGLTexture {
@@ -152,7 +206,7 @@ export class PipelineRenderer {
     // Declare what gamut the drawing buffer holds so the browser colour-manages it.
     const gl = this.gl as WebGL2RenderingContext & { drawingBufferColorSpace?: string };
     if (this.p3Supported) gl.drawingBufferColorSpace = p.displayGamut === 1 ? "display-p3" : "srgb";
-    this.renderPass(null, this.texWidth, this.texHeight, p);
+    this.renderPass(null, this.outWidth, this.outHeight, p);
   }
 
   /** Render the current source + params into `fbo` (null = canvas) at w×h. */
@@ -162,6 +216,11 @@ export class PipelineRenderer {
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
     gl.viewport(0, 0, w, h);
     gl.useProgram(this.program);
+    // Crop / straighten transform + out-of-image fill.
+    const xfLoc = this.uniforms["u_texXform"];
+    if (xfLoc) gl.uniformMatrix3fv(xfLoc, false, this.texXform);
+    const bgLoc = this.uniforms["u_bgColor"];
+    if (bgLoc) gl.uniform3f(bgLoc, this.bgColor[0], this.bgColor[1], this.bgColor[2]);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.sourceTex);
     gl.uniform1i(this.uniforms["u_input"], 0);
@@ -183,24 +242,41 @@ export class PipelineRenderer {
   }
 
   /**
-   * Render a downscaled copy with the last-drawn params into an offscreen FBO,
-   * read it back, and bin a 256-entry histogram from the display-encoded pixels.
-   * This replaces the brittle JS mirror of the shader pipeline: whatever the
-   * shader does, the histogram reflects it exactly.
+   * Bin a 256-entry histogram (R, G, B, luma) from the processed, display-encoded
+   * output. Whatever the shader does, the histogram reflects it exactly — there
+   * is no JS mirror of the pipeline.
+   *
+   * The GPU path scatters every pixel of a 1024px-capped render into a float
+   * accumulation target, so the only read-back is 256×4 counts. It both removes
+   * the large per-frame read-back stall and fixes the accuracy of the CPU path:
+   * that path point-samples a 256px copy, and any bilinear filtering there would
+   * average neighbours, narrowing the distribution and hiding clipping.
    */
   readHistogram(): HistogramBins {
+    return this.histoGpuSupported ? this.readHistogramGPU() : this.readHistogramCPU();
+  }
+
+  /** CPU fallback: render a small copy, read it back, and bin it in JS. */
+  private readHistogramCPU(): HistogramBins {
     const gl = this.gl;
     const bins: HistogramBins = {
       r: new Uint32Array(256), g: new Uint32Array(256),
       b: new Uint32Array(256), l: new Uint32Array(256),
     };
-    if (!this.sourceTex || !this.texWidth || !this.texHeight) return bins;
+    if (!this.sourceTex || !this.outWidth || !this.outHeight) return bins;
 
-    this.ensureHistoFbo();
-    this.renderPass(this.histoFbo, this.histoW, this.histoH, this.lastParams);
-    const n = this.histoW * this.histoH;
+    const { w, h } = this.ensureHistoFbo(HISTO_LONG_CPU);
+    // Point-sample the source (NEAREST) so the downscale doesn't average
+    // neighbours — averaging narrows the distribution and hides clipping.
+    gl.bindTexture(gl.TEXTURE_2D, this.sourceTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    this.renderPass(this.histoFbo, w, h, this.lastParams);
+    const srcFilter = gl.getExtension("OES_texture_float_linear") ? gl.LINEAR : gl.NEAREST;
+    gl.bindTexture(gl.TEXTURE_2D, this.sourceTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, srcFilter);
+    const n = w * h;
     const buf = new Uint8Array(n * 4);
-    gl.readPixels(0, 0, this.histoW, this.histoH, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
     for (let i = 0; i < n; i++) {
@@ -212,13 +288,67 @@ export class PipelineRenderer {
     return bins;
   }
 
-  private ensureHistoFbo(): void {
+  /** GPU path: scatter every pixel into a 256×4 float bin texture. */
+  private readHistogramGPU(): HistogramBins {
     const gl = this.gl;
-    const long = Math.max(this.texWidth, this.texHeight) || 1;
-    const scale = Math.min(1, 256 / long);
-    const w = Math.max(1, Math.round(this.texWidth * scale));
-    const h = Math.max(1, Math.round(this.texHeight * scale));
-    if (this.histoFbo && this.histoW === w && this.histoH === h) return;
+    const bins: HistogramBins = {
+      r: new Uint32Array(256), g: new Uint32Array(256),
+      b: new Uint32Array(256), l: new Uint32Array(256),
+    };
+    if (!this.sourceTex || !this.outWidth || !this.outHeight) return bins;
+
+    // 1. Render the processed, display-encoded image into an RGBA8 FBO. Point-
+    //    sample the source (NEAREST minification) so the downscale doesn't
+    //    average neighbours — averaging pulls extremes toward the mean, which
+    //    narrows the distribution and under-reports clipping.
+    const { w, h } = this.ensureHistoFbo(HISTO_LONG_GPU);
+    gl.bindTexture(gl.TEXTURE_2D, this.sourceTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    this.renderPass(this.histoFbo, w, h, this.lastParams);
+    const srcFilter = gl.getExtension("OES_texture_float_linear") ? gl.LINEAR : gl.NEAREST;
+    gl.bindTexture(gl.TEXTURE_2D, this.sourceTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, srcFilter);
+
+    // 2. Scatter every pixel into 256 bins × 4 rows (R,G,B,L) via additive float
+    //    blending — a full-image histogram computed entirely on the GPU.
+    if (!this.ensureHistoBin()) return this.readHistogramCPU(); // float FBO incomplete
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.histoBinFbo);
+    gl.viewport(0, 0, 256, 4);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(this.histoProgram!);
+    gl.bindVertexArray(this.histoVao!);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.histoTex);
+    gl.uniform1i(this.histoUniforms!.u_src, 0);
+    gl.uniform1i(this.histoUniforms!.u_srcW, w);
+    gl.enable(gl.BLEND);
+    gl.blendEquation(gl.FUNC_ADD);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.drawArrays(gl.POINTS, 0, w * h * 4);
+    gl.disable(gl.BLEND);
+
+    // 3. Read back the 256×4 counts (16 KB) and unpack the red channel.
+    const buf = new Float32Array(256 * 4 * 4);
+    gl.readPixels(0, 0, 256, 4, gl.RGBA, gl.FLOAT, buf);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    const rows = [bins.r, bins.g, bins.b, bins.l];
+    for (let ch = 0; ch < 4; ch++) {
+      const row = rows[ch];
+      const base = ch * 256 * 4;
+      for (let bin = 0; bin < 256; bin++) row[bin] = buf[base + bin * 4] >>> 0;
+    }
+    return bins;
+  }
+
+  /** (Re)create the RGBA8 FBO the histogram is binned from, capped to `longCap`. */
+  private ensureHistoFbo(longCap: number): { w: number; h: number } {
+    const gl = this.gl;
+    const long = Math.max(this.outWidth, this.outHeight) || 1;
+    const scale = Math.min(1, longCap / long);
+    const w = Math.max(1, Math.round(this.outWidth * scale));
+    const h = Math.max(1, Math.round(this.outHeight * scale));
+    if (this.histoFbo && this.histoW === w && this.histoH === h) return { w, h };
     if (this.histoTex) gl.deleteTexture(this.histoTex);
     if (this.histoFbo) gl.deleteFramebuffer(this.histoFbo);
     const tex = gl.createTexture()!;
@@ -234,6 +364,70 @@ export class PipelineRenderer {
     this.histoFbo = fbo;
     this.histoW = w;
     this.histoH = h;
+    return { w, h };
+  }
+
+  /**
+   * Lazily build the 256×4 RGBA32F accumulation target and the scatter program.
+   * Returns false (and permanently disables the GPU path) if the float FBO is
+   * not framebuffer-complete on this device.
+   */
+  private ensureHistoBin(): boolean {
+    const gl = this.gl;
+    if (this.histoBinFbo) return true;
+    const tex = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 256, 4, 0, gl.RGBA, gl.FLOAT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const fbo = gl.createFramebuffer()!;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (!ok) {
+      gl.deleteTexture(tex);
+      gl.deleteFramebuffer(fbo);
+      this.histoGpuSupported = false;
+      return false;
+    }
+    this.histoBinTex = tex;
+    this.histoBinFbo = fbo;
+
+    // One point per (pixel, channel). gl_VertexID derives both, the vertex shader
+    // fetches the pixel and positions the point at its bin column / channel row.
+    const vs = `#version 300 es
+precision highp float;
+uniform sampler2D u_src;
+uniform int u_srcW;
+void main() {
+  int vid = gl_VertexID;
+  int pix = vid >> 2;          // pixel index
+  int ch  = vid & 3;           // 0=R 1=G 2=B 3=Luma
+  ivec2 coord = ivec2(pix % u_srcW, pix / u_srcW);
+  vec3 rgb = texelFetch(u_src, coord, 0).rgb;
+  float v = (ch == 0) ? rgb.r
+          : (ch == 1) ? rgb.g
+          : (ch == 2) ? rgb.b
+          : dot(rgb, vec3(0.2126, 0.7152, 0.0722)); // Rec.709 luma, display-encoded
+  int bin = clamp(int(v * 255.0 + 0.5), 0, 255);
+  gl_Position = vec4((float(bin) + 0.5) / 128.0 - 1.0,
+                     (float(ch) + 0.5) / 2.0 - 1.0, 0.0, 1.0);
+  gl_PointSize = 1.0;
+}`;
+    const fs = `#version 300 es
+precision highp float;
+out vec4 o;
+void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
+    this.histoProgram = this.compileProgramVS(vs, fs);
+    this.histoUniforms = {
+      u_src: gl.getUniformLocation(this.histoProgram, "u_src"),
+      u_srcW: gl.getUniformLocation(this.histoProgram, "u_srcW"),
+    };
+    this.histoVao = gl.createVertexArray(); // attribute-less: positions come from gl_VertexID
+    return true;
   }
 
   /**
@@ -243,8 +437,8 @@ export class PipelineRenderer {
    */
   async toBlob(type = "image/jpeg", quality = 0.92): Promise<Blob> {
     const gl = this.gl;
-    const w = this.texWidth;
-    const h = this.texHeight;
+    const w = this.outWidth;
+    const h = this.outHeight;
     if (!w || !h) throw new Error("nothing to read back");
     // The back buffer holds values in the gamut chosen for the last draw(); tag the
     // read-back canvas with the same colour space so the export matches the preview.
@@ -276,6 +470,10 @@ export class PipelineRenderer {
     if (this.profileLutTex) gl.deleteTexture(this.profileLutTex);
     if (this.histoTex) gl.deleteTexture(this.histoTex);
     if (this.histoFbo) gl.deleteFramebuffer(this.histoFbo);
+    if (this.histoBinTex) gl.deleteTexture(this.histoBinTex);
+    if (this.histoBinFbo) gl.deleteFramebuffer(this.histoBinFbo);
+    if (this.histoProgram) gl.deleteProgram(this.histoProgram);
+    if (this.histoVao) gl.deleteVertexArray(this.histoVao);
     gl.deleteProgram(this.program);
     gl.deleteVertexArray(this.vao);
   }
@@ -310,9 +508,13 @@ export class PipelineRenderer {
   }
 
   private compileProgram(fsSource: string): WebGLProgram {
+    return this.compileProgramVS(VERTEX_SHADER, fsSource);
+  }
+
+  private compileProgramVS(vsSource: string, fsSource: string): WebGLProgram {
     const gl = this.gl;
     const prog = gl.createProgram()!;
-    const vs = this.compile(gl.VERTEX_SHADER, VERTEX_SHADER);
+    const vs = this.compile(gl.VERTEX_SHADER, vsSource);
     const fs = this.compile(gl.FRAGMENT_SHADER, fsSource);
     gl.attachShader(prog, vs); gl.attachShader(prog, fs);
     gl.linkProgram(prog);

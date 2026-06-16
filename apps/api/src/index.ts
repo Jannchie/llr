@@ -211,7 +211,14 @@ async function handleRender(request: IncomingMessage, response: ServerResponse):
 }
 
 async function handleRenderLinear(request: IncomingMessage, response: ServerResponse): Promise<void> {
-  const body = await readJson<{ sourceId: string; profileId?: string; halfSize?: boolean; maxSize?: number; dcpCode?: string }>(request);
+  const body = await readJson<{
+    sourceId: string;
+    profileId?: string;
+    halfSize?: boolean;
+    maxSize?: number;
+    dcpCode?: string;
+    denoise?: { enabled?: boolean; model?: string; amount?: number };
+  }>(request);
   if (!body.sourceId) {
     sendJson(response, { error: "Missing sourceId" }, 400);
     return;
@@ -233,6 +240,7 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
     maxSize: body.maxSize ?? 1600,
     recipe: { autoTone: false },
     dcpCode: body.dcpCode,
+    denoise: body.denoise,
   });
 
   sendJson(response, {

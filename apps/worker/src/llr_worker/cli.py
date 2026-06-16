@@ -19,6 +19,7 @@ import rawpy
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 from .dcp import DcpProfile, apply_dcp_profile, load_dcp_profile
+from .denoise import DEFAULT_MODEL, denoise_raw_inplace, get_denoiser
 
 
 RAW_EXTENSIONS = {".arw", ".srf", ".sr2", ".dng", ".cr2", ".cr3", ".nef", ".raf", ".rw2", ".orf"}
@@ -44,6 +45,10 @@ class RawMetadata:
     black_level: list[int] | None
     white_level: int | None
     rgb_xyz_matrix: list[list[float]] | None
+    # Full-resolution output dimensions (before half_size binning / max_size
+    # downscaling), so the frontend can report zoom relative to the original.
+    full_width: int | None
+    full_height: int | None
 
 
 @dataclass
@@ -56,10 +61,17 @@ class PreparedLinear:
 PREPARED_CACHE: OrderedDict[tuple[Any, ...], PreparedLinear] = OrderedDict()
 PREPARED_CACHE_MAX = 4
 
-# Cache raw-decoded camera RGB data keyed by (sourcePath, halfSize, maxSize).
-# DCP code changes re-apply DCP on cached data instead of re-decoding the RAW file.
+# Cache raw-decoded camera RGB data keyed by (sourcePath, halfSize, maxSize,
+# denoiseModel). DCP code changes re-apply DCP on cached data instead of
+# re-decoding the RAW file. Noisy and denoised variants of a source are cached
+# under separate keys (denoiseModel = "" vs the model id).
 RAW_CAMERA_CACHE: OrderedDict[tuple[Any, ...], tuple[np.ndarray, RawMetadata]] = OrderedDict()
-RAW_CAMERA_CACHE_MAX = 4
+RAW_CAMERA_CACHE_MAX = 6
+
+# No-DCP fallback decode cache, keyed like RAW_CAMERA_CACHE. There is no DCP step
+# to re-apply, so this stores the final ProPhoto linear — important once denoise
+# makes a re-decode cost seconds (so amount tweaks must not re-run inference).
+_FALLBACK_CACHE: OrderedDict[tuple[Any, ...], tuple[np.ndarray, RawMetadata, dict[str, Any]]] = OrderedDict()
 
 
 NEUTRAL_RECIPE: dict[str, Any] = {
@@ -402,13 +414,21 @@ def _linear_cache_key(
     half_size: bool,
     max_size: int | None,
     dcp_code: str | None,
+    denoise_model: str | None,
+    denoise_amount: float,
 ) -> tuple[Any, ...]:
     try:
         st = input_path.stat()
         base = (str(input_path), st.st_size, int(st.st_mtime_ns))
     except OSError:
         base = (str(input_path),)
-    return base + (bool(half_size), int(max_size or 0), dcp_code or "")
+    return base + (
+        bool(half_size),
+        int(max_size or 0),
+        dcp_code or "",
+        denoise_model or "",
+        round(float(denoise_amount), 3),
+    )
 
 
 _LINEAR_CACHE: OrderedDict[tuple[Any, ...], tuple[np.ndarray, dict[str, Any]]] = OrderedDict()
@@ -428,8 +448,16 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
         max_size = int(max_size) if max_size else None
     dcp_code: str | None = request.get("dcpCode")
 
+    # RAW-domain denoise request. amount<=0 (or disabled) is treated as off so
+    # the heavy inference and the second decode are skipped entirely.
+    denoise_req = request.get("denoise") or {}
+    dn_amount = max(0.0, min(1.0, float(denoise_req.get("amount", 1.0))))
+    dn_model: str | None = None
+    if bool(denoise_req.get("enabled", False)) and dn_amount > 0.0:
+        dn_model = str(denoise_req.get("model") or DEFAULT_MODEL)
+
     # Check processed sRGB cache first
-    cache_key = _linear_cache_key(input_path, half_size, max_size, dcp_code)
+    cache_key = _linear_cache_key(input_path, half_size, max_size, dcp_code, dn_model, dn_amount)
     if cache_key in _LINEAR_CACHE:
         linear_arr, color_profile = _LINEAR_CACHE[cache_key]
         _LINEAR_CACHE.move_to_end(cache_key)
@@ -439,6 +467,8 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
         return {
             "width": linear_arr.shape[1],
             "height": linear_arr.shape[0],
+            "fullWidth": color_profile.get("fullWidth"),
+            "fullHeight": color_profile.get("fullHeight"),
             "output": str(output_path),
             "colorProfile": color_profile,
             "bytesWritten": len(linear),
@@ -454,6 +484,28 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
         half_size=half_size, max_size=max_size,
     )
 
+    # Blend the denoised decode over the noisy one by the requested amount. The
+    # heavy inference happens inside this second prepare_linear and is cached by
+    # cache_key (denoise_model), so amount changes only re-run this cheap lerp.
+    if dn_model is not None:
+        prepared_dn = prepare_linear(
+            input_path, recipe, root,
+            dcp_arg=None, disable_dcp=False,
+            half_size=half_size, max_size=max_size,
+            denoise_model=dn_model,
+        )
+        blended = prepared.linear * (1.0 - dn_amount) + prepared_dn.linear * dn_amount
+        prepared = PreparedLinear(
+            linear=blended.astype(np.float32),
+            metadata=prepared.metadata,
+            color_profile=prepared.color_profile,
+        )
+
+    # Stash full-resolution dims on the color profile so both this response and
+    # the _LINEAR_CACHE-hit path above can report zoom relative to the original.
+    prepared.color_profile["fullWidth"] = prepared.metadata.full_width
+    prepared.color_profile["fullHeight"] = prepared.metadata.full_height
+
     # Cache processed sRGB so switching back to this DCP code is instant
     linear_arr = prepared.linear.astype(np.float32)
     _LINEAR_CACHE[cache_key] = (linear_arr, prepared.color_profile)
@@ -467,6 +519,8 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     return {
         "width": prepared.linear.shape[1],
         "height": prepared.linear.shape[0],
+        "fullWidth": prepared.metadata.full_width,
+        "fullHeight": prepared.metadata.full_height,
         "output": str(output_path),
         "colorProfile": prepared.color_profile,
         "bytesWritten": len(linear),
@@ -602,7 +656,47 @@ def build_crs_attrs(settings: dict[str, Any]) -> "OrderedDict[str, str]":
     attrs["crs:SplitToningHighlightHue"] = f"{hue360(_num(grading, 'hlH'))}"
     attrs["crs:SplitToningHighlightSaturation"] = f"{int(round(_num(grading, 'hlS')))}"
     attrs["crs:SplitToningBalance"] = f"{int(round(_num(grading, 'balance')))}"
+
+    _add_crop_attrs(attrs, settings.get("crop") or {})
     return attrs
+
+
+def _add_crop_attrs(attrs: "OrderedDict[str, str]", crop: dict[str, Any]) -> None:
+    """Adobe crs crop fields, written only when the crop has an effect.
+
+    The exported JPEG is already cropped/straightened in pixels; these mirror the
+    recompose for Lightroom-compatible round-tripping alongside the lossless
+    llr:Settings blob (which also carries flips/orientation)."""
+    cx = _num(crop, "cx", 0.5)
+    cy = _num(crop, "cy", 0.5)
+    w = _num(crop, "w", 1.0)
+    h = _num(crop, "h", 1.0)
+    angle = _num(crop, "angle", 0.0)
+    flip_h = bool(crop.get("flipH"))
+    flip_v = bool(crop.get("flipV"))
+    orientation = int(_num(crop, "orientation", 0.0))
+
+    def near(a: float, b: float) -> bool:
+        return abs(a - b) < 1e-3
+
+    is_default = (
+        near(cx, 0.5) and near(cy, 0.5) and near(w, 1.0) and near(h, 1.0)
+        and near(angle, 0.0) and not flip_h and not flip_v and orientation == 0
+    )
+    if is_default:
+        return
+
+    left = clamp(cx - w / 2, 0.0, 1.0)
+    right = clamp(cx + w / 2, 0.0, 1.0)
+    top = clamp(cy - h / 2, 0.0, 1.0)
+    bottom = clamp(cy + h / 2, 0.0, 1.0)
+    attrs["crs:HasCrop"] = "True"
+    attrs["crs:CropLeft"] = f"{left:.6f}"
+    attrs["crs:CropTop"] = f"{top:.6f}"
+    attrs["crs:CropRight"] = f"{right:.6f}"
+    attrs["crs:CropBottom"] = f"{bottom:.6f}"
+    attrs["crs:CropAngle"] = f"{angle:.4f}"
+    attrs["crs:CropConstrainToWarp"] = "1"
 
 
 def _curve_settings(settings: dict[str, Any]) -> dict[str, Any]:
@@ -802,12 +896,15 @@ def render_raw(
     return image, prepared.metadata, auto_tone, prepared.color_profile
 
 
-def _raw_cache_key(input_path: Path, half_size: bool, max_size: int | None) -> tuple[Any, ...]:
+def _raw_cache_key(
+    input_path: Path, half_size: bool, max_size: int | None, denoise_model: str | None
+) -> tuple[Any, ...]:
     try:
         stat = input_path.stat()
-        return (str(input_path), bool(half_size), int(max_size or 0), stat.st_size, int(stat.st_mtime_ns))
+        base = (str(input_path), bool(half_size), int(max_size or 0), stat.st_size, int(stat.st_mtime_ns))
     except OSError:
-        return (str(input_path), bool(half_size), int(max_size or 0))
+        base = (str(input_path), bool(half_size), int(max_size or 0))
+    return base + (denoise_model or "",)
 
 
 def prepare_linear(
@@ -818,8 +915,9 @@ def prepare_linear(
     disable_dcp: bool,
     half_size: bool = False,
     max_size: int | None = None,
+    denoise_model: str | None = None,
 ) -> PreparedLinear:
-    cache_key = _raw_cache_key(input_path, half_size, max_size)
+    cache_key = _raw_cache_key(input_path, half_size, max_size, denoise_model)
 
     # Cache hit: re-apply DCP on cached camera RGB without re-decoding RAW
     if cache_key in RAW_CAMERA_CACHE:
@@ -834,8 +932,22 @@ def prepare_linear(
         # DCP no longer available; fall through to re-decode
         RAW_CAMERA_CACHE.pop(cache_key, None)
 
+    # Cache hit for the no-DCP fallback: linear is final unless DCP reappeared.
+    if cache_key in _FALLBACK_CACHE:
+        linear, metadata, color_profile = _FALLBACK_CACHE[cache_key]
+        _FALLBACK_CACHE.move_to_end(cache_key)
+        dcp_profile, _ = resolve_dcp_profile(root, dcp_arg, disable_dcp, recipe, metadata)
+        if dcp_profile is None:
+            return PreparedLinear(linear=linear, metadata=metadata, color_profile=color_profile)
+        _FALLBACK_CACHE.pop(cache_key, None)
+
     with rawpy.imread(str(input_path)) as raw:
         metadata = read_raw_metadata(input_path, raw)
+        # RAW-domain denoise: clean the Bayer mosaic in place so the postprocess
+        # calls below demosaic the denoised data. Heavy, so it is cached via
+        # cache_key (which includes denoise_model) like any other camera RGB.
+        if denoise_model:
+            denoise_raw_inplace(raw, get_denoiser(denoise_model))
         dcp_profile, dcp_selection = resolve_dcp_profile(root, dcp_arg, disable_dcp, recipe, metadata)
         if dcp_profile is None:
             # Scene-referred fallback: deliver linear ProPhoto (D50) so the browser
@@ -853,6 +965,9 @@ def prepare_linear(
             if max_size:
                 linear = downsample_linear(linear, max_size)
             color_profile = libraw_color_profile_info()
+            _FALLBACK_CACHE[cache_key] = (linear, metadata, color_profile)
+            while len(_FALLBACK_CACHE) > RAW_CAMERA_CACHE_MAX:
+                _FALLBACK_CACHE.popitem(last=False)
         else:
             camera_rgb = raw.postprocess(
                 use_camera_wb=True,
@@ -952,6 +1067,7 @@ def apply_saturation_linear(linear: np.ndarray, saturation: float, vibrance: flo
 
 def read_raw_metadata(input_path: Path, raw: rawpy.RawPy) -> RawMetadata:
     exif = read_exiftool_metadata(input_path)
+    sizes = raw.sizes
     return RawMetadata(
         make=exif.get("Make"),
         model=exif.get("Model"),
@@ -962,6 +1078,8 @@ def read_raw_metadata(input_path: Path, raw: rawpy.RawPy) -> RawMetadata:
         black_level=[int(value) for value in raw.black_level_per_channel] if raw.black_level_per_channel else None,
         white_level=int(raw.white_level) if raw.white_level else None,
         rgb_xyz_matrix=raw.rgb_xyz_matrix.astype(float).tolist() if raw.rgb_xyz_matrix is not None else None,
+        full_width=int(sizes.iwidth) if sizes else None,
+        full_height=int(sizes.iheight) if sizes else None,
     )
 
 

@@ -6,11 +6,24 @@ requires-python = ">=3.11"
 dependencies = [
   "numpy>=2.2.0",
   "pillow>=11.0.0",
-  "rawpy>=0.25.0"
+  "rawpy>=0.25.0",
+  "scikit-image>=0.24.0",
+  "pywavelets>=1.6.0",
+  "torch>=2.6.0"
 ]
 
 [project.scripts]
 llr-worker = "llr_worker.cli:main"
+
+# PyTorch CUDA wheels (RTX 3090 / Ampere). torch is loaded lazily by the
+# denoise module, so the worker still imports/runs if these wheels are absent.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu126" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
 
 [build-system]
 requires = ["hatchling"]

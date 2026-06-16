@@ -45,7 +45,7 @@
   --shadow-float: 0 6px 22px rgba(0, 0, 0, 0.4), inset 0 0 0 0.5px rgba(255, 255, 255, 0.08);
 
   --stage-inset: 14px;
-  --filmstrip-h: 124px;
+  --filmstrip-h: 140px;
   --topbar-h: 48px;
   --rail-w: 332px;
 
@@ -242,6 +242,22 @@ button {
   }
 }
 
+/* Generic loading spinner (reuses the `spin` keyframes) */
+.spinner {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.16);
+  border-top-color: var(--accent);
+  animation: spin 0.7s linear infinite;
+}
+
+.spinner-lg {
+  width: 26px;
+  height: 26px;
+  border-width: 2.5px;
+}
+
 /* ---------- Center: inset image stage floating in the canvas ---------- */
 
 .center {
@@ -282,11 +298,35 @@ button {
   position: absolute;
   inset: 0;
   display: grid;
-  place-items: center;
+  place-content: center;
+  justify-items: center;
+  gap: 14px;
   z-index: 1;
   color: var(--text-dim);
   background: var(--viewport-bg);
   letter-spacing: 0.02em;
+}
+
+/* Non-blocking activity pill: shown while re-decoding / importing over an
+   already-visible image, so the current preview stays in view. */
+.viewport-busy {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 13px 6px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+  background: rgba(20, 20, 22, 0.72);
+  backdrop-filter: blur(12px);
+  border-radius: var(--radius-pill);
+  box-shadow: var(--shadow-float);
+  pointer-events: none;
 }
 
 .dropzone {
@@ -612,6 +652,57 @@ input[type="range"]:active::-webkit-slider-thumb {
   border-color: var(--accent);
 }
 
+.panel-hint {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--accent);
+}
+
+/* ---------- iOS-style toggle switch ---------- */
+
+.switch {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-self: start;
+  cursor: pointer;
+}
+
+.switch input {
+  position: absolute;
+  width: 0;
+  height: 0;
+  opacity: 0;
+}
+
+.switch-track {
+  display: inline-flex;
+  align-items: center;
+  width: 40px;
+  height: 24px;
+  padding: 2px;
+  border-radius: 12px;
+  background: var(--control);
+  transition: background 160ms ease;
+}
+
+.switch input:checked + .switch-track {
+  background: var(--accent);
+}
+
+.switch-thumb {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  transition: transform 160ms ease;
+}
+
+.switch input:checked + .switch-track .switch-thumb {
+  transform: translateX(16px);
+}
+
 /* ---------- Segmented control (HSL H/S/L) ---------- */
 
 .hsl-tabs {
@@ -892,16 +983,17 @@ input[type="range"]:active::-webkit-slider-thumb {
   gap: 10px;
   padding: 12px;
   overflow-x: auto;
-  align-items: stretch;
+  align-items: flex-start;
 }
 
 .film-cell {
   flex: 0 0 auto;
-  width: 134px;
+  width: 108px;
   display: grid;
-  grid-template-rows: 1fr auto auto;
+  grid-template-rows: auto auto auto;
+  align-content: start;
   gap: 4px;
-  padding: 5px;
+  padding: 6px;
   border-radius: var(--radius);
   text-align: left;
   transition: background 120ms, box-shadow 120ms;
@@ -909,15 +1001,51 @@ input[type="range"]:active::-webkit-slider-thumb {
 
 .film-thumb {
   position: relative;
+  width: 100%;
+  aspect-ratio: 3 / 2;
+  overflow: hidden;
+  border-radius: var(--radius-sm);
+  background: var(--viewport-bg);
+}
+
+/* Shimmer placeholder while a thumbnail is still being generated/cached. */
+.thumb-skeleton {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg,
+    rgba(255, 255, 255, 0.03) 20%,
+    rgba(255, 255, 255, 0.09) 50%,
+    rgba(255, 255, 255, 0.03) 80%);
+  background-size: 200% 100%;
+  background-position: 200% 0;
+  animation: shimmer 1.3s ease-in-out infinite;
+}
+
+@keyframes shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+
+/* Spinner over the active cell's thumb while its pixels are decoding. */
+.thumb-loading {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(13, 13, 14, 0.42);
+}
+
+.thumb-loading .spinner {
+  width: 18px;
+  height: 18px;
 }
 
 .film-cell img {
   display: block;
   width: 100%;
-  height: 56px;
-  object-fit: cover;
-  background: var(--viewport-bg);
-  border-radius: var(--radius-sm);
+  height: 100%;
+  object-fit: contain;
 }
 
 .film-cell:hover {
@@ -1007,6 +1135,7 @@ input[type="range"]:active::-webkit-slider-thumb {
 
 .film-name {
   font-size: 12px;
+  line-height: 16px;
   color: var(--text);
   white-space: nowrap;
   overflow: hidden;
@@ -1015,6 +1144,7 @@ input[type="range"]:active::-webkit-slider-thumb {
 
 .film-size {
   font-size: 11px;
+  line-height: 14px;
   color: var(--text-mute);
   font-variant-numeric: tabular-nums;
 }
@@ -1076,3 +1206,120 @@ input[type="range"]:active::-webkit-slider-thumb {
 .filmstrip-track::-webkit-scrollbar-track {
   background: transparent;
 }
+
+/* ── Crop & Straighten ───────────────────────────────────────────────────── */
+
+.icon-btn.is-on {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.crop-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+  overflow: visible;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.crop-catch {
+  fill: transparent;
+  pointer-events: all;
+  cursor: move;
+}
+
+.crop-dim {
+  fill: rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+}
+
+.crop-grid line {
+  stroke: rgba(255, 255, 255, 0.4);
+  pointer-events: none;
+  vector-effect: non-scaling-stroke;
+  shape-rendering: crispEdges;
+}
+
+.crop-frame {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.95);
+  pointer-events: none;
+  vector-effect: non-scaling-stroke;
+}
+
+.crop-handle {
+  fill: #fff;
+  stroke: rgba(0, 0, 0, 0.35);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+  pointer-events: all;
+  rx: 1px;
+}
+
+/* Crop panel controls */
+.crop-aspect {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+}
+
+.crop-aspect .control-select {
+  flex: 1;
+  min-width: 0;
+}
+
+.icon-mini {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  background: var(--sep);
+  transition: color 130ms, background 130ms;
+}
+
+.icon-mini svg { width: 15px; height: 15px; }
+.icon-mini:hover { color: var(--text); background: var(--sep-strong); }
+
+.crop-buttons {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.crop-tool {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 34px;
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  background: var(--sep);
+  transition: color 130ms, background 130ms, transform 80ms;
+}
+
+.crop-tool svg { width: 17px; height: 17px; }
+.crop-tool:hover { color: var(--text); background: var(--sep-strong); }
+.crop-tool:active { transform: scale(0.94); }
+.crop-tool.is-on { color: var(--accent); background: var(--accent-soft); }
+
+.crop-done {
+  width: 100%;
+  margin-top: 12px;
+  height: 36px;
+  border-radius: var(--radius);
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+  font-size: 13px;
+  transition: background 130ms;
+}
+
+.crop-done:hover { background: var(--accent-strong); }
