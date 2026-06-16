@@ -509,9 +509,13 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     # decode/DCP/downsample paths already yield C-contiguous float32, so this is a
     # no-op there (avoids a full ~tens-of-MB copy) and only copies when it must.
     linear_arr = np.ascontiguousarray(prepared.linear, dtype=np.float32)
-    _LINEAR_CACHE[cache_key] = (linear_arr, prepared.color_profile)
-    while len(_LINEAR_CACHE) > _LINEAR_CACHE_MAX:
-        _LINEAR_CACHE.popitem(last=False)
+    # Skip caching full-resolution exports (half_size off and no max_size cap): a
+    # single entry can be hundreds of MB and exports are one-off, so caching them
+    # would pin gigabytes with no reuse. Previews (half/max-size capped) still cache.
+    if half_size or max_size:
+        _LINEAR_CACHE[cache_key] = (linear_arr, prepared.color_profile)
+        while len(_LINEAR_CACHE) > _LINEAR_CACHE_MAX:
+            _LINEAR_CACHE.popitem(last=False)
 
     linear = linear_arr.tobytes()
     with open(output_path, "wb") as f:
