@@ -24,14 +24,13 @@ from .denoise import DEFAULT_MODEL, denoise_raw_inplace, get_denoiser
 
 RAW_EXTENSIONS = {".arw", ".srf", ".sr2", ".dng", ".cr2", ".cr3", ".nef", ".raf", ".rw2", ".orf"}
 LOCAL_CAMERA_PROFILE_ROOT = Path("vendor/adobe-camera-profiles/Camera")
-SRGB_U8_LUT = np.round(
-    np.where(
-        np.linspace(0, 1, 65536, dtype=np.float32) <= 0.0031308,
-        np.linspace(0, 1, 65536, dtype=np.float32) * 12.92,
-        1.055 * np.power(np.linspace(0, 1, 65536, dtype=np.float32), 1 / 2.4) - 0.055,
-    )
-    * 255
-).astype(np.uint8)
+def _build_srgb_u8_lut() -> np.ndarray:
+    x = np.linspace(0, 1, 65536, dtype=np.float32)
+    encoded = np.where(x <= 0.0031308, x * 12.92, 1.055 * np.power(x, 1 / 2.4) - 0.055)
+    return np.round(encoded * 255).astype(np.uint8)
+
+
+SRGB_U8_LUT = _build_srgb_u8_lut()
 
 
 @dataclass(frozen=True)
