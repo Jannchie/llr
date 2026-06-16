@@ -375,8 +375,11 @@ function evaluateSpline(points: CurvePoint[], t: number): number {
     if (s0 * s1 <= 0) { m[i] = 0; continue; }
     const w0 = 2 * s1 + s0;
     const w1 = s1 + 2 * s0;
-    const denom = w0 + w1;
-    m[i] = denom > 1e-9 ? (s0 * s1 * (w0 + w1)) / (w0 * s0 + w1 * s1) : 0;
+    // Weighted-harmonic-mean tangent (Fritsch-Carlson). Guard on the divisor, not
+    // on (w0+w1): for a locally *decreasing* segment both secants are negative, so
+    // w0+w1 < 0 and a ">1e-9" test would wrongly flatten the tangent there.
+    const denom = w0 * s0 + w1 * s1;
+    m[i] = Math.abs(denom) > 1e-9 ? (s0 * s1 * (w0 + w1)) / denom : 0;
   }
   let seg = 0;
   for (let i = 0; i < n - 1; i++) {
