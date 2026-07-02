@@ -1556,6 +1556,41 @@ function trackFill(value: number, min: number, max: number): string {
   const b = Math.max(p, z);
   return `linear-gradient(to right, var(--track-bg) ${a}%, var(--accent) ${a}%, var(--accent) ${b}%, var(--track-bg) ${b}%)`;
 }
+
+// Lightroom-style scroll-to-nudge: hovering any range slider and scrolling steps
+// the value by one `step` (Shift ×10), instead of scrolling the panel. Applied via
+// event delegation on the settings rail so every slider — base, HSL, grading,
+// denoise, crop angle — gets it without per-input wiring.
+const vWheelAdjust = {
+  mounted(el: HTMLElement) {
+    const onWheel = (e: WheelEvent) => {
+      const input = (e.target as HTMLElement | null)?.closest?.(
+        'input[type="range"]',
+      ) as HTMLInputElement | null;
+      if (!input || input.disabled) return;
+      e.preventDefault();
+      const step = Number(input.step) || 1;
+      const min = Number(input.min);
+      const max = Number(input.max);
+      const cur = Number(input.value);
+      const mult = e.shiftKey ? 10 : 1;
+      const dir = e.deltaY < 0 ? 1 : -1; // scroll up → increase
+      let next = clamp(cur + dir * step * mult, min, max);
+      const decimals = (String(step).split(".")[1] || "").length;
+      if (decimals) next = Number(next.toFixed(decimals));
+      if (next === cur) return;
+      input.value = String(next);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    (el as unknown as { _wheelAdjust?: (e: WheelEvent) => void })._wheelAdjust = onWheel;
+  },
+  unmounted(el: HTMLElement) {
+    const fn = (el as unknown as { _wheelAdjust?: (e: WheelEvent) => void })._wheelAdjust;
+    if (fn) el.removeEventListener("wheel", fn);
+  },
+};
 </script>
 
 <template>
@@ -1696,7 +1731,7 @@ function trackFill(value: number, min: number, max: number): string {
       </footer>
     </main>
 
-    <aside class="right">
+    <aside class="right" v-wheel-adjust>
       <div class="histogram-wrap" v-show="activeSource">
         <canvas ref="histoCanvasRef" class="histogram" />
       </div>

@@ -510,7 +510,7 @@ button {
 .histogram {
   display: block;
   width: 100%;
-  height: 76px;
+  height: 110px;
   background: var(--viewport-bg);
   border-radius: var(--radius);
 }
