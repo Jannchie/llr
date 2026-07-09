@@ -39,13 +39,14 @@
   --radius-sm: 6px;
   --radius-pill: 999px;
 
-  /* Elevation — soft ambient shadows do the separating, not borders */
+  /* Elevation — a hairline defines the card, a short shadow lifts it. A wide
+     ambient blur reads as haze once six cards stack up the rail. */
   --shadow-knob: 0 1px 3px rgba(0, 0, 0, 0.5), 0 0 0 0.5px rgba(0, 0, 0, 0.12);
-  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.25), 0 6px 18px -14px rgba(0, 0, 0, 0.7);
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.28), inset 0 0 0 0.5px rgba(255, 255, 255, 0.05);
   --shadow-float: 0 6px 22px rgba(0, 0, 0, 0.4), inset 0 0 0 0.5px rgba(255, 255, 255, 0.08);
 
   --stage-inset: 14px;
-  --filmstrip-h: 140px;
+  --filmstrip-h: 110px;
   --topbar-h: 48px;
   --rail-w: 332px;
 
@@ -99,6 +100,14 @@ button {
     "filmstrip filmstrip";
   height: 100vh;
   background: var(--bg);
+}
+
+/* Nothing imported yet: drop the filmstrip row so the stage owns the height. */
+.app.no-filmstrip {
+  grid-template-rows: var(--topbar-h) 1fr;
+  grid-template-areas:
+    "topbar topbar"
+    "center right";
 }
 
 /* ---------- Topbar (borderless, blends into the canvas) ---------- */
@@ -456,7 +465,7 @@ button {
   grid-area: right;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
   padding: var(--stage-inset) var(--stage-inset) var(--stage-inset) 0;
   background: var(--bg);
   overflow-y: auto;
@@ -465,7 +474,7 @@ button {
 .panel {
   background: var(--card);
   border-radius: var(--radius-card);
-  padding: 14px 16px 16px;
+  padding: 12px 14px 14px;
   box-shadow: var(--shadow-card);
 }
 
@@ -478,11 +487,27 @@ button {
   font-weight: 600;
   letter-spacing: -0.01em;
   color: var(--text);
-  margin-bottom: 12px;
+  margin-bottom: 10px;
 }
 
-.panel:first-of-type .panel-head {
+/* A panel that is nothing but its header (Settings before an image loads). */
+.panel-head:only-child {
   margin-bottom: 0;
+}
+
+.panel-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+/* Marks a group holding non-default values, so the rail can be scanned for
+   edits without reading every row. */
+.panel-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
 }
 
 .ghost {
@@ -519,7 +544,7 @@ button {
 
 .slider {
   display: grid;
-  grid-template-columns: 66px 1fr 48px;
+  grid-template-columns: 62px 1fr 44px;
   gap: 10px;
   align-items: center;
   padding: 5px 0;
@@ -528,6 +553,14 @@ button {
 .slider label {
   color: var(--text-dim);
   font-size: 12px;
+  transition: color 120ms;
+}
+
+/* A row holding a non-default value reads brighter than an untouched one —
+   the panel becomes scannable without a per-row reset affordance. */
+.slider.is-modified label,
+.hsl-row.is-modified .hsl-label {
+  color: var(--text);
 }
 
 /* Shared range-input look (iOS slider) — every slider variant */
@@ -575,21 +608,30 @@ input[type="range"]:active::-webkit-slider-thumb {
   transform: scale(1.1);
 }
 
-/* ---------- Number inputs ---------- */
+/* ---------- Number inputs ----------
+   Values read as text, not as a column of filled chips: a dozen boxed fields
+   out-weigh the sliders they annotate. The field surfaces on hover/focus, so
+   it still announces itself as editable at the moment you reach for it. */
 
 .slider-number,
 .hsl-number {
   width: 100%;
-  background: var(--control);
+  background: transparent;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
-  color: var(--text);
-  text-align: center;
-  padding: 4px 5px;
+  color: var(--text-dim);
+  text-align: right;
+  padding: 4px 6px;
   font-size: 12px;
   font-variant-numeric: tabular-nums;
   appearance: textfield;
-  transition: border-color 120ms, background 120ms;
+  transition: color 120ms, border-color 120ms, background 120ms;
+}
+
+.slider.is-modified .slider-number,
+.hsl-row.is-modified .hsl-number {
+  color: var(--text);
+  font-weight: 500;
 }
 
 .slider-number::-webkit-outer-spin-button,
@@ -602,7 +644,8 @@ input[type="range"]:active::-webkit-slider-thumb {
 
 .slider-number:hover,
 .hsl-number:hover {
-  background: var(--control-hover);
+  background: var(--control);
+  color: var(--text);
 }
 
 .slider-number:focus,
@@ -610,13 +653,16 @@ input[type="range"]:active::-webkit-slider-thumb {
   outline: none;
   border-color: var(--accent);
   background: var(--control-hover);
+  color: var(--text);
 }
 
 /* ---------- Select ---------- */
 
+/* Wider label column than a slider row: these labels are words, not the short
+   nouns the sliders use ("AI Denoise" wraps at the slider's 62px). */
 .control-row {
   display: grid;
-  grid-template-columns: 66px 1fr;
+  grid-template-columns: 70px 1fr;
   align-items: center;
   gap: 10px;
 }
@@ -968,7 +1014,7 @@ input[type="range"]:active::-webkit-slider-thumb {
   font-size: 12px;
   font-weight: 500;
   border-radius: var(--radius);
-  margin: 12px 0 12px 12px;
+  margin: 10px 0 10px 12px;
   transition: background 120ms;
 }
 
@@ -978,20 +1024,20 @@ input[type="range"]:active::-webkit-slider-thumb {
 
 .filmstrip-track {
   display: flex;
-  gap: 10px;
-  padding: 12px;
+  gap: 8px;
+  padding: 10px 12px;
   overflow-x: auto;
   align-items: flex-start;
 }
 
 .film-cell {
   flex: 0 0 auto;
-  width: 108px;
+  width: 100px;
   display: grid;
-  grid-template-rows: auto auto auto;
+  grid-template-rows: auto auto;
   align-content: start;
-  gap: 4px;
-  padding: 6px;
+  gap: 3px;
+  padding: 5px;
   border-radius: var(--radius);
   text-align: left;
   transition: background 120ms, box-shadow 120ms;
@@ -1132,19 +1178,16 @@ input[type="range"]:active::-webkit-slider-thumb {
 }
 
 .film-name {
-  font-size: 12px;
-  line-height: 16px;
-  color: var(--text);
+  font-size: 11px;
+  line-height: 15px;
+  color: var(--text-dim);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.film-size {
-  font-size: 11px;
-  line-height: 14px;
-  color: var(--text-mute);
-  font-variant-numeric: tabular-nums;
+.film-cell.is-active .film-name {
+  color: var(--text);
 }
 
 /* ---------- Drag overlay ---------- */

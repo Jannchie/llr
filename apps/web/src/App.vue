@@ -227,6 +227,15 @@ const presetNames = Object.keys(CURVE_PRESETS);
 
 const isPointChannel = (ch: ToneChannel): ch is PointChannel => ch !== "parametric";
 
+// Which rows/groups hold a non-default value. Drives the brightened row text
+// and the accent dot on a group header, so edits are visible without opening
+// or reading every panel.
+const isEdited = (key: RecipeKey): boolean => recipe[key] !== SLIDER_DEFAULTS[key];
+const groupEdited = (group: SliderGroup): boolean => group.items.some(s => isEdited(s.key));
+const hslEdited = computed(() =>
+  hslHue.some(v => v !== 0) || hslSat.some(v => v !== 0) || hslLum.some(v => v !== 0));
+const gradingEdited = computed(() => Object.values(grading).some(v => v !== 0));
+
 // Basic-panel values currently baked into the GPU curve LUT (Contrast, Blacks
 // and positive Whites are display-referred stages of the LUT chain, not shader
 // uniforms). null = the LUT holds the identity curve (hold-to-compare swapped
@@ -1591,6 +1600,18 @@ function trackFill(value: number, min: number, max: number): string {
   return `linear-gradient(to right, var(--track-bg) ${a}%, var(--accent) ${a}%, var(--accent) ${b}%, var(--track-bg) ${b}%)`;
 }
 
+// White balance reads as a colour axis, not an amount: an accent fill growing
+// from the left would say "this is set" on a slider sitting at its default.
+// Neutral is placed where the default value puts the thumb (6500K -> 45%).
+const WB_TRACK: Partial<Record<RecipeKey, string>> = {
+  temperature: "linear-gradient(to right, #3f7dff, #f2ead9 45%, #ffb648)",
+  tint: "linear-gradient(to right, #4fc26a, #d8d8d8 50%, #d264d8)",
+};
+
+function sliderTrack(spec: SliderSpec): string {
+  return WB_TRACK[spec.key] ?? trackFill(recipe[spec.key], spec.min, spec.max);
+}
+
 // Lightroom-style scroll-to-nudge: hovering any range slider and scrolling steps
 // the value by one `step` (Shift ×10), instead of scrolling the panel. Applied via
 // event delegation on the settings rail so every slider — base, HSL, grading,
@@ -1628,7 +1649,7 @@ const vWheelAdjust = {
 </script>
 
 <template>
-  <div class="app" :class="{ 'is-drag': isDragging }"
+  <div class="app" :class="{ 'is-drag': isDragging, 'no-filmstrip': !sources.length }"
     @dragover.prevent="isDragging = true"
     @dragleave.prevent="isDragging = false"
     @drop="onDrop">
@@ -1668,7 +1689,10 @@ const vWheelAdjust = {
         </button>
       </div>
       <div class="meta-summary">
-        <span v-if="activeSource">{{ activeSource.name }}</span>
+        <template v-if="activeSource">
+          <span>{{ activeSource.name }}</span>
+          <span class="meta-empty">{{ formatBytes(activeSource.size) }}</span>
+        </template>
         <span v-else class="meta-empty">No image loaded</span>
       </div>
       <button class="export-btn" type="button" :disabled="!activeSource || exporting" @click="exportImage">
@@ -1862,12 +1886,18 @@ const vWheelAdjust = {
         </div>
       </section>
       <section v-for="group in groups" :key="group.title" class="panel" v-show="!cropMode">
-        <header class="panel-head">{{ group.title }}</header>
-        <div v-for="spec in group.items" :key="spec.key" class="slider">
+        <header class="panel-head">
+          <span class="panel-title">
+            {{ group.title }}
+            <span v-if="groupEdited(group)" class="panel-dot" aria-hidden="true" />
+          </span>
+        </header>
+        <div v-for="spec in group.items" :key="spec.key" class="slider"
+          :class="{ 'is-modified': isEdited(spec.key) }">
           <label :for="`s-${spec.key}`">{{ spec.label }}</label>
           <input :id="`s-${spec.key}`" v-model.number="recipe[spec.key]" type="range"
             :min="spec.min" :max="spec.max" :step="spec.step"
-            :style="{ '--track': trackFill(recipe[spec.key], spec.min, spec.max) }"
+            :style="{ '--track': sliderTrack(spec) }"
             @dblclick="recipe[spec.key] = SLIDER_DEFAULTS[spec.key]" title="Double-click to reset" />
           <input v-model.number="recipe[spec.key]" class="slider-number" type="number"
             :min="spec.min" :max="spec.max" :step="spec.step" :aria-label="spec.label" />
@@ -1899,14 +1929,18 @@ const vWheelAdjust = {
 
       <section class="panel" v-if="activeSource && !cropMode">
         <header class="panel-head">
-          <span>HSL / Color</span>
+          <span class="panel-title">
+            HSL / Color
+            <span v-if="hslEdited" class="panel-dot" aria-hidden="true" />
+          </span>
         </header>
         <div class="hsl-tabs">
           <button :class="{ active: hslTab === 'hue' }" @click="hslTab = 'hue'">H</button>
           <button :class="{ active: hslTab === 'sat' }" @click="hslTab = 'sat'">S</button>
           <button :class="{ active: hslTab === 'lum' }" @click="hslTab = 'lum'">L</button>
         </div>
-        <div v-for="(range, i) in HSL_RANGES" :key="range.name" class="hsl-row">
+        <div v-for="(range, i) in HSL_RANGES" :key="range.name" class="hsl-row"
+          :class="{ 'is-modified': hslValue(i) !== 0 }">
           <span class="hsl-dot" :style="{ background: range.color }" />
           <span class="hsl-label">{{ range.name }}</span>
           <input type="range" min="-100" max="100" step="1"
@@ -1922,7 +1956,10 @@ const vWheelAdjust = {
 
       <section class="panel" v-if="activeSource && !cropMode">
         <header class="panel-head">
-          <span>Color Grading</span>
+          <span class="panel-title">
+            Color Grading
+            <span v-if="gradingEdited" class="panel-dot" aria-hidden="true" />
+          </span>
         </header>
         <div class="grading-group">
           <div class="grading-header">
@@ -2054,11 +2091,12 @@ const vWheelAdjust = {
       </section>
     </aside>
 
-    <footer class="filmstrip">
+    <footer class="filmstrip" v-if="sources.length">
       <button class="filmstrip-import" type="button" @click="pickFiles">＋ Import</button>
       <div class="filmstrip-track">
         <button v-for="source in sources" :key="source.id" type="button"
           class="film-cell" :class="{ 'is-active': source.id === activeId, 'is-invalid': source.invalid }"
+          :title="`${source.name} · ${formatBytes(source.size)}`"
           @click="selectSource(source.id)">
           <div class="film-thumb">
             <img v-if="thumbSrc(source)" :src="thumbSrc(source)" :alt="source.name" />
@@ -2069,7 +2107,6 @@ const vWheelAdjust = {
             <span v-if="source.invalid" class="film-badge" title="源文件已失效，请重新导入">失效</span>
           </div>
           <span class="film-name">{{ source.name }}</span>
-          <span class="film-size">{{ formatBytes(source.size) }}</span>
         </button>
       </div>
     </footer>
