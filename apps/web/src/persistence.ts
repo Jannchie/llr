@@ -1,20 +1,29 @@
 // Local persistence for the editor session, so a refresh keeps the imported
 // image list and each image's edit state + undo history.
 //
-// Two stores, deliberately separated:
-//   - `llr.state.v1`  — small structured JSON (sources, per-image edits, view
-//      settings). Rewritten on every edit, so it must stay compact.
+// Backed by IndexedDB: writes are asynchronous (the previous localStorage
+// store serialized the whole session synchronously on the main thread, right
+// in the gaps of a slider drag) and values are structured-cloned, so there is
+// no JSON round-trip and no 5 MB quota shared with the thumbnails. A one-time
+// migration imports any existing localStorage session.
+//
+// Two records, deliberately separated:
+//   - `llr.state.v1`  — small structured session (sources, per-image edits,
+//      view settings). Rewritten on every edit.
 //   - `llr.thumbs.v1` — cached downscaled thumbnails (data URLs). Rewritten only
 //      when a new thumbnail is generated, so the hot edit-save path stays cheap.
 //
 // Image pixels are NOT stored here: the RAW files live server-side under
 // tmp/sessions/<id> and are re-decoded on demand by their (persisted) id.
 
+const DB_NAME = "llr";
+const DB_VERSION = 1;
+const STORE = "kv";
 const STATE_KEY = "llr.state.v1";
 const THUMBS_KEY = "llr.thumbs.v1";
 
-// Cap per-image undo history in the persisted payload to keep localStorage
-// bounded; the in-memory history is unaffected.
+// Cap per-image undo history in the persisted payload to keep the session
+// record bounded; the in-memory history is unaffected.
 const PERSIST_HISTORY_CAP = 50;
 
 export type PersistedSource = {
@@ -38,16 +47,107 @@ export type PersistedState<S, V> = {
   edits: Record<string, PersistedEdit<S>>;
 };
 
-export function loadState<S, V>(): PersistedState<S, V> | null {
+// --- IndexedDB plumbing (best-effort: every failure degrades to "no persistence") ---
+
+let dbPromise: Promise<IDBDatabase | null> | null = null;
+
+function openDb(): Promise<IDBDatabase | null> {
+  if (!dbPromise) {
+    dbPromise = new Promise((resolve) => {
+      try {
+        const req = indexedDB.open(DB_NAME, DB_VERSION);
+        req.onupgradeneeded = () => { req.result.createObjectStore(STORE); };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => resolve(null);
+        req.onblocked = () => resolve(null);
+      } catch {
+        resolve(null);
+      }
+    });
+  }
+  return dbPromise;
+}
+
+async function idbGet<T>(key: string): Promise<T | null> {
+  const db = await openDb();
+  if (!db) return null;
+  return new Promise((resolve) => {
+    try {
+      const req = db.transaction(STORE, "readonly").objectStore(STORE).get(key);
+      req.onsuccess = () => resolve((req.result as T | undefined) ?? null);
+      req.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+async function idbSet(key: string, value: unknown): Promise<boolean> {
+  const db = await openDb();
+  if (!db) return false;
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(STORE, "readwrite");
+      tx.objectStore(STORE).put(value, key);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => resolve(false);
+      tx.onabort = () => resolve(false);
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+async function idbDelete(key: string): Promise<void> {
+  const db = await openDb();
+  if (!db) return;
+  await new Promise<void>((resolve) => {
+    try {
+      const tx = db.transaction(STORE, "readwrite");
+      tx.objectStore(STORE).delete(key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+      tx.onabort = () => resolve();
+    } catch {
+      resolve();
+    }
+  });
+}
+
+/** Read a record from the pre-IndexedDB localStorage store (migration path). */
+function readLegacy<T>(key: string): T | null {
   try {
-    const raw = localStorage.getItem(STATE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as PersistedState<S, V>;
-    if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.sources)) return null;
-    return parsed;
+    const raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as T) : null;
   } catch {
     return null;
   }
+}
+
+function dropLegacy(key: string): void {
+  try {
+    localStorage.removeItem(key);
+  } catch {
+    // ignore
+  }
+}
+
+// --- Session state ---
+
+function isValidState<S, V>(s: PersistedState<S, V> | null): s is PersistedState<S, V> {
+  return !!s && s.version === 1 && Array.isArray(s.sources);
+}
+
+export async function loadState<S, V>(): Promise<PersistedState<S, V> | null> {
+  const fromDb = await idbGet<PersistedState<S, V>>(STATE_KEY);
+  if (isValidState(fromDb)) return fromDb;
+  // One-time migration from the previous localStorage store.
+  const legacy = readLegacy<PersistedState<S, V>>(STATE_KEY);
+  if (isValidState(legacy)) {
+    void idbSet(STATE_KEY, legacy).then((ok) => { if (ok) dropLegacy(STATE_KEY); });
+    return legacy;
+  }
+  return null;
 }
 
 function trimEdit<S>(e: PersistedEdit<S>): PersistedEdit<S> {
@@ -60,48 +160,32 @@ function trimEdit<S>(e: PersistedEdit<S>): PersistedEdit<S> {
   };
 }
 
-export function saveState<S, V>(state: PersistedState<S, V>): void {
+export async function saveState<S, V>(state: PersistedState<S, V>): Promise<void> {
   const edits: Record<string, PersistedEdit<S>> = {};
   for (const [id, e] of Object.entries(state.edits)) edits[id] = trimEdit(e);
-  try {
-    localStorage.setItem(STATE_KEY, JSON.stringify({ ...state, edits }));
-  } catch {
-    // Quota exceeded: retry with histories collapsed to just the current edit.
-    try {
-      const slim: Record<string, PersistedEdit<S>> = {};
-      for (const [id, e] of Object.entries(state.edits)) {
-        slim[id] = { snapshot: e.snapshot, history: [e.snapshot], historyIndex: 0 };
-      }
-      localStorage.setItem(STATE_KEY, JSON.stringify({ ...state, edits: slim }));
-    } catch {
-      // Out of room even slimmed down — drop persistence silently this round.
-    }
-  }
+  await idbSet(STATE_KEY, { ...state, edits });
 }
 
-export function clearState(): void {
-  try {
-    localStorage.removeItem(STATE_KEY);
-  } catch {
-    // ignore
-  }
+export async function clearState(): Promise<void> {
+  await idbDelete(STATE_KEY);
+  dropLegacy(STATE_KEY);
 }
 
-export function loadThumbs(): Record<string, string> {
-  try {
-    const raw = localStorage.getItem(THUMBS_KEY);
-    return raw ? (JSON.parse(raw) as Record<string, string>) : {};
-  } catch {
-    return {};
+// --- Thumbnails ---
+
+export async function loadThumbs(): Promise<Record<string, string>> {
+  const fromDb = await idbGet<Record<string, string>>(THUMBS_KEY);
+  if (fromDb) return fromDb;
+  const legacy = readLegacy<Record<string, string>>(THUMBS_KEY);
+  if (legacy) {
+    void idbSet(THUMBS_KEY, legacy).then((ok) => { if (ok) dropLegacy(THUMBS_KEY); });
+    return legacy;
   }
+  return {};
 }
 
-export function saveThumbs(thumbs: Record<string, string>): void {
-  try {
-    localStorage.setItem(THUMBS_KEY, JSON.stringify(thumbs));
-  } catch {
-    // ignore — thumbnails are a nicety, not load-bearing
-  }
+export async function saveThumbs(thumbs: Record<string, string>): Promise<void> {
+  await idbSet(THUMBS_KEY, thumbs);
 }
 
 // Downscale an image URL to a compact JPEG data URL for offline thumbnail

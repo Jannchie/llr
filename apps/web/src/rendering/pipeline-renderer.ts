@@ -29,6 +29,17 @@ export interface EditParams {
 
 const HSL_ZERO = [0, 0, 0, 0, 0, 0, 0, 0];
 
+/**
+ * Override for the histogram's render window: logical output dims plus the
+ * output→source-texcoord transform (see setOutput). Lets the crop editor bin
+ * the tight crop box while the canvas shows the padded straighten bbox.
+ */
+export interface HistogramView {
+  width: number;
+  height: number;
+  texXform: Float32Array;
+}
+
 // Long-edge cap for the processed image the histogram is binned from. Each
 // update re-runs the full pipeline shader at this size, so the cap trades bin
 // smoothness/clipping accuracy against per-update GPU cost. The GPU path scatters
@@ -106,6 +117,14 @@ export class PipelineRenderer {
   private maskVao: WebGLVertexArrayObject | null = null;
   /** Whether R16F render targets are available for the mask pre-pass. */
   private maskSupported = false;
+  /** Whether float textures are LINEAR-filterable (OES_texture_float_linear). */
+  private floatLinear = false;
+  // Async histogram read-back: persistent PIXEL_PACK buffer + the in-flight
+  // read (only one at a time; concurrent callers share it).
+  private histoPbo: WebGLBuffer | null = null;
+  private histoPending: Promise<HistogramBins> | null = null;
+  private quadBuffers: WebGLBuffer[] = [];
+  private destroyed = false;
   /** Whether the browser exposes a wide-gamut drawing buffer. */
   readonly p3Supported: boolean = false;
 
@@ -122,6 +141,7 @@ export class PipelineRenderer {
     const floatRenderable = !!gl.getExtension("EXT_color_buffer_float");
     this.histoGpuSupported = floatRenderable && !!gl.getExtension("EXT_float_blend");
     this.maskSupported = floatRenderable;
+    this.floatLinear = !!gl.getExtension("OES_texture_float_linear");
 
     const pass = PASSES[0];
     this.program = this.compileProgram(pass.fsSource);
@@ -156,16 +176,17 @@ export class PipelineRenderer {
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB32F, width, height, 0, gl.RGB, gl.FLOAT, pixels);
     // LINEAR for smooth straighten/crop resampling (NEAREST is identical at 1:1).
-    const filter = gl.getExtension("OES_texture_float_linear") ? gl.LINEAR : gl.NEAREST;
+    const filter = this.floatLinear ? gl.LINEAR : gl.NEAREST;
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     this.sourceTex = tex;
     // Default to a 1:1, un-cropped output; callers override via setOutput().
+    // The drawing buffer itself is (re)sized in draw() — sizing it here would
+    // allocate a transient full-resolution buffer that the next draw discards.
     this.outWidth = width; this.outHeight = height;
     this.texXform = new Float32Array([1, 0, 0, 0, -1, 0, 0, 1, 1]);
-    this.canvas.width = width; this.canvas.height = height;
     this.buildLumaMask();
   }
 
@@ -260,8 +281,8 @@ export class PipelineRenderer {
     this.outHeight = Math.max(1, Math.round(height));
     this.texXform = texXform;
     if (bg) this.bgColor = bg;
-    this.canvas.width = this.outWidth;
-    this.canvas.height = this.outHeight;
+    // The drawing buffer is sized in draw() from outWidth × previewScale —
+    // sizing it here would allocate a full-resolution buffer per crop change.
   }
 
   /**
@@ -286,7 +307,7 @@ export class PipelineRenderer {
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, 2048, 1, 0, gl.RED, gl.FLOAT, lut);
     }
     // Prefer LINEAR for smooth interpolation; fall back to NEAREST if float-linear not available
-    const filter = gl.getExtension("OES_texture_float_linear") ? gl.LINEAR : gl.NEAREST;
+    const filter = this.floatLinear ? gl.LINEAR : gl.NEAREST;
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -294,10 +315,21 @@ export class PipelineRenderer {
     return tex;
   }
 
-  /** Upload an interleaved RGB tone-curve LUT (length 2048*3, per-channel). */
+  /**
+   * Upload an interleaved RGB tone-curve LUT (length 2048*3, per-channel).
+   * The texture is created once and updated in place (texSubImage2D): this is
+   * re-run every rAF while dragging Contrast/Blacks, so delete+create would
+   * churn a fresh GPU allocation per frame.
+   */
   uploadCurveLUT(lut: Float32Array): void {
-    if (this.curveLutTex) this.gl.deleteTexture(this.curveLutTex);
-    this.curveLutTex = this.makeLutTexture(lut, 3);
+    const gl = this.gl;
+    if (!this.curveLutTex) {
+      this.curveLutTex = this.makeLutTexture(lut, 3);
+      return;
+    }
+    gl.bindTexture(gl.TEXTURE_2D, this.curveLutTex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 2048, 1, gl.RGB, gl.FLOAT, lut);
   }
 
   /**
@@ -307,10 +339,18 @@ export class PipelineRenderer {
    */
   uploadProfileCurveLUT(lut: Float32Array | null): void {
     const gl = this.gl;
-    if (this.profileLutTex) gl.deleteTexture(this.profileLutTex);
-    const identity = new Float32Array(2048);
-    for (let i = 0; i < 2048; i++) identity[i] = i / 2047;
-    this.profileLutTex = this.makeLutTexture(lut ?? identity);
+    let data = lut;
+    if (!data) {
+      data = new Float32Array(2048);
+      for (let i = 0; i < 2048; i++) data[i] = i / 2047;
+    }
+    if (!this.profileLutTex) {
+      this.profileLutTex = this.makeLutTexture(data);
+    } else {
+      gl.bindTexture(gl.TEXTURE_2D, this.profileLutTex);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 2048, 1, gl.RED, gl.FLOAT, data);
+    }
     this.hasProfileCurve = lut != null;
   }
 
@@ -335,7 +375,7 @@ export class PipelineRenderer {
   }
 
   /** Render the current source + params into `fbo` (null = canvas) at w×h. */
-  private renderPass(fbo: WebGLFramebuffer | null, w: number, h: number, p: EditParams): void {
+  private renderPass(fbo: WebGLFramebuffer | null, w: number, h: number, p: EditParams, texXform?: Float32Array): void {
     const gl = this.gl;
     if (!this.sourceTex) return;
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
@@ -343,7 +383,7 @@ export class PipelineRenderer {
     gl.useProgram(this.program);
     // Crop / straighten transform + out-of-image fill.
     const xfLoc = this.uniforms["u_texXform"];
-    if (xfLoc) gl.uniformMatrix3fv(xfLoc, false, this.texXform);
+    if (xfLoc) gl.uniformMatrix3fv(xfLoc, false, texXform ?? this.texXform);
     const bgLoc = this.uniforms["u_bgColor"];
     if (bgLoc) gl.uniform3f(bgLoc, this.bgColor[0], this.bgColor[1], this.bgColor[2]);
     gl.activeTexture(gl.TEXTURE0);
@@ -376,18 +416,29 @@ export class PipelineRenderer {
    * output. Whatever the shader does, the histogram reflects it exactly — there
    * is no JS mirror of the pipeline.
    *
-   * The GPU path scatters every pixel of a 1024px-capped render into a float
-   * accumulation target, so the only read-back is 256×4 counts. It both removes
-   * the large per-frame read-back stall and fixes the accuracy of the CPU path:
-   * that path point-samples a 256px copy, and any bilinear filtering there would
-   * average neighbours, narrowing the distribution and hiding clipping.
+   * The GPU path scatters every pixel of a HISTO_LONG_GPU-capped render into a
+   * float accumulation target, so the only read-back is 256×4 counts, and that
+   * read-back is asynchronous (PBO + fence): the returned promise resolves when
+   * the GPU has finished, so the main thread never stalls on a sync while a
+   * slider drag is redrawing. Only one read is in flight at a time; concurrent
+   * callers share it.
+   *
+   * `view` overrides the histogram's render window (dims + output→texcoord
+   * transform). The crop editor passes the tight crop box here: its canvas
+   * renders a padded bounding box whose out-of-image fill would otherwise be
+   * binned as real pixels.
    */
-  readHistogram(): HistogramBins {
-    return this.histoGpuSupported ? this.readHistogramGPU() : this.readHistogramCPU();
+  readHistogram(view?: HistogramView): Promise<HistogramBins> {
+    if (this.histoPending) return this.histoPending;
+    const run = this.histoGpuSupported
+      ? this.readHistogramGPU(view)
+      : Promise.resolve(this.readHistogramCPU(view));
+    this.histoPending = run.finally(() => { this.histoPending = null; });
+    return this.histoPending;
   }
 
-  /** CPU fallback: render a small copy, read it back, and bin it in JS. */
-  private readHistogramCPU(): HistogramBins {
+  /** CPU fallback: render a small copy, read it back (sync), and bin it in JS. */
+  private readHistogramCPU(view?: HistogramView): HistogramBins {
     const gl = this.gl;
     const bins: HistogramBins = {
       r: new Uint32Array(256), g: new Uint32Array(256),
@@ -395,15 +446,14 @@ export class PipelineRenderer {
     };
     if (!this.sourceTex || !this.outWidth || !this.outHeight) return bins;
 
-    const { w, h } = this.ensureHistoFbo(HISTO_LONG_CPU);
+    const { w, h } = this.ensureHistoFbo(HISTO_LONG_CPU, view);
     // Point-sample the source (NEAREST) so the downscale doesn't average
     // neighbours — averaging narrows the distribution and hides clipping.
     gl.bindTexture(gl.TEXTURE_2D, this.sourceTex);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    this.renderPass(this.histoFbo, w, h, this.lastParams);
-    const srcFilter = gl.getExtension("OES_texture_float_linear") ? gl.LINEAR : gl.NEAREST;
+    this.renderPass(this.histoFbo, w, h, this.lastParams, view?.texXform);
     gl.bindTexture(gl.TEXTURE_2D, this.sourceTex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, srcFilter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, this.floatLinear ? gl.LINEAR : gl.NEAREST);
     const n = w * h;
     const buf = new Uint8Array(n * 4);
     gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
@@ -419,7 +469,7 @@ export class PipelineRenderer {
   }
 
   /** GPU path: scatter every pixel into a 256×4 float bin texture. */
-  private readHistogramGPU(): HistogramBins {
+  private async readHistogramGPU(view?: HistogramView): Promise<HistogramBins> {
     const gl = this.gl;
     const bins: HistogramBins = {
       r: new Uint32Array(256), g: new Uint32Array(256),
@@ -431,17 +481,16 @@ export class PipelineRenderer {
     //    sample the source (NEAREST minification) so the downscale doesn't
     //    average neighbours — averaging pulls extremes toward the mean, which
     //    narrows the distribution and under-reports clipping.
-    const { w, h } = this.ensureHistoFbo(HISTO_LONG_GPU);
+    const { w, h } = this.ensureHistoFbo(HISTO_LONG_GPU, view);
     gl.bindTexture(gl.TEXTURE_2D, this.sourceTex);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    this.renderPass(this.histoFbo, w, h, this.lastParams);
-    const srcFilter = gl.getExtension("OES_texture_float_linear") ? gl.LINEAR : gl.NEAREST;
+    this.renderPass(this.histoFbo, w, h, this.lastParams, view?.texXform);
     gl.bindTexture(gl.TEXTURE_2D, this.sourceTex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, srcFilter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, this.floatLinear ? gl.LINEAR : gl.NEAREST);
 
     // 2. Scatter every pixel into 256 bins × 4 rows (R,G,B,L) via additive float
     //    blending — a full-image histogram computed entirely on the GPU.
-    if (!this.ensureHistoBin()) return this.readHistogramCPU(); // float FBO incomplete
+    if (!this.ensureHistoBin()) return this.readHistogramCPU(view); // float FBO incomplete
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.histoBinFbo);
     gl.viewport(0, 0, 256, 4);
     gl.clearColor(0, 0, 0, 0);
@@ -458,10 +507,26 @@ export class PipelineRenderer {
     gl.drawArrays(gl.POINTS, 0, w * h * 4);
     gl.disable(gl.BLEND);
 
-    // 3. Read back the 256×4 counts (16 KB) and unpack the red channel.
-    const buf = new Float32Array(256 * 4 * 4);
-    gl.readPixels(0, 0, 256, 4, gl.RGBA, gl.FLOAT, buf);
+    // 3. Queue the 256×4 read-back (16 KB) into a PBO and wait on a fence, so
+    //    the copy happens without forcing a full GPU sync on the main thread.
+    if (!this.histoPbo) this.histoPbo = gl.createBuffer()!;
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.histoPbo);
+    gl.bufferData(gl.PIXEL_PACK_BUFFER, 256 * 4 * 4 * 4, gl.STREAM_READ);
+    gl.readPixels(0, 0, 256, 4, gl.RGBA, gl.FLOAT, 0);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    if (sync) {
+      gl.flush();
+      await this.waitSync(sync);
+      gl.deleteSync(sync);
+    }
+    if (this.destroyed || gl.isContextLost()) return bins;
+
+    const buf = new Float32Array(256 * 4 * 4);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.histoPbo);
+    gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, buf);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
     const rows = [bins.r, bins.g, bins.b, bins.l];
     for (let ch = 0; ch < 4; ch++) {
       const row = rows[ch];
@@ -471,13 +536,32 @@ export class PipelineRenderer {
     return bins;
   }
 
-  /** (Re)create the RGBA8 FBO the histogram is binned from, capped to `longCap`. */
-  private ensureHistoFbo(longCap: number): { w: number; h: number } {
+  /** Resolve once the given fence signals, polling without blocking the GPU. */
+  private waitSync(sync: WebGLSync): Promise<void> {
     const gl = this.gl;
-    const long = Math.max(this.outWidth, this.outHeight) || 1;
+    return new Promise((resolve) => {
+      const check = (): void => {
+        if (this.destroyed || gl.isContextLost()) { resolve(); return; }
+        const res = gl.clientWaitSync(sync, 0, 0);
+        if (res === gl.ALREADY_SIGNALED || res === gl.CONDITION_SATISFIED || res === gl.WAIT_FAILED) {
+          resolve();
+          return;
+        }
+        setTimeout(check, 4);
+      };
+      check();
+    });
+  }
+
+  /** (Re)create the RGBA8 FBO the histogram is binned from, capped to `longCap`. */
+  private ensureHistoFbo(longCap: number, view?: HistogramView): { w: number; h: number } {
+    const gl = this.gl;
+    const baseW = view?.width ?? this.outWidth;
+    const baseH = view?.height ?? this.outHeight;
+    const long = Math.max(baseW, baseH) || 1;
     const scale = Math.min(1, longCap / long);
-    const w = Math.max(1, Math.round(this.outWidth * scale));
-    const h = Math.max(1, Math.round(this.outHeight * scale));
+    const w = Math.max(1, Math.round(baseW * scale));
+    const h = Math.max(1, Math.round(baseH * scale));
     if (this.histoFbo && this.histoW === w && this.histoH === h) return { w, h };
     if (this.histoTex) gl.deleteTexture(this.histoTex);
     if (this.histoFbo) gl.deleteFramebuffer(this.histoFbo);
@@ -597,6 +681,7 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
 
   destroy(): void {
     const gl = this.gl;
+    this.destroyed = true;
     if (this.sourceTex) gl.deleteTexture(this.sourceTex);
     if (this.curveLutTex) gl.deleteTexture(this.curveLutTex);
     if (this.profileLutTex) gl.deleteTexture(this.profileLutTex);
@@ -606,12 +691,21 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     if (this.histoBinFbo) gl.deleteFramebuffer(this.histoBinFbo);
     if (this.histoProgram) gl.deleteProgram(this.histoProgram);
     if (this.histoVao) gl.deleteVertexArray(this.histoVao);
+    if (this.histoPbo) gl.deleteBuffer(this.histoPbo);
     if (this.maskTex) gl.deleteTexture(this.maskTex);
     if (this.maskProgDown) gl.deleteProgram(this.maskProgDown);
     if (this.maskProgBlur) gl.deleteProgram(this.maskProgBlur);
     if (this.maskVao) gl.deleteVertexArray(this.maskVao);
+    for (const buf of this.quadBuffers) gl.deleteBuffer(buf);
+    this.quadBuffers = [];
     gl.deleteProgram(this.program);
     gl.deleteVertexArray(this.vao);
+    // Release the context itself. Deleting objects frees their memory, but the
+    // context slot stays occupied until GC — and browsers cap live WebGL
+    // contexts (~16), evicting the oldest when a repeatedly-created offscreen
+    // export renderer pushes past the cap. That eviction can hit the main
+    // preview, which has no context-restore path.
+    gl.getExtension("WEBGL_lose_context")?.loseContext();
   }
 
   private setUniforms(p: EditParams): void {
@@ -695,6 +789,7 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     const vao = gl.createVertexArray()!;
     gl.bindVertexArray(vao);
     const buf = gl.createBuffer()!;
+    this.quadBuffers.push(buf); // deleting a VAO doesn't cascade to its buffers
     gl.bindBuffer(gl.ARRAY_BUFFER, buf);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,-1,1,1,-1,1,1]), gl.STATIC_DRAW);
     gl.enableVertexAttribArray(attribLoc);

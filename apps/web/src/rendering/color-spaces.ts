@@ -65,6 +65,11 @@ export const SRGB_TO_PROPHOTO: Mat3 = [
 ];
 // ProPhoto(D50) luminance weights (Y row of ProPhoto->XYZ-D50)
 export const PROPHOTO_Y: readonly [number, number, number] = [0.28804020, 0.71187410, 0.00008570];
+// Display-linear luminance weights (Y rows of sRGB/Display-P3 -> XYZ-D65).
+// Used for equal-luminance gray in gamut compression — must match the gamut
+// the values are expressed in, or the "neutral" axis picks up a colour cast.
+export const REC709_Y: readonly [number, number, number] = [0.21267290, 0.71515220, 0.07217500];
+export const P3_Y: readonly [number, number, number] = [0.22897456, 0.69173852, 0.07928691];
 
 // XYZ(D50) -> linear ProPhoto(D50), for white-balance gain computation.
 export const XYZ_D50_TO_PROPHOTO: Mat3 = [
@@ -158,6 +163,8 @@ const MATRICES: ReadonlyArray<readonly [string, Mat3]> = [
 export const COLOR_GLSL = `
 ${MATRICES.map(([n, m]) => glslMat3(n, m)).join("\n")}
 const vec3 PROPHOTO_Y = vec3(${f(PROPHOTO_Y[0])}, ${f(PROPHOTO_Y[1])}, ${f(PROPHOTO_Y[2])});
+const vec3 REC709_Y = vec3(${f(REC709_Y[0])}, ${f(REC709_Y[1])}, ${f(REC709_Y[2])});
+const vec3 P3_Y = vec3(${f(P3_Y[0])}, ${f(P3_Y[1])}, ${f(P3_Y[2])});
 
 float ppLuma(vec3 c) { return dot(c, PROPHOTO_Y); }
 

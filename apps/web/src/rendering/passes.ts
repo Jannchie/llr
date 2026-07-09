@@ -7,7 +7,8 @@
  * not applied here.
  */
 
-import { COLOR_GLSL } from "./color-spaces";
+import { COLOR_GLSL, PROPHOTO_Y } from "./color-spaces";
+import { TONAL_GLSL } from "./tonal-model";
 
 export const VERTEX_SHADER = `#version 300 es
 precision highp float;
@@ -70,6 +71,12 @@ uniform int u_displayGamut;     // 0 = sRGB, 1 = Display-P3
 uniform vec3 u_bgColor;         // display-encoded fill for areas outside the image (crop editor)
 
 ${COLOR_GLSL}
+${TONAL_GLSL}
+
+// Sample a 2048-entry LUT: entry i holds the output for input i/2047, so map
+// x onto texel centers ((x*2047 + 0.5)/2048) — sampling at x directly is off
+// by up to half a texel across the range.
+float lutCoord(float x) { return (x * 2047.0 + 0.5) / 2048.0; }
 
 // ===== View transforms: scene-linear ProPhoto -> display-linear ProPhoto [0,1] =====
 
@@ -80,9 +87,9 @@ vec3 viewTransformLR(vec3 c) {
     // The DCP profile tone curve IS the camera's display rendering — apply it per
     // channel (as Adobe/ACR do). This matches the camera/"official" look closely.
     return vec3(
-      texture(u_profile_lut, vec2(clamp(c.r, 0.0, 1.0), 0.5)).r,
-      texture(u_profile_lut, vec2(clamp(c.g, 0.0, 1.0), 0.5)).r,
-      texture(u_profile_lut, vec2(clamp(c.b, 0.0, 1.0), 0.5)).r
+      texture(u_profile_lut, vec2(lutCoord(clamp(c.r, 0.0, 1.0)), 0.5)).r,
+      texture(u_profile_lut, vec2(lutCoord(clamp(c.g, 0.0, 1.0)), 0.5)).r,
+      texture(u_profile_lut, vec2(lutCoord(clamp(c.b, 0.0, 1.0)), 0.5)).r
     );
   }
   // Fallback (no profile curve): identity here; the display sRGB encode supplies the
@@ -111,29 +118,18 @@ vec3 viewTransform(vec3 c) {
   return (u_viewTransform == 1) ? viewTransformAgX(c) : viewTransformLR(c);
 }
 
-// ===== Exposure shoulder / tonal-region constants =====
-// NOTE: keep in lockstep with the TS mirror in tonal-model.ts (the vitest
-// calibration harness runs the same math over a synthetic step wedge).
-const float LOG2_MID  = -2.4739312;  // log2(0.18): middle gray in log2 luminance
-const float LX_WHITE  =  2.4739312;  // diffuse white, stops above middle gray
-const float EXPO_KNEE = -1.0;        // shoulder knee: 1 stop below diffuse white
-const float EXPO_P    =  1.5;        // shoulder span: luminance ceiling at KNEE+P
-
-// Soft highlight shoulder in log2 luminance: identity below the knee, slope
-// decaying to 0 above it (ceiling at EXPO_KNEE + EXPO_P). Monotone, C1.
-float expoShoulder(float x) {
-  return x <= EXPO_KNEE ? x
-       : EXPO_KNEE + EXPO_P * (1.0 - exp(-(x - EXPO_KNEE) / EXPO_P));
-}
+// Exposure shoulder / tonal-region constants + expoShoulder come from
+// TONAL_GLSL above — generated from tonal-model.ts, the tested TS mirror.
 
 // Gamut compression: bring out-of-gamut display-linear RGB back inside [0,1]^3
 // by desaturating toward the equal-luminance gray. Preserves luminance and keeps
-// hue far more stable than a per-channel clamp.
-vec3 gamutMap(vec3 c) {
+// hue far more stable than a per-channel clamp. Yw must be the luminance
+// weights of the gamut that c is expressed in.
+vec3 gamutMap(vec3 c, vec3 Yw) {
   float lo = min(min(c.r, c.g), c.b);
   float hi = max(max(c.r, c.g), c.b);
   if (lo >= 0.0 && hi <= 1.0) return c;
-  float l = clamp(dot(c, vec3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
+  float l = clamp(dot(c, Yw), 0.0, 1.0);
   float s = 1.0;
   if (lo < 0.0) s = min(s, (0.0 - l) / (lo - l));
   if (hi > 1.0) s = min(s, (1.0 - l) / (hi - l));
@@ -199,8 +195,8 @@ void main() {
       float maskLx = (u_hasMask == 1)
         ? texture(u_mask_lum, v_texCoord).r + u_maskShift
         : pixLx;
-      float wHi = smoothstep(-0.5, 2.5, max(pixLx, maskLx));
-      float wSh = 1.0 - smoothstep(-3.5, 0.5, min(pixLx, maskLx));
+      float wHi = smoothstep(HI_EDGE0, HI_EDGE1, max(pixLx, maskLx));
+      float wSh = 1.0 - smoothstep(SH_EDGE0, SH_EDGE1, min(pixLx, maskLx));
       // Only *negative* Whites acts here, on pixel luma: pulling the white
       // point down means rescuing scene values above 1.0, which the view
       // transform clamps away — so recovery exists only scene-referred.
@@ -208,10 +204,10 @@ void main() {
       // asymptotes below 1.0 and flattens the top stops, so no scene-referred
       // gain can move the clip point. Positive Whites is a display-referred
       // white-point scale baked into the curve LUT (curve.ts basicCurve).
-      float wWh = smoothstep(-1.5, LX_WHITE, pixLx);
-      lOut += (u_highlights >= 0.0 ? 0.9 : 1.3) * u_highlights * wHi
-            + (u_shadows    >= 0.0 ? 1.8 : 1.1) * u_shadows    * wSh
-            + 1.35 * min(u_whites, 0.0) * wWh;
+      float wWh = smoothstep(WH_EDGE0, LX_WHITE, pixLx);
+      lOut += (u_highlights >= 0.0 ? HI_GAIN_POS : HI_GAIN_NEG) * u_highlights * wHi
+            + (u_shadows    >= 0.0 ? SH_GAIN_POS : SH_GAIN_NEG) * u_shadows    * wSh
+            + WH_GAIN * min(u_whites, 0.0) * wWh;
     }
     c *= exp2(lOut - l);
   }
@@ -280,9 +276,9 @@ void main() {
   // RGB master -> per-channel.
   c = clamp(c, 0.0, 1.0);
   c = vec3(
-    texture(u_curve_lut, vec2(c.r, 0.5)).r,
-    texture(u_curve_lut, vec2(c.g, 0.5)).g,
-    texture(u_curve_lut, vec2(c.b, 0.5)).b
+    texture(u_curve_lut, vec2(lutCoord(c.r), 0.5)).r,
+    texture(u_curve_lut, vec2(lutCoord(c.g), 0.5)).g,
+    texture(u_curve_lut, vec2(lutCoord(c.b), 0.5)).b
   );
 
   // --- Color Grading (display-referred split-toning) ---
@@ -301,7 +297,7 @@ void main() {
 
   // ===== Display: ProPhoto -> target gamut -> compress -> encode =====
   vec3 disp = (u_displayGamut == 1) ? (PROPHOTO_TO_P3 * c) : (PROPHOTO_TO_SRGB * c);
-  disp = gamutMap(disp);
+  disp = gamutMap(disp, (u_displayGamut == 1) ? P3_Y : REC709_Y);
   outColor = vec4(srgbEncode(disp), 1.0); // sRGB transfer (Display-P3 shares it)
 }`;
 
@@ -326,7 +322,7 @@ precision highp float;
 in vec2 v_uv;
 out vec4 outColor;
 uniform sampler2D u_input;
-const vec3 PP_Y = vec3(0.28804020, 0.71187410, 0.00008570); // = PROPHOTO_Y
+const vec3 PP_Y = vec3(${PROPHOTO_Y[0]}, ${PROPHOTO_Y[1]}, ${PROPHOTO_Y[2]});
 void main() {
   vec3 c = max(texture(u_input, v_uv).rgb, 0.0);
   outColor = vec4(log2(max(dot(c, PP_Y), 1e-6)), 0.0, 0.0, 1.0);

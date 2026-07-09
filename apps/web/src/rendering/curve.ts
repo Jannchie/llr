@@ -153,8 +153,26 @@ export function curveToLUT(points: CurvePoint[]): Float32Array {
   const sorted = [...points].sort((a, b) => a.x - b.x);
   if (sorted[0].x > 0) sorted.unshift({ x: 0, y: 0 });
   if (sorted[sorted.length - 1].x < 1) sorted.push({ x: 1, y: 1 });
+  const n = sorted.length;
+  const first = sorted[0];
+  const last = sorted[n - 1];
+  // Tangents are a property of the curve, not the sample: compute them once
+  // instead of per LUT entry (evaluating per entry redid the full O(n)
+  // Fritsch-Carlson pass 2048 times per channel).
+  const m = n > 2 ? splineTangents(sorted) : null;
+  let seg = 0; // samples are in ascending x — advance the segment cursor, no search
   for (let i = 0; i < LUT_SIZE; i++) {
-    lut[i] = clamp01(evaluateSpline(sorted, i / (LUT_SIZE - 1)));
+    const t = i / (LUT_SIZE - 1);
+    let y: number;
+    if (t <= first.x) y = first.y;
+    else if (t >= last.x) y = last.y;
+    else if (!m) {
+      y = first.y + ((last.y - first.y) * (t - first.x)) / ((last.x - first.x) || 1e-6);
+    } else {
+      while (seg < n - 2 && t > sorted[seg + 1].x) seg++;
+      y = hermiteAt(sorted, m, seg, t);
+    }
+    lut[i] = clamp01(y);
   }
   return lut;
 }
@@ -302,6 +320,8 @@ const GRID_COLOR = "#1f1f1f";
 const POINT_RADIUS = 5;
 const SPLIT_RADIUS = 6;
 
+let hoverEnvelopeCache: { key: string; max: Float32Array; min: Float32Array } | null = null;
+
 const CHANNEL_COLOR: Record<ToneChannel, string> = {
   parametric: "#c8cdd4",
   rgb: "#c8cdd4",
@@ -344,12 +364,17 @@ export function renderToneCurve(
   // that region can move the curve, the way Lightroom previews it on hover.
   if (channel === "parametric" && hoverRegion >= 0) {
     const key = REGION_KEYS[Math.max(0, Math.min(3, hoverRegion))];
-    const pMax: ParametricCurve = { ...tc.parametric };
-    const pMin: ParametricCurve = { ...tc.parametric };
-    pMax[key] = 100;
-    pMin[key] = -100;
-    const lutMax = parametricToLUT(pMax);
-    const lutMin = parametricToLUT(pMin);
+    // Memoise the two envelope LUTs: the hover repaints on every mousemove, and
+    // neither bound changes until the region or the parametric values do.
+    const cacheKey = `${key}|${JSON.stringify(tc.parametric)}`;
+    if (!hoverEnvelopeCache || hoverEnvelopeCache.key !== cacheKey) {
+      const pMax: ParametricCurve = { ...tc.parametric };
+      const pMin: ParametricCurve = { ...tc.parametric };
+      pMax[key] = 100;
+      pMin[key] = -100;
+      hoverEnvelopeCache = { key: cacheKey, max: parametricToLUT(pMax), min: parametricToLUT(pMin) };
+    }
+    const { max: lutMax, min: lutMin } = hoverEnvelopeCache;
     // Fill between the bounding curves (max forward, min back).
     ctx.beginPath();
     for (let i = 0; i <= 128; i++) {
@@ -471,24 +496,13 @@ const REGION_KEYS = ["shadows", "darks", "lights", "highlights"] as const;
 
 // --- spline internals ---
 
-function evaluateSpline(points: CurvePoint[], t: number): number {
+/** Fritsch-Carlson monotone tangents, one per knot (n >= 3). */
+function splineTangents(points: CurvePoint[]): number[] {
   const n = points.length;
-  if (n === 0) return t;
-  if (n === 1) return points[0].y;
-  const t0 = points[0].x, t1 = points[n - 1].x;
-  if (t <= t0) return points[0].y;
-  if (t >= t1) return points[n - 1].y;
-
-  if (n === 2) {
-    const f = (t - t0) / ((t1 - t0) || 1e-6);
-    return points[0].y + (points[1].y - points[0].y) * f;
-  }
-
-  // --- Fritsch-Carlson monotone cubic Hermite spline ---
-  const sec: number[] = [];
+  const sec: number[] = new Array(n - 1);
   for (let i = 0; i < n - 1; i++) {
     const dx = points[i + 1].x - points[i].x;
-    sec.push(dx > 1e-9 ? (points[i + 1].y - points[i].y) / dx : 0);
+    sec[i] = dx > 1e-9 ? (points[i + 1].y - points[i].y) / dx : 0;
   }
   const m: number[] = new Array(n).fill(0);
   m[0] = sec[0];
@@ -504,10 +518,11 @@ function evaluateSpline(points: CurvePoint[], t: number): number {
     const denom = w0 * s0 + w1 * s1;
     m[i] = Math.abs(denom) > 1e-9 ? (s0 * s1 * (w0 + w1)) / denom : 0;
   }
-  let seg = 0;
-  for (let i = 0; i < n - 1; i++) {
-    if (t >= points[i].x && t <= points[i + 1].x) { seg = i; break; }
-  }
+  return m;
+}
+
+/** Cubic Hermite on segment `seg` at absolute x `t`, with precomputed tangents. */
+function hermiteAt(points: CurvePoint[], m: number[], seg: number, t: number): number {
   const x0 = points[seg].x, y0 = points[seg].y;
   const x1 = points[seg + 1].x, y1 = points[seg + 1].y;
   const dx = x1 - x0;

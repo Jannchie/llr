@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from "vue";
 import { PipelineRenderer, type EditParams } from "./rendering/pipeline-renderer";
 import { renderHistogram } from "./rendering/histogram";
 import {
@@ -461,12 +461,16 @@ function onCurveLeave(): void {
   if (curveHover.value !== -1) { curveHover.value = -1; renderCurveCanvas(); }
 }
 
-// Init curve canvas
+// Init curve canvas. The canvas is torn down/recreated when the panel toggles
+// (crop mode, image switch), so disconnect the previous observer or each
+// round-trip leaks one.
+let curveResizeObs: ResizeObserver | null = null;
 watch(curveCanvas, (cvs) => {
+  curveResizeObs?.disconnect();
+  curveResizeObs = null;
   if (cvs) {
-    // Observe resize to redraw
-    const obs = new ResizeObserver(() => renderCurveCanvas());
-    obs.observe(cvs);
+    curveResizeObs = new ResizeObserver(() => renderCurveCanvas());
+    curveResizeObs.observe(cvs);
   }
 });
 
@@ -487,7 +491,9 @@ const defaultDenoise = (): typeof denoise => ({ enabled: false, model: "wavelet"
 const MAX_HISTORY = 100;
 const HISTORY_DEBOUNCE = 300;
 
-const history = ref<Snapshot[]>([]);
+// shallowRef: snapshots are immutable once captured and only length/index are
+// read reactively — deep-proxying up to 100 snapshots per push is pure cost.
+const history = shallowRef<Snapshot[]>([]);
 const historyIndex = ref(-1);
 const pendingDirty = ref(false);
 let isRestoring = false;
@@ -567,7 +573,11 @@ function setEditState(s: Snapshot): void {
   cropAspect.value = "free";
   Object.assign(denoise, s.denoise ?? defaultDenoise());
   dcpCode.value = s.dcp;
-  if (webglRenderer) webglRenderer.uploadCurveLUT(buildToneCurveLUT(toneCurve.value));
+  // Rebake with the snapshot's Basic values (bakeCurveLUT also syncs bakedBasic).
+  // Uploading a curve-only LUT here would leave a stale bakedBasic: if the
+  // snapshot's Contrast/Blacks happen to equal it, drawWebGL's sameBasic check
+  // skips the rebake and the GPU keeps rendering without them.
+  if (webglRenderer) bakeCurveLUT();
   renderCurveCanvas();
 }
 
@@ -656,7 +666,7 @@ function persistNow(): void {
     sources: sources.value.map(s => ({ id: s.id, name: s.name, size: s.size, embeddedUrl: s.embeddedUrl })),
     edits: editsObj,
   };
-  saveState(state);
+  void saveState(state);
 }
 
 function schedulePersist(): void {
@@ -677,7 +687,7 @@ function thumbSrc(s: Source): string {
 async function cacheThumb(s: Source): Promise<void> {
   if (thumbs[s.id] || !s.embeddedUrl) return;
   const data = await generateThumb(resolveUrl(s.embeddedUrl));
-  if (data) { thumbs[s.id] = data; saveThumbs({ ...thumbs }); }
+  if (data) { thumbs[s.id] = data; void saveThumbs({ ...thumbs }); }
 }
 
 function markInvalid(id: string): void {
@@ -701,6 +711,8 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
   currentSourceId = id;
   status.value = "rendering";
   errorMessage.value = null;
+  timing.value = null; // stale timing would mask the live status in the footer
+  const t0 = performance.now();
   try {
     const linRes = await fetch(`${API}/render-linear`, {
       method: "POST", headers: { "content-type": "application/json" },
@@ -709,12 +721,12 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     if (linRes.status === 404) { markInvalid(id); return false; }
     if (!linRes.ok) throw new Error(await linRes.text());
     const linMeta = await linRes.json() as { width: number; height: number; fullWidth?: number; fullHeight?: number; linearUrl: string; colorProfile?: ColorProfileMeta };
-    const binRes = await fetch(linMeta.linearUrl);
+    const binRes = await fetch(resolveUrl(linMeta.linearUrl));
     if (binRes.status === 404) { markInvalid(id); return false; }
     if (!binRes.ok) throw new Error("Failed to fetch linear data");
     const linearFloat = new Float32Array(await binRes.arrayBuffer());
 
-    linearFloatData = linearFloat;
+    hasLinearData = true;
     profileCurveLUT = buildProfileLUT(linMeta.colorProfile);
     srcW.value = linMeta.width;
     srcH.value = linMeta.height;
@@ -735,6 +747,7 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     applyCropRender();
     src.invalid = false;
     status.value = "idle";
+    timing.value = Math.round(performance.now() - t0);
     return true;
   } catch (err) {
     status.value = "error";
@@ -832,12 +845,27 @@ function buildProfileLUT(cp: ColorProfileMeta | undefined): Float32Array | null 
 
 // ── Histogram ──
 
-let linearFloatData: Float32Array | null = null;
+// Whether the renderer holds decoded pixels (histogram guard). The decoded
+// Float32Array itself lives on the GPU after upload — keeping a JS reference
+// here would pin ~50 MB per image for nothing.
+let hasLinearData = false;
+let histoBusy = false;
 const histoCanvasRef = ref<HTMLCanvasElement | null>(null);
 
-function updateHistogram(): void {
+// In the crop editor the canvas renders a padded straighten bbox whose
+// out-of-image fill would be binned as real pixels — hand the histogram the
+// tight crop box instead (it re-renders offscreen with its own transform).
+function cropHistogramView(): { width: number; height: number; texXform: Float32Array } {
+  const [iw, ih] = currentImageDims();
+  const rect = cropOutputRect(crop, iw, ih);
+  const [ow, oh] = cropOutputSize(crop, srcW.value, srcH.value);
+  return { width: ow, height: oh, texXform: buildCropTransform(crop, srcW.value, srcH.value, rect) };
+}
+
+async function updateHistogram(): Promise<void> {
   const canvas = histoCanvasRef.value;
-  if (!canvas || !linearFloatData || !imageW.value || !imageH.value) return;
+  if (!canvas || !hasLinearData || !imageW.value || !imageH.value || !webglRenderer) return;
+  if (histoBusy) { scheduleHistogram(); return; } // a read is in flight; retry after it
   const rect = canvas.getBoundingClientRect();
   let w = rect.width;
   let h = rect.height;
@@ -845,17 +873,24 @@ function updateHistogram(): void {
   if (w <= 0 || h <= 0) {
     const parent = canvas.parentElement;
     if (parent) { w = parent.clientWidth - 32; h = 80; }
-    if (w <= 0) { requestAnimationFrame(() => updateHistogram()); return; }
+    if (w <= 0) { requestAnimationFrame(() => void updateHistogram()); return; }
   }
-  const dpr = window.devicePixelRatio || 1;
-  canvas.width = Math.round(w * dpr);
-  canvas.height = Math.round(h * dpr);
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  if (!webglRenderer) return;
-  const bins = webglRenderer.readHistogram();
-  renderHistogram(ctx, w, h, bins);
+  histoBusy = true;
+  try {
+    const bins = await webglRenderer.readHistogram(cropMode.value ? cropHistogramView() : undefined);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const dpr = window.devicePixelRatio || 1;
+    // Assigning width/height resets the canvas even when unchanged — skip it.
+    const bw = Math.round(w * dpr);
+    const bh = Math.round(h * dpr);
+    if (canvas.width !== bw) canvas.width = bw;
+    if (canvas.height !== bh) canvas.height = bh;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    renderHistogram(ctx, w, h, bins);
+  } finally {
+    histoBusy = false;
+  }
 }
 
 function scheduleHistogram(): void {
@@ -864,7 +899,7 @@ function scheduleHistogram(): void {
   histoTimer = window.setTimeout(() => {
     histoTimer = 0;
     histoLast = performance.now();
-    updateHistogram();
+    void updateHistogram();
   }, wait);
 }
 
@@ -1347,9 +1382,15 @@ watch(showOriginal, (v) => {
   scheduleWebGLDraw();
 });
 
-watch(recipe, () => { if (!isRestoring) scheduleWebGLDraw(); }, { deep: true });
-watch([hslHue, hslSat, hslLum], () => { if (!isRestoring) scheduleWebGLDraw(); }, { deep: true });
-watch(grading, () => { if (!isRestoring) scheduleWebGLDraw(); }, { deep: true });
+// One deep watcher per object, doing draw + history + persist together: a
+// second deep watcher over the same objects would re-traverse them on every
+// slider input for no benefit (history/persist scheduling self-guards on
+// isRestoring and is debounced).
+watch([recipe, hslHue, hslSat, hslLum, grading], () => {
+  if (!isRestoring) scheduleWebGLDraw();
+  scheduleHistoryCommit();
+  schedulePersist();
+}, { deep: true });
 watch(viewSettings, () => { scheduleWebGLDraw(); schedulePersist(); }, { deep: true });
 
 // Zoom/fit only move CSS pixels; the drawing buffer is rendered at the on-screen
@@ -1358,12 +1399,24 @@ watch(viewSettings, () => { scheduleWebGLDraw(); schedulePersist(); }, { deep: t
 watch([zoom, fitScale], () => { if (webglRenderer) scheduleWebGLDraw(); });
 
 // Crop changes resize the output, so they re-render (not just redraw) the editor
-// or the committed view.
-watch(crop, () => { if (!isRestoring) applyCropRender(); }, { deep: true });
+// or the committed view. rAF-coalesced like scheduleWebGLDraw: crop drags emit
+// mousemove faster than the display refreshes, and each render is a full
+// setOutput + pipeline draw.
+let cropRenderPending = false;
+function scheduleCropRender(): void {
+  if (cropRenderPending) return;
+  cropRenderPending = true;
+  requestAnimationFrame(() => { cropRenderPending = false; applyCropRender(); });
+}
+watch(crop, () => {
+  if (!isRestoring) scheduleCropRender();
+  scheduleHistoryCommit();
+  schedulePersist();
+}, { deep: true });
 
-// Record edit changes into undo/redo history (coalesced; suppressed during restore)
-// and persist the session.
-watch([recipe, hslHue, hslSat, hslLum, grading, toneCurve, dcpCode, crop, denoise],
+// History/persist for the edit state not covered above (redraws handled by
+// their own paths: curve LUT bake, dcp/denoise re-decode).
+watch([toneCurve, dcpCode, denoise],
   () => { scheduleHistoryCommit(); schedulePersist(); }, { deep: true });
 
 // Re-decode when the user changes the DCP style (keeps the current view).
@@ -1388,15 +1441,20 @@ watch(denoise, () => {
   }, 250);
 }, { deep: true });
 
-// Flush the latest edit synchronously on tab close (beforeunload won't wait for
-// the debounced persist).
+// Flush the latest edit on tab close. The IndexedDB write is async, so also
+// flush whenever the tab goes hidden — that fires earlier and more reliably
+// than beforeunload (mobile tab switches, window close).
 function persistOnUnload(): void { persistNow(); }
+function persistOnHidden(): void { if (document.visibilityState === "hidden") persistNow(); }
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeyDown);
   window.removeEventListener('keyup', onKeyUp);
   window.removeEventListener('beforeunload', persistOnUnload);
+  document.removeEventListener('visibilitychange', persistOnHidden);
   resizeObs?.disconnect();
+  curveResizeObs?.disconnect();
+  curveResizeObs = null;
   destroyWebGL();
 });
 
@@ -1404,10 +1462,11 @@ onMounted(async () => {
   window.addEventListener('keydown', onKeyDown);
   window.addEventListener('keyup', onKeyUp);
   window.addEventListener('beforeunload', persistOnUnload);
+  document.addEventListener('visibilitychange', persistOnHidden);
   resizeObs = new ResizeObserver(() => recomputeFit());
   if (viewportRef.value) resizeObs.observe(viewportRef.value);
 
-  Object.assign(thumbs, loadThumbs());
+  Object.assign(thumbs, await loadThumbs());
 
   // Restore a previous session if one exists; otherwise auto-load the sample.
   if (await restoreSession()) return;
@@ -1426,7 +1485,7 @@ onMounted(async () => {
 // Rehydrate imported images + their edits from localStorage. Returns false if
 // there's nothing to restore (so the caller falls back to the sample).
 async function restoreSession(): Promise<boolean> {
-  const persisted = loadState<Snapshot, typeof viewSettings>();
+  const persisted = await loadState<Snapshot, typeof viewSettings>();
   if (!persisted || !persisted.sources.length) return false;
 
   sources.value = persisted.sources.map(s => ({ ...s }));
@@ -1494,13 +1553,11 @@ async function uploadFiles(files: File[]): Promise<void> {
   }
 
   // Make the last imported image active and render it (loadSource sets the
-  // final status to idle/error).
+  // final status to idle/error and records the decode timing).
   if (lastId) {
-    const t0 = performance.now();
     activeId.value = lastId;
     loadEditFromMap(lastId);
     await loadSource(lastId, { resetView: true });
-    timing.value = Math.round(performance.now() - t0);
   } else {
     status.value = "idle";
   }
@@ -1542,7 +1599,7 @@ async function exportImage(): Promise<void> {
     });
     if (!linRes.ok) throw new Error(await linRes.text());
     const linMeta = await linRes.json() as { width: number; height: number; linearUrl: string; colorProfile?: ColorProfileMeta };
-    const binRes = await fetch(linMeta.linearUrl);
+    const binRes = await fetch(resolveUrl(linMeta.linearUrl));
     if (!binRes.ok) throw new Error("Failed to fetch full-resolution data");
     const linear = new Float32Array(await binRes.arrayBuffer());
 
