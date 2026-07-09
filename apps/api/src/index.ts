@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
-import { access, mkdir, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { dirname, extname, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -17,6 +17,7 @@ type RecipeBody = {
 };
 
 const port = Number(process.env.PORT ?? 8790);
+const host = process.env.HOST ?? "127.0.0.1";
 const repoRoot = resolveRepoRoot();
 const sessionsRoot = resolve(repoRoot, "tmp/sessions");
 const RAW_EXTENSIONS = new Set([
@@ -37,6 +38,16 @@ const RAW_EXTENSIONS = new Set([
   ".tiff"
 ]);
 
+const JSON_BODY_LIMIT = 10 * 1024 * 1024;
+const FORM_BODY_LIMIT = 512 * 1024 * 1024;
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+class HttpError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
+
 const NUMERIC_RECIPE_KEYS = [
   "exposure",
   "contrast",
@@ -52,7 +63,7 @@ const NUMERIC_RECIPE_KEYS = [
 ] as const;
 
 const server = createServer((request, response) => {
-  setCors(response);
+  setCors(request, response);
   if (request.method === "OPTIONS") {
     response.writeHead(204).end();
     return;
@@ -61,17 +72,20 @@ const server = createServer((request, response) => {
   void route(request, response).catch((error: unknown) => {
     console.error(error);
     if (!response.headersSent) {
-      sendJson(response, { error: errorMessage(error) }, 500);
+      sendJson(response, { error: errorMessage(error) }, error instanceof HttpError ? error.status : 500);
     } else {
       response.end();
     }
   });
 });
 
-server.listen(port, () => {
-  console.log(`LLR API listening on http://localhost:${port}`);
+server.listen(port, host, () => {
+  console.log(`LLR API listening on http://${host}:${port}`);
   console.log(`Workspace root: ${repoRoot}`);
 });
+
+void cleanupSessions();
+setInterval(() => void cleanupSessions(), 60 * 60 * 1000).unref();
 
 async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
@@ -246,7 +260,7 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
   sendJson(response, {
     width: meta.width,
     height: meta.height,
-    linearUrl: `/api/sources/${body.sourceId}/linear.bin`,
+    linearUrl: `/sources/${body.sourceId}/linear.bin`,
     colorProfile: meta.colorProfile ?? null,
   });
 }
@@ -292,6 +306,33 @@ async function handleExport(request: IncomingMessage, response: ServerResponse):
   streamFile(response, exportPath);
 }
 
+async function cleanupSessions(): Promise<void> {
+  let entries;
+  try {
+    entries = await readdir(sessionsRoot, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.warn(`session cleanup failed: ${errorMessage(error)}`);
+    }
+    return;
+  }
+  const now = Date.now();
+  for (const entry of entries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    const dir = resolve(sessionsRoot, entry.name);
+    try {
+      const stats = await stat(dir);
+      if (now - stats.mtimeMs > SESSION_TTL_MS) {
+        await rm(dir, { recursive: true, force: true });
+      }
+    } catch (error) {
+      console.warn(`session cleanup failed for ${dir}: ${errorMessage(error)}`);
+    }
+  }
+}
+
 async function findSource(sessionDir: string): Promise<string | null> {
   for (const ext of RAW_EXTENSIONS) {
     const candidate = resolve(sessionDir, `source${ext}`);
@@ -317,13 +358,27 @@ class WorkerDaemon {
     this.cwd = cwd;
   }
 
-  async send(payload: Record<string, unknown>): Promise<DaemonResponse> {
+  async send(payload: Record<string, unknown>, timeoutMs = 120_000): Promise<DaemonResponse> {
     await this.ensureRunning();
     const id = randomUUID();
     return new Promise<DaemonResponse>((resolvePromise, rejectPromise) => {
-      this.pending.set(id, { resolve: resolvePromise, reject: rejectPromise });
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        rejectPromise(new Error(`worker daemon request timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      this.pending.set(id, {
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolvePromise(value);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          rejectPromise(error);
+        }
+      });
       const child = this.child;
       if (!child) {
+        clearTimeout(timer);
         this.pending.delete(id);
         rejectPromise(new Error("worker daemon is not running"));
         return;
@@ -363,9 +418,7 @@ class WorkerDaemon {
       child.stderr.on("data", onReady);
       child.once("error", rejectReady);
       child.once("exit", (code) => {
-        if (code !== 0) {
-          rejectReady(new Error(`worker daemon exited before ready (code ${code ?? "null"})`));
-        }
+        rejectReady(new Error(`worker daemon exited before ready (code ${code ?? "null"})`));
       });
     });
 
@@ -428,15 +481,40 @@ async function readFormData(request: IncomingMessage): Promise<FormData> {
     }
   }
 
-  const body = Readable.toWeb(request) as unknown as BodyInit;
+  let exceeded = false;
+  const limited = Readable.from((async function* () {
+    let total = 0;
+    for await (const chunk of request) {
+      total += (chunk as Buffer).length;
+      if (total > FORM_BODY_LIMIT) {
+        exceeded = true;
+        throw new HttpError(413, "Request body too large");
+      }
+      yield chunk as Buffer;
+    }
+  })());
+
+  const body = Readable.toWeb(limited) as unknown as BodyInit;
   const fakeUrl = `http://localhost${request.url ?? "/"}`;
   const req = new Request(fakeUrl, { method: "POST", headers, body, duplex: "half" } as RequestInit & { duplex: "half" });
-  return req.formData();
+  try {
+    return await req.formData();
+  } catch (error) {
+    if (exceeded) {
+      throw new HttpError(413, "Request body too large");
+    }
+    throw error;
+  }
 }
 
 async function readJson<T>(request: IncomingMessage): Promise<T> {
   const chunks: Buffer[] = [];
+  let total = 0;
   for await (const chunk of request) {
+    total += (chunk as Buffer).length;
+    if (total > JSON_BODY_LIMIT) {
+      throw new HttpError(413, "Request body too large");
+    }
     chunks.push(chunk as Buffer);
   }
   const text = Buffer.concat(chunks).toString("utf8");
@@ -448,30 +526,42 @@ async function readJson<T>(request: IncomingMessage): Promise<T> {
 
 function streamFile(response: ServerResponse, path: string): void {
   const stream = createReadStream(path);
+  stream.once("open", () => {
+    response.writeHead(200, {
+      "content-type": "image/jpeg",
+      "cache-control": "no-store"
+    });
+    stream.pipe(response);
+  });
   stream.on("error", (error: NodeJS.ErrnoException) => {
+    if (response.headersSent) {
+      response.destroy();
+      return;
+    }
     if (error.code === "ENOENT") {
       sendJson(response, { error: "Not found" }, 404);
     } else {
       sendJson(response, { error: errorMessage(error) }, 500);
     }
   });
-  response.writeHead(200, {
-    "content-type": "image/jpeg",
-    "cache-control": "no-store"
-  });
-  stream.pipe(response);
 }
 
 function streamBinary(response: ServerResponse, path: string): void {
   const stream = createReadStream(path);
-  stream.on("error", (error: NodeJS.ErrnoException) => {
+  stream.once("open", () => {
+    response.writeHead(200, {
+      "content-type": "application/octet-stream",
+      "cache-control": "no-store",
+    });
+    stream.pipe(response);
+  });
+  stream.on("error", () => {
+    if (response.headersSent) {
+      response.destroy();
+      return;
+    }
     response.writeHead(404).end();
   });
-  response.writeHead(200, {
-    "content-type": "application/octet-stream",
-    "cache-control": "no-store",
-  });
-  stream.pipe(response);
 }
 
 function pickExtension(filename: string): string {
@@ -484,10 +574,23 @@ function sendJson(response: ServerResponse, body: unknown, status = 200): void {
   response.end(JSON.stringify(body, null, 2));
 }
 
-function setCors(response: ServerResponse): void {
-  response.setHeader("Access-Control-Allow-Origin", "*");
+function setCors(request: IncomingMessage, response: ServerResponse): void {
+  const origin = request.headers.origin;
+  if (typeof origin !== "string" || !isLocalOrigin(origin)) {
+    return;
+  }
+  response.setHeader("Access-Control-Allow-Origin", origin);
   response.setHeader("Access-Control-Allow-Headers", "content-type");
   response.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+}
+
+function isLocalOrigin(origin: string): boolean {
+  try {
+    const { hostname } = new URL(origin);
+    return hostname === "localhost" || hostname === "127.0.0.1";
+  } catch {
+    return false;
+  }
 }
 
 function errorMessage(error: unknown): string {
