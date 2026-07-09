@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "build": "pnpm -r build",
-    "check": "pnpm -r check && uv run --project apps/worker python -m compileall -q apps/worker/src",
+    "check": "pnpm -r check && pnpm -r test && uv run --project apps/worker python -m compileall -q apps/worker/src",
     "dev": "pnpm --parallel --filter @llr/api --filter @llr/web dev",
     "dev:api": "pnpm --filter @llr/api dev",
     "dev:web": "pnpm --filter @llr/web dev",
