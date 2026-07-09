@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import math
 import os
@@ -8,8 +9,11 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
 import traceback
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -71,6 +75,7 @@ RAW_CAMERA_CACHE_MAX = 6
 # to re-apply, so this stores the final ProPhoto linear — important once denoise
 # makes a re-decode cost seconds (so amount tweaks must not re-run inference).
 _FALLBACK_CACHE: OrderedDict[tuple[Any, ...], tuple[np.ndarray, RawMetadata, dict[str, Any]]] = OrderedDict()
+_FALLBACK_CACHE_MAX = 6
 
 
 NEUTRAL_RECIPE: dict[str, Any] = {
@@ -192,6 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+@functools.lru_cache(maxsize=1)
 def find_repo_root() -> Path:
     start = Path(os.environ.get("INIT_CWD", os.getcwd())).resolve()
     for candidate in [start, *start.parents]:
@@ -283,33 +289,66 @@ def render_export(args: argparse.Namespace, root: Path) -> None:
     )
 
 
+# Daemon concurrency: requests run on a small thread pool so a multi-second
+# denoise render-linear cannot block cheap commands (ping, export) for other
+# sources. Requests for the same source (the `input` path, which keys every
+# global cache) are serialised via a per-source lock — the caches assume no
+# same-source concurrency. _CACHE_LOCK guards the cache dicts themselves
+# (lookup/insert/eviction) against cross-source races.
+DAEMON_MAX_WORKERS = 3
+
+_STDOUT_LOCK = threading.Lock()
+_CACHE_LOCK = threading.Lock()
+_SOURCE_LOCKS: dict[str, threading.Lock] = {}
+_SOURCE_LOCKS_GUARD = threading.Lock()
+
+
+def _source_lock(source: str) -> threading.Lock:
+    with _SOURCE_LOCKS_GUARD:
+        lock = _SOURCE_LOCKS.get(source)
+        if lock is None:
+            lock = threading.Lock()
+            _SOURCE_LOCKS[source] = lock
+        return lock
+
+
 def run_daemon(root: Path) -> None:
     sys.stderr.write("llr-worker daemon ready\n")
     sys.stderr.flush()
-    for raw_line in sys.stdin:
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            request = json.loads(line)
-        except json.JSONDecodeError as error:
-            emit_response({"id": None, "ok": False, "error": f"invalid JSON: {error}"})
-            continue
+    # Exiting the `with` block waits for all in-flight tasks after stdin EOF.
+    with ThreadPoolExecutor(max_workers=DAEMON_MAX_WORKERS) as executor:
+        for raw_line in sys.stdin:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                request = json.loads(line)
+            except json.JSONDecodeError as error:
+                emit_response({"id": None, "ok": False, "error": f"invalid JSON: {error}"})
+                continue
+            executor.submit(daemon_worker, request, root)
 
-        request_id = request.get("id")
-        try:
+
+def daemon_worker(request: dict[str, Any], root: Path) -> None:
+    request_id = request.get("id")
+    source = request.get("input")
+    guard = _source_lock(source) if isinstance(source, str) and source else nullcontext()
+    try:
+        with guard:
             response = handle_daemon_request(request, root)
-            response["id"] = request_id
-            response["ok"] = True
-            emit_response(response)
-        except Exception as error:  # noqa: BLE001
-            traceback.print_exc(file=sys.stderr)
-            emit_response({"id": request_id, "ok": False, "error": str(error)})
+        response["id"] = request_id
+        response["ok"] = True
+        emit_response(response)
+    except Exception as error:  # noqa: BLE001
+        traceback.print_exc(file=sys.stderr)
+        emit_response({"id": request_id, "ok": False, "error": str(error)})
 
 
 def emit_response(payload: dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(payload) + "\n")
-    sys.stdout.flush()
+    line = json.dumps(payload) + "\n"
+    with _STDOUT_LOCK:
+        sys.stdout.write(line)
+        sys.stdout.flush()
 
 
 def handle_daemon_request(request: dict[str, Any], root: Path) -> dict[str, Any]:
@@ -374,7 +413,10 @@ def daemon_render(request: dict[str, Any], root: Path) -> dict[str, Any]:
     lut = load_cube_lut(resolve_path(root, lut_path)) if lut_path else None
 
     cache_key = build_cache_key(input_path, profile_id, dcp_arg, disable_dcp, half_size, max_size)
-    prepared = PREPARED_CACHE.get(cache_key)
+    with _CACHE_LOCK:
+        prepared = PREPARED_CACHE.get(cache_key)
+        if prepared is not None:
+            PREPARED_CACHE.move_to_end(cache_key)
     cache_hit = prepared is not None
     if prepared is None:
         prepared = prepare_linear(
@@ -386,11 +428,10 @@ def daemon_render(request: dict[str, Any], root: Path) -> dict[str, Any]:
             half_size=half_size,
             max_size=max_size,
         )
-        PREPARED_CACHE[cache_key] = prepared
-        while len(PREPARED_CACHE) > PREPARED_CACHE_MAX:
-            PREPARED_CACHE.popitem(last=False)
-    else:
-        PREPARED_CACHE.move_to_end(cache_key)
+        with _CACHE_LOCK:
+            PREPARED_CACHE[cache_key] = prepared
+            while len(PREPARED_CACHE) > PREPARED_CACHE_MAX:
+                PREPARED_CACHE.popitem(last=False)
 
     image, auto_tone = finalize_image(prepared, recipe, lut, max_size=None)
     quality = 82 if half_size else 92
@@ -457,9 +498,12 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
 
     # Check processed sRGB cache first
     cache_key = _linear_cache_key(input_path, half_size, max_size, dcp_code, dn_model, dn_amount)
-    if cache_key in _LINEAR_CACHE:
-        linear_arr, color_profile = _LINEAR_CACHE[cache_key]
-        _LINEAR_CACHE.move_to_end(cache_key)
+    with _CACHE_LOCK:
+        cached_linear = _LINEAR_CACHE.get(cache_key)
+        if cached_linear is not None:
+            _LINEAR_CACHE.move_to_end(cache_key)
+    if cached_linear is not None:
+        linear_arr, color_profile = cached_linear
         linear = linear_arr.tobytes()
         with open(output_path, "wb") as f:
             f.write(linear)
@@ -513,9 +557,10 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     # single entry can be hundreds of MB and exports are one-off, so caching them
     # would pin gigabytes with no reuse. Previews (half/max-size capped) still cache.
     if half_size or max_size:
-        _LINEAR_CACHE[cache_key] = (linear_arr, prepared.color_profile)
-        while len(_LINEAR_CACHE) > _LINEAR_CACHE_MAX:
-            _LINEAR_CACHE.popitem(last=False)
+        with _CACHE_LOCK:
+            _LINEAR_CACHE[cache_key] = (linear_arr, prepared.color_profile)
+            while len(_LINEAR_CACHE) > _LINEAR_CACHE_MAX:
+                _LINEAR_CACHE.popitem(last=False)
 
     linear = linear_arr.tobytes()
     with open(output_path, "wb") as f:
@@ -925,9 +970,12 @@ def prepare_linear(
     cache_key = _raw_cache_key(input_path, half_size, max_size, denoise_model)
 
     # Cache hit: re-apply DCP on cached camera RGB without re-decoding RAW
-    if cache_key in RAW_CAMERA_CACHE:
-        camera_rgb, metadata = RAW_CAMERA_CACHE[cache_key]
-        RAW_CAMERA_CACHE.move_to_end(cache_key)
+    with _CACHE_LOCK:
+        cached_camera = RAW_CAMERA_CACHE.get(cache_key)
+        if cached_camera is not None:
+            RAW_CAMERA_CACHE.move_to_end(cache_key)
+    if cached_camera is not None:
+        camera_rgb, metadata = cached_camera
         dcp_profile, dcp_selection = resolve_dcp_profile(root, dcp_arg, disable_dcp, recipe, metadata)
         if dcp_profile is not None:
             linear, dcp_info = apply_dcp_profile(camera_rgb, dcp_profile)
@@ -935,16 +983,21 @@ def prepare_linear(
             color_profile["selection"] = dcp_selection
             return PreparedLinear(linear=linear, metadata=metadata, color_profile=color_profile)
         # DCP no longer available; fall through to re-decode
-        RAW_CAMERA_CACHE.pop(cache_key, None)
+        with _CACHE_LOCK:
+            RAW_CAMERA_CACHE.pop(cache_key, None)
 
     # Cache hit for the no-DCP fallback: linear is final unless DCP reappeared.
-    if cache_key in _FALLBACK_CACHE:
-        linear, metadata, color_profile = _FALLBACK_CACHE[cache_key]
-        _FALLBACK_CACHE.move_to_end(cache_key)
+    with _CACHE_LOCK:
+        cached_fallback = _FALLBACK_CACHE.get(cache_key)
+        if cached_fallback is not None:
+            _FALLBACK_CACHE.move_to_end(cache_key)
+    if cached_fallback is not None:
+        linear, metadata, color_profile = cached_fallback
         dcp_profile, _ = resolve_dcp_profile(root, dcp_arg, disable_dcp, recipe, metadata)
         if dcp_profile is None:
             return PreparedLinear(linear=linear, metadata=metadata, color_profile=color_profile)
-        _FALLBACK_CACHE.pop(cache_key, None)
+        with _CACHE_LOCK:
+            _FALLBACK_CACHE.pop(cache_key, None)
 
     with rawpy.imread(str(input_path)) as raw:
         metadata = read_raw_metadata(input_path, raw)
@@ -970,9 +1023,10 @@ def prepare_linear(
             if max_size:
                 linear = downsample_linear(linear, max_size)
             color_profile = libraw_color_profile_info()
-            _FALLBACK_CACHE[cache_key] = (linear, metadata, color_profile)
-            while len(_FALLBACK_CACHE) > RAW_CAMERA_CACHE_MAX:
-                _FALLBACK_CACHE.popitem(last=False)
+            with _CACHE_LOCK:
+                _FALLBACK_CACHE[cache_key] = (linear, metadata, color_profile)
+                while len(_FALLBACK_CACHE) > _FALLBACK_CACHE_MAX:
+                    _FALLBACK_CACHE.popitem(last=False)
         else:
             camera_rgb = raw.postprocess(
                 use_camera_wb=True,
@@ -987,9 +1041,10 @@ def prepare_linear(
             if max_size:
                 camera_rgb = downsample_linear(camera_rgb, max_size)
             # Cache camera RGB so DCP code changes skip RAW re-decode
-            RAW_CAMERA_CACHE[cache_key] = (camera_rgb, metadata)
-            while len(RAW_CAMERA_CACHE) > RAW_CAMERA_CACHE_MAX:
-                RAW_CAMERA_CACHE.popitem(last=False)
+            with _CACHE_LOCK:
+                RAW_CAMERA_CACHE[cache_key] = (camera_rgb, metadata)
+                while len(RAW_CAMERA_CACHE) > RAW_CAMERA_CACHE_MAX:
+                    RAW_CAMERA_CACHE.popitem(last=False)
             linear, dcp_info = apply_dcp_profile(camera_rgb, dcp_profile)
             color_profile = dcp_info.to_json()
             color_profile["selection"] = dcp_selection
@@ -1116,6 +1171,7 @@ def read_exiftool_metadata(input_path: Path) -> dict[str, str | None]:
     return {key: string_or_none(record.get(key)) for key in ["Make", "Model", "LensModel", "CreativeStyle", "WhiteBalance"]}
 
 
+@functools.lru_cache(maxsize=1)
 def detect_exiftool() -> str | None:
     root = find_repo_root()
     local = root / "vendor/exiftool/usr/bin/exiftool"
