@@ -5,7 +5,7 @@ import { renderHistogram } from "./rendering/histogram";
 import {
   curveToLUT, buildToneCurveLUT, defaultToneCurve, normalizeToneCurve,
   renderToneCurve, hitTest, hitTestSplit, regionForX,
-  CURVE_PRESETS, type CurvePoint, type ToneCurve, type ToneChannel, type PointChannel,
+  CURVE_PRESETS, type BasicAdjust, type CurvePoint, type ToneCurve, type ToneChannel, type PointChannel,
 } from "./rendering/curve";
 import {
   defaultCrop, cloneCrop, isDefaultCrop, imageDims, buildCropTransform,
@@ -227,8 +227,33 @@ const presetNames = Object.keys(CURVE_PRESETS);
 
 const isPointChannel = (ch: ToneChannel): ch is PointChannel => ch !== "parametric";
 
+// Basic-panel values currently baked into the GPU curve LUT (Contrast, Blacks
+// and positive Whites are display-referred stages of the LUT chain, not shader
+// uniforms). null = the LUT holds the identity curve (hold-to-compare swapped
+// it in).
+let bakedBasic: BasicAdjust | null = { contrast: 0, blacks: 0, whites: 0 };
+
+function currentBasic(): BasicAdjust {
+  return { contrast: recipe.contrast, blacks: recipe.blacks, whites: recipe.whites };
+}
+
+function sameBasic(a: BasicAdjust, b: BasicAdjust): boolean {
+  // Negative Whites is a shader uniform, not part of the bake — clamp both
+  // sides so dragging it below zero doesn't rebake the LUT every frame.
+  return a.contrast === b.contrast && a.blacks === b.blacks
+    && Math.max(a.whites, 0) === Math.max(b.whites, 0);
+}
+
+/** Rebake + upload the curve LUT with the live tone curve and Basic values. */
+function bakeCurveLUT(): void {
+  if (!webglRenderer) return;
+  const basic = currentBasic();
+  webglRenderer.uploadCurveLUT(buildToneCurveLUT(toneCurve.value, basic));
+  bakedBasic = basic;
+}
+
 function applyCurveLUT(): void {
-  if (webglRenderer) webglRenderer.uploadCurveLUT(buildToneCurveLUT(toneCurve.value));
+  bakeCurveLUT();
   scheduleWebGLDraw();
 }
 
@@ -243,7 +268,7 @@ function resetCurve(): void {
   toneCurve.value = defaultToneCurve();
   curveActive.value = -1;
   renderCurveCanvas();
-  if (webglRenderer) webglRenderer.uploadCurveLUT(buildToneCurveLUT(toneCurve.value));
+  bakeCurveLUT();
   drawWebGL(); // immediate, no RAF-batching for reset
 }
 
@@ -695,7 +720,7 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
       p3Supported.value = webglRenderer.p3Supported;
     }
     webglRenderer.uploadImage(linearFloat, linMeta.width, linMeta.height);
-    webglRenderer.uploadCurveLUT(buildToneCurveLUT(toneCurve.value));
+    bakeCurveLUT();
     webglRenderer.uploadProfileCurveLUT(profileCurveLUT);
     // Apply the current crop/straighten (sets output dims, fit, draws, histogram).
     applyCropRender();
@@ -764,12 +789,10 @@ const fullResZoom = computed(() => {
 function buildPipelineParams(): Partial<EditParams> {
   return {
     exposure: recipe.exposure,
-    contrast: 1 + recipe.contrast / 100,
     saturation: 1 + recipe.saturation / 100,
     highlights: recipe.highlights / 100,
     shadows: recipe.shadows / 100,
     whites: recipe.whites / 100,
-    blacks: recipe.blacks / 100,
     vibrance: 1 + recipe.vibrance / 100,
     clarity: recipe.clarity,
     dehaze: recipe.dehaze,
@@ -864,6 +887,12 @@ function computePreviewScale(): number {
 
 function drawWebGL(): void {
   if (!webglRenderer) return;
+  // Contrast/Blacks/+Whites live in the curve LUT bake, not shader uniforms.
+  // Draws are rAF-coalesced (scheduleWebGLDraw), so this rebakes at most once
+  // per frame during a slider drag (sub-millisecond on the CPU).
+  if (!showOriginal.value && (bakedBasic === null || !sameBasic(bakedBasic, currentBasic()))) {
+    bakeCurveLUT();
+  }
   webglRenderer.setPreviewScale(computePreviewScale());
   webglRenderer.draw(showOriginal.value ? baselineParams() : buildPipelineParams());
 }
@@ -1300,7 +1329,12 @@ function onKeyUp(e: KeyboardEvent): void {
 // identity while previewing the original, restoring the live curve on release.
 watch(showOriginal, (v) => {
   if (!webglRenderer) return;
-  webglRenderer.uploadCurveLUT(v ? IDENTITY_CURVE_LUT : buildToneCurveLUT(toneCurve.value));
+  if (v) {
+    webglRenderer.uploadCurveLUT(IDENTITY_CURVE_LUT);
+    bakedBasic = null; // GPU LUT no longer matches the live bake
+  } else {
+    bakeCurveLUT();
+  }
   scheduleWebGLDraw();
 });
 
@@ -1506,7 +1540,7 @@ async function exportImage(): Promise<void> {
     // 2. Render full-res off-screen with the current edit params + crop, read back as JPEG
     renderer = new PipelineRenderer(document.createElement("canvas"));
     renderer.uploadImage(linear, linMeta.width, linMeta.height);
-    renderer.uploadCurveLUT(buildToneCurveLUT(toneCurve.value));
+    renderer.uploadCurveLUT(buildToneCurveLUT(toneCurve.value, currentBasic()));
     renderer.uploadProfileCurveLUT(buildProfileLUT(linMeta.colorProfile));
     const [iw, ih] = imageDims(linMeta.width, linMeta.height, crop.orientation);
     const rect = cropOutputRect(crop, iw, ih);

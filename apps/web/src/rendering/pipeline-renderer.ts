@@ -5,14 +5,16 @@
  * Renders directly to canvas — no FBO ping-pong needed.
  */
 
-import { PASSES, VERTEX_SHADER } from "./passes";
-import { computeWbGain } from "./color-spaces";
+import { MASK_BLUR_SHADER, MASK_DOWNSAMPLE_SHADER, MASK_VERTEX_SHADER, PASSES, VERTEX_SHADER } from "./passes";
+import { computeWbGain, PROPHOTO_Y } from "./color-spaces";
 import type { HistogramBins } from "./histogram";
 
+// Contrast and Blacks are not here: they are display-referred and baked into
+// the tone-curve LUT (curve.ts BasicAdjust), not shader uniforms.
 export interface EditParams {
-  exposure: number; contrast: number; saturation: number;
+  exposure: number; saturation: number;
   temperature: number; tint: number;
-  highlights: number; shadows: number; whites: number; blacks: number;
+  highlights: number; shadows: number; whites: number;
   vibrance: number; clarity: number; dehaze: number;
   // HSL (8 ranges, each [-1, 1])
   hslH: number[]; hslS: number[]; hslL: number[];
@@ -35,10 +37,15 @@ const HSL_ZERO = [0, 0, 0, 0, 0, 0, 0, 0];
 const HISTO_LONG_GPU = 512;
 const HISTO_LONG_CPU = 256;
 
+// Long-edge cap for the blurred log-luminance mask (Highlights/Shadows
+// locality). Fixed regardless of source size so the blur is a constant
+// fraction of the frame and preview/export masks match by construction.
+const MASK_LONG = 256;
+
 export const DEFAULT_PARAMS: EditParams = {
-  exposure: 0, contrast: 1, saturation: 1,
+  exposure: 0, saturation: 1,
   temperature: 6500, tint: 0,
-  highlights: 0, shadows: 0, whites: 0, blacks: 0,
+  highlights: 0, shadows: 0, whites: 0,
   vibrance: 1, clarity: 0, dehaze: 0,
   hslH: [...HSL_ZERO], hslS: [...HSL_ZERO], hslL: [...HSL_ZERO],
   gradShH: 0, gradShS: 0, gradMdH: 0, gradMdS: 0,
@@ -88,6 +95,17 @@ export class PipelineRenderer {
   } | null = null;
   /** Whether a float render target we can additively blend into is available. */
   private histoGpuSupported = false;
+  // Blurred log2-luminance mask (see MASK_* shaders): built once per
+  // uploadImage; per-frame WB/exposure shifts are applied additively in the
+  // main shader via u_maskShift. Null when unsupported -> u_hasMask = 0 and
+  // the shader falls back to per-pixel region weights.
+  private maskTex: WebGLTexture | null = null;
+  private maskProgDown: WebGLProgram | null = null;
+  private maskProgBlur: WebGLProgram | null = null;
+  private maskBlurDir: WebGLUniformLocation | null = null;
+  private maskVao: WebGLVertexArrayObject | null = null;
+  /** Whether R16F render targets are available for the mask pre-pass. */
+  private maskSupported = false;
   /** Whether the browser exposes a wide-gamut drawing buffer. */
   readonly p3Supported: boolean = false;
 
@@ -101,9 +119,9 @@ export class PipelineRenderer {
     // Full-image GPU histogram needs a float colour buffer we can additively
     // blend into. Calling getExtension also enables it. Where unavailable,
     // readHistogram() falls back to the CPU read-back path.
-    this.histoGpuSupported = !!(
-      gl.getExtension("EXT_color_buffer_float") && gl.getExtension("EXT_float_blend")
-    );
+    const floatRenderable = !!gl.getExtension("EXT_color_buffer_float");
+    this.histoGpuSupported = floatRenderable && !!gl.getExtension("EXT_float_blend");
+    this.maskSupported = floatRenderable;
 
     const pass = PASSES[0];
     this.program = this.compileProgram(pass.fsSource);
@@ -111,6 +129,7 @@ export class PipelineRenderer {
     this.uniforms["u_input"] = gl.getUniformLocation(this.program, "u_input");
     this.uniforms["u_curve_lut"] = gl.getUniformLocation(this.program, "u_curve_lut");
     this.uniforms["u_profile_lut"] = gl.getUniformLocation(this.program, "u_profile_lut");
+    this.uniforms["u_mask_lum"] = gl.getUniformLocation(this.program, "u_mask_lum");
     this.vao = this.createFullScreenQuad();
 
     // Upload identity LUTs as defaults (user tone curve + DCP profile curve).
@@ -147,6 +166,88 @@ export class PipelineRenderer {
     this.outWidth = width; this.outHeight = height;
     this.texXform = new Float32Array([1, 0, 0, 0, -1, 0, 0, 1, 1]);
     this.canvas.width = width; this.canvas.height = height;
+    this.buildLumaMask();
+  }
+
+  /**
+   * Build the blurred log2-luminance mask for the uploaded image: downsample
+   * to ≤MASK_LONG long edge, then a separable Gaussian, into an R16F texture
+   * in source UV space. The single bilinear downsample tap aliases on large
+   * sources; the σ=8 px blur washes it out, and the mask is built once per
+   * upload so there is no temporal shimmer.
+   */
+  private buildLumaMask(): void {
+    const gl = this.gl;
+    if (this.maskTex) { gl.deleteTexture(this.maskTex); this.maskTex = null; }
+    if (!this.maskSupported || !this.sourceTex) return;
+    if (!this.ensureMaskPrograms()) return;
+    const long = Math.max(this.texWidth, this.texHeight) || 1;
+    const scale = Math.min(1, MASK_LONG / long);
+    const w = Math.max(1, Math.round(this.texWidth * scale));
+    const h = Math.max(1, Math.round(this.texHeight * scale));
+
+    const makeTarget = (): { tex: WebGLTexture; fbo: WebGLFramebuffer } => {
+      const t = gl.createTexture()!;
+      gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, w, h, 0, gl.RED, gl.FLOAT, null);
+      // R16F is texture-filterable in core WebGL2 (unlike R32F).
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      const f = gl.createFramebuffer()!;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+      return { tex: t, fbo: f };
+    };
+    const a = makeTarget();
+    const complete = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    if (!complete) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.deleteTexture(a.tex); gl.deleteFramebuffer(a.fbo);
+      this.maskSupported = false; // permanently: u_hasMask=0 -> per-pixel fallback
+      return;
+    }
+    const b = makeTarget();
+
+    gl.viewport(0, 0, w, h);
+    gl.bindVertexArray(this.maskVao);
+    gl.activeTexture(gl.TEXTURE0);
+    const run = (prog: WebGLProgram, src: WebGLTexture, dst: WebGLFramebuffer, dir?: [number, number]) => {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, dst);
+      gl.useProgram(prog);
+      gl.bindTexture(gl.TEXTURE_2D, src);
+      gl.uniform1i(gl.getUniformLocation(prog, "u_input"), 0);
+      if (dir) gl.uniform2f(this.maskBlurDir, dir[0], dir[1]);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+    };
+    run(this.maskProgDown!, this.sourceTex, a.fbo);              // log2 luma
+    run(this.maskProgBlur!, a.tex, b.fbo, [1 / w, 0]);           // blur X
+    run(this.maskProgBlur!, b.tex, a.fbo, [0, 1 / h]);           // blur Y
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    // Only the finished texture outlives the build.
+    gl.deleteFramebuffer(a.fbo);
+    gl.deleteFramebuffer(b.fbo);
+    gl.deleteTexture(b.tex);
+    this.maskTex = a.tex;
+  }
+
+  /** Lazily compile the mask downsample/blur programs and their quad VAO. */
+  private ensureMaskPrograms(): boolean {
+    const gl = this.gl;
+    if (this.maskProgDown) return true;
+    try {
+      this.maskProgDown = this.compileProgramVS(MASK_VERTEX_SHADER, MASK_DOWNSAMPLE_SHADER);
+      this.maskProgBlur = this.compileProgramVS(MASK_VERTEX_SHADER, MASK_BLUR_SHADER);
+    } catch (err) {
+      console.warn("[pipeline] mask programs unavailable:", err);
+      this.maskSupported = false;
+      return false;
+    }
+    this.maskBlurDir = gl.getUniformLocation(this.maskProgBlur, "u_dir");
+    this.maskVao = this.makeQuadVao(0); // MASK_VERTEX_SHADER: layout(location = 0)
+    return true;
   }
 
   /**
@@ -258,6 +359,11 @@ export class PipelineRenderer {
       gl.activeTexture(gl.TEXTURE2);
       gl.bindTexture(gl.TEXTURE_2D, this.profileLutTex);
       gl.uniform1i(this.uniforms["u_profile_lut"], 2);
+    }
+    if (this.maskTex) {
+      gl.activeTexture(gl.TEXTURE3);
+      gl.bindTexture(gl.TEXTURE_2D, this.maskTex);
+      gl.uniform1i(this.uniforms["u_mask_lum"], 3);
     }
     gl.activeTexture(gl.TEXTURE0);
     this.setUniforms(p);
@@ -500,6 +606,10 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     if (this.histoBinFbo) gl.deleteFramebuffer(this.histoBinFbo);
     if (this.histoProgram) gl.deleteProgram(this.histoProgram);
     if (this.histoVao) gl.deleteVertexArray(this.histoVao);
+    if (this.maskTex) gl.deleteTexture(this.maskTex);
+    if (this.maskProgDown) gl.deleteProgram(this.maskProgDown);
+    if (this.maskProgBlur) gl.deleteProgram(this.maskProgBlur);
+    if (this.maskVao) gl.deleteVertexArray(this.maskVao);
     gl.deleteProgram(this.program);
     gl.deleteVertexArray(this.vao);
   }
@@ -516,18 +626,27 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     i("u_displayGamut", p.displayGamut);
     i("u_hasProfileCurve", this.hasProfileCurve ? 1 : 0);
     s("u_exposure", p.exposure); s("u_highlights", p.highlights);
-    s("u_shadows", p.shadows); s("u_whites", p.whites); s("u_blacks", p.blacks);
-    s("u_contrast", p.contrast); s("u_vibrance", p.vibrance); s("u_saturation", p.saturation);
+    s("u_shadows", p.shadows); s("u_whites", p.whites);
+    s("u_vibrance", p.vibrance); s("u_saturation", p.saturation);
     s("u_clarity", p.clarity / 100);
     s("u_dehaze", p.dehaze / 100);
     // Activity flags let the shader skip its two costliest blocks (luma region/
     // contrast and the Oklab HSL mixer) when they are at their identity defaults.
-    const tonalActive = p.highlights !== 0 || p.shadows !== 0 || p.whites !== 0 || p.blacks !== 0;
+    // Positive Whites is display-referred (baked into the curve LUT), so only
+    // its negative half engages the shader's tonal block.
+    const tonalActive = p.highlights !== 0 || p.shadows !== 0 || p.whites < 0;
     const hslActive = (p.hslH?.some((v) => v !== 0) ?? false)
       || (p.hslS?.some((v) => v !== 0) ?? false)
       || (p.hslL?.some((v) => v !== 0) ?? false);
     i("u_tonalActive", tonalActive ? 1 : 0);
     i("u_hslActive", hslActive ? 1 : 0);
+    // The blurred log-luma mask is static per image; WB and exposure reach it
+    // as an additive log2 shift (scalar WB luma gain + the linear part of
+    // exposure — the shoulder is ignored, which only makes the mask read
+    // slightly bright inside compressed highlights, softening a soft weight).
+    i("u_hasMask", this.maskTex ? 1 : 0);
+    const wbLuma = PROPHOTO_Y[0] * wb[0] + PROPHOTO_Y[1] * wb[1] + PROPHOTO_Y[2] * wb[2];
+    s("u_maskShift", Math.log2(Math.max(wbLuma, 1e-6)) + p.exposure - Math.log2(0.18));
     // HSL
     for (let band = 0; band < 8; band++) {
       s(`u_hsl_h[${band}]`, p.hslH?.[band] ?? 0);
@@ -568,15 +687,18 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
   }
 
   private createFullScreenQuad(): WebGLVertexArrayObject {
+    return this.makeQuadVao(this.gl.getAttribLocation(this.program, "a_position"));
+  }
+
+  private makeQuadVao(attribLoc: number): WebGLVertexArrayObject {
     const gl = this.gl;
     const vao = gl.createVertexArray()!;
     gl.bindVertexArray(vao);
     const buf = gl.createBuffer()!;
     gl.bindBuffer(gl.ARRAY_BUFFER, buf);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,-1,1,1,-1,1,1]), gl.STATIC_DRAW);
-    const a = gl.getAttribLocation(this.program, "a_position");
-    gl.enableVertexAttribArray(a);
-    gl.vertexAttribPointer(a, 2, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(attribLoc);
+    gl.vertexAttribPointer(attribLoc, 2, gl.FLOAT, false, 0, 0);
     return vao;
   }
 }

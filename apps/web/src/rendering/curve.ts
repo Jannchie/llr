@@ -41,6 +41,30 @@ export interface ToneCurve {
 export type ToneChannel = "parametric" | "rgb" | "red" | "green" | "blue";
 export type PointChannel = "rgb" | "red" | "green" | "blue";
 
+/**
+ * Basic-panel adjustments baked into the display-referred curve chain
+ * (ahead of the Tone Curve panel's parametric/point stages, as in Lightroom).
+ */
+export interface BasicAdjust {
+  contrast: number; // -100..100
+  blacks: number;   // -100..100
+  /**
+   * Only the positive half acts here. The camera profile's tone curve
+   * asymptotes below 1.0 and flattens the top stops, so a scene-referred gain
+   * can never push the white point to clip — blowing the whites has to happen
+   * display-referred. Pulling them back is the opposite: display values above
+   * white are already clamped, so recovery only exists scene-referred, and
+   * negative Whites stays in the shader.
+   */
+  whites: number;   // -100..100
+}
+
+export const DEFAULT_BASIC: BasicAdjust = { contrast: 0, blacks: 0, whites: 0 };
+
+export function isDefaultBasic(b: BasicAdjust): boolean {
+  return b.contrast === 0 && b.blacks === 0 && b.whites <= 0;
+}
+
 const LUT_SIZE = 2048;
 
 const clamp = (v: number, lo: number, hi: number) => (v < lo ? lo : v > hi ? hi : v);
@@ -183,6 +207,61 @@ export function parametricToLUT(p: ParametricCurve): Float32Array {
   return lut;
 }
 
+// sRGB transfer function (shared by Display-P3). Must match the GLSL
+// srgbEncode in color-spaces.ts.
+export const srgbEncode = (c: number): number =>
+  c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+export const srgbDecode = (c: number): number =>
+  c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+
+/**
+ * Display-referred Basic-panel curve: Contrast S-curve, then the two endpoint
+ * remaps (Whites blows, Blacks crushes). The endpoint remaps run last so each
+ * clip point lands exactly where its slider puts it, whatever the contrast
+ * shape. Like the parametric approximation above, the constants approximate
+ * ACR PV2012's response (the exported XMP carries the raw slider values, so
+ * Lightroom applies its own exact interpretation).
+ *
+ * The shader samples this LUT with *display-linear* values (the sRGB encode
+ * comes last), but Lightroom's Basic sliders act on the perceptual axis —
+ * middle gray at ~0.46, not the ~0.22 it occupies in display-linear. So the
+ * stage runs on the encoded axis and hands back a linear value: the pivot and
+ * the endpoint thresholds below all mean what they say on screen.
+ */
+export function basicCurve(x: number, basic: BasicAdjust): number {
+  let y = srgbEncode(clamp01(x));
+  const cv = clamp(basic.contrast / 100, -1, 1);
+  if (cv !== 0) {
+    // Power-pair S-curve: C1 at the pivot with slope 1.45^cv, endpoints pinned.
+    // k>1 gives an S (deeper toe/shoulder); k<1 the flattening inverse.
+    const P = 0.435; // ≈ middle gray on the encoded axis
+    const k = Math.pow(1.45, cv);
+    y = y <= P
+      ? P * Math.pow(y / P, k)
+      : 1 - (1 - P) * Math.pow((1 - y) / (1 - P), k);
+  }
+  const w = clamp(basic.whites / 100, 0, 1); // negative Whites lives in the shader
+  if (w > 0) {
+    // White-point scale — the exact mirror of the Blacks crush below
+    // (x/(1-t) is (x-t)/(1-t) reflected through x→1-x). +100 clips everything
+    // above 0.85 on screen; black point untouched. Pitched a little stronger
+    // than the crush, matching how Whites outweighs Blacks in Lightroom.
+    const t = 0.15 * w;
+    y = Math.min(y / (1 - t), 1);
+  }
+  const b = clamp(basic.blacks / 100, -1, 1);
+  if (b < 0) {
+    // Black-point crush: remap [t,1] → [0,1]; -100 clips everything below 0.12.
+    const t = 0.12 * -b;
+    y = Math.max((y - t) / (1 - t), 0);
+  } else if (b > 0) {
+    // Fog lift — gentler than the crush, white point untouched.
+    const t = 0.08 * b;
+    y = t + y * (1 - t);
+  }
+  return srgbDecode(clamp01(y));
+}
+
 /** Linear-sample a 2048-entry LUT at x in [0,1]. */
 function sampleLUT(lut: Float32Array, x: number): number {
   const t = clamp01(x) * (LUT_SIZE - 1);
@@ -194,17 +273,22 @@ function sampleLUT(lut: Float32Array, x: number): number {
 /**
  * Bake the full Lightroom curve stack into one interleaved RGB LUT
  * (length 2048*3). Each entry i holds the output for input i/(2047), per channel:
- *   out_c = pointChannel_c( pointRGB( parametric( x ) ) )
+ *   out_c = pointChannel_c( pointRGB( parametric( basic( x ) ) ) )
+ * `basic` is the Basic panel's display-referred stage (Contrast + Blacks),
+ * applied ahead of the Tone Curve panel exactly as in Lightroom.
  */
-export function buildToneCurveLUT(tc: ToneCurve): Float32Array {
+export function buildToneCurveLUT(tc: ToneCurve, basic: BasicAdjust = DEFAULT_BASIC): Float32Array {
   const param = parametricToLUT(tc.parametric);
   const rgb = curveToLUT(tc.rgb);
   const red = curveToLUT(tc.red);
   const green = curveToLUT(tc.green);
   const blue = curveToLUT(tc.blue);
+  const applyBasic = !isDefaultBasic(basic);
   const out = new Float32Array(LUT_SIZE * 3);
   for (let i = 0; i < LUT_SIZE; i++) {
-    const master = sampleLUT(rgb, sampleLUT(param, i / (LUT_SIZE - 1)));
+    const x = i / (LUT_SIZE - 1);
+    const xb = applyBasic ? basicCurve(x, basic) : x;
+    const master = sampleLUT(rgb, sampleLUT(param, xb));
     out[i * 3 + 0] = sampleLUT(red, master);
     out[i * 3 + 1] = sampleLUT(green, master);
     out[i * 3 + 2] = sampleLUT(blue, master);

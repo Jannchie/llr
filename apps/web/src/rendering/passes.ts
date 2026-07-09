@@ -1,8 +1,10 @@
 /**
  * Single-pass WebGL2 shader for RAW image editing.
  *
- * All per-pixel operations (WB, exposure, tone, contrast, vib/sat, gamma)
- * are fused into one shader to eliminate FBO ping-pong overhead.
+ * All per-pixel operations (WB, exposure, tonal regions, vib/sat, gamma) are
+ * fused into one shader to eliminate FBO ping-pong overhead. Contrast and
+ * Blacks are display-referred and baked into the tone-curve LUT (curve.ts),
+ * not applied here.
  */
 
 import { COLOR_GLSL } from "./color-spaces";
@@ -32,13 +34,18 @@ uniform float u_exposure;
 uniform float u_highlights;
 uniform float u_shadows;
 uniform float u_whites;
-uniform float u_blacks;
-uniform float u_contrast;
 uniform float u_vibrance;
 uniform float u_saturation;
 uniform float u_clarity;
 uniform float u_dehaze;
-uniform int u_tonalActive;      // 1 if any highlights/shadows/whites/blacks is non-zero
+uniform int u_tonalActive;      // 1 if any highlights/shadows/whites is non-zero
+// Blurred log2 source luminance (see MASK_* shaders below): drives the
+// Highlights/Shadows region weights so a pixel moves with its *neighborhood*
+// — local contrast survives, as in Lightroom. Built once per uploaded image;
+// per-frame WB/exposure enter additively via u_maskShift (log2 space).
+uniform sampler2D u_mask_lum;
+uniform float u_maskShift;      // log2(luma(wbGain)) + exposure - log2(0.18)
+uniform int u_hasMask;          // 0 -> fall back to per-pixel weights
 uniform int u_hslActive;        // 1 if any HSL band adjustment is non-zero
 // HSL Color Mixer (8 ranges × 3 adjustments)
 uniform float u_hsl_h[8];
@@ -104,6 +111,21 @@ vec3 viewTransform(vec3 c) {
   return (u_viewTransform == 1) ? viewTransformAgX(c) : viewTransformLR(c);
 }
 
+// ===== Exposure shoulder / tonal-region constants =====
+// NOTE: keep in lockstep with the TS mirror in tonal-model.ts (the vitest
+// calibration harness runs the same math over a synthetic step wedge).
+const float LOG2_MID  = -2.4739312;  // log2(0.18): middle gray in log2 luminance
+const float LX_WHITE  =  2.4739312;  // diffuse white, stops above middle gray
+const float EXPO_KNEE = -1.0;        // shoulder knee: 1 stop below diffuse white
+const float EXPO_P    =  1.5;        // shoulder span: luminance ceiling at KNEE+P
+
+// Soft highlight shoulder in log2 luminance: identity below the knee, slope
+// decaying to 0 above it (ceiling at EXPO_KNEE + EXPO_P). Monotone, C1.
+float expoShoulder(float x) {
+  return x <= EXPO_KNEE ? x
+       : EXPO_KNEE + EXPO_P * (1.0 - exp(-(x - EXPO_KNEE) / EXPO_P));
+}
+
 // Gamut compression: bring out-of-gamut display-linear RGB back inside [0,1]^3
 // by desaturating toward the equal-luminance gray. Preserves luminance and keeps
 // hue far more stable than a per-channel clamp.
@@ -149,41 +171,49 @@ void main() {
   // --- White Balance (relative gain, unit at temp=6500 / tint=0) ---
   c *= u_wbGain;
 
-  // --- Exposure ---
-  c *= exp2(u_exposure);
-
-  // === Tonal region adjustments on scene luminance (log-luminance masks) ===
-  // Region gains and contrast both act purely on luminance; with neither engaged
-  // (the default) the block is an identity multiply, so skip it. The branch is on
-  // uniforms — coherent across every pixel, so the GPU takes one side with no
-  // divergence — and it also avoids a needless luma round-trip on untouched frames.
-  if (u_tonalActive == 1 || u_contrast != 1.0) {
-    float Y0 = ppLuma(c);
-    float Y = max(Y0, 1e-6);
+  // === Exposure (highlight-shouldered) + tonal region gains ===
+  // One log-luminance block, applied to RGB as a single hue-preserving ratio.
+  // With everything at defaults the block is an identity multiply, so skip it.
+  // The branch is on uniforms — coherent across every pixel, no divergence —
+  // and it avoids a needless luma round-trip on untouched frames.
+  // (Contrast and Blacks are display-referred and live in the curve LUT bake.)
+  if (u_exposure != 0.0 || u_tonalActive == 1) {
+    float Y0 = max(ppLuma(c), 1e-6);
+    float l = log2(Y0);
+    // Exposure: mids move exactly +E; the stops added above EXPO_KNEE compress
+    // through the shoulder so brights roll off instead of walling at clip.
+    // Negative exposure stays a pure gain (as in Lightroom).
+    float lOut = (u_exposure > 0.0)
+      ? l + expoShoulder(l + u_exposure) - expoShoulder(l)
+      : l + u_exposure;
     if (u_tonalActive == 1) {
-      float lx = log2(Y / 0.18);                          // stops from middle gray
-      // Lightroom model: Highlights/Shadows are *bumps* that taper at the extremes
-      // (recover the bright/dark region without moving the clip points), while
-      // Whites/Blacks are *broad ramps* pivoted at the opposite endpoint (scale a
-      // wide range and set where white/black clip).
-      float wHi = clamp(smoothstep(0.0, 2.0, lx) - smoothstep(3.0, 5.5, lx), 0.0, 1.0); // bright bump, white-point protected
-      float wSh = 1.0 - smoothstep(-3.5, 0.0, lx);        // shadows
-      float wWh = smoothstep(-2.0, 3.5, lx);              // whites: pivots at black -> broad, reaches mids, max at white
-      float wBl = 1.0 - smoothstep(-5.0, -1.5, lx);       // blacks (extreme lows)
-      float gain = 0.0;
-      gain += (u_highlights >= 0.0 ? 0.70 : 0.90) * u_highlights * wHi;
-      gain += (u_shadows    >= 0.0 ? 0.80 : 0.55) * u_shadows    * wSh;
-      gain += (u_whites     >= 0.0 ? 0.70 : 0.80) * u_whites     * wWh;
-      gain += (u_blacks     <= 0.0 ? 0.60 : 0.50) * u_blacks     * wBl;
-      Y *= exp2(gain);
+      float pixLx = lOut - LOG2_MID;                   // stops from middle gray, post-exposure
+      // Highlights responds to a pixel that is bright itself OR sits in a
+      // bright neighborhood (max); Shadows is the mirror (min). This keeps
+      // small speculars/windows responsive (pixel term) while dark texture
+      // inside a bright region moves with the region (mask term) — local
+      // contrast preserved, as in Lightroom. A blended average does neither:
+      // it dilutes small features out of the window and drags region interiors
+      // out of it. Log-domain blurring makes the dark side dominate the mask
+      // near edges, which keeps highlight recovery from bleeding dark halos.
+      float maskLx = (u_hasMask == 1)
+        ? texture(u_mask_lum, v_texCoord).r + u_maskShift
+        : pixLx;
+      float wHi = smoothstep(-0.5, 2.5, max(pixLx, maskLx));
+      float wSh = 1.0 - smoothstep(-3.5, 0.5, min(pixLx, maskLx));
+      // Only *negative* Whites acts here, on pixel luma: pulling the white
+      // point down means rescuing scene values above 1.0, which the view
+      // transform clamps away — so recovery exists only scene-referred.
+      // Blowing the whites is the opposite case: the profile tone curve
+      // asymptotes below 1.0 and flattens the top stops, so no scene-referred
+      // gain can move the clip point. Positive Whites is a display-referred
+      // white-point scale baked into the curve LUT (curve.ts basicCurve).
+      float wWh = smoothstep(-1.5, LX_WHITE, pixLx);
+      lOut += (u_highlights >= 0.0 ? 0.9 : 1.3) * u_highlights * wHi
+            + (u_shadows    >= 0.0 ? 1.8 : 1.1) * u_shadows    * wSh
+            + 1.35 * min(u_whites, 0.0) * wWh;
     }
-    if (u_contrast != 1.0) {
-      // -- Contrast: power curve pivoting at middle gray (scene-linear) --
-      float contrastPow = 1.0 + (u_contrast - 1.0) * 0.6; // u_contrast = 1 + slider/100
-      Y = 0.18 * pow(max(Y / 0.18, 1e-6), contrastPow);
-    }
-    // Apply the luminance change to RGB, hue-preserving in ProPhoto.
-    c *= Y / max(Y0, 1e-6);
+    c *= exp2(lOut - l);
   }
 
   // --- Clarity (local mid-tone contrast, scene-linear around mid gray) ---
@@ -244,9 +274,10 @@ void main() {
   // ===== View transform: scene-linear -> display-referred ProPhoto [0,1] =====
   c = viewTransform(c);
 
-  // --- Tone Curve (parametric + per-channel point curves, display-referred) ---
+  // --- Tone Curve (basic + parametric + per-channel point curves, display-referred) ---
   // Lightroom applies the tone curve per channel, so contrast also shifts
-  // saturation. The LUT bakes parametric -> RGB master -> per-channel.
+  // saturation. The LUT bakes basic (Contrast/Blacks) -> parametric ->
+  // RGB master -> per-channel.
   c = clamp(c, 0.0, 1.0);
   c = vec3(
     texture(u_curve_lut, vec2(c.r, 0.5)).r,
@@ -274,6 +305,56 @@ void main() {
   outColor = vec4(srgbEncode(disp), 1.0); // sRGB transfer (Display-P3 shares it)
 }`;
 
+// ===== Luma-mask pre-pass (blurred log2 luminance for Highlights/Shadows) =====
+// Runs once per uploaded image into a small (≤256 px long edge) R16F texture:
+// downsample to log2 luma, then a separable Gaussian. Rendered in raw source-
+// texture UV space with no u_texXform — the main pass samples the mask at
+// v_texCoord, which *is* source UV after its transform, so crop / straighten /
+// flip stay aligned by construction.
+
+export const MASK_VERTEX_SHADER = `#version 300 es
+precision highp float;
+layout(location = 0) in vec2 a_position;
+out vec2 v_uv;
+void main() {
+  v_uv = a_position * 0.5 + 0.5;
+  gl_Position = vec4(a_position, 0.0, 1.0);
+}`;
+
+export const MASK_DOWNSAMPLE_SHADER = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 outColor;
+uniform sampler2D u_input;
+const vec3 PP_Y = vec3(0.28804020, 0.71187410, 0.00008570); // = PROPHOTO_Y
+void main() {
+  vec3 c = max(texture(u_input, v_uv).rgb, 0.0);
+  outColor = vec4(log2(max(dot(c, PP_Y), 1e-6)), 0.0, 0.0, 1.0);
+}`;
+
+// Separable Gaussian, one axis per pass (u_dir = one texel step). σ/radius are
+// fixed at the mask's ≤256 px resolution, so the blur is a constant fraction
+// (~3%) of the frame regardless of source size — preview and export produce
+// identical masks by construction. Naive taps: 41 reads over ≤256×256 texels,
+// once per image upload; not worth a bilinear-pair optimisation.
+export const MASK_BLUR_SHADER = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 outColor;
+uniform sampler2D u_input;
+uniform vec2 u_dir;
+const float SIGMA = 8.0;
+const int RADIUS = 20;          // 2.5σ
+void main() {
+  float sum = 0.0, wsum = 0.0;
+  for (int i = -RADIUS; i <= RADIUS; i++) {
+    float w = exp(-0.5 * float(i * i) / (SIGMA * SIGMA));
+    sum += w * texture(u_input, v_uv + float(i) * u_dir).r;
+    wsum += w;
+  }
+  outColor = vec4(sum / wsum, 0.0, 0.0, 1.0);
+}`;
+
 export interface PassDef {
   name: string;
   fsSource: string;
@@ -285,9 +366,9 @@ export const PASSES: PassDef[] = [
   { name: "process", fsSource: PROCESS_SHADER, uniforms: [
     "u_texXform", "u_bgColor",
     "u_wbGain", "u_exposure", "u_viewTransform", "u_displayGamut",
-    "u_highlights", "u_shadows", "u_whites", "u_blacks",
-    "u_contrast", "u_vibrance", "u_saturation", "u_clarity", "u_dehaze",
-    "u_tonalActive", "u_hslActive",
+    "u_highlights", "u_shadows", "u_whites",
+    "u_vibrance", "u_saturation", "u_clarity", "u_dehaze",
+    "u_tonalActive", "u_hslActive", "u_maskShift", "u_hasMask",
     "u_hsl_h[0]","u_hsl_h[1]","u_hsl_h[2]","u_hsl_h[3]","u_hsl_h[4]","u_hsl_h[5]","u_hsl_h[6]","u_hsl_h[7]",
     "u_hsl_s[0]","u_hsl_s[1]","u_hsl_s[2]","u_hsl_s[3]","u_hsl_s[4]","u_hsl_s[5]","u_hsl_s[6]","u_hsl_s[7]",
     "u_hsl_l[0]","u_hsl_l[1]","u_hsl_l[2]","u_hsl_l[3]","u_hsl_l[4]","u_hsl_l[5]","u_hsl_l[6]","u_hsl_l[7]",
