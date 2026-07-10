@@ -21,7 +21,8 @@ export {
 export {
   defaultCrop, cloneCrop, isDefaultCrop, imageDims, buildCropTransform,
   cropOutputRect, cropOutputSize, straightenedBBox, cornersInsideImage,
-  constrainCrop, applyAspectRatio, resolveAspectRatio, rotate90, ASPECT_PRESETS,
+  constrainCrop, applyAspectRatio, resolveAspectRatio, resolveAspectFraction,
+  cropOutputSizeForAspect, rotate90, ASPECT_PRESETS,
   customAspectKey, parseCustomAspect, ratioToFraction,
   type CropState, type Orientation, type Rect, type AspectPreset,
 } from "./crop";

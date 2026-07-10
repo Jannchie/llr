@@ -10,7 +10,8 @@ import {
 import {
   defaultCrop, cloneCrop, isDefaultCrop, imageDims, buildCropTransform,
   cropOutputRect, cropOutputSize, straightenedBBox, constrainCrop,
-  applyAspectRatio, resolveAspectRatio, rotate90, cornersInsideImage,
+  applyAspectRatio, resolveAspectRatio, resolveAspectFraction, cropOutputSizeForAspect,
+  rotate90, cornersInsideImage,
   ASPECT_PRESETS, customAspectKey, parseCustomAspect, ratioToFraction,
   type CropState, type Rect,
 } from "./rendering/crop";
@@ -1659,7 +1660,10 @@ async function exportImage(): Promise<void> {
     renderer.uploadProfileCurveLUT(buildProfileLUT(linMeta.colorProfile));
     const [iw, ih] = imageDims(linMeta.width, linMeta.height, crop.orientation);
     const rect = cropOutputRect(crop, iw, ih);
-    const [ow, oh] = cropOutputSize(crop, linMeta.width, linMeta.height);
+    // Snap the output dims to the locked aspect so e.g. a 4:3 crop exports at
+    // an exact 4:3 pixel size instead of each axis rounding independently.
+    const fraction = resolveAspectFraction(cropAspect.value, linMeta.width, linMeta.height, crop);
+    const [ow, oh] = cropOutputSizeForAspect(crop, linMeta.width, linMeta.height, fraction);
     renderer.setOutput(ow, oh, buildCropTransform(crop, linMeta.width, linMeta.height, rect), WORKSPACE_BG);
     renderer.draw(buildPipelineParams());
     const blob = await renderer.toBlob("image/jpeg", 0.92);

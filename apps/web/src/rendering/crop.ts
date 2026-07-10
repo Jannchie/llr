@@ -264,26 +264,70 @@ export function parseCustomAspect(key: string): [number, number] | null {
   return [w, h];
 }
 
+/** Reduce a (possibly decimal, e.g. 8.5:11) w:h pair to an integer fraction. */
+function toIntFraction(w: number, h: number): [number, number] | null {
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return null;
+  let scale = 1;
+  while (scale < 1e6 && (!Number.isInteger(w * scale) || !Number.isInteger(h * scale))) scale *= 10;
+  let p = Math.round(w * scale);
+  let q = Math.round(h * scale);
+  const g = gcd(p, q);
+  return [p / g, q / g];
+}
+
 /**
- * Resolve an aspect key (preset or "custom:w:h") to a concrete pixel ratio
- * (w/h) oriented to match the crop box's current landscape/portrait
- * orientation; null means free.
+ * Resolve an aspect key (preset or "custom:w:h") to a reduced integer w:h
+ * fraction, oriented to match the crop box's current landscape/portrait
+ * orientation; null means free. The exact fraction lets exports snap their
+ * pixel dimensions to the true ratio instead of rounding each axis.
  */
-export function resolveAspectRatio(key: string, srcW: number, srcH: number, c: CropState): number | null {
-  let base: number | null;
+export function resolveAspectFraction(key: string, srcW: number, srcH: number, c: CropState): [number, number] | null {
+  const [iw, ih] = imageDims(srcW, srcH, c.orientation);
+  let base: [number, number] | null;
   const custom = parseCustomAspect(key);
   if (custom) {
-    base = custom[0] / custom[1];
+    base = toIntFraction(custom[0], custom[1]);
   } else {
     const preset = ASPECT_PRESETS.find((p) => p.key === key);
     if (!preset || preset.ratio === null) return null;
-    base = preset.ratio;
+    if (preset.ratio === 0) {
+      base = toIntFraction(iw, ih);
+    } else {
+      const parts = key.split(":");
+      base = toIntFraction(Number(parts[0]), Number(parts[1]));
+    }
   }
-  const [iw, ih] = imageDims(srcW, srcH, c.orientation);
-  if (base === 0) base = iw / ih;
-  const long = Math.max(base, 1 / base);
+  if (!base) return null;
+  let [p, q] = base;
+  if (p < q) [p, q] = [q, p]; // long:short
   const landscape = c.w * iw >= c.h * ih;
-  return landscape ? long : 1 / long;
+  return landscape ? [p, q] : [q, p];
+}
+
+/**
+ * Resolve an aspect key to a concrete pixel ratio (w/h) oriented to match the
+ * crop box's current landscape/portrait orientation; null means free.
+ */
+export function resolveAspectRatio(key: string, srcW: number, srcH: number, c: CropState): number | null {
+  const f = resolveAspectFraction(key, srcW, srcH, c);
+  return f ? f[0] / f[1] : null;
+}
+
+/**
+ * Committed output size snapped to an exact integer multiple of the locked
+ * aspect fraction (e.g. 4:3 → 6228×4671, never 6229×4672). Falls back to the
+ * nominal rounded size for free crops or when the box doesn't actually match
+ * the fraction (legacy state), where snapping would distort.
+ */
+export function cropOutputSizeForAspect(
+  c: CropState, srcW: number, srcH: number, fraction: [number, number] | null,
+): [number, number] {
+  const [ow, oh] = cropOutputSize(c, srcW, srcH);
+  if (!fraction) return [ow, oh];
+  const [p, q] = fraction;
+  if (Math.abs((ow / oh) / (p / q) - 1) > 0.01) return [ow, oh];
+  const k = Math.max(1, Math.min(Math.round(ow / p), Math.round(oh / q)));
+  return [p * k, q * k];
 }
 
 /**

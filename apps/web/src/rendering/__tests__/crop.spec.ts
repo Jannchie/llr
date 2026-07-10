@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   applyAspectRatio, buildCropTransform, cloneCrop, constrainCrop, cornersInsideImage,
-  cropOutputRect, cropOutputSize, customAspectKey, defaultCrop, imageDims, isDefaultCrop,
-  parseCustomAspect, ratioToFraction, resolveAspectRatio, rotate90,
-  straightenedBBox, type CropState,
+  cropOutputRect, cropOutputSize, cropOutputSizeForAspect, customAspectKey, defaultCrop,
+  imageDims, isDefaultCrop, parseCustomAspect, ratioToFraction, resolveAspectFraction,
+  resolveAspectRatio, rotate90, straightenedBBox, type CropState,
 } from "../crop";
 
 const SRC_W = 6000;
@@ -157,6 +157,42 @@ describe("resolveAspectRatio", () => {
     expect(parseCustomAspect("custom:a:b")).toBeNull();
     expect(parseCustomAspect("4:3")).toBeNull();
     expect(resolveAspectRatio("custom:-1:2", SRC_W, SRC_H, defaultCrop())).toBeNull();
+  });
+});
+
+describe("resolveAspectFraction / cropOutputSizeForAspect", () => {
+  const FULL_W = 7008;
+  const FULL_H = 4672; // exact 3:2 camera crop
+
+  it("reduces preset keys to integer fractions, oriented to the box", () => {
+    expect(resolveAspectFraction("4:3", FULL_W, FULL_H, defaultCrop())).toEqual([4, 3]);
+    expect(resolveAspectFraction("16:10", FULL_W, FULL_H, defaultCrop())).toEqual([8, 5]);
+    expect(resolveAspectFraction("8.5:11", FULL_W, FULL_H, defaultCrop())).toEqual([22, 17]);
+    const portrait: CropState = { ...defaultCrop(), w: 0.4, h: 0.9 };
+    expect(resolveAspectFraction("4:3", FULL_W, FULL_H, portrait)).toEqual([3, 4]);
+    expect(resolveAspectFraction("orig", FULL_W, FULL_H, defaultCrop())).toEqual([3, 2]);
+    expect(resolveAspectFraction("free", FULL_W, FULL_H, defaultCrop())).toBeNull();
+  });
+
+  it("snaps the export size to an exact multiple of the fraction", () => {
+    // Largest centered 4:3 box on the 3:2 frame: nominal 6229×4672 rounds to
+    // the exact pair 6228×4671.
+    const c = applyAspectRatio(defaultCrop(), 4 / 3, FULL_W, FULL_H);
+    const [ow, oh] = cropOutputSizeForAspect(c, FULL_W, FULL_H, [4, 3]);
+    expect([ow, oh]).toEqual([6228, 4671]);
+    expect((ow / 4) % 1).toBe(0);
+    expect(oh).toBe((ow / 4) * 3);
+  });
+
+  it("keeps the full frame exact when the image already matches the ratio", () => {
+    const c = applyAspectRatio(defaultCrop(), 3 / 2, FULL_W, FULL_H);
+    expect(cropOutputSizeForAspect(c, FULL_W, FULL_H, [3, 2])).toEqual([FULL_W, FULL_H]);
+  });
+
+  it("refuses to snap when the box doesn't match the fraction", () => {
+    const wide: CropState = { ...defaultCrop(), w: 1, h: 0.5 }; // 3:1 box
+    expect(cropOutputSizeForAspect(wide, FULL_W, FULL_H, [4, 3]))
+      .toEqual(cropOutputSize(wide, FULL_W, FULL_H));
   });
 });
 

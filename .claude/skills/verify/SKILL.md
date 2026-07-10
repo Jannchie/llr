@@ -42,6 +42,9 @@ pnpm dev   # starts @llr/api (port 8790) + @llr/web (vite, port 5173 or next fre
 - Stopping `pnpm dev` can leave the API (`tsx src/index.ts`) and worker daemon alive,
   holding port 8790 → next start dies with EADDRINUSE. `pkill -f "tsx src/index.ts";
   pkill -f "llr-worker daemon"` before relaunching.
+- Run `pnpm dev` from the repo root — the shell cwd persists between Bash calls, and
+  from `apps/web` it silently starts only Vite (API missing → decode hangs on proxy
+  ECONNREFUSED).
 
 - WebGL renders fine in headless Chrome; screenshots show the real render.
 - Don't run `pnpm check`/`vitest` as verification — drive the app.
