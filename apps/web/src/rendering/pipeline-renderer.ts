@@ -680,6 +680,19 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
   }
 
   destroy(): void {
+    this.release();
+    // Release the context itself. Deleting objects frees their memory, but the
+    // context slot stays occupied until GC — and browsers cap live WebGL
+    // contexts (~16), evicting the oldest when a repeatedly-created offscreen
+    // export renderer pushes past the cap. That eviction can hit the main
+    // preview, which has no context-restore path.
+    this.gl.getExtension("WEBGL_lose_context")?.loseContext();
+  }
+
+  // Free every GL object but keep the context alive. A canvas only ever gets
+  // one WebGL context, so the persistent preview canvas must use this (not
+  // destroy()) to be able to host a new PipelineRenderer later.
+  release(): void {
     const gl = this.gl;
     this.destroyed = true;
     if (this.sourceTex) gl.deleteTexture(this.sourceTex);
@@ -700,12 +713,6 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     this.quadBuffers = [];
     gl.deleteProgram(this.program);
     gl.deleteVertexArray(this.vao);
-    // Release the context itself. Deleting objects frees their memory, but the
-    // context slot stays occupied until GC — and browsers cap live WebGL
-    // contexts (~16), evicting the oldest when a repeatedly-created offscreen
-    // export renderer pushes past the cap. That eviction can hit the main
-    // preview, which has no context-restore path.
-    gl.getExtension("WEBGL_lose_context")?.loseContext();
   }
 
   private setUniforms(p: EditParams): void {
