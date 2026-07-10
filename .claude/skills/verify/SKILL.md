@@ -33,7 +33,15 @@ pnpm dev   # starts @llr/api (port 8790) + @llr/web (vite, port 5173 or next fre
   body/stage first before pressing single-key shortcuts (r/x/o/Enter).
 - Undo/redo: `Control+z` / `Control+Shift+z`.
 
+- Export: `page.expect_download()` around `page.click(".export-btn")` captures the JPEG
+  (full-res WebGL render + upload; allow a 180s timeout). Inspect metadata with the
+  system `exiftool` (vendor/exiftool has no binary in this checkout).
+
 ## Gotchas
+
+- Stopping `pnpm dev` can leave the API (`tsx src/index.ts`) and worker daemon alive,
+  holding port 8790 → next start dies with EADDRINUSE. `pkill -f "tsx src/index.ts";
+  pkill -f "llr-worker daemon"` before relaunching.
 
 - WebGL renders fine in headless Chrome; screenshots show the real render.
 - Don't run `pnpm check`/`vitest` as verification — drive the app.

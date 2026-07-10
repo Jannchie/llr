@@ -612,7 +612,15 @@ def daemon_export(request: dict[str, Any], root: Path) -> dict[str, Any]:
 
 
 def copy_exif_provenance(original: Path, target: Path) -> bool:
-    """Copy a curated set of camera EXIF tags from the original into the export."""
+    """Copy all camera metadata from the original into the export.
+
+    Copies every writable tag group (EXIF, GPS, maker notes, IPTC, ...) so no
+    shooting metadata is lost, then overrides the few tags that must describe
+    the export itself: orientation/rotation is baked into the pixels, the EXIF
+    pixel dimensions are the export's, and Software identifies the renderer.
+    XMP is excluded because daemon_export injects LLR's own packet, and the
+    source ICC profile would mislabel the rendered (sRGB) colors.
+    """
     command = detect_exiftool()
     if command is None:
         return False
@@ -623,21 +631,13 @@ def copy_exif_provenance(original: Path, target: Path) -> bool:
                 "-overwrite_original",
                 "-tagsFromFile",
                 str(original),
-                "-Make",
-                "-Model",
-                "-LensModel",
-                "-LensInfo",
-                "-DateTimeOriginal",
-                "-CreateDate",
-                "-OffsetTime",
-                "-FNumber",
-                "-ExposureTime",
-                "-ISO",
-                "-FocalLength",
-                "-FocalLengthIn35mmFormat",
-                "-ExposureProgram",
-                "-MeteringMode",
-                "-Flash",
+                "-all:all",
+                "--xmp:all",
+                "--icc_profile:all",
+                "-tagsFromFile",
+                "@",
+                "-ExifImageWidth<ImageWidth",
+                "-ExifImageHeight<ImageHeight",
                 "-Orientation#=1",
                 "-Software=LLR",
                 str(target),
