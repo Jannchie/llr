@@ -107,6 +107,15 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
     return;
   }
 
+  // Remove the server-side cached copy of an import. Only ever touches
+  // tmp/sessions — the user's original file never enters this system.
+  const sourceMatch = pathname.match(/^\/sources\/([\w-]+)$/);
+  if (method === "DELETE" && sourceMatch) {
+    await rm(resolve(sessionsRoot, sourceMatch[1]), { recursive: true, force: true });
+    sendJson(response, { ok: true });
+    return;
+  }
+
   const embeddedMatch = pathname.match(/^\/sources\/([\w-]+)\/embedded\.jpg$/);
   if (method === "GET" && embeddedMatch) {
     streamFile(response, resolve(sessionsRoot, embeddedMatch[1], "embedded.jpg"));
@@ -581,7 +590,7 @@ function setCors(request: IncomingMessage, response: ServerResponse): void {
   }
   response.setHeader("Access-Control-Allow-Origin", origin);
   response.setHeader("Access-Control-Allow-Headers", "content-type");
-  response.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  response.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
 }
 
 function isLocalOrigin(origin: string): boolean {

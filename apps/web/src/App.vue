@@ -778,6 +778,38 @@ async function selectSource(id: string): Promise<void> {
   schedulePersist();
 }
 
+// Remove an image from the library: drop its edit, thumbnail and server-side
+// cached copy. The original file on the user's disk is never touched — imports
+// only ever copy bytes into the server cache.
+async function removeSource(id: string): Promise<void> {
+  const idx = sources.value.findIndex(s => s.id === id);
+  if (idx < 0) return;
+  sources.value = sources.value.filter(s => s.id !== id);
+  edits.delete(id);
+  if (thumbs[id]) { delete thumbs[id]; void saveThumbs({ ...thumbs }); }
+  void fetch(`${API}/sources/${id}`, { method: "DELETE" }).catch(() => {});
+  if (id === activeId.value) {
+    cropMode.value = false;
+    const next = sources.value[Math.min(idx, sources.value.length - 1)];
+    if (next) {
+      activeId.value = next.id;
+      loadEditFromMap(next.id);
+      await loadSource(next.id, { resetView: true });
+    } else {
+      // Keep webglRenderer alive: its canvas context is single-use (destroy()
+      // loses it for good), so the next import reuses it. The canvas is hidden
+      // via the activeSource gate in the template.
+      activeId.value = null;
+      currentSourceId = "";
+      hasLinearData = false;
+      loadEditFromMap(id); // id is gone from the map -> resets the live edit to defaults
+      status.value = "idle";
+      errorMessage.value = null;
+    }
+  }
+  persistNow();
+}
+
 const activeSource = computed(() => sources.value.find(s => s.id === activeId.value) ?? null);
 
 const displayTransform = computed(() => {
@@ -1845,7 +1877,7 @@ const vWheelAdjust = {
           <span class="spinner spinner-lg" aria-hidden="true" />
           <span>Importing…</span>
         </div>
-        <canvas v-show="webglRenderer != null && !activeSource?.invalid" ref="canvasRef" class="preview" :style="{ transform: displayTransform, width: imageW + 'px', height: imageH + 'px' }" />
+        <canvas v-show="webglRenderer != null && activeSource && !activeSource.invalid" ref="canvasRef" class="preview" :style="{ transform: displayTransform, width: imageW + 'px', height: imageH + 'px' }" />
         <div v-show="activeSource && webglRenderer && (status === 'rendering' || status === 'uploading')"
           class="viewport-busy" aria-live="polite">
           <span class="spinner" aria-hidden="true" />
@@ -2219,20 +2251,28 @@ const vWheelAdjust = {
     <footer class="filmstrip" v-if="sources.length">
       <button class="filmstrip-import" type="button" @click="pickFiles">＋ Import</button>
       <div class="filmstrip-track">
-        <button v-for="source in sources" :key="source.id" type="button"
-          class="film-cell" :class="{ 'is-active': source.id === activeId, 'is-invalid': source.invalid }"
-          :title="`${source.name} · ${formatBytes(source.size)}`"
-          @click="selectSource(source.id)">
-          <div class="film-thumb">
-            <img v-if="thumbSrc(source)" :src="thumbSrc(source)" :alt="source.name" />
-            <div v-else class="thumb-skeleton" aria-hidden="true" />
-            <span v-if="source.id === activeId && status === 'rendering'" class="thumb-loading" aria-hidden="true">
-              <span class="spinner" />
-            </span>
-            <span v-if="source.invalid" class="film-badge" title="源文件已失效，请重新导入">失效</span>
-          </div>
-          <span class="film-name">{{ source.name }}</span>
-        </button>
+        <div v-for="source in sources" :key="source.id"
+          class="film-cell" :class="{ 'is-active': source.id === activeId, 'is-invalid': source.invalid }">
+          <button type="button" class="film-cell-main"
+            :title="`${source.name} · ${formatBytes(source.size)}`"
+            @click="selectSource(source.id)">
+            <div class="film-thumb">
+              <img v-if="thumbSrc(source)" :src="thumbSrc(source)" :alt="source.name" />
+              <div v-else class="thumb-skeleton" aria-hidden="true" />
+              <span v-if="source.id === activeId && status === 'rendering'" class="thumb-loading" aria-hidden="true">
+                <span class="spinner" />
+              </span>
+              <span v-if="source.invalid" class="film-badge" title="源文件已失效，请重新导入">失效</span>
+            </div>
+            <span class="film-name">{{ source.name }}</span>
+          </button>
+          <button type="button" class="film-remove" title="从库中移除（不影响磁盘上的原始文件）"
+            aria-label="从库中移除" @click="removeSource(source.id)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
+              <path d="M6 6l12 12M18 6L6 18" />
+            </svg>
+          </button>
+        </div>
       </div>
     </footer>
 

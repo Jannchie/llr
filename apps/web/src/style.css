@@ -1031,8 +1031,13 @@ input[type="range"]:active::-webkit-slider-thumb {
 }
 
 .film-cell {
+  position: relative;
   flex: 0 0 auto;
   width: 100px;
+}
+
+.film-cell-main {
+  width: 100%;
   display: grid;
   grid-template-rows: auto auto;
   align-content: start;
@@ -1092,13 +1097,43 @@ input[type="range"]:active::-webkit-slider-thumb {
   object-fit: contain;
 }
 
-.film-cell:hover {
+.film-cell:hover .film-cell-main {
   background: var(--card);
 }
 
-.film-cell.is-active {
+.film-cell.is-active .film-cell-main {
   background: var(--card);
   box-shadow: 0 0 0 2px var(--accent);
+}
+
+/* Hover-revealed "remove from library" control on the thumb's top-right. */
+.film-remove {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  color: #fff;
+  background: rgba(13, 13, 14, 0.72);
+  opacity: 0;
+  transition: opacity 120ms, background 120ms;
+}
+
+.film-remove svg {
+  width: 10px;
+  height: 10px;
+}
+
+.film-cell:hover .film-remove,
+.film-remove:focus-visible {
+  opacity: 1;
+}
+
+.film-remove:hover {
+  background: rgba(255, 69, 58, 0.92);
 }
 
 .film-cell.is-invalid img {
