@@ -585,10 +585,12 @@ def daemon_extract_preview(request: dict[str, Any], root: Path) -> dict[str, Any
 
 
 # ── Export: embed edit settings into the rendered JPEG as XMP ──
+#
+# LLR writes its own XMP schema (the llr: namespace) instead of Adobe's
+# camera-raw-settings fields: structured llr:* tags for at-a-glance reading
+# plus the lossless llr:Settings JSON blob as the authoritative record.
 
 LLR_XMP_NS = "http://ns.llr.app/xmp/1.0/"
-CRS_XMP_NS = "http://ns.adobe.com/camera-raw-settings/1.0/"
-HSL_CRS_NAMES = ["Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta"]
 
 
 def daemon_export(request: dict[str, Any], root: Path) -> dict[str, Any]:
@@ -596,7 +598,7 @@ def daemon_export(request: dict[str, Any], root: Path) -> dict[str, Any]:
 
     The frontend renders the full-resolution image via WebGL and posts the JPEG;
     here we (best-effort) copy the original camera EXIF for provenance and inject
-    an XMP packet carrying both a lossless LLR JSON blob and Adobe crs fields.
+    an XMP packet carrying structured llr:* fields plus a lossless LLR JSON blob.
     """
     input_path = resolve_path(root, request["input"])
     target_path = resolve_path(root, request["target"])
@@ -656,67 +658,76 @@ def _num(source: dict[str, Any], key: str, default: float = 0.0) -> float:
         return default
 
 
-def build_crs_attrs(settings: dict[str, Any]) -> "OrderedDict[str, str]":
+def build_llr_attrs(settings: dict[str, Any]) -> "OrderedDict[str, str]":
+    """Structured llr:* fields mirroring LLR's own parameter model.
+
+    Names and units follow the internal recipe (not Adobe's), so the schema can
+    carry everything the editor has — including midtone grading, flips, and 90°
+    orientation, which crs could not express."""
     recipe = settings.get("recipe", {}) or {}
     attrs: OrderedDict[str, str] = OrderedDict()
-    attrs["crs:Version"] = "15.0"
-    attrs["crs:ProcessVersion"] = "11.0"
-    attrs["crs:Exposure2012"] = f"{_num(recipe, 'exposure'):+.2f}"
-    attrs["crs:Contrast2012"] = f"{int(round(_num(recipe, 'contrast')))}"
-    attrs["crs:Highlights2012"] = f"{int(round(_num(recipe, 'highlights')))}"
-    attrs["crs:Shadows2012"] = f"{int(round(_num(recipe, 'shadows')))}"
-    attrs["crs:Whites2012"] = f"{int(round(_num(recipe, 'whites')))}"
-    attrs["crs:Blacks2012"] = f"{int(round(_num(recipe, 'blacks')))}"
-    attrs["crs:Clarity2012"] = f"{int(round(_num(recipe, 'clarity')))}"
-    attrs["crs:Dehaze"] = f"{int(round(_num(recipe, 'dehaze')))}"
-    attrs["crs:Vibrance"] = f"{int(round(_num(recipe, 'vibrance')))}"
-    attrs["crs:Saturation"] = f"{int(round(_num(recipe, 'saturation')))}"
-    attrs["crs:WhiteBalance"] = "Custom"
-    attrs["crs:Temperature"] = f"{int(round(_num(recipe, 'temperature', 6500)))}"
-    attrs["crs:Tint"] = f"{int(round(_num(recipe, 'tint')))}"
+    attrs["llr:Version"] = "1"
+    attrs["llr:Exposure"] = f"{_num(recipe, 'exposure'):+.2f}"
+    for key, name in (
+        ("contrast", "Contrast"), ("highlights", "Highlights"), ("shadows", "Shadows"),
+        ("whites", "Whites"), ("blacks", "Blacks"), ("clarity", "Clarity"),
+        ("dehaze", "Dehaze"), ("vibrance", "Vibrance"), ("saturation", "Saturation"),
+    ):
+        attrs[f"llr:{name}"] = f"{int(round(_num(recipe, key)))}"
+    attrs["llr:Temperature"] = f"{int(round(_num(recipe, 'temperature', 6500)))}"
+    attrs["llr:Tint"] = f"{int(round(_num(recipe, 'tint')))}"
 
-    # Parametric (region) tone curve — Lightroom crs:Parametric* fields.
+    # Parametric (region) tone curve.
     parametric = _curve_settings(settings).get("parametric", {}) or {}
-    attrs["crs:ParametricShadows"] = f"{int(round(_num(parametric, 'shadows')))}"
-    attrs["crs:ParametricDarks"] = f"{int(round(_num(parametric, 'darks')))}"
-    attrs["crs:ParametricLights"] = f"{int(round(_num(parametric, 'lights')))}"
-    attrs["crs:ParametricHighlights"] = f"{int(round(_num(parametric, 'highlights')))}"
-    attrs["crs:ParametricShadowSplit"] = f"{int(round(_num(parametric, 'shadowSplit', 25)))}"
-    attrs["crs:ParametricMidtoneSplit"] = f"{int(round(_num(parametric, 'midtoneSplit', 50)))}"
-    attrs["crs:ParametricHighlightSplit"] = f"{int(round(_num(parametric, 'highlightSplit', 75)))}"
+    attrs["llr:ParametricShadows"] = f"{int(round(_num(parametric, 'shadows')))}"
+    attrs["llr:ParametricDarks"] = f"{int(round(_num(parametric, 'darks')))}"
+    attrs["llr:ParametricLights"] = f"{int(round(_num(parametric, 'lights')))}"
+    attrs["llr:ParametricHighlights"] = f"{int(round(_num(parametric, 'highlights')))}"
+    attrs["llr:ParametricShadowSplit"] = f"{int(round(_num(parametric, 'shadowSplit', 25)))}"
+    attrs["llr:ParametricMidtoneSplit"] = f"{int(round(_num(parametric, 'midtoneSplit', 50)))}"
+    attrs["llr:ParametricHighlightSplit"] = f"{int(round(_num(parametric, 'highlightSplit', 75)))}"
 
-    hue = settings.get("hslHue") or []
-    sat = settings.get("hslSat") or []
-    lum = settings.get("hslLum") or []
-    for i, name in enumerate(HSL_CRS_NAMES):
-        if i < len(hue):
-            attrs[f"crs:HueAdjustment{name}"] = f"{int(round(float(hue[i])))}"
-        if i < len(sat):
-            attrs[f"crs:SaturationAdjustment{name}"] = f"{int(round(float(sat[i])))}"
-        if i < len(lum):
-            attrs[f"crs:LuminanceAdjustment{name}"] = f"{int(round(float(lum[i])))}"
+    # HSL: 8 channels (red→magenta), comma-joined in channel order.
+    def joined(values: Any) -> str:
+        return ",".join(f"{int(round(float(v)))}" for v in (values or []))
 
+    for key, name in (("hslHue", "HslHue"), ("hslSat", "HslSaturation"), ("hslLum", "HslLuminance")):
+        if settings.get(key):
+            attrs[f"llr:{name}"] = joined(settings[key])
+
+    # Color grading, including the midtone wheel and blend that crs lacked.
     grading = settings.get("grading", {}) or {}
 
     def hue360(value: float) -> int:
         return int(round(((value % 360) + 360) % 360))
 
-    attrs["crs:SplitToningShadowHue"] = f"{hue360(_num(grading, 'shH'))}"
-    attrs["crs:SplitToningShadowSaturation"] = f"{int(round(_num(grading, 'shS')))}"
-    attrs["crs:SplitToningHighlightHue"] = f"{hue360(_num(grading, 'hlH'))}"
-    attrs["crs:SplitToningHighlightSaturation"] = f"{int(round(_num(grading, 'hlS')))}"
-    attrs["crs:SplitToningBalance"] = f"{int(round(_num(grading, 'balance')))}"
+    attrs["llr:GradingShadowHue"] = f"{hue360(_num(grading, 'shH'))}"
+    attrs["llr:GradingShadowSaturation"] = f"{int(round(_num(grading, 'shS')))}"
+    attrs["llr:GradingMidtoneHue"] = f"{hue360(_num(grading, 'mdH'))}"
+    attrs["llr:GradingMidtoneSaturation"] = f"{int(round(_num(grading, 'mdS')))}"
+    attrs["llr:GradingHighlightHue"] = f"{hue360(_num(grading, 'hlH'))}"
+    attrs["llr:GradingHighlightSaturation"] = f"{int(round(_num(grading, 'hlS')))}"
+    attrs["llr:GradingBlend"] = f"{int(round(_num(grading, 'blend', 50)))}"
+    attrs["llr:GradingBalance"] = f"{int(round(_num(grading, 'balance')))}"
+
+    dcp = settings.get("dcp")
+    if dcp:
+        attrs["llr:Dcp"] = str(dcp)
+    denoise = settings.get("denoise") or {}
+    if denoise.get("enabled"):
+        attrs["llr:DenoiseModel"] = str(denoise.get("model", ""))
+        attrs["llr:DenoiseAmount"] = f"{int(round(_num(denoise, 'amount', 100)))}"
 
     _add_crop_attrs(attrs, settings.get("crop") or {})
     return attrs
 
 
 def _add_crop_attrs(attrs: "OrderedDict[str, str]", crop: dict[str, Any]) -> None:
-    """Adobe crs crop fields, written only when the crop has an effect.
+    """Crop/recompose fields, written only when the crop has an effect.
 
-    The exported JPEG is already cropped/straightened in pixels; these mirror the
-    recompose for Lightroom-compatible round-tripping alongside the lossless
-    llr:Settings blob (which also carries flips/orientation)."""
+    The exported JPEG is already cropped/straightened in pixels; these record
+    the recompose in LLR's own model (normalized center/size in image space,
+    straighten angle, flips, 90° orientation)."""
     cx = _num(crop, "cx", 0.5)
     cy = _num(crop, "cy", 0.5)
     w = _num(crop, "w", 1.0)
@@ -736,17 +747,18 @@ def _add_crop_attrs(attrs: "OrderedDict[str, str]", crop: dict[str, Any]) -> Non
     if is_default:
         return
 
-    left = clamp(cx - w / 2, 0.0, 1.0)
-    right = clamp(cx + w / 2, 0.0, 1.0)
-    top = clamp(cy - h / 2, 0.0, 1.0)
-    bottom = clamp(cy + h / 2, 0.0, 1.0)
-    attrs["crs:HasCrop"] = "True"
-    attrs["crs:CropLeft"] = f"{left:.6f}"
-    attrs["crs:CropTop"] = f"{top:.6f}"
-    attrs["crs:CropRight"] = f"{right:.6f}"
-    attrs["crs:CropBottom"] = f"{bottom:.6f}"
-    attrs["crs:CropAngle"] = f"{angle:.4f}"
-    attrs["crs:CropConstrainToWarp"] = "1"
+    attrs["llr:HasCrop"] = "True"
+    attrs["llr:CropCenterX"] = f"{cx:.6f}"
+    attrs["llr:CropCenterY"] = f"{cy:.6f}"
+    attrs["llr:CropWidth"] = f"{w:.6f}"
+    attrs["llr:CropHeight"] = f"{h:.6f}"
+    attrs["llr:CropAngle"] = f"{angle:.4f}"
+    if flip_h:
+        attrs["llr:CropFlipH"] = "True"
+    if flip_v:
+        attrs["llr:CropFlipV"] = "True"
+    if orientation:
+        attrs["llr:CropOrientation"] = f"{orientation}"
 
 
 def _curve_settings(settings: dict[str, Any]) -> dict[str, Any]:
@@ -760,20 +772,20 @@ def _curve_settings(settings: dict[str, Any]) -> dict[str, Any]:
 
 
 def _tone_curve_points(points: Any) -> list[str]:
-    """Convert a list of {x,y} (0-1) control points to Lightroom "X, Y" (0-255)."""
+    """Format a list of {x,y} control points as "x, y" in normalized [0,1]."""
     out: list[str] = []
     for point in points or []:
         try:
-            x = int(round(clamp(float(point["x"]) * 255, 0, 255)))
-            y = int(round(clamp(float(point["y"]) * 255, 0, 255)))
+            x = clamp(float(point["x"]), 0.0, 1.0)
+            y = clamp(float(point["y"]), 0.0, 1.0)
         except (KeyError, TypeError, ValueError):
             continue
-        out.append(f"{x}, {y}")
+        out.append(f"{x:.4f}, {y:.4f}")
     return out
 
 
 def _is_identity_curve(points: list[str]) -> bool:
-    return points in ([], ["0, 0", "255, 255"])
+    return points in ([], ["0.0000, 0.0000", "1.0000, 1.0000"])
 
 
 def _xml_escape(text: str) -> str:
@@ -789,22 +801,22 @@ def _tone_curve_block(tag: str, points: list[str]) -> str:
         return ""
     items = "\n     ".join(f"<rdf:li>{_xml_escape(point)}</rdf:li>" for point in points)
     return (
-        f"\n   <crs:{tag}>\n    <rdf:Seq>\n     "
+        f"\n   <llr:{tag}>\n    <rdf:Seq>\n     "
         + items
-        + f"\n    </rdf:Seq>\n   </crs:{tag}>"
+        + f"\n    </rdf:Seq>\n   </llr:{tag}>"
     )
 
 
 def build_xmp_packet(settings: dict[str, Any]) -> str:
-    crs_attrs = build_crs_attrs(settings)
+    llr_attrs = build_llr_attrs(settings)
     curve = _curve_settings(settings)
     llr_json = json.dumps(settings, separators=(",", ":"), ensure_ascii=False)
 
-    attr_lines = "\n   ".join(f'{key}="{_xml_attr(value)}"' for key, value in crs_attrs.items())
+    attr_lines = "\n   ".join(f'{key}="{_xml_attr(value)}"' for key, value in llr_attrs.items())
 
-    # RGB master curve is always written; per-channel curves only when non-identity.
-    tone_block = _tone_curve_block("ToneCurvePV2012", _tone_curve_points(curve.get("rgb")))
-    for tag, key in (("ToneCurvePV2012Red", "red"), ("ToneCurvePV2012Green", "green"), ("ToneCurvePV2012Blue", "blue")):
+    # Point tone curves, one Seq per channel, only when non-identity.
+    tone_block = ""
+    for tag, key in (("ToneCurveRgb", "rgb"), ("ToneCurveRed", "red"), ("ToneCurveGreen", "green"), ("ToneCurveBlue", "blue")):
         pts = _tone_curve_points(curve.get(key))
         if not _is_identity_curve(pts):
             tone_block += _tone_curve_block(tag, pts)
@@ -814,10 +826,8 @@ def build_xmp_packet(settings: dict[str, Any]) -> str:
         '<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="LLR">\n'
         ' <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">\n'
         '  <rdf:Description rdf:about=""\n'
-        f'   xmlns:crs="{CRS_XMP_NS}"\n'
         f'   xmlns:llr="{LLR_XMP_NS}"\n'
-        f"   {attr_lines}\n"
-        '   llr:Version="1">'
+        f"   {attr_lines}>"
         f"{tone_block}\n"
         f"   <llr:Settings>{_xml_escape(llr_json)}</llr:Settings>\n"
         "  </rdf:Description>\n"

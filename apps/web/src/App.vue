@@ -1664,7 +1664,7 @@ async function exportImage(): Promise<void> {
     renderer.draw(buildPipelineParams());
     const blob = await renderer.toBlob("image/jpeg", 0.92);
 
-    // 3. Embed edit settings (LLR JSON + Adobe crs) into the JPEG server-side
+    // 3. Embed edit settings (llr:* XMP + lossless LLR JSON) into the JPEG server-side
     const fd = new FormData();
     fd.append("file", blob, "export.jpg");
     fd.append("meta", JSON.stringify({ sourceId: currentSourceId, settings: captureSnapshot() }));
