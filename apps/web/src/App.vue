@@ -1698,7 +1698,8 @@ async function exportImage(): Promise<void> {
     const [ow, oh] = cropOutputSizeForAspect(crop, linMeta.width, linMeta.height, fraction);
     renderer.setOutput(ow, oh, buildCropTransform(crop, linMeta.width, linMeta.height, rect), WORKSPACE_BG);
     renderer.draw(buildPipelineParams());
-    const blob = await renderer.toBlob("image/jpeg", 0.92);
+    // quality 1.0 also disables the browser encoder's 4:2:0 chroma subsampling
+    const blob = await renderer.toBlob("image/jpeg", 1.0);
 
     // 3. Embed edit settings (llr:* XMP + lossless LLR JSON) into the JPEG server-side
     const fd = new FormData();
