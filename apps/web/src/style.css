@@ -29,6 +29,7 @@
   --accent-strong: #409cff;
   --accent-soft: rgba(10, 132, 255, 0.18);
   --error: #ff6961;
+  --danger: rgba(255, 69, 58, 0.92);  /* destructive fills (iOS dark system red) */
 
   /* Slider track (unfilled) */
   --track-bg: rgba(255, 255, 255, 0.16);
@@ -1133,7 +1134,7 @@ input[type="range"]:active::-webkit-slider-thumb {
 }
 
 .film-remove:hover {
-  background: rgba(255, 69, 58, 0.92);
+  background: var(--danger);
 }
 
 .film-cell.is-invalid img {
@@ -1153,7 +1154,7 @@ input[type="range"]:active::-webkit-slider-thumb {
   font-weight: 600;
   letter-spacing: 0.02em;
   color: #fff;
-  background: rgba(255, 69, 58, 0.92);
+  background: var(--danger);
   border-radius: var(--radius-pill);
 }
 
@@ -1205,7 +1206,7 @@ input[type="range"]:active::-webkit-slider-thumb {
   font-size: 13px;
   line-height: 1.4;
   color: #fff;
-  background: rgba(255, 69, 58, 0.92);
+  background: var(--danger);
   border-radius: var(--radius);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
   cursor: pointer;

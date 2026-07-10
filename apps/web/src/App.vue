@@ -766,15 +766,20 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
   }
 }
 
+// Point the live edit + pixels at `id` (does NOT save the outgoing edit).
+function activateSource(id: string): Promise<boolean> {
+  activeId.value = id;
+  loadEditFromMap(id);
+  return loadSource(id, { resetView: true });
+}
+
 // Switch the active image: stash the current edit, load the target's edit + pixels.
 async function selectSource(id: string): Promise<void> {
   if (id === activeId.value) return;
   flushPendingHistory();
   cropMode.value = false; // leave the crop editor when switching images
   syncLiveToMap(activeId.value);
-  activeId.value = id;
-  loadEditFromMap(id);
-  await loadSource(id, { resetView: true });
+  await activateSource(id);
   schedulePersist();
 }
 
@@ -788,26 +793,28 @@ async function removeSource(id: string): Promise<void> {
   edits.delete(id);
   if (thumbs[id]) { delete thumbs[id]; void saveThumbs({ ...thumbs }); }
   void fetch(`${API}/sources/${id}`, { method: "DELETE" }).catch(() => {});
+  let loading: Promise<boolean> | null = null;
   if (id === activeId.value) {
     cropMode.value = false;
     const next = sources.value[Math.min(idx, sources.value.length - 1)];
     if (next) {
-      activeId.value = next.id;
-      loadEditFromMap(next.id);
-      await loadSource(next.id, { resetView: true });
+      loading = activateSource(next.id); // synchronously points activeId + live edit at next
     } else {
-      // Keep webglRenderer alive: its canvas context is single-use (destroy()
-      // loses it for good), so the next import reuses it. The canvas is hidden
-      // via the activeSource gate in the template.
       activeId.value = null;
       currentSourceId = "";
       hasLinearData = false;
+      srcW.value = 0;
+      srcH.value = 0;
+      timing.value = null;
+      destroyWebGL({ keepContext: true }); // frees the removed image's GPU texture
       loadEditFromMap(id); // id is gone from the map -> resets the live edit to defaults
       status.value = "idle";
       errorMessage.value = null;
     }
   }
+  // Persist the removal now — not after the neighbour's multi-second decode.
   persistNow();
+  await loading;
 }
 
 const activeSource = computed(() => sources.value.find(s => s.id === activeId.value) ?? null);
@@ -986,11 +993,18 @@ function drawWebGL(): void {
 function startCompare(): void { if (activeSource.value && !cropMode.value) showOriginal.value = true; }
 function endCompare(): void { showOriginal.value = false; }
 
-function destroyWebGL(): void {
+// keepContext: release GL objects but keep the canvas's context usable, so the
+// persistent preview canvas can host a new renderer later (a canvas whose
+// context was lost via destroy() can never get another one).
+function destroyWebGL(opts: { keepContext?: boolean } = {}): void {
   if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
   if (histoTimer) { clearTimeout(histoTimer); histoTimer = 0; }
   drawPending = false;
-  if (webglRenderer) { webglRenderer.destroy(); webglRenderer = null; }
+  if (webglRenderer) {
+    if (opts.keepContext) webglRenderer.release();
+    else webglRenderer.destroy();
+    webglRenderer = null;
+  }
 }
 
 // ── Crop rendering ──
@@ -1578,9 +1592,7 @@ async function restoreSession(): Promise<boolean> {
   const targetId = persisted.activeId && sources.value.some(s => s.id === persisted.activeId)
     ? persisted.activeId
     : sources.value[0].id;
-  activeId.value = targetId;
-  loadEditFromMap(targetId);
-  await loadSource(targetId, { resetView: true });
+  await activateSource(targetId);
 
   // Backfill any thumbnails missing from the cache (e.g. first run after upgrade).
   for (const s of sources.value) if (!thumbs[s.id]) void cacheThumb(s);
@@ -1637,9 +1649,7 @@ async function uploadFiles(files: File[]): Promise<void> {
   // Make the last imported image active and render it (loadSource sets the
   // final status to idle/error and records the decode timing).
   if (lastId) {
-    activeId.value = lastId;
-    loadEditFromMap(lastId);
-    await loadSource(lastId, { resetView: true });
+    await activateSource(lastId);
   } else {
     status.value = "idle";
   }
