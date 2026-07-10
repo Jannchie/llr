@@ -1312,6 +1312,25 @@ input[type="range"]:active::-webkit-slider-thumb {
   min-width: 0;
 }
 
+.crop-custom {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+}
+
+.crop-custom .slider-number {
+  flex: 1;
+  min-width: 0;
+  width: auto;
+}
+
+.crop-custom-x {
+  flex: none;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
 .icon-mini {
   display: inline-flex;
   align-items: center;

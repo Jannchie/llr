@@ -11,7 +11,8 @@ import {
   defaultCrop, cloneCrop, isDefaultCrop, imageDims, buildCropTransform,
   cropOutputRect, cropOutputSize, straightenedBBox, constrainCrop,
   applyAspectRatio, resolveAspectRatio, rotate90, cornersInsideImage,
-  ASPECT_PRESETS, type CropState, type Rect,
+  ASPECT_PRESETS, customAspectKey, parseCustomAspect, ratioToFraction,
+  type CropState, type Rect,
 } from "./rendering/crop";
 import {
   loadState, saveState, loadThumbs, saveThumbs, generateThumb,
@@ -158,7 +159,10 @@ const viewSettings = reactive({ viewTransform: 0, displayGamut: 0 });
 // the display back to the cropped output. All geometry lives in crop.ts.
 const crop = reactive<CropState>(defaultCrop());
 const cropMode = ref(false);
-const cropAspect = ref<string>("free");
+// Aspect lock for the crop box. Defaults to 4:3 for new images; part of the
+// per-image snapshot so it survives image switches / undo / persistence.
+const DEFAULT_ASPECT = "4:3";
+const cropAspect = ref<string>(DEFAULT_ASPECT);
 // Crop-editor render window (output-frame px) + the canvas scale used to draw it,
 // kept so the overlay can map between screen, output-frame and crop-box space.
 const cropBBox = reactive<Rect>({ x: 0, y: 0, w: 1, h: 1 });
@@ -482,6 +486,7 @@ type Snapshot = {
   grading: typeof grading;
   curve: ToneCurve;
   crop: CropState;
+  aspect?: string;  // crop aspect-lock key; optional: absent in older persisted sessions
   dcp: string;
   denoise?: typeof denoise;  // optional: absent in pre-denoise persisted sessions
 };
@@ -511,6 +516,7 @@ function defaultSnapshot(): Snapshot {
     grading: { shH: 0, shS: 0, mdH: 0, mdS: 0, hlH: 0, hlS: 0, blend: 50, balance: 0 } as typeof grading,
     curve: defaultToneCurve(),
     crop: defaultCrop(),
+    aspect: DEFAULT_ASPECT,
     dcp: "",
     denoise: defaultDenoise(),
   };
@@ -526,6 +532,7 @@ function captureSnapshot(): Snapshot {
     grading: { ...grading },
     curve: normalizeToneCurve(toneCurve.value),
     crop: cloneCrop(crop),
+    aspect: cropAspect.value,
     dcp: dcpCode.value,
     denoise: { ...denoise },
   };
@@ -570,7 +577,9 @@ function setEditState(s: Snapshot): void {
   toneCurve.value = normalizeToneCurve(s.curve);
   curveActive.value = -1;
   Object.assign(crop, s.crop ? cloneCrop(s.crop) : defaultCrop());
-  cropAspect.value = "free";
+  // Older snapshots have no aspect: fall back to "free" so a legacy crop box
+  // that doesn't match the new default lock isn't reshaped by the next drag.
+  cropAspect.value = s.aspect ?? "free";
   Object.assign(denoise, s.denoise ?? defaultDenoise());
   dcpCode.value = s.dcp;
   // Rebake with the snapshot's Basic values (bakeCurveLUT also syncs bakedBasic).
@@ -1004,6 +1013,12 @@ function enterCropMode(): void {
   flushPendingHistory();
   cropMode.value = true;
   zoom.value = 1; pan.x = 0; pan.y = 0;
+  // Untouched image with an aspect lock (e.g. the 4:3 default): propose the
+  // largest centered box of that ratio, so the lock and the box agree.
+  if (isDefaultCrop(crop)) {
+    const ratio = lockedRatio.value;
+    if (ratio != null) Object.assign(crop, applyAspectRatio(crop, ratio, srcW.value, srcH.value));
+  }
   nextTick(renderCropEditor);
 }
 
@@ -1026,25 +1041,36 @@ function resetCrop(): void {
 
 // ── Crop controls (aspect / straighten / rotate / flip) ──
 
-const lockedRatio = computed(() => resolveAspectRatio(cropAspect.value, srcW.value, srcH.value, crop.orientation));
+const lockedRatio = computed(() => resolveAspectRatio(cropAspect.value, srcW.value, srcH.value, crop));
+
+// Custom aspect ("Enter Custom…", Lightroom-style). The two numbers live in the
+// aspect key itself ("custom:16:10") so they persist/undo with the snapshot.
+const customAspect = computed(() => parseCustomAspect(cropAspect.value));
 
 function selectAspect(key: string): void {
+  if (key === "custom") {
+    // Seed the custom inputs from the current lock (or the box shape for free).
+    const [iw, ih] = currentImageDims();
+    const r = lockedRatio.value ?? (crop.w * iw) / (crop.h * ih);
+    const [fw, fh] = ratioToFraction(Math.max(r, 1 / r));
+    key = customAspectKey(fw, fh);
+  }
   cropAspect.value = key;
-  const ratio = resolveAspectRatio(key, srcW.value, srcH.value, crop.orientation);
+  const ratio = resolveAspectRatio(key, srcW.value, srcH.value, crop);
   if (ratio != null) Object.assign(crop, applyAspectRatio(crop, ratio, srcW.value, srcH.value));
 }
 
-const ASPECT_SWAP: Record<string, string> = {
-  "2:3": "3:2", "3:2": "2:3", "4:5": "5:4", "5:4": "4:5", "3:4": "4:3",
-  "4:3": "3:4", "5:7": "7:5", "7:5": "5:7", "9:16": "16:9", "16:9": "9:16",
-};
+function setCustomAspect(w: number, h: number): void {
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return;
+  selectAspect(customAspectKey(w, h));
+}
 
+// Swap the crop box between landscape/portrait (Lightroom's X). The aspect key
+// is orientation-agnostic, so swapping the box's pixel dims is enough: the
+// locked ratio re-resolves to follow the new orientation.
 function swapAspect(): void {
-  const k = cropAspect.value;
-  if (ASPECT_SWAP[k]) { selectAspect(ASPECT_SWAP[k]); return; }
-  if (k === "orig" || k === "1:1") return;
-  // Free aspect: swap the current box's pixel dimensions.
   const [iw, ih] = currentImageDims();
+  if (Math.abs(crop.w * iw - crop.h * ih) < 0.5) return; // square box: nothing to swap
   const next = constrainCrop({ ...crop, w: (crop.h * ih) / iw, h: (crop.w * iw) / ih }, srcW.value, srcH.value);
   Object.assign(crop, next);
 }
@@ -1075,13 +1101,31 @@ const cropBoxRect = computed<Rect>(() => {
   return { x: crop.cx * iw - Wc / 2, y: crop.cy * ih - Hc / 2, w: Wc, h: Hc };
 });
 
-// Thirds grid lines inside the crop box, in output-frame coords.
-const cropThirds = computed(() => {
+// Guide overlay inside the crop box (O cycles, Lightroom-style).
+const CROP_GUIDES = ["thirds", "golden", "diagonal", "grid", "off"] as const;
+type CropGuide = (typeof CROP_GUIDES)[number];
+const cropGuide = ref<CropGuide>("thirds");
+
+function cycleCropGuide(): void {
+  const i = CROP_GUIDES.indexOf(cropGuide.value);
+  cropGuide.value = CROP_GUIDES[(i + 1) % CROP_GUIDES.length];
+}
+
+// Guide lines in output-frame coords: fractional v/h lines plus box diagonals.
+const cropGuideLines = computed(() => {
   const r = cropBoxRect.value;
-  return {
-    v: [r.x + r.w / 3, r.x + (2 * r.w) / 3],
-    h: [r.y + r.h / 3, r.y + (2 * r.h) / 3],
-  };
+  const at = (fs: number[]) => ({
+    v: fs.map((f) => r.x + r.w * f),
+    h: fs.map((f) => r.y + r.h * f),
+    diag: false,
+  });
+  switch (cropGuide.value) {
+    case "thirds": return at([1 / 3, 2 / 3]);
+    case "golden": return at([0.382, 0.618]);
+    case "grid": return at([0.25, 0.5, 0.75]);
+    case "diagonal": return { v: [], h: [], diag: true };
+    default: return { v: [], h: [], diag: false };
+  }
 });
 
 const CROP_HANDLES: { key: CropHandle; fx: number; fy: number; cursor: string }[] = [
@@ -1115,7 +1159,7 @@ function cropHandlePos(h: { fx: number; fy: number }): { x: number; y: number } 
 
 type CropDrag =
   | { mode: "move"; startX: number; startY: number; cx: number; cy: number }
-  | { mode: "resize"; handle: CropHandle; l: number; t: number; r: number; b: number }
+  | { mode: "resize"; handle: CropHandle; l: number; t: number; r: number; b: number; startRatio: number }
   | { mode: "rotate"; startPointerDeg: number; startAngle: number };
 let cropDrag: CropDrag | null = null;
 
@@ -1139,7 +1183,7 @@ function onCropHandleDown(e: MouseEvent, handle: CropHandle): void {
   e.preventDefault();
   e.stopPropagation();
   const r = cropBoxRect.value;
-  cropDrag = { mode: "resize", handle, l: r.x, t: r.y, r: r.x + r.w, b: r.y + r.h };
+  cropDrag = { mode: "resize", handle, l: r.x, t: r.y, r: r.x + r.w, b: r.y + r.h, startRatio: r.w / r.h };
   attachCropDrag();
 }
 
@@ -1177,7 +1221,7 @@ function onCropDragMove(e: MouseEvent): void {
     const deg = (Math.atan2(p.y - crop.cy * ih, p.x - crop.cx * iw) * 180) / Math.PI;
     setAngle(cropDrag.startAngle + (deg - cropDrag.startPointerDeg));
   } else {
-    resizeCropTo(p.x, p.y, cropDrag);
+    resizeCropTo(p.x, p.y, cropDrag, e.shiftKey);
   }
 }
 
@@ -1204,7 +1248,7 @@ function moveCropTo(ncx: number, ncy: number): void {
   setCrop({ cx: x, cy: y });
 }
 
-function resizeCropTo(qx: number, qy: number, d: { handle: CropHandle; l: number; t: number; r: number; b: number }): void {
+function resizeCropTo(qx: number, qy: number, d: { handle: CropHandle; l: number; t: number; r: number; b: number; startRatio: number }, shift = false): void {
   const [iw, ih] = currentImageDims();
   const MIN = Math.max(24, 0.05 * Math.min(iw, ih));
   let { l, t, r, b } = d;
@@ -1215,7 +1259,8 @@ function resizeCropTo(qx: number, qy: number, d: { handle: CropHandle; l: number
   if (hasT) t = Math.min(qy, b - MIN);
   if (hasB) b = Math.max(qy, t + MIN);
 
-  const ratio = lockedRatio.value;
+  // Shift temporarily locks the box's shape at drag start (Lightroom-style).
+  const ratio = lockedRatio.value ?? (shift ? d.startRatio : null);
   if (ratio != null) {
     const corner = (hasL || hasR) && (hasT || hasB);
     if (corner) {
@@ -1336,10 +1381,13 @@ function onKeyDown(e: KeyboardEvent): void {
     if (k === "y") { e.preventDefault(); redo(); return; }
   }
 
-  // Crop tool: R toggles, Esc / Enter commit & exit (Lightroom-style).
+  // Crop tool: R toggles, Esc / Enter commit & exit, X swaps orientation,
+  // O cycles the guide overlay (Lightroom-style).
   if (!inEditableText && activeSource.value && !e.ctrlKey && !e.metaKey && !e.altKey) {
     if (e.key === "r" || e.key === "R") { e.preventDefault(); toggleCropMode(); return; }
     if (cropMode.value && (e.key === "Escape" || e.key === "Enter")) { e.preventDefault(); exitCropMode(); return; }
+    if (cropMode.value && (e.key === "x" || e.key === "X")) { e.preventDefault(); swapAspect(); return; }
+    if (cropMode.value && (e.key === "o" || e.key === "O")) { e.preventDefault(); cycleCropGuide(); return; }
   }
 
   // Backslash holds the "before" view; release (onKeyUp) restores the edit.
@@ -1415,8 +1463,9 @@ watch(crop, () => {
 }, { deep: true });
 
 // History/persist for the edit state not covered above (redraws handled by
-// their own paths: curve LUT bake, dcp/denoise re-decode).
-watch([toneCurve, dcpCode, denoise],
+// their own paths: curve LUT bake, dcp/denoise re-decode; aspect is snapshot
+// state but changes no pixels by itself).
+watch([toneCurve, dcpCode, denoise, cropAspect],
   () => { scheduleHistoryCommit(); schedulePersist(); }, { deep: true });
 
 // Re-decode when the user changes the DCP style (keeps the current view).
@@ -1806,10 +1855,14 @@ const vWheelAdjust = {
           <rect class="crop-catch" :x="cropBBox.x" :y="cropBBox.y" :width="cropBBox.w" :height="cropBBox.h" />
           <!-- dim outside the crop -->
           <path class="crop-dim" :d="cropDimPath" fill-rule="evenodd" />
-          <!-- rule-of-thirds grid -->
+          <!-- guide overlay (O cycles: thirds / golden / diagonal / grid / off) -->
           <g class="crop-grid" :stroke-width="1 * ofPerScreen">
-            <line v-for="(x, i) in cropThirds.v" :key="'v'+i" :x1="x" :y1="cropBoxRect.y" :x2="x" :y2="cropBoxRect.y + cropBoxRect.h" />
-            <line v-for="(y, i) in cropThirds.h" :key="'h'+i" :x1="cropBoxRect.x" :y1="y" :x2="cropBoxRect.x + cropBoxRect.w" :y2="y" />
+            <line v-for="(x, i) in cropGuideLines.v" :key="'v'+i" :x1="x" :y1="cropBoxRect.y" :x2="x" :y2="cropBoxRect.y + cropBoxRect.h" />
+            <line v-for="(y, i) in cropGuideLines.h" :key="'h'+i" :x1="cropBoxRect.x" :y1="y" :x2="cropBoxRect.x + cropBoxRect.w" :y2="y" />
+            <template v-if="cropGuideLines.diag">
+              <line :x1="cropBoxRect.x" :y1="cropBoxRect.y" :x2="cropBoxRect.x + cropBoxRect.w" :y2="cropBoxRect.y + cropBoxRect.h" />
+              <line :x1="cropBoxRect.x + cropBoxRect.w" :y1="cropBoxRect.y" :x2="cropBoxRect.x" :y2="cropBoxRect.y + cropBoxRect.h" />
+            </template>
           </g>
           <!-- crop box border -->
           <rect class="crop-frame" :x="cropBoxRect.x" :y="cropBoxRect.y" :width="cropBoxRect.w" :height="cropBoxRect.h" :stroke-width="1.5 * ofPerScreen" />
@@ -1859,16 +1912,27 @@ const vWheelAdjust = {
         <div class="control-row">
           <label class="control-label">Aspect</label>
           <div class="crop-aspect">
-            <select class="control-select" :value="cropAspect"
+            <select class="control-select" :value="customAspect ? 'custom' : cropAspect"
               @change="selectAspect(($event.target as HTMLSelectElement).value)">
               <option v-for="a in ASPECT_PRESETS" :key="a.key" :value="a.key">{{ a.label }}</option>
+              <option value="custom">Custom…</option>
             </select>
-            <button class="icon-mini" type="button" title="Swap orientation" @click="swapAspect" aria-label="Swap aspect">
+            <button class="icon-mini" type="button" title="Swap orientation (X)" @click="swapAspect" aria-label="Swap aspect">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M16 3l4 4-4 4" /><path d="M20 7H8a4 4 0 0 0-4 4" />
                 <path d="M8 21l-4-4 4-4" /><path d="M4 17h12a4 4 0 0 0 4-4" />
               </svg>
             </button>
+          </div>
+        </div>
+        <div class="control-row" v-if="customAspect">
+          <label class="control-label">Ratio</label>
+          <div class="crop-custom">
+            <input class="slider-number" type="number" min="0.1" step="0.1" :value="customAspect[0]"
+              @change="setCustomAspect(($event.target as HTMLInputElement).valueAsNumber, customAspect![1])" />
+            <span class="crop-custom-x">×</span>
+            <input class="slider-number" type="number" min="0.1" step="0.1" :value="customAspect[1]"
+              @change="setCustomAspect(customAspect![0], ($event.target as HTMLInputElement).valueAsNumber)" />
           </div>
         </div>
         <div class="slider">

@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   applyAspectRatio, buildCropTransform, cloneCrop, constrainCrop, cornersInsideImage,
-  cropOutputRect, cropOutputSize, defaultCrop, imageDims, isDefaultCrop, rotate90,
+  cropOutputRect, cropOutputSize, customAspectKey, defaultCrop, imageDims, isDefaultCrop,
+  parseCustomAspect, ratioToFraction, resolveAspectRatio, rotate90,
   straightenedBBox, type CropState,
 } from "../crop";
 
@@ -124,6 +125,48 @@ describe("applyAspectRatio", () => {
       expect((c.w * iw) / (c.h * ih)).toBeCloseTo(ratio, 3);
       expect(cornersInsideImage(c, iw, ih)).toBe(true);
     }
+  });
+});
+
+describe("resolveAspectRatio", () => {
+  it("orients presets to the crop box (landscape box → w/h > 1)", () => {
+    const landscape = defaultCrop(); // 6000×4000 full-frame box
+    expect(resolveAspectRatio("4:3", SRC_W, SRC_H, landscape)).toBeCloseTo(4 / 3, 9);
+    const portrait: CropState = { ...defaultCrop(), w: 0.4, h: 0.9 };
+    expect(resolveAspectRatio("4:3", SRC_W, SRC_H, portrait)).toBeCloseTo(3 / 4, 9);
+  });
+
+  it("resolves Original to the image ratio, oriented to the box", () => {
+    expect(resolveAspectRatio("orig", SRC_W, SRC_H, defaultCrop())).toBeCloseTo(SRC_W / SRC_H, 9);
+    const portrait: CropState = { ...defaultCrop(), w: 0.3, h: 0.8 };
+    expect(resolveAspectRatio("orig", SRC_W, SRC_H, portrait)).toBeCloseTo(SRC_H / SRC_W, 9);
+    // 90°-rotated image: image space is 4000×6000, default box is portrait.
+    const rotated: CropState = { ...defaultCrop(), orientation: 90 };
+    expect(resolveAspectRatio("orig", SRC_W, SRC_H, rotated)).toBeCloseTo(SRC_H / SRC_W, 9);
+  });
+
+  it("returns null for free and unknown keys", () => {
+    expect(resolveAspectRatio("free", SRC_W, SRC_H, defaultCrop())).toBeNull();
+    expect(resolveAspectRatio("nope", SRC_W, SRC_H, defaultCrop())).toBeNull();
+  });
+
+  it("parses custom keys and rejects malformed ones", () => {
+    expect(resolveAspectRatio(customAspectKey(16, 10), SRC_W, SRC_H, defaultCrop())).toBeCloseTo(1.6, 9);
+    expect(parseCustomAspect("custom:8.5:11")).toEqual([8.5, 11]);
+    expect(parseCustomAspect("custom:0:3")).toBeNull();
+    expect(parseCustomAspect("custom:a:b")).toBeNull();
+    expect(parseCustomAspect("4:3")).toBeNull();
+    expect(resolveAspectRatio("custom:-1:2", SRC_W, SRC_H, defaultCrop())).toBeNull();
+  });
+});
+
+describe("ratioToFraction", () => {
+  it("recovers simple fractions from pixel ratios", () => {
+    expect(ratioToFraction(3 / 2)).toEqual([3, 2]);
+    expect(ratioToFraction(16 / 9)).toEqual([16, 9]);
+    expect(ratioToFraction(1)).toEqual([1, 1]);
+    // Near-miss ratios snap to the closest small fraction.
+    expect(ratioToFraction(1.334)).toEqual([4, 3]);
   });
 });
 

@@ -227,33 +227,84 @@ export function constrainCrop(c: CropState, srcW: number, srcH: number): CropSta
 
 export type AspectPreset = { key: string; label: string; ratio: number | null };
 
-// ratio = output width / height in real pixels. null = free, "orig" handled live.
+// Lightroom-style orientation-agnostic presets: each ratio is listed once and
+// stored as long/short (≥ 1); the resolved pixel ratio follows the crop box's
+// current landscape/portrait orientation (swap with the X button/key).
+// null = free, 0 = the image's own ratio ("Original").
 export const ASPECT_PRESETS: AspectPreset[] = [
   { key: "free", label: "Free", ratio: null },
   { key: "orig", label: "Original", ratio: 0 },
   { key: "1:1", label: "1 × 1", ratio: 1 },
-  { key: "2:3", label: "2 × 3", ratio: 2 / 3 },
-  { key: "3:2", label: "3 × 2", ratio: 3 / 2 },
-  { key: "4:5", label: "4 × 5", ratio: 4 / 5 },
-  { key: "5:4", label: "5 × 4", ratio: 5 / 4 },
-  { key: "3:4", label: "3 × 4", ratio: 3 / 4 },
+  { key: "4:5", label: "4 × 5 / 8 × 10", ratio: 5 / 4 },
+  { key: "8.5:11", label: "8.5 × 11", ratio: 11 / 8.5 },
+  { key: "5:7", label: "5 × 7", ratio: 7 / 5 },
   { key: "4:3", label: "4 × 3", ratio: 4 / 3 },
-  { key: "5:7", label: "5 × 7", ratio: 5 / 7 },
-  { key: "7:5", label: "7 × 5", ratio: 7 / 5 },
-  { key: "9:16", label: "9 × 16", ratio: 9 / 16 },
+  { key: "2:3", label: "2 × 3 / 4 × 6", ratio: 3 / 2 },
+  { key: "16:10", label: "16 × 10", ratio: 16 / 10 },
   { key: "16:9", label: "16 × 9", ratio: 16 / 9 },
+  { key: "1:2", label: "1 × 2", ratio: 2 },
+  { key: "65:24", label: "65 × 24 (XPan)", ratio: 65 / 24 },
 ];
 
-/** Resolve a preset key to a concrete pixel ratio (w/h); null means free. */
-export function resolveAspectRatio(key: string, srcW: number, srcH: number, orientation: Orientation): number | null {
-  const preset = ASPECT_PRESETS.find((p) => p.key === key);
-  if (!preset) return null;
-  if (preset.ratio === null) return null;
-  if (preset.ratio === 0) {
-    const [iw, ih] = imageDims(srcW, srcH, orientation);
-    return iw / ih;
+/** Prefix for user-entered ratios; full keys look like "custom:16:10". */
+export const CUSTOM_ASPECT_PREFIX = "custom:";
+
+export function customAspectKey(w: number, h: number): string {
+  return `${CUSTOM_ASPECT_PREFIX}${w}:${h}`;
+}
+
+/** Parse a "custom:w:h" key into [w, h]; null if malformed/degenerate. */
+export function parseCustomAspect(key: string): [number, number] | null {
+  if (!key.startsWith(CUSTOM_ASPECT_PREFIX)) return null;
+  const parts = key.slice(CUSTOM_ASPECT_PREFIX.length).split(":");
+  if (parts.length !== 2) return null;
+  const w = Number(parts[0]);
+  const h = Number(parts[1]);
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return null;
+  return [w, h];
+}
+
+/**
+ * Resolve an aspect key (preset or "custom:w:h") to a concrete pixel ratio
+ * (w/h) oriented to match the crop box's current landscape/portrait
+ * orientation; null means free.
+ */
+export function resolveAspectRatio(key: string, srcW: number, srcH: number, c: CropState): number | null {
+  let base: number | null;
+  const custom = parseCustomAspect(key);
+  if (custom) {
+    base = custom[0] / custom[1];
+  } else {
+    const preset = ASPECT_PRESETS.find((p) => p.key === key);
+    if (!preset || preset.ratio === null) return null;
+    base = preset.ratio;
   }
-  return preset.ratio;
+  const [iw, ih] = imageDims(srcW, srcH, c.orientation);
+  if (base === 0) base = iw / ih;
+  const long = Math.max(base, 1 / base);
+  const landscape = c.w * iw >= c.h * ih;
+  return landscape ? long : 1 / long;
+}
+
+/**
+ * Approximate a pixel ratio as a small "w:h" fraction (denominator ≤ 20),
+ * used to seed the custom-aspect inputs from the current crop box.
+ */
+export function ratioToFraction(ratio: number): [number, number] {
+  let best: [number, number] = [1, 1];
+  let bestErr = Infinity;
+  for (let den = 1; den <= 20; den++) {
+    const num = Math.max(1, Math.round(ratio * den));
+    const err = Math.abs(num / den - ratio);
+    if (err < bestErr - 1e-12) { bestErr = err; best = [num, den]; }
+  }
+  const g = gcd(best[0], best[1]);
+  return [best[0] / g, best[1] / g];
+}
+
+function gcd(a: number, b: number): number {
+  while (b) { const t = a % b; a = b; b = t; }
+  return a;
 }
 
 /**
