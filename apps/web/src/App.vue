@@ -160,9 +160,9 @@ const viewSettings = reactive({ viewTransform: 0, displayGamut: 0 });
 // the display back to the cropped output. All geometry lives in crop.ts.
 const crop = reactive<CropState>(defaultCrop());
 const cropMode = ref(false);
-// Aspect lock for the crop box. Defaults to 4:3 for new images; part of the
-// per-image snapshot so it survives image switches / undo / persistence.
-const DEFAULT_ASPECT = "4:3";
+// Aspect lock for the crop box. Defaults to the image's own ratio; part of
+// the per-image snapshot so it survives image switches / undo / persistence.
+const DEFAULT_ASPECT = "orig";
 const cropAspect = ref<string>(DEFAULT_ASPECT);
 // Crop-editor render window (output-frame px) + the canvas scale used to draw it,
 // kept so the overlay can map between screen, output-frame and crop-box space.
