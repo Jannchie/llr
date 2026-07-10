@@ -50,8 +50,12 @@ class RawMetadata:
     rgb_xyz_matrix: list[list[float]] | None
     # Full-resolution output dimensions (before half_size binning / max_size
     # downscaling), so the frontend can report zoom relative to the original.
+    # When the RAW carries a camera crop, these are the cropped dims.
     full_width: int | None
     full_height: int | None
+    # Camera-intended crop (DNG DefaultCropOrigin/Size) mapped into the
+    # postprocess output frame: ((x, y, w, h), (frame_w, frame_h)), or None.
+    camera_crop: tuple[tuple[int, int, int, int], tuple[int, int]] | None = None
 
 
 @dataclass
@@ -1030,6 +1034,7 @@ def prepare_linear(
                 output_bps=16,
                 half_size=half_size,
             ).astype(np.float32) / 65535.0
+            linear = apply_camera_crop(linear, metadata.camera_crop)
             if max_size:
                 linear = downsample_linear(linear, max_size)
             color_profile = libraw_color_profile_info()
@@ -1046,6 +1051,7 @@ def prepare_linear(
                 output_bps=16,
                 half_size=half_size,
             ).astype(np.float32) / 65535.0
+            camera_rgb = apply_camera_crop(camera_rgb, metadata.camera_crop)
             if camera_rgb.shape[-1] != 3:
                 raise ValueError("DCP rendering currently supports only three-channel camera RGB data")
             if max_size:
@@ -1135,9 +1141,87 @@ def apply_saturation_linear(linear: np.ndarray, saturation: float, vibrance: flo
     return np.clip(luma + chroma * sat_scale, 0.0, None)
 
 
+def _parse_int_pair(value: Any) -> tuple[int, int] | None:
+    if isinstance(value, list):
+        parts = value
+    elif isinstance(value, str):
+        parts = value.split()
+    else:
+        return None
+    if len(parts) != 2:
+        return None
+    try:
+        return int(float(parts[0])), int(float(parts[1]))
+    except (TypeError, ValueError):
+        return None
+
+
+def camera_crop_rect(
+    raw: rawpy.RawPy, exif: dict[str, Any]
+) -> tuple[tuple[int, int, int, int], tuple[int, int]] | None:
+    """The camera-intended crop (DNG DefaultCropOrigin/Size) in the postprocess
+    output frame.
+
+    LibRaw renders the full visible sensor area, which extends a few pixels
+    past the region the camera actually framed (and carries the camera's
+    aspect-mode crop, e.g. 4:3/16:9 shooting modes). The DNG tags are relative
+    to the visible area's top-left in sensor orientation; postprocess applies
+    the camera flip, so the rect is transformed into the flipped frame here.
+    Returns ((x, y, w, h), (frame_w, frame_h)), or None when absent/degenerate.
+    """
+    origin = _parse_int_pair(exif.get("DefaultCropOrigin"))
+    size = _parse_int_pair(exif.get("DefaultCropSize"))
+    sizes = raw.sizes
+    if origin is None or size is None or sizes is None:
+        return None
+    x, y = origin
+    w, h = size
+    vw, vh = int(sizes.width), int(sizes.height)
+    if w <= 0 or h <= 0 or x < 0 or y < 0 or x + w > vw or y + h > vh:
+        return None
+    if w == vw and h == vh:
+        return None
+    flip = int(sizes.flip or 0)
+    if flip == 3:  # 180°
+        x, y = vw - x - w, vh - y - h
+    elif flip == 5:  # 90° counter-clockwise
+        x, y, w, h = y, vw - x - w, h, w
+        vw, vh = vh, vw
+    elif flip == 6:  # 90° clockwise
+        x, y, w, h = vh - y - h, x, h, w
+        vw, vh = vh, vw
+    return (x, y, w, h), (vw, vh)
+
+
+def apply_camera_crop(
+    arr: np.ndarray, crop: tuple[tuple[int, int, int, int], tuple[int, int]] | None
+) -> np.ndarray:
+    """Trim a postprocessed image to the camera crop, scaling the full-frame
+    rect down when the decode is half-size."""
+    if crop is None:
+        return arr
+    (x, y, w, h), (fw, fh) = crop
+    ah, aw = arr.shape[:2]
+    sx = aw / fw
+    sy = ah / fh
+    x0 = min(max(int(round(x * sx)), 0), aw - 1)
+    y0 = min(max(int(round(y * sy)), 0), ah - 1)
+    x1 = min(max(int(round((x + w) * sx)), x0 + 1), aw)
+    y1 = min(max(int(round((y + h) * sy)), y0 + 1), ah)
+    if x0 == 0 and y0 == 0 and x1 == aw and y1 == ah:
+        return arr
+    return np.ascontiguousarray(arr[y0:y1, x0:x1])
+
+
 def read_raw_metadata(input_path: Path, raw: rawpy.RawPy) -> RawMetadata:
     exif = read_exiftool_metadata(input_path)
     sizes = raw.sizes
+    camera_crop = camera_crop_rect(raw, exif)
+    if camera_crop:
+        full_width, full_height = camera_crop[0][2], camera_crop[0][3]
+    else:
+        full_width = int(sizes.iwidth) if sizes else None
+        full_height = int(sizes.iheight) if sizes else None
     return RawMetadata(
         make=exif.get("Make"),
         model=exif.get("Model"),
@@ -1148,12 +1232,13 @@ def read_raw_metadata(input_path: Path, raw: rawpy.RawPy) -> RawMetadata:
         black_level=[int(value) for value in raw.black_level_per_channel] if raw.black_level_per_channel else None,
         white_level=int(raw.white_level) if raw.white_level else None,
         rgb_xyz_matrix=raw.rgb_xyz_matrix.astype(float).tolist() if raw.rgb_xyz_matrix is not None else None,
-        full_width=int(sizes.iwidth) if sizes else None,
-        full_height=int(sizes.iheight) if sizes else None,
+        full_width=full_width,
+        full_height=full_height,
+        camera_crop=camera_crop,
     )
 
 
-def read_exiftool_metadata(input_path: Path) -> dict[str, str | None]:
+def read_exiftool_metadata(input_path: Path) -> dict[str, Any]:
     command = detect_exiftool()
     if command is None:
         return {}
@@ -1169,6 +1254,8 @@ def read_exiftool_metadata(input_path: Path) -> dict[str, str | None]:
                 "-LensModel",
                 "-CreativeStyle",
                 "-WhiteBalance",
+                "-DefaultCropOrigin",
+                "-DefaultCropSize",
                 str(input_path),
             ],
             env=exiftool_env(),
@@ -1178,7 +1265,10 @@ def read_exiftool_metadata(input_path: Path) -> dict[str, str | None]:
 
     records = json.loads(output)
     record = records[0] if records else {}
-    return {key: string_or_none(record.get(key)) for key in ["Make", "Model", "LensModel", "CreativeStyle", "WhiteBalance"]}
+    out: dict[str, Any] = {key: string_or_none(record.get(key)) for key in ["Make", "Model", "LensModel", "CreativeStyle", "WhiteBalance"]}
+    for key in ["DefaultCropOrigin", "DefaultCropSize"]:
+        out[key] = record.get(key)
+    return out
 
 
 @functools.lru_cache(maxsize=1)
