@@ -60,11 +60,9 @@ const groups: SliderGroup[] = [
   ]},
 ];
 
-const SLIDER_DEFAULTS: Record<string, number> = {
-  exposure: 0, contrast: 0, highlights: 0, shadows: 0,
-  whites: 0, blacks: 0, clarity: 0, dehaze: 0,
-  temperature: 6500, tint: 0, vibrance: 0, saturation: 0,
-};
+// Derived from defaultRecipe so the two can't drift (double-click reset and
+// isEdited both compare against these).
+const SLIDER_DEFAULTS: Record<string, number> = { ...defaultRecipe() };
 
 // ── state ──
 
@@ -81,7 +79,8 @@ const dcpCode = ref("");  // empty = auto-detect
 // AI RAW denoise. Applied in the worker on the Bayer mosaic before demosaic, so
 // changing it re-decodes linear.bin (like dcpCode) rather than re-running the
 // WebGL shader. amount is 0..100 (normalised to 0..1 for the API).
-const denoise = reactive({ enabled: false, model: "wavelet", amount: 100 });
+const defaultDenoise = () => ({ enabled: false, model: "wavelet", amount: 100 });
+const denoise = reactive(defaultDenoise());
 const denoiseBusy = ref(false);
 const exporting = ref(false);
 // Hold-to-compare: while true we draw the unedited original (baseline params +
@@ -143,13 +142,14 @@ const hslSat = reactive([0, 0, 0, 0, 0, 0, 0, 0]);
 const hslLum = reactive([0, 0, 0, 0, 0, 0, 0, 0]);
 const hslTab = ref<"hue"|"sat"|"lum">("hue");
 
-const grading = reactive({
+const defaultGrading = () => ({
   shH: 0, shS: 0,
   mdH: 0, mdS: 0,
   hlH: 0, hlS: 0,
   blend: 50,
   balance: 0,
 });
+const grading = reactive(defaultGrading());
 
 // View settings (not part of the per-image recipe): tone-mapping look + display gamut.
 const viewSettings = reactive({ viewTransform: 0, displayGamut: 0 });
@@ -493,8 +493,6 @@ type Snapshot = {
   denoise?: typeof denoise;  // optional: absent in pre-denoise persisted sessions
 };
 
-const defaultDenoise = (): typeof denoise => ({ enabled: false, model: "wavelet", amount: 100 });
-
 const MAX_HISTORY = 100;
 const HISTORY_DEBOUNCE = 300;
 
@@ -515,7 +513,7 @@ function defaultSnapshot(): Snapshot {
     hslHue: [0, 0, 0, 0, 0, 0, 0, 0],
     hslSat: [0, 0, 0, 0, 0, 0, 0, 0],
     hslLum: [0, 0, 0, 0, 0, 0, 0, 0],
-    grading: { shH: 0, shS: 0, mdH: 0, mdS: 0, hlH: 0, hlS: 0, blend: 50, balance: 0 } as typeof grading,
+    grading: defaultGrading(),
     curve: defaultToneCurve(),
     crop: defaultCrop(),
     aspect: DEFAULT_ASPECT,
