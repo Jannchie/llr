@@ -8,15 +8,19 @@ dependencies = [
   "pillow>=11.0.0",
   "rawpy>=0.25.0",
   "scikit-image>=0.24.0",
-  "pywavelets>=1.6.0",
-  "torch>=2.6.0"
+  "pywavelets>=1.6.0"
 ]
+
+# The neural denoise backend is deferred and nothing imports torch yet (the
+# denoise module loads it lazily), so keep the multi-GB CUDA wheels out of the
+# default environment: uv sync --project apps/worker --extra neural
+[project.optional-dependencies]
+neural = ["torch>=2.6.0"]
 
 [project.scripts]
 llr-worker = "llr_worker.cli:main"
 
-# PyTorch CUDA wheels (RTX 3090 / Ampere). torch is loaded lazily by the
-# denoise module, so the worker still imports/runs if these wheels are absent.
+# PyTorch CUDA wheels (RTX 3090 / Ampere).
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu126" }]
 

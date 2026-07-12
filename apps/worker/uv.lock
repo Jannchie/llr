@@ -144,6 +144,10 @@ dependencies = [
     { name = "pywavelets" },
     { name = "rawpy" },
     { name = "scikit-image" },
+]
+
+[package.optional-dependencies]
+neural = [
     { name = "torch" },
 ]
 
@@ -154,8 +158,9 @@ requires-dist = [
     { name = "pywavelets", specifier = ">=1.6.0" },
     { name = "rawpy", specifier = ">=0.25.0" },
     { name = "scikit-image", specifier = ">=0.24.0" },
-    { name = "torch", specifier = ">=2.6.0", index = "https://download.pytorch.org/whl/cu126" },
+    { name = "torch", marker = "extra == 'neural'", specifier = ">=2.6.0", index = "https://download.pytorch.org/whl/cu126" },
 ]
+provides-extras = ["neural"]
 
 [[package]]
 name = "markupsafe"
