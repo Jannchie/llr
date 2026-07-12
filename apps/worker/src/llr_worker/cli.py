@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import rawpy
@@ -509,9 +509,8 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
             _LINEAR_CACHE.move_to_end(cache_key)
     if cached_linear is not None:
         linear_arr, color_profile = cached_linear
-        linear = linear_arr.tobytes()
         with open(output_path, "wb") as f:
-            f.write(linear)
+            linear_arr.tofile(f)
         return {
             "width": linear_arr.shape[1],
             "height": linear_arr.shape[0],
@@ -519,35 +518,52 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
             "fullHeight": color_profile.get("fullHeight"),
             "output": str(output_path),
             "colorProfile": color_profile,
-            "bytesWritten": len(linear),
+            "bytesWritten": linear_arr.nbytes,
         }
 
     recipe = merge_recipe(PROFILES[profile_id], {})
     if dcp_code:
         recipe["dcpCode"] = dcp_code
 
-    prepared = prepare_linear(
-        input_path, recipe, root,
-        dcp_arg=None, disable_dcp=False,
-        half_size=half_size, max_size=max_size,
-    )
+    # The noisy and denoised variants share one lazily opened LibRaw handle:
+    # opening is skipped entirely when both variants are cache hits, and a
+    # first-time denoise request no longer reads + unpacks the RAW twice.
+    shared_raw: rawpy.RawPy | None = None
 
-    # Blend the denoised decode over the noisy one by the requested amount. The
-    # heavy inference happens inside this second prepare_linear and is cached by
-    # cache_key (denoise_model), so amount changes only re-run this cheap lerp.
-    if dn_model is not None:
-        prepared_dn = prepare_linear(
+    def open_raw() -> rawpy.RawPy:
+        nonlocal shared_raw
+        if shared_raw is None:
+            shared_raw = rawpy.imread(str(input_path))
+        return shared_raw
+
+    try:
+        prepared = prepare_linear(
             input_path, recipe, root,
             dcp_arg=None, disable_dcp=False,
             half_size=half_size, max_size=max_size,
-            denoise_model=dn_model,
+            raw_provider=open_raw,
         )
-        blended = prepared.linear * (1.0 - dn_amount) + prepared_dn.linear * dn_amount
-        prepared = PreparedLinear(
-            linear=blended.astype(np.float32),
-            metadata=prepared.metadata,
-            color_profile=prepared.color_profile,
-        )
+
+        # Blend the denoised decode over the noisy one by the requested amount. The
+        # heavy inference happens inside this second prepare_linear and is cached by
+        # cache_key (denoise_model), so amount changes only re-run this cheap lerp.
+        if dn_model is not None:
+            prepared_dn = prepare_linear(
+                input_path, recipe, root,
+                dcp_arg=None, disable_dcp=False,
+                half_size=half_size, max_size=max_size,
+                denoise_model=dn_model,
+                raw_provider=open_raw,
+            )
+            blended = prepared.linear * (1.0 - dn_amount) + prepared_dn.linear * dn_amount
+            prepared = PreparedLinear(
+                linear=blended.astype(np.float32),
+                metadata=prepared.metadata,
+                color_profile=prepared.color_profile,
+            )
+    finally:
+        if shared_raw is not None:
+            shared_raw.close()
 
     # Stash full-resolution dims on the color profile so both this response and
     # the _LINEAR_CACHE-hit path above can report zoom relative to the original.
@@ -567,9 +583,8 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
             while len(_LINEAR_CACHE) > _LINEAR_CACHE_MAX:
                 _LINEAR_CACHE.popitem(last=False)
 
-    linear = linear_arr.tobytes()
     with open(output_path, "wb") as f:
-        f.write(linear)
+        linear_arr.tofile(f)
 
     return {
         "width": prepared.linear.shape[1],
@@ -578,7 +593,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
         "fullHeight": prepared.metadata.full_height,
         "output": str(output_path),
         "colorProfile": prepared.color_profile,
-        "bytesWritten": len(linear),
+        "bytesWritten": linear_arr.nbytes,
     }
 
 
@@ -1058,7 +1073,16 @@ def prepare_linear(
     half_size: bool = False,
     max_size: int | None = None,
     denoise_model: str | None = None,
+    raw_provider: Callable[[], rawpy.RawPy] | None = None,
 ) -> PreparedLinear:
+    """Decode RAW into linear working-space RGB (cached per variant).
+
+    `raw_provider` lets a caller that needs several variants of the same file
+    (noisy + denoised) share one opened LibRaw handle instead of re-reading and
+    re-unpacking the RAW per variant. The provider owns the handle's lifetime;
+    it is only invoked on a cache miss. A denoise variant mutates the shared
+    handle's Bayer data in place, so decode the noisy variant first.
+    """
     cache_key = _raw_cache_key(input_path, half_size, max_size, denoise_model)
 
     # Cache hit: re-apply DCP on cached camera RGB without re-decoding RAW
@@ -1091,7 +1115,7 @@ def prepare_linear(
         with _CACHE_LOCK:
             _FALLBACK_CACHE.pop(cache_key, None)
 
-    with rawpy.imread(str(input_path)) as raw:
+    with rawpy.imread(str(input_path)) if raw_provider is None else nullcontext(raw_provider()) as raw:
         metadata = read_raw_metadata(input_path, raw)
         # RAW-domain denoise: clean the Bayer mosaic in place so the postprocess
         # calls below demosaic the denoised data. Heavy, so it is cached via
@@ -1317,6 +1341,18 @@ def read_raw_metadata(input_path: Path, raw: rawpy.RawPy) -> RawMetadata:
 
 
 def read_exiftool_metadata(input_path: Path) -> dict[str, Any]:
+    # Memoized by (path, size, mtime): each call spawns a Perl process
+    # (~100-200 ms) and every decode of the same unchanged file asked again.
+    try:
+        stat = input_path.stat()
+    except OSError:
+        return {}
+    return dict(_read_exiftool_metadata_cached(str(input_path), stat.st_size, stat.st_mtime_ns))
+
+
+@functools.lru_cache(maxsize=64)
+def _read_exiftool_metadata_cached(path: str, size: int, mtime_ns: int) -> dict[str, Any]:
+    input_path = Path(path)
     command = detect_exiftool()
     if command is None:
         return {}
@@ -1467,13 +1503,22 @@ def find_local_camera_dcp(root: Path, metadata: RawMetadata, override_code: str 
 
 
 def find_camera_profile_dir(profile_root: Path, metadata: RawMetadata) -> Path | None:
-    exact_name = f"{format_camera_make(metadata.make)} {metadata.model}".strip()
+    return _find_camera_profile_dir_cached(profile_root, metadata.make, metadata.model)
+
+
+# Both lookups scan the vendored Adobe profile tree (hundreds of camera dirs /
+# dozens of .dcp files) and run on every decode and DCP re-apply, so they are
+# memoized. The tree is static vendored data; profiles installed while the
+# daemon runs are picked up on restart.
+@functools.lru_cache(maxsize=64)
+def _find_camera_profile_dir_cached(profile_root: Path, make: str | None, model: str | None) -> Path | None:
+    exact_name = f"{format_camera_make(make)} {model}".strip()
     exact_dir = profile_root / exact_name
     if exact_dir.exists():
         return exact_dir
 
-    model_key = normalize_profile_name(metadata.model)
-    make_key = normalize_profile_name(metadata.make)
+    model_key = normalize_profile_name(model)
+    make_key = normalize_profile_name(make)
     for candidate in sorted(profile_root.iterdir()):
         if not candidate.is_dir():
             continue
@@ -1484,6 +1529,7 @@ def find_camera_profile_dir(profile_root: Path, metadata: RawMetadata) -> Path |
     return None
 
 
+@functools.lru_cache(maxsize=256)
 def find_dcp_by_code(profile_dir: Path, code: str) -> Path | None:
     suffix = f" camera {code.lower()}.dcp"
     for candidate in sorted(profile_dir.glob("*.dcp")):
