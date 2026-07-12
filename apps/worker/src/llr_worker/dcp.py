@@ -8,7 +8,6 @@ from typing import Any
 
 import numpy as np
 
-
 DCP_TAGS = {
     50721: "color_matrix_1",
     50722: "color_matrix_2",

@@ -14,7 +14,7 @@ import {
   type CropState,
 } from "./rendering/crop";
 import { type PersistedEdit } from "./persistence";
-import { trackFill, formatBytes, type Source } from "./ui";
+import { trackFill, formatBytes, clamp } from "./ui";
 import SliderRow from "./components/SliderRow.vue";
 import Filmstrip from "./components/Filmstrip.vue";
 import { useViewport } from "./composables/useViewport";
@@ -158,8 +158,8 @@ const cropMode = ref(false);
 
 const {
   zoom, pan, fitScale, viewportRef, isPanning,
-  displayTransform, zoomPercent, fullResZoom,
-  recomputeFit, startPan, doPan, stopPan, applyZoom,
+  displayTransform, zoomPercent,
+  recomputeFit, startPan, doPan, stopPan,
   onWheel, zoomIn, zoomOut, fitView, zoomToFull, onDoubleClick,
 } = useViewport({ imageW, imageH, srcW, srcH, srcFullW, srcFullH, cropMode });
 const {
@@ -274,7 +274,6 @@ let isRestoring = false;
 // When true, the dcpCode watcher skips its re-decode — used while we load a
 // source explicitly (switching images / restoring) to avoid a double decode.
 let suppressDcpReload = false;
-let historyTimer = 0;
 
 function defaultSnapshot(): Snapshot {
   return {
@@ -374,10 +373,10 @@ function applyStoredEdit(e: ImageEdit | null): void {
 }
 
 const {
-  sources, activeId, activeSource, thumbs,
-  syncLiveToMap, persistNow, schedulePersist,
-  thumbSrc, cacheThumb, markInvalid,
-  activateSource, selectSource, removeSource,
+  sources, activeId, activeSource,
+  persistNow, schedulePersist,
+  thumbSrc, markInvalid,
+  selectSource, removeSource,
   restoreSession, loadThumbCache, uploadFiles,
 } = useLibrary<Snapshot, typeof viewSettings>({
   api: API,
@@ -970,13 +969,6 @@ async function exportImage(): Promise<void> {
     renderer?.destroy();
     exporting.value = false;
   }
-}
-function isAbsoluteUrl(u: string): boolean {
-  return u.startsWith("blob:") || u.startsWith("data:") || u.startsWith("http");
-}
-
-function clamp(v: number, lo: number, hi: number): number {
-  return v < lo ? lo : v > hi ? hi : v;
 }
 
 // White balance reads as a colour axis, not an amount: an accent fill growing

@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "build": "pnpm -r build",
-    "check": "pnpm -r check && pnpm -r test && uv run --project apps/worker python -m compileall -q apps/worker/src",
+    "check": "pnpm -r check && pnpm -r test && pnpm lint && uv run --project apps/worker python -m compileall -q apps/worker/src",
+    "lint": "eslint . && uv run --project apps/worker ruff check apps/worker/src",
     "dev": "pnpm --parallel --filter @llr/api --filter @llr/web dev",
     "dev:api": "pnpm --filter @llr/api dev",
     "dev:web": "pnpm --filter @llr/web dev",
@@ -14,7 +15,11 @@
   },
   "devDependencies": {
     "@types/node": "^22.15.3",
+    "eslint": "^10.7.0",
+    "eslint-plugin-vue": "^10.9.2",
     "tsx": "^4.19.4",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.63.0",
+    "vue-eslint-parser": "^10.4.1"
   }
 }

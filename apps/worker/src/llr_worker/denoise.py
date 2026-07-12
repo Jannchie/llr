@@ -22,7 +22,6 @@ from typing import Any, Callable, Protocol
 
 import numpy as np
 
-
 # ── Bayer pack / unpack ────────────────────────────────────────────────────
 #
 # A Bayer mosaic interleaves four "phases" in a 2x2 tile. We split those phases

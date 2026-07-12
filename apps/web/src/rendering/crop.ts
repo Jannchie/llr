@@ -269,8 +269,8 @@ function toIntFraction(w: number, h: number): [number, number] | null {
   if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return null;
   let scale = 1;
   while (scale < 1e6 && (!Number.isInteger(w * scale) || !Number.isInteger(h * scale))) scale *= 10;
-  let p = Math.round(w * scale);
-  let q = Math.round(h * scale);
+  const p = Math.round(w * scale);
+  const q = Math.round(h * scale);
   const g = gcd(p, q);
   return [p / g, q / g];
 }
