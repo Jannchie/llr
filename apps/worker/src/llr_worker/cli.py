@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import hashlib
 import json
 import math
 import os
@@ -610,11 +611,11 @@ def daemon_export(request: dict[str, Any], root: Path) -> dict[str, Any]:
 
     exif_copied = copy_exif_provenance(input_path, target_path)
 
-    xmp = build_xmp_packet(settings)
-    data = embed_xmp_app1(target_path.read_bytes(), xmp)
+    payloads, xmp_bytes = build_xmp_segments(settings)
+    data = embed_xmp_app1(target_path.read_bytes(), payloads)
     target_path.write_bytes(data)
 
-    return {"output": str(target_path), "exifCopied": exif_copied, "xmpBytes": len(xmp)}
+    return {"output": str(target_path), "exifCopied": exif_copied, "xmpBytes": xmp_bytes}
 
 
 def copy_exif_provenance(original: Path, target: Path) -> bool:
@@ -811,29 +812,51 @@ def _tone_curve_block(tag: str, points: list[str]) -> str:
     )
 
 
-def build_xmp_packet(settings: dict[str, Any]) -> str:
+def build_xmp_packet(
+    settings: dict[str, Any],
+    extended_guid: str | None = None,
+    include_curves: bool = True,
+) -> str:
+    """The standard XMP packet.
+
+    With `extended_guid` set, the llr:Settings JSON is omitted and replaced by
+    an xmpNote:HasExtendedXMP pointer (XMP Spec part 3) — used when the JSON
+    blob would overflow the 64 KB APP1 segment limit. `include_curves=False`
+    additionally drops the tone-curve Seq blocks (they are still recoverable
+    from llr:Settings) when even those overflow the main packet.
+    """
     llr_attrs = build_llr_attrs(settings)
     curve = _curve_settings(settings)
-    llr_json = json.dumps(settings, separators=(",", ":"), ensure_ascii=False)
 
     attr_lines = "\n   ".join(f'{key}="{_xml_attr(value)}"' for key, value in llr_attrs.items())
 
     # Point tone curves, one Seq per channel, only when non-identity.
     tone_block = ""
-    for tag, key in (("ToneCurveRgb", "rgb"), ("ToneCurveRed", "red"), ("ToneCurveGreen", "green"), ("ToneCurveBlue", "blue")):
-        pts = _tone_curve_points(curve.get(key))
-        if not _is_identity_curve(pts):
-            tone_block += _tone_curve_block(tag, pts)
+    if include_curves:
+        for tag, key in (("ToneCurveRgb", "rgb"), ("ToneCurveRed", "red"), ("ToneCurveGreen", "green"), ("ToneCurveBlue", "blue")):
+            pts = _tone_curve_points(curve.get(key))
+            if not _is_identity_curve(pts):
+                tone_block += _tone_curve_block(tag, pts)
+
+    if extended_guid is None:
+        llr_json = json.dumps(settings, separators=(",", ":"), ensure_ascii=False)
+        ext_ns = ""
+        ext_attr = ""
+        settings_block = f"\n   <llr:Settings>{_xml_escape(llr_json)}</llr:Settings>"
+    else:
+        ext_ns = '\n   xmlns:xmpNote="http://ns.adobe.com/xmp/note/"'
+        ext_attr = f'\n   xmpNote:HasExtendedXMP="{extended_guid}"'
+        settings_block = ""
 
     return (
         '<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
         '<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="LLR">\n'
         ' <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">\n'
         '  <rdf:Description rdf:about=""\n'
-        f'   xmlns:llr="{LLR_XMP_NS}"\n'
-        f"   {attr_lines}>"
-        f"{tone_block}\n"
-        f"   <llr:Settings>{_xml_escape(llr_json)}</llr:Settings>\n"
+        f'   xmlns:llr="{LLR_XMP_NS}"{ext_ns}\n'
+        f"   {attr_lines}{ext_attr}>"
+        f"{tone_block}"
+        f"{settings_block}\n"
         "  </rdf:Description>\n"
         " </rdf:RDF>\n"
         "</x:xmpmeta>\n"
@@ -841,21 +864,76 @@ def build_xmp_packet(settings: dict[str, Any]) -> str:
     )
 
 
-def embed_xmp_app1(jpeg: bytes, xmp_packet: str) -> bytes:
-    """Insert an XMP APP1 segment into a JPEG without re-encoding pixels."""
+def build_extended_xmp(settings: dict[str, Any]) -> str:
+    """The ExtendedXMP serialization carrying only llr:Settings (no xpacket PI)."""
+    llr_json = json.dumps(settings, separators=(",", ":"), ensure_ascii=False)
+    return (
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="LLR">\n'
+        ' <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">\n'
+        '  <rdf:Description rdf:about=""\n'
+        f'   xmlns:llr="{LLR_XMP_NS}">\n'
+        f"   <llr:Settings>{_xml_escape(llr_json)}</llr:Settings>\n"
+        "  </rdf:Description>\n"
+        " </rdf:RDF>\n"
+        "</x:xmpmeta>"
+    )
+
+
+XMP_STD_HEADER = b"http://ns.adobe.com/xap/1.0/\x00"
+XMP_EXT_HEADER = b"http://ns.adobe.com/xmp/extension/\x00"
+MAX_APP1_PAYLOAD = 0xFFFF - 2  # the 2-byte length field counts itself
+# Each extension chunk header: namespace + 32-char GUID + u32 total + u32 offset.
+EXT_CHUNK_SIZE = MAX_APP1_PAYLOAD - len(XMP_EXT_HEADER) - 32 - 8
+
+
+def build_xmp_segments(settings: dict[str, Any]) -> tuple[list[bytes], int]:
+    """APP1 payloads for the settings XMP, plus the total XMP byte count.
+
+    A normal edit fits one standard XMP APP1. A heavy edit (big curves + HSL +
+    grading JSON) can overflow the 64 KB segment limit; then the llr:Settings
+    blob moves to Extended XMP chunks so export never fails on packet size.
+    """
+    packet = build_xmp_packet(settings).encode("utf-8")
+    if len(XMP_STD_HEADER) + len(packet) <= MAX_APP1_PAYLOAD:
+        return [XMP_STD_HEADER + packet], len(packet)
+
+    extended = build_extended_xmp(settings).encode("utf-8")
+    guid = hashlib.md5(extended).hexdigest().upper()
+    main = build_xmp_packet(settings, extended_guid=guid).encode("utf-8")
+    if len(XMP_STD_HEADER) + len(main) > MAX_APP1_PAYLOAD:
+        # Huge tone curves inflate the main packet too; drop the Seq blocks
+        # (the full curves still live in llr:Settings in the extended packet).
+        main = build_xmp_packet(settings, extended_guid=guid, include_curves=False).encode("utf-8")
+    if len(XMP_STD_HEADER) + len(main) > MAX_APP1_PAYLOAD:
+        raise ValueError("XMP packet too large even without the settings blob")
+    payloads = [XMP_STD_HEADER + main]
+    for offset in range(0, len(extended), EXT_CHUNK_SIZE):
+        chunk = extended[offset : offset + EXT_CHUNK_SIZE]
+        payloads.append(
+            XMP_EXT_HEADER
+            + guid.encode("ascii")
+            + struct.pack(">II", len(extended), offset)
+            + chunk
+        )
+    return payloads, len(main) + len(extended)
+
+
+def embed_xmp_app1(jpeg: bytes, payloads: list[bytes]) -> bytes:
+    """Insert XMP APP1 segment(s) into a JPEG without re-encoding pixels."""
     if jpeg[:2] != b"\xff\xd8":
         raise ValueError("export target is not a JPEG file")
-    payload = b"http://ns.adobe.com/xap/1.0/\x00" + xmp_packet.encode("utf-8")
-    if len(payload) + 2 > 0xFFFF:
-        raise ValueError("XMP packet too large for a single APP1 segment")
-    segment = b"\xff\xe1" + struct.pack(">H", len(payload) + 2) + payload
+    segments = bytearray()
+    for payload in payloads:
+        if len(payload) + 2 > 0xFFFF:
+            raise ValueError("XMP APP1 payload exceeds segment limit")
+        segments += b"\xff\xe1" + struct.pack(">H", len(payload) + 2) + payload
 
     # Insert after the SOI and any leading APP0/APP1 (JFIF/EXIF) segments.
     insert_at = 2
     while jpeg[insert_at : insert_at + 2] in (b"\xff\xe0", b"\xff\xe1"):
         seg_len = struct.unpack(">H", jpeg[insert_at + 2 : insert_at + 4])[0]
         insert_at += 2 + seg_len
-    return jpeg[:insert_at] + segment + jpeg[insert_at:]
+    return jpeg[:insert_at] + bytes(segments) + jpeg[insert_at:]
 
 
 def build_cache_key(
