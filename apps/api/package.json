@@ -7,8 +7,5 @@
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "dev": "tsx src/index.ts"
-  },
-  "dependencies": {
-    "@llr/profiles": "workspace:*"
   }
 }

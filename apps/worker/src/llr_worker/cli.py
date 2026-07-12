@@ -4,7 +4,6 @@ import argparse
 import functools
 import hashlib
 import json
-import math
 import os
 import shutil
 import struct
@@ -21,7 +20,7 @@ from typing import Any, Callable
 
 import numpy as np
 import rawpy
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from PIL import Image, ImageOps
 
 from .dcp import DcpProfile, apply_dcp_profile, load_dcp_profile
 from .denoise import DEFAULT_MODEL, denoise_raw_inplace, get_denoiser
@@ -29,13 +28,6 @@ from .denoise import DEFAULT_MODEL, denoise_raw_inplace, get_denoiser
 
 RAW_EXTENSIONS = {".arw", ".srf", ".sr2", ".dng", ".cr2", ".cr3", ".nef", ".raf", ".rw2", ".orf"}
 LOCAL_CAMERA_PROFILE_ROOT = Path("vendor/adobe-camera-profiles/Camera")
-def _build_srgb_u8_lut() -> np.ndarray:
-    x = np.linspace(0, 1, 65536, dtype=np.float32)
-    encoded = np.where(x <= 0.0031308, x * 12.92, 1.055 * np.power(x, 1 / 2.4) - 0.055)
-    return np.round(encoded * 255).astype(np.uint8)
-
-
-SRGB_U8_LUT = _build_srgb_u8_lut()
 
 
 @dataclass(frozen=True)
@@ -65,9 +57,6 @@ class PreparedLinear:
     metadata: RawMetadata
     color_profile: dict[str, Any]
 
-
-PREPARED_CACHE: OrderedDict[tuple[Any, ...], PreparedLinear] = OrderedDict()
-PREPARED_CACHE_MAX = 4
 
 # Cache raw-decoded camera RGB data keyed by (sourcePath, halfSize, maxSize,
 # denoiseModel). DCP code changes re-apply DCP on cached data instead of
@@ -146,10 +135,6 @@ def main() -> None:
             render_preview(args, root)
             return
 
-        if args.command == "export":
-            render_export(args, root)
-            return
-
         if args.command == "daemon":
             run_daemon(root)
             return
@@ -170,34 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
     preview.add_argument("input")
     preview.add_argument("output")
 
-    export = subparsers.add_parser("export")
-    export.add_argument("input")
-    export.add_argument("output")
-    export.add_argument("--profile", default="standard", choices=sorted(PROFILES))
-    export.add_argument("--dcp", help="Optional external DCP camera profile. Standard auto-detects local profiles when omitted.")
-    export.add_argument("--no-dcp", action="store_true", help="Disable local DCP auto-detection.")
-    export.add_argument("--lut", help="Optional .cube LUT applied in display sRGB space.")
-    export.add_argument("--auto-tone", dest="auto_tone", action="store_true", default=None)
-    export.add_argument("--no-auto-tone", dest="auto_tone", action="store_false")
-    export.add_argument("--half-size", dest="half_size", action="store_true", help="Decode the RAW with 2x2 binning for ~2x faster preview.")
-    export.add_argument("--max-size", dest="max_size", type=int, help="Down-scale the output JPEG so its long edge fits this many pixels.")
-    export.add_argument("--preview", action="store_true", help="Shortcut for --half-size --max-size 1600.")
-
     subparsers.add_parser("daemon")
-    for key in [
-        "exposure",
-        "contrast",
-        "highlights",
-        "shadows",
-        "whites",
-        "blacks",
-        "vibrance",
-        "saturation",
-        "clarity",
-        "dehaze",
-        "sharpen",
-    ]:
-        export.add_argument(f"--{key}", type=float)
 
     return parser
 
@@ -241,57 +199,6 @@ def render_preview(args: argparse.Namespace, root: Path) -> None:
     image.thumbnail((2400, 2400), Image.Resampling.LANCZOS)
     save_jpeg(image, output_path, quality=86)
     print(f"Wrote {output_path}")
-
-
-def render_export(args: argparse.Namespace, root: Path) -> None:
-    input_path = resolve_path(root, args.input)
-    output_path = resolve_path(root, args.output)
-    recipe = merge_recipe(PROFILES[args.profile], recipe_overrides(args))
-    lut = load_cube_lut(resolve_path(root, args.lut)) if args.lut else None
-    half_size = bool(getattr(args, "half_size", False) or getattr(args, "preview", False))
-    max_size: int | None = getattr(args, "max_size", None)
-    if getattr(args, "preview", False) and max_size is None:
-        max_size = 1600
-    quality = 86 if half_size else 92
-
-    if is_raw(input_path):
-        image, metadata, auto_tone, color_profile = render_raw(
-            input_path,
-            recipe,
-            lut,
-            root,
-            dcp_arg=args.dcp,
-            disable_dcp=bool(args.no_dcp),
-            half_size=half_size,
-            max_size=max_size,
-        )
-    else:
-        image = apply_display_recipe(open_rgb(input_path), recipe)
-        if lut:
-            image = Image.fromarray(apply_cube_lut(np.asarray(image, dtype=np.uint8), lut), mode="RGB")
-        if max_size:
-            image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-        metadata = None
-        auto_tone = None
-        color_profile = None
-
-    save_jpeg(image, output_path, quality=quality)
-    print(
-        json.dumps(
-            {
-                "output": str(output_path),
-                "pipeline": "rawpy-libraw+dcp" if is_dcp_color_profile(color_profile) else "rawpy-libraw",
-                "metadata": metadata_to_json(metadata),
-                "recipe": recipe,
-                "colorProfile": color_profile,
-                "autoTone": auto_tone,
-                "lut": str(resolve_path(root, args.lut)) if args.lut else None,
-                "halfSize": half_size,
-                "maxSize": max_size,
-            },
-            indent=2,
-        )
-    )
 
 
 # Daemon concurrency: requests run on a small thread pool so a multi-second
@@ -357,9 +264,7 @@ def emit_response(payload: dict[str, Any]) -> None:
 
 
 def handle_daemon_request(request: dict[str, Any], root: Path) -> dict[str, Any]:
-    command = request.get("command", "render")
-    if command == "render":
-        return daemon_render(request, root)
+    command = request.get("command")
     if command == "render-linear":
         return daemon_linear(request, root)
     if command == "extract-preview":
@@ -367,91 +272,8 @@ def handle_daemon_request(request: dict[str, Any], root: Path) -> dict[str, Any]
     if command == "export":
         return daemon_export(request, root)
     if command == "ping":
-        return {"pong": True, "cacheSize": len(PREPARED_CACHE)}
+        return {"pong": True, "cacheSize": len(_LINEAR_CACHE)}
     raise ValueError(f"unknown command: {command}")
-
-
-def daemon_render(request: dict[str, Any], root: Path) -> dict[str, Any]:
-    input_path = resolve_path(root, request["input"])
-    output_path = resolve_path(root, request["output"])
-    profile_id = request.get("profile") or "standard"
-    if profile_id not in PROFILES:
-        profile_id = "standard"
-    disable_dcp = bool(request.get("disableDcp", False))
-    dcp_arg = request.get("dcp")
-    half_size = bool(request.get("halfSize", False))
-    max_size = request.get("maxSize")
-    if isinstance(max_size, str):
-        max_size = int(max_size) if max_size else None
-    lut_path = request.get("lut")
-    auto_tone_value: bool | None = None
-    if "autoTone" in request and request["autoTone"] is not None:
-        auto_tone_value = bool(request["autoTone"])
-
-    overrides: dict[str, Any] = {}
-    raw_recipe = request.get("recipe") or {}
-    for key in [
-        "exposure",
-        "contrast",
-        "highlights",
-        "shadows",
-        "whites",
-        "blacks",
-        "vibrance",
-        "saturation",
-        "clarity",
-        "dehaze",
-        "sharpen",
-    ]:
-        value = raw_recipe.get(key)
-        if value is None:
-            continue
-        try:
-            overrides[key] = float(value)
-        except (TypeError, ValueError):
-            continue
-
-    if auto_tone_value is not None:
-        overrides["autoTone"] = auto_tone_value
-
-    recipe = merge_recipe(PROFILES[profile_id], overrides)
-    lut = load_cube_lut(resolve_path(root, lut_path)) if lut_path else None
-
-    cache_key = build_cache_key(input_path, profile_id, dcp_arg, disable_dcp, half_size, max_size)
-    with _CACHE_LOCK:
-        prepared = PREPARED_CACHE.get(cache_key)
-        if prepared is not None:
-            PREPARED_CACHE.move_to_end(cache_key)
-    cache_hit = prepared is not None
-    if prepared is None:
-        prepared = prepare_linear(
-            input_path,
-            recipe,
-            root,
-            dcp_arg=dcp_arg,
-            disable_dcp=disable_dcp,
-            half_size=half_size,
-            max_size=max_size,
-        )
-        with _CACHE_LOCK:
-            PREPARED_CACHE[cache_key] = prepared
-            while len(PREPARED_CACHE) > PREPARED_CACHE_MAX:
-                PREPARED_CACHE.popitem(last=False)
-
-    image, auto_tone = finalize_image(prepared, recipe, lut, max_size=None)
-    quality = 82 if half_size else 92
-    save_jpeg(image, output_path, quality=quality)
-
-    return {
-        "output": str(output_path),
-        "metadata": metadata_to_json(prepared.metadata),
-        "colorProfile": prepared.color_profile,
-        "pipeline": "rawpy-libraw+dcp" if is_dcp_color_profile(prepared.color_profile) else "rawpy-libraw",
-        "autoTone": auto_tone,
-        "cached": cache_hit,
-        "halfSize": half_size,
-        "maxSize": max_size,
-    }
 
 
 def _linear_cache_key(
@@ -951,51 +773,6 @@ def embed_xmp_app1(jpeg: bytes, payloads: list[bytes]) -> bytes:
     return jpeg[:insert_at] + bytes(segments) + jpeg[insert_at:]
 
 
-def build_cache_key(
-    input_path: Path,
-    profile_id: str,
-    dcp_arg: str | None,
-    disable_dcp: bool,
-    half_size: bool,
-    max_size: int | None,
-) -> tuple[Any, ...]:
-    try:
-        stat = input_path.stat()
-        signature: tuple[Any, ...] = (stat.st_size, int(stat.st_mtime_ns))
-    except OSError:
-        signature = (None,)
-    return (
-        str(input_path),
-        profile_id,
-        dcp_arg or "",
-        bool(disable_dcp),
-        bool(half_size),
-        int(max_size) if max_size else 0,
-        signature,
-    )
-
-
-def recipe_overrides(args: argparse.Namespace) -> dict[str, Any]:
-    overrides = {
-        key: getattr(args, key)
-        for key in [
-            "exposure",
-            "contrast",
-            "highlights",
-            "shadows",
-            "whites",
-            "blacks",
-            "vibrance",
-            "saturation",
-            "clarity",
-            "dehaze",
-            "sharpen",
-        ]
-    }
-    overrides["autoTone"] = args.auto_tone
-    return overrides
-
-
 def merge_recipe(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
     return {**base, **{key: value for key, value in overrides.items() if value is not None}}
 
@@ -1028,29 +805,6 @@ def extract_preview_image(input_path: Path) -> Image.Image:
             return Image.fromarray(thumb.data, mode="RGB")
 
     raise ValueError(f"Unsupported RAW thumbnail in {input_path}")
-
-
-def render_raw(
-    input_path: Path,
-    recipe: dict[str, Any],
-    lut: CubeLut | None,
-    root: Path,
-    dcp_arg: str | None,
-    disable_dcp: bool,
-    half_size: bool = False,
-    max_size: int | None = None,
-) -> tuple[Image.Image, RawMetadata, dict[str, Any] | None, dict[str, Any]]:
-    prepared = prepare_linear(
-        input_path,
-        recipe,
-        root,
-        dcp_arg=dcp_arg,
-        disable_dcp=disable_dcp,
-        half_size=half_size,
-        max_size=max_size,
-    )
-    image, auto_tone = finalize_image(prepared, recipe, lut, max_size=None)
-    return image, prepared.metadata, auto_tone, prepared.color_profile
 
 
 def _raw_cache_key(
@@ -1185,62 +939,6 @@ def downsample_linear(linear: np.ndarray, max_size: int) -> np.ndarray:
         plane = plane.resize((new_w, new_h), Image.Resampling.BILINEAR)
         out[..., channel] = np.asarray(plane, dtype=np.float32)
     return out
-
-
-def finalize_image(
-    prepared: PreparedLinear,
-    recipe: dict[str, Any],
-    lut: CubeLut | None,
-    max_size: int | None = None,
-) -> tuple[Image.Image, dict[str, Any] | None]:
-    linear = prepared.linear
-    color_profile = prepared.color_profile
-
-    auto_tone = None
-    if bool(recipe.get("autoTone", False)):
-        linear, auto_tone = apply_auto_tone(linear)
-
-    linear = apply_linear_controls(linear, recipe)
-    linear = apply_contrast_linear(linear, float(recipe["contrast"]))
-    linear = apply_saturation_linear(linear, float(recipe["saturation"]), float(recipe["vibrance"]))
-
-    display = linear_to_srgb(linear)
-    if int(color_profile.get("toneCurveSamples", 0)) == 0:
-        display = apply_tone_curve(display, recipe)
-
-    if lut:
-        display = apply_cube_lut(display, lut)
-
-    image = Image.fromarray(display, mode="RGB")
-    image = apply_sharpen(image, float(recipe["sharpen"]))
-    if max_size:
-        image.thumbnail((max_size, max_size), Image.Resampling.BILINEAR)
-    return image, auto_tone
-
-
-def apply_contrast_linear(linear: np.ndarray, contrast: float) -> np.ndarray:
-    if contrast == 0:
-        return linear
-    pivot = 0.18
-    strength = contrast / 100.0
-    radius = 0.5
-    delta = linear - pivot
-    falloff = np.maximum(0.0, 1.0 - np.square(delta / radius))
-    return np.maximum(0.0, linear + strength * delta * falloff)
-
-
-def apply_saturation_linear(linear: np.ndarray, saturation: float, vibrance: float) -> np.ndarray:
-    if saturation == 0 and vibrance == 0:
-        return linear
-    luma = luminance(linear)[..., None]
-    chroma = linear - luma
-    sat_scale = 1.0 + saturation / 100.0
-    if vibrance != 0:
-        max_chroma = np.max(np.abs(chroma), axis=2, keepdims=True)
-        muted_mask = np.clip(1.0 - max_chroma * 2.5, 0.0, 1.0)
-        vib_scale = 1.0 + vibrance / 100.0 * muted_mask
-        chroma = chroma * vib_scale
-    return np.clip(luma + chroma * sat_scale, 0.0, None)
 
 
 def _parse_int_pair(value: Any) -> tuple[int, int] | None:
@@ -1574,162 +1272,6 @@ def libraw_color_profile_info() -> dict[str, Any]:
     }
 
 
-def apply_auto_tone(linear: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
-    image = np.nan_to_num(linear, nan=0.0, posinf=1.0, neginf=0.0)
-    luma = luminance(image)
-    sample = luma[np.isfinite(luma) & (luma > 0)]
-
-    if sample.size < 16:
-        return np.clip(image, 0, 1), {"enabled": True, "reason": "insufficient-sample"}
-
-    black_percentile = 0.2
-    white_percentile = 99.9
-    black_point = float(np.percentile(sample, black_percentile))
-    white_point = float(np.percentile(sample, white_percentile))
-
-    if white_point <= black_point + 1e-5:
-        return np.clip(image, 0, 1), {"enabled": True, "reason": "flat-image"}
-
-    image = np.clip((image - black_point) / (white_point - black_point), 0, 1)
-    normalized_luma = luminance(image)
-    mid_sample = normalized_luma[np.isfinite(normalized_luma) & (normalized_luma > 0.001) & (normalized_luma < 0.98)]
-    source_median = float(np.percentile(mid_sample, 50)) if mid_sample.size else 0.22
-    target_median = 0.16
-    midtone_power = 1.0
-
-    if 0 < source_median < 1:
-        midtone_power = clamp(math.log(target_median) / math.log(clamp(source_median, 0.001, 0.999)), 0.65, 1.45)
-        image = np.power(image, midtone_power)
-
-    return np.clip(image, 0, 1), {
-        "enabled": True,
-        "space": "linear-srgb",
-        "blackPercentile": black_percentile,
-        "whitePercentile": white_percentile,
-        "blackPoint": round(black_point, 6),
-        "whitePoint": round(white_point, 6),
-        "sourceMedian": round(source_median, 6),
-        "targetMedian": target_median,
-        "midtonePower": round(float(midtone_power), 6),
-    }
-
-
-def apply_linear_controls(linear: np.ndarray, recipe: dict[str, Any]) -> np.ndarray:
-    image = linear * (2 ** float(recipe["exposure"]))
-    image = apply_highlight_shadow_controls(image, recipe)
-    return np.clip(image, 0, 1)
-
-
-def apply_highlight_shadow_controls(image: np.ndarray, recipe: dict[str, Any]) -> np.ndarray:
-    shadows = float(recipe["shadows"]) / 100
-    highlights = float(recipe["highlights"]) / 100
-    whites = float(recipe["whites"]) / 100
-    blacks = float(recipe["blacks"]) / 100
-    if shadows == 0 and highlights == 0 and whites == 0 and blacks == 0:
-        return image
-
-    luma = luminance(image)
-    shadow_mask = np.clip((0.55 - luma) / 0.55, 0, 1)[..., None]
-    highlight_mask = np.clip((luma - 0.45) / 0.55, 0, 1)[..., None]
-    image = image * (1 + shadows * 0.35 * shadow_mask)
-    image = image * (1 + highlights * 0.30 * highlight_mask)
-    image = image + whites * 0.06 * highlight_mask
-    image = image + blacks * 0.04 * (1 - shadow_mask)
-    return image
-
-
-def linear_to_srgb(linear: np.ndarray) -> np.ndarray:
-    indexes = np.clip(linear * 65535, 0, 65535).astype(np.uint16)
-    return SRGB_U8_LUT[indexes]
-
-
-def apply_tone_curve(display: np.ndarray, recipe: dict[str, Any]) -> np.ndarray:
-    tone_curve = recipe.get("toneCurve", [])
-    if len(tone_curve) < 3:
-        return display
-
-    xs = np.array([clamp(float(point["x"]), 0, 255) for point in tone_curve], dtype=np.float32)
-    ys = np.array([clamp(float(point["y"]), 0, 255) for point in tone_curve], dtype=np.float32)
-    curve = np.interp(np.arange(256, dtype=np.float32), xs, ys).astype(np.uint8)
-    return curve[display]
-
-
-def apply_display_recipe(image: Image.Image, recipe: dict[str, Any], skip_tone_curve: bool = False) -> Image.Image:
-    contrast = 1 + float(recipe["contrast"]) / 100 + float(recipe["clarity"]) / 220 + float(recipe["dehaze"]) / 260
-    saturation = 1 + (float(recipe["saturation"]) + float(recipe["vibrance"]) * 0.6) / 100
-    image = ImageEnhance.Contrast(image).enhance(clamp(contrast, 0.1, 4))
-    image = ImageEnhance.Color(image).enhance(clamp(saturation, 0, 3))
-    if not skip_tone_curve:
-        image = Image.fromarray(apply_tone_curve(np.asarray(image, dtype=np.uint8), recipe), mode="RGB")
-    return image
-
-
-def apply_sharpen(image: Image.Image, amount: float) -> Image.Image:
-    if amount <= 0:
-        return image
-    return image.filter(ImageFilter.UnsharpMask(radius=1.0, percent=int(clamp(amount * 4, 0, 180)), threshold=2))
-
-
-@dataclass(frozen=True)
-class CubeLut:
-    size: int
-    values: np.ndarray
-
-
-def load_cube_lut(path: Path) -> CubeLut:
-    size: int | None = None
-    rows: list[list[float]] = []
-    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        parts = stripped.split()
-        key = parts[0].upper()
-        if key == "LUT_3D_SIZE":
-            size = int(parts[1])
-            continue
-        if key in {"TITLE", "DOMAIN_MIN", "DOMAIN_MAX", "LUT_1D_SIZE"}:
-            continue
-        if len(parts) >= 3 and all(is_float(part) for part in parts[:3]):
-            rows.append([float(parts[0]), float(parts[1]), float(parts[2])])
-
-    if size is None:
-        raise ValueError(f"{path} is missing LUT_3D_SIZE")
-    if len(rows) != size**3:
-        raise ValueError(f"{path} has {len(rows)} LUT rows, expected {size ** 3}")
-
-    return CubeLut(size=size, values=np.array(rows, dtype=np.float32).reshape((size, size, size, 3)))
-
-
-def apply_cube_lut(image: np.ndarray, lut: CubeLut) -> np.ndarray:
-    source = image.astype(np.float32) / 255
-    max_index = lut.size - 1
-    scaled = source * max_index
-    lower = np.floor(scaled).astype(np.int32)
-    upper = np.clip(lower + 1, 0, max_index)
-    amount = scaled - lower
-
-    c000 = lut.values[lower[..., 0], lower[..., 1], lower[..., 2]]
-    c100 = lut.values[upper[..., 0], lower[..., 1], lower[..., 2]]
-    c010 = lut.values[lower[..., 0], upper[..., 1], lower[..., 2]]
-    c110 = lut.values[upper[..., 0], upper[..., 1], lower[..., 2]]
-    c001 = lut.values[lower[..., 0], lower[..., 1], upper[..., 2]]
-    c101 = lut.values[upper[..., 0], lower[..., 1], upper[..., 2]]
-    c011 = lut.values[lower[..., 0], upper[..., 1], upper[..., 2]]
-    c111 = lut.values[upper[..., 0], upper[..., 1], upper[..., 2]]
-
-    tx = amount[..., 0:1]
-    ty = amount[..., 1:2]
-    tz = amount[..., 2:3]
-    c00 = c000 * (1 - tx) + c100 * tx
-    c10 = c010 * (1 - tx) + c110 * tx
-    c01 = c001 * (1 - tx) + c101 * tx
-    c11 = c011 * (1 - tx) + c111 * tx
-    c0 = c00 * (1 - ty) + c10 * ty
-    c1 = c01 * (1 - ty) + c11 * ty
-    return np.clip((c0 * (1 - tz) + c1 * tz) * 255, 0, 255).astype(np.uint8)
-
-
 def open_rgb(path: Path | Any) -> Image.Image:
     with Image.open(path) as image:
         return ImageOps.exif_transpose(image).convert("RGB")
@@ -1738,10 +1280,6 @@ def open_rgb(path: Path | Any) -> Image.Image:
 def save_jpeg(image: Image.Image, output_path: Path, quality: int) -> None:
     ensure_parent(output_path)
     image.save(output_path, "JPEG", quality=quality, optimize=True)
-
-
-def luminance(image: np.ndarray) -> np.ndarray:
-    return image[..., 0] * 0.2126 + image[..., 1] * 0.7152 + image[..., 2] * 0.0722
 
 
 def run_capture(command: list[str], env: dict[str, str] | None = None) -> str:
@@ -1754,14 +1292,6 @@ def string_or_none(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
-
-
-def is_float(value: str) -> bool:
-    try:
-        float(value)
-    except ValueError:
-        return False
-    return True
 
 
 def clamp(value: float, minimum: float, maximum: float) -> float:

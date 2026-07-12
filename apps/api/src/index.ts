@@ -7,20 +7,15 @@ import { dirname, extname, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { profiles } from "@llr/profiles";
-
-type RecipeBody = {
-  sourceId: string;
-  recipe: Record<string, unknown>;
-  profileId?: string;
-  autoTone?: boolean;
-};
 
 const port = Number(process.env.PORT ?? 8790);
 const host = process.env.HOST ?? "127.0.0.1";
 const repoRoot = resolveRepoRoot();
 const sessionsRoot = resolve(repoRoot, "tmp/sessions");
-const RAW_EXTENSIONS = new Set([
+// Upload formats the worker can decode: RAW via LibRaw, plus plain images
+// (jpg/png/tiff) via Pillow. Broader than the worker's RAW_EXTENSIONS, which
+// answers "is this a RAW file", not "can we ingest it".
+const SUPPORTED_EXTENSIONS = new Set([
   ".arw",
   ".srf",
   ".sr2",
@@ -47,20 +42,6 @@ class HttpError extends Error {
     super(message);
   }
 }
-
-const NUMERIC_RECIPE_KEYS = [
-  "exposure",
-  "contrast",
-  "highlights",
-  "shadows",
-  "whites",
-  "blacks",
-  "vibrance",
-  "saturation",
-  "clarity",
-  "dehaze",
-  "sharpen"
-] as const;
 
 const server = createServer((request, response) => {
   setCors(request, response);
@@ -97,11 +78,6 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
     return;
   }
 
-  if (method === "GET" && pathname === "/profiles") {
-    sendJson(response, { profiles });
-    return;
-  }
-
   if (method === "POST" && pathname === "/sources") {
     await handleSourceUpload(request, response);
     return;
@@ -119,17 +95,6 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
   const embeddedMatch = pathname.match(/^\/sources\/([\w-]+)\/embedded\.jpg$/);
   if (method === "GET" && embeddedMatch) {
     streamFile(response, resolve(sessionsRoot, embeddedMatch[1], "embedded.jpg"));
-    return;
-  }
-
-  const renderMatch = pathname.match(/^\/sources\/([\w-]+)\/render\.jpg$/);
-  if (method === "GET" && renderMatch) {
-    streamFile(response, resolve(sessionsRoot, renderMatch[1], "render.jpg"));
-    return;
-  }
-
-  if (method === "POST" && pathname === "/render") {
-    await handleRender(request, response);
     return;
   }
 
@@ -155,7 +120,7 @@ async function handleSourceUpload(request: IncomingMessage, response: ServerResp
   }
 
   const ext = pickExtension(file.name);
-  if (!RAW_EXTENSIONS.has(ext)) {
+  if (!SUPPORTED_EXTENSIONS.has(ext)) {
     sendJson(response, { error: `Unsupported extension: ${ext || "(none)"}` }, 415);
     return;
   }
@@ -177,54 +142,6 @@ async function handleSourceUpload(request: IncomingMessage, response: ServerResp
     embeddedUrl: `/sources/${id}/embedded.jpg`,
     renderUrl: null
   }, 201);
-}
-
-async function handleRender(request: IncomingMessage, response: ServerResponse): Promise<void> {
-  const body = await readJson<RecipeBody>(request);
-  if (!body.sourceId) {
-    sendJson(response, { error: "Missing sourceId" }, 400);
-    return;
-  }
-
-  const sessionDir = resolve(sessionsRoot, body.sourceId);
-  const sourcePath = await findSource(sessionDir);
-  if (!sourcePath) {
-    sendJson(response, { error: "Unknown sourceId" }, 404);
-    return;
-  }
-
-  const outputPath = resolve(sessionDir, "render.jpg");
-  const profileId = body.profileId === "standard" || body.profileId === "neutral" ? body.profileId : "standard";
-
-  const recipe: Record<string, number> = {};
-  for (const key of NUMERIC_RECIPE_KEYS) {
-    const value = body.recipe?.[key];
-    if (typeof value === "number" && Number.isFinite(value)) {
-      recipe[key] = value;
-    }
-  }
-
-  const meta = await daemon.send({
-    command: "render",
-    input: sourcePath,
-    output: outputPath,
-    profile: profileId,
-    autoTone: body.autoTone ?? null,
-    halfSize: true,
-    maxSize: 1024,
-    recipe
-  });
-
-  sendJson(response, {
-    sourceId: body.sourceId,
-    renderUrl: `/sources/${body.sourceId}/render.jpg?t=${Date.now()}`,
-    metadata: meta?.metadata ?? null,
-    recipe: null,
-    pipeline: meta?.pipeline ?? null,
-    colorProfile: meta?.colorProfile ?? null,
-    autoTone: meta?.autoTone ?? null,
-    cached: meta?.cached ?? null
-  });
 }
 
 async function handleRenderLinear(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -372,7 +289,7 @@ async function cleanupSessions(): Promise<void> {
 }
 
 async function findSource(sessionDir: string): Promise<string | null> {
-  for (const ext of RAW_EXTENSIONS) {
+  for (const ext of SUPPORTED_EXTENSIONS) {
     const candidate = resolve(sessionDir, `source${ext}`);
     try {
       await access(candidate);
