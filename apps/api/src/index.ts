@@ -302,17 +302,23 @@ async function handleExport(request: IncomingMessage, response: ServerResponse):
     return;
   }
 
-  const exportPath = resolve(sessionDir, "export.jpg");
-  await writeFile(exportPath, Buffer.from(await file.arrayBuffer()));
-
-  await daemon.send({
-    command: "export",
-    input: sourcePath,
-    target: exportPath,
-    settings: meta.settings ?? {}
-  });
-
-  streamFile(response, exportPath);
+  // Per-request filename: concurrent exports of the same source must not
+  // overwrite each other's file between the write, the daemon's in-place XMP
+  // embed, and the response stream.
+  const exportPath = resolve(sessionDir, `export-${randomUUID()}.jpg`);
+  try {
+    await writeFile(exportPath, Buffer.from(await file.arrayBuffer()));
+    await daemon.send({
+      command: "export",
+      input: sourcePath,
+      target: exportPath,
+      settings: meta.settings ?? {}
+    });
+  } catch (error) {
+    await rm(exportPath, { force: true });
+    throw error;
+  }
+  streamFile(response, exportPath, () => void rm(exportPath, { force: true }));
 }
 
 async function cleanupSessions(): Promise<void> {
@@ -533,8 +539,9 @@ async function readJson<T>(request: IncomingMessage): Promise<T> {
   return JSON.parse(text) as T;
 }
 
-function streamFile(response: ServerResponse, path: string): void {
+function streamFile(response: ServerResponse, path: string, onClose?: () => void): void {
   const stream = createReadStream(path);
+  if (onClose) stream.once("close", onClose);
   stream.once("open", () => {
     response.writeHead(200, {
       "content-type": "image/jpeg",
