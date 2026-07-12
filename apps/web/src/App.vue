@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { PipelineRenderer, type EditParams } from "./rendering/pipeline-renderer";
 import { renderHistogram } from "./rendering/histogram";
 import {
@@ -20,12 +20,14 @@ import {
   loadThumbs, saveThumb, deleteThumb, generateThumb,
   type PersistedEdit,
 } from "./persistence";
+import { trackFill, formatBytes, type Source } from "./ui";
+import SliderRow from "./components/SliderRow.vue";
+import Filmstrip from "./components/Filmstrip.vue";
+import { useViewport } from "./composables/useViewport";
+import { useHistory } from "./composables/useHistory";
 
 // ── types ──
 
-// `invalid` is frontend-only (set when the server can no longer decode the
-// source, e.g. tmp/sessions was cleared); never persisted.
-type Source = { id: string; name: string; size: number; embeddedUrl: string; invalid?: boolean; };
 type RecipeKey = "exposure"|"contrast"|"highlights"|"shadows"|"whites"|"blacks"|"vibrance"|"saturation"|"temperature"|"tint"|"clarity"|"dehaze";
 type Recipe = Record<RecipeKey, number>;
 type SliderSpec = { key: RecipeKey; label: string; min: number; max: number; step: number };
@@ -102,9 +104,6 @@ let histoLast = 0;
 const HISTO_MIN_MS = 90;
 
 // ── Pan / Zoom state ──
-const zoom = ref(0); // 0 = no image, 1 = fit to viewport
-const pan = reactive({ x: 0, y: 0 });
-const fitScale = ref(1);
 // imageW/imageH are the *displayed output* dims (the crop result in normal mode,
 // or the straighten bounding box in the crop editor). srcW/srcH are the decoded
 // source texture dims that the crop transform maps from.
@@ -116,12 +115,6 @@ const srcH = ref(0);
 // downscale), reported by the worker so zoom % can be relative to the original.
 const srcFullW = ref(0);
 const srcFullH = ref(0);
-const viewportRef = ref<HTMLDivElement | null>(null);
-const isPanning = ref(false);
-let panStartX = 0;
-let panStartY = 0;
-let panStartPanX = 0;
-let panStartPanY = 0;
 let resizeObs: ResizeObserver | null = null;
 
 // ── HSL & Color Grading state ──
@@ -151,6 +144,12 @@ const defaultGrading = () => ({
 });
 const grading = reactive(defaultGrading());
 
+const GRADING_BANDS = [
+  { band: "sh", label: "Shadows", hueKey: "shH", satKey: "shS" },
+  { band: "md", label: "Midtones", hueKey: "mdH", satKey: "mdS" },
+  { band: "hl", label: "Highlights", hueKey: "hlH", satKey: "hlS" },
+] as const;
+
 // View settings (not part of the per-image recipe): tone-mapping look + display gamut.
 const viewSettings = reactive({ viewTransform: 0, displayGamut: 0 });
 
@@ -161,6 +160,13 @@ const viewSettings = reactive({ viewTransform: 0, displayGamut: 0 });
 // the display back to the cropped output. All geometry lives in crop.ts.
 const crop = reactive<CropState>(defaultCrop());
 const cropMode = ref(false);
+
+const {
+  zoom, pan, fitScale, viewportRef, isPanning,
+  displayTransform, zoomPercent, fullResZoom,
+  recomputeFit, startPan, doPan, stopPan, applyZoom,
+  onWheel, zoomIn, zoomOut, fitView, zoomToFull, onDoubleClick,
+} = useViewport({ imageW, imageH, srcW, srcH, srcFullW, srcFullH, cropMode });
 // Aspect lock for the crop box. Defaults to the image's own ratio; part of
 // the per-image snapshot so it survives image switches / undo / persistence.
 const DEFAULT_ASPECT = "orig";
@@ -493,14 +499,6 @@ type Snapshot = {
   denoise?: typeof denoise;  // optional: absent in pre-denoise persisted sessions
 };
 
-const MAX_HISTORY = 100;
-const HISTORY_DEBOUNCE = 300;
-
-// shallowRef: snapshots are immutable once captured and only length/index are
-// read reactively — deep-proxying up to 100 snapshots per push is pure cost.
-const history = shallowRef<Snapshot[]>([]);
-const historyIndex = ref(-1);
-const pendingDirty = ref(false);
 let isRestoring = false;
 // When true, the dcpCode watcher skips its re-decode — used while we load a
 // source explicitly (switching images / restoring) to avoid a double decode.
@@ -522,8 +520,16 @@ function defaultSnapshot(): Snapshot {
   };
 }
 
-const canUndo = computed(() => historyIndex.value > 0 || pendingDirty.value);
-const canRedo = computed(() => historyIndex.value < history.value.length - 1);
+const {
+  history, historyIndex, pendingDirty, canUndo, canRedo,
+  scheduleCommit: scheduleHistoryCommit, flushPending: flushPendingHistory,
+  undo, redo, init: initHistory,
+} = useHistory<Snapshot>({
+  capture: () => captureSnapshot(),
+  apply: (s) => applySnapshot(s),
+  suspended: () => isRestoring,
+  onCommitted: () => schedulePersist(),
+});
 
 function captureSnapshot(): Snapshot {
   return {
@@ -536,36 +542,6 @@ function captureSnapshot(): Snapshot {
     dcp: dcpCode.value,
     denoise: { ...denoise },
   };
-}
-
-function snapshotsEqual(a: Snapshot, b: Snapshot): boolean {
-  return JSON.stringify(a) === JSON.stringify(b);
-}
-
-// Commit the current edit state as a new history entry, dropping any redo branch.
-function commitHistory(): void {
-  pendingDirty.value = false;
-  const snap = captureSnapshot();
-  const cur = history.value[historyIndex.value];
-  if (cur && snapshotsEqual(cur, snap)) return;
-  const next = history.value.slice(0, historyIndex.value + 1);
-  next.push(snap);
-  if (next.length > MAX_HISTORY) next.shift();
-  history.value = next;
-  historyIndex.value = next.length - 1;
-}
-
-// Coalesce rapid edits (slider/curve drags) into one entry, committed after a quiet period.
-function scheduleHistoryCommit(): void {
-  if (isRestoring) return;
-  pendingDirty.value = true;
-  if (historyTimer) clearTimeout(historyTimer);
-  historyTimer = window.setTimeout(() => { historyTimer = 0; commitHistory(); }, HISTORY_DEBOUNCE);
-}
-
-function flushPendingHistory(): void {
-  if (historyTimer) { clearTimeout(historyTimer); historyTimer = 0; }
-  if (pendingDirty.value) commitHistory();
 }
 
 // Push a snapshot into the live reactive edit state (no draw scheduling — the
@@ -597,27 +573,6 @@ function applySnapshot(s: Snapshot): void {
   nextTick(() => { isRestoring = false; });
 }
 
-function undo(): void {
-  flushPendingHistory();
-  if (historyIndex.value <= 0) return;
-  historyIndex.value--;
-  applySnapshot(history.value[historyIndex.value]);
-  nextTick(() => schedulePersist());
-}
-
-function redo(): void {
-  flushPendingHistory();
-  if (historyIndex.value >= history.value.length - 1) return;
-  historyIndex.value++;
-  applySnapshot(history.value[historyIndex.value]);
-  nextTick(() => schedulePersist());
-}
-
-function initHistory(): void {
-  history.value = [captureSnapshot()];
-  historyIndex.value = 0;
-  pendingDirty.value = false;
-}
 initHistory();
 
 // ── Per-image edits + persistence ──
@@ -854,42 +809,6 @@ async function removeSource(id: string): Promise<void> {
 
 const activeSource = computed(() => sources.value.find(s => s.id === activeId.value) ?? null);
 
-const displayTransform = computed(() => {
-  if (!imageW.value || !imageH.value) return '';
-  const vp = viewportRef.value;
-  if (!vp) return '';
-  const vw = vp.clientWidth;
-  const vh = vp.clientHeight;
-  const scale = fitScale.value * zoom.value;
-  const tx = (vw - imageW.value * scale) / 2 + pan.x;
-  const ty = (vh - imageH.value * scale) / 2 + pan.y;
-  return `translate(${tx}px, ${ty}px) scale(${scale})`;
-});
-
-// Ratio that rescales preview px → original full-res px (≤1; 1 when the preview
-// is already full resolution). Lets us report/zoom relative to the original.
-const previewToFull = computed(() => {
-  const previewLong = Math.max(srcW.value, srcH.value);
-  const fullLong = Math.max(srcFullW.value, srcFullH.value);
-  return previewLong > 0 && fullLong > 0 ? previewLong / fullLong : 1;
-});
-
-// Zoom % is reported relative to the original full-resolution image (100% =
-// one original pixel per CSS pixel), not the downscaled preview: `scale` maps
-// preview px → screen px, and `previewToFull` rescales that to original px.
-const zoomPercent = computed(() => {
-  if (!imageW.value || !imageH.value) return 0;
-  return Math.round(fitScale.value * zoom.value * previewToFull.value * 100);
-});
-
-// Internal zoom factor (1 = fit) that displays the original image at 100%
-// (1:1 original px per CSS px), clamped to the allowed zoom range.
-const fullResZoom = computed(() => {
-  const z = fitScale.value > 0 && previewToFull.value > 0
-    ? 1 / (fitScale.value * previewToFull.value) : 1;
-  return Math.min(50, Math.max(0.1, z));
-});
-
 // ── WebGL ──
 
 function buildPipelineParams(): Partial<EditParams> {
@@ -1070,13 +989,6 @@ function destroyWebGL(opts: { keepContext?: boolean } = {}): void {
 // Normal view: render the crop box region (cropped output dims). Crop editor:
 // render the full straightened image's bounding box so the user sees beyond the
 // crop, with the overlay drawn on top.
-
-function recomputeFit(): void {
-  const vp = viewportRef.value;
-  if (!vp || !imageW.value || !imageH.value) return;
-  const margin = cropMode.value ? 0.86 : 1; // leave room for crop handles
-  fitScale.value = Math.min(vp.clientWidth / imageW.value, vp.clientHeight / imageH.value) * margin;
-}
 
 function renderNormal(): void {
   if (!webglRenderer || !srcW.value || !srcH.value) return;
@@ -1389,91 +1301,6 @@ function resizeCropTo(qx: number, qy: number, d: { handle: CropHandle; l: number
   if (cornersInsideImage(cand, iw, ih)) Object.assign(crop, cand);
 }
 
-// ── Pan / Zoom ──
-
-function startPan(e: MouseEvent): void {
-  if (e.button !== 0 || cropMode.value) return;
-  isPanning.value = true;
-  panStartX = e.clientX;
-  panStartY = e.clientY;
-  panStartPanX = pan.x;
-  panStartPanY = pan.y;
-}
-
-function doPan(e: MouseEvent): void {
-  if (!isPanning.value) return;
-  pan.x = panStartPanX + (e.clientX - panStartX);
-  pan.y = panStartPanY + (e.clientY - panStartY);
-}
-
-function stopPan(): void {
-  isPanning.value = false;
-}
-
-function applyZoom(newZoom: number, mx: number, my: number): void {
-  if (!viewportRef.value || !imageW.value || !imageH.value) return;
-  const vp = viewportRef.value;
-  const vw = vp.clientWidth;
-  const vh = vp.clientHeight;
-  const oldScale = fitScale.value * zoom.value;
-  const newScale = fitScale.value * newZoom;
-  const oldTx = (vw - imageW.value * oldScale) / 2 + pan.x;
-  const oldTy = (vh - imageH.value * oldScale) / 2 + pan.y;
-  const imgX = (mx - oldTx) / oldScale;
-  const imgY = (my - oldTy) / oldScale;
-  pan.x = (mx - imgX * newScale) - (vw - imageW.value * newScale) / 2;
-  pan.y = (my - imgY * newScale) - (vh - imageH.value * newScale) / 2;
-  zoom.value = newZoom;
-}
-
-function onWheel(e: WheelEvent): void {
-  if (cropMode.value || !imageW.value || !imageH.value || !viewportRef.value) return;
-  e.preventDefault();
-  const delta = -e.deltaY;
-  const factor = delta > 0 ? 1.1 : 1 / 1.1;
-  const newZoom = Math.max(0.1, Math.min(50, zoom.value * factor));
-  if (newZoom === zoom.value) return;
-  const vp = viewportRef.value;
-  const rect = vp.getBoundingClientRect();
-  applyZoom(newZoom, e.clientX - rect.left, e.clientY - rect.top);
-}
-
-function zoomIn(): void {
-  const newZoom = Math.min(50, zoom.value * 1.25);
-  const vp = viewportRef.value;
-  if (vp) applyZoom(newZoom, vp.clientWidth / 2, vp.clientHeight / 2);
-}
-
-function zoomOut(): void {
-  const newZoom = Math.max(0.1, zoom.value / 1.25);
-  const vp = viewportRef.value;
-  if (vp) applyZoom(newZoom, vp.clientWidth / 2, vp.clientHeight / 2);
-}
-
-function fitView(): void {
-  zoom.value = 1;
-  pan.x = 0;
-  pan.y = 0;
-}
-
-// Zoom to 100% (original 1:1), anchored at the viewport center.
-function zoomToFull(): void {
-  const vp = viewportRef.value;
-  if (vp) applyZoom(fullResZoom.value, vp.clientWidth / 2, vp.clientHeight / 2);
-}
-
-// Toggle between Fit and 100% (original 1:1). From Fit, zoom to 100% anchored at
-// the cursor; from any other zoom, return to a centered Fit.
-function onDoubleClick(e: MouseEvent): void {
-  if (cropMode.value || !imageW.value || !imageH.value || !viewportRef.value) return;
-  if (Math.abs(zoom.value - 1) < 1e-3) {
-    const rect = viewportRef.value.getBoundingClientRect();
-    applyZoom(fullResZoom.value, e.clientX - rect.left, e.clientY - rect.top);
-  } else {
-    fitView();
-  }
-}
-
 function onKeyDown(e: KeyboardEvent): void {
   const ae = document.activeElement as HTMLElement | null;
   const inEditableText = !!ae && (ae.tagName === "TEXTAREA" ||
@@ -1784,27 +1611,12 @@ async function exportImage(): Promise<void> {
     exporting.value = false;
   }
 }
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1048576) return `${(n/1024).toFixed(0)} KB`;
-  return `${(n/1048576).toFixed(1)} MB`;
-}
 function isAbsoluteUrl(u: string): boolean {
   return u.startsWith("blob:") || u.startsWith("data:") || u.startsWith("http");
 }
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
-}
-
-// Build a filled-track gradient for a range input. Bipolar sliders (min<0<max)
-// fill from the center toward the thumb; unipolar fill from the left.
-function trackFill(value: number, min: number, max: number): string {
-  const p = clamp((value - min) / (max - min), 0, 1) * 100;
-  const z = min < 0 && max > 0 ? (-min) / (max - min) * 100 : 0;
-  const a = Math.min(p, z);
-  const b = Math.max(p, z);
-  return `linear-gradient(to right, var(--track-bg) ${a}%, var(--accent) ${a}%, var(--accent) ${b}%, var(--track-bg) ${b}%)`;
 }
 
 // White balance reads as a colour axis, not an amount: an accent fill growing
@@ -1814,10 +1626,6 @@ const WB_TRACK: Partial<Record<RecipeKey, string>> = {
   temperature: "linear-gradient(to right, #3f7dff, #f2ead9 45%, #ffb648)",
   tint: "linear-gradient(to right, #4fc26a, #d8d8d8 50%, #d264d8)",
 };
-
-function sliderTrack(spec: SliderSpec): string {
-  return WB_TRACK[spec.key] ?? trackFill(recipe[spec.key], spec.min, spec.max);
-}
 
 // Lightroom-style scroll-to-nudge: hovering any range slider and scrolling steps
 // the value by one `step` (Shift ×10), instead of scrolling the panel. Applied via
@@ -2036,17 +1844,8 @@ const vWheelAdjust = {
               @change="setCustomAspect(customAspect![0], ($event.target as HTMLInputElement).valueAsNumber)" />
           </div>
         </div>
-        <div class="slider">
-          <label>Angle</label>
-          <input type="range" min="-45" max="45" step="0.1"
-            :value="crop.angle"
-            :style="{ '--track': trackFill(crop.angle, -45, 45) }"
-            @input="setAngle(($event.target as HTMLInputElement).valueAsNumber)"
-            @dblclick="setAngle(0)" title="Double-click to reset" />
-          <input class="slider-number" type="number" min="-45" max="45" step="0.1"
-            :value="Number(crop.angle.toFixed(1))"
-            @input="setAngle(($event.target as HTMLInputElement).valueAsNumber)" />
-        </div>
+        <SliderRow :model-value="Number(crop.angle.toFixed(1))" @update:model-value="setAngle"
+          label="Angle" :min="-45" :max="45" :step="0.1" />
         <div class="crop-buttons">
           <button type="button" class="crop-tool" title="Rotate left 90°" @click="rotateCrop(-1)">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -2114,16 +1913,10 @@ const vWheelAdjust = {
             <span v-if="groupEdited(group)" class="panel-dot" aria-hidden="true" />
           </span>
         </header>
-        <div v-for="spec in group.items" :key="spec.key" class="slider"
-          :class="{ 'is-modified': isEdited(spec.key) }">
-          <label :for="`s-${spec.key}`">{{ spec.label }}</label>
-          <input :id="`s-${spec.key}`" v-model.number="recipe[spec.key]" type="range"
-            :min="spec.min" :max="spec.max" :step="spec.step"
-            :style="{ '--track': sliderTrack(spec) }"
-            @dblclick="recipe[spec.key] = SLIDER_DEFAULTS[spec.key]" title="Double-click to reset" />
-          <input v-model.number="recipe[spec.key]" class="slider-number" type="number"
-            :min="spec.min" :max="spec.max" :step="spec.step" :aria-label="spec.label" />
-        </div>
+        <SliderRow v-for="spec in group.items" :key="spec.key"
+          v-model="recipe[spec.key]" :label="spec.label" :input-id="`s-${spec.key}`"
+          :min="spec.min" :max="spec.max" :step="spec.step"
+          :reset-value="SLIDER_DEFAULTS[spec.key]" :track="WB_TRACK[spec.key]" show-modified />
       </section>
 
       <section class="panel" v-if="activeSource && !cropMode">
@@ -2138,15 +1931,8 @@ const vWheelAdjust = {
             <span class="switch-track"><span class="switch-thumb" /></span>
           </label>
         </div>
-        <div v-show="denoise.enabled" class="slider" style="margin-top: 12px;">
-          <label for="denoise-amount">Amount</label>
-          <input id="denoise-amount" type="range" min="0" max="100" step="1"
-            v-model.number="denoise.amount"
-            :style="{ '--track': trackFill(denoise.amount, 0, 100) }"
-            @dblclick="denoise.amount = 100" title="Double-click to reset" />
-          <input v-model.number="denoise.amount" class="slider-number" type="number"
-            min="0" max="100" step="1" aria-label="Denoise amount" />
-        </div>
+        <SliderRow v-show="denoise.enabled" v-model="denoise.amount" style="margin-top: 12px;"
+          label="Amount" input-id="denoise-amount" :min="0" :max="100" :reset-value="100" />
       </section>
 
       <section class="panel" v-if="activeSource && !cropMode">
@@ -2161,19 +1947,10 @@ const vWheelAdjust = {
           <button :class="{ active: hslTab === 'sat' }" @click="hslTab = 'sat'">S</button>
           <button :class="{ active: hslTab === 'lum' }" @click="hslTab = 'lum'">L</button>
         </div>
-        <div v-for="(range, i) in HSL_RANGES" :key="range.name" class="hsl-row"
-          :class="{ 'is-modified': hslValue(i) !== 0 }">
-          <span class="hsl-dot" :style="{ background: range.color }" />
-          <span class="hsl-label">{{ range.name }}</span>
-          <input type="range" min="-100" max="100" step="1"
-            :value="hslValue(i)"
-            :style="{ '--track': trackFill(hslValue(i), -100, 100) }"
-            @input="setHsl(i, ($event.target as HTMLInputElement).valueAsNumber)"
-            @dblclick="setHsl(i, 0)" title="Double-click to reset" />
-          <input class="hsl-number" type="number" min="-100" max="100" step="1"
-            :value="hslValue(i)"
-            @input="setHsl(i, ($event.target as HTMLInputElement).valueAsNumber)" />
-        </div>
+        <SliderRow v-for="(range, i) in HSL_RANGES" :key="range.name"
+          :model-value="hslValue(i)" @update:model-value="v => setHsl(i, v)"
+          :label="range.name" :dot-color="range.color" row-class="hsl-row" number-class="hsl-number"
+          :min="-100" :max="100" show-modified />
       </section>
 
       <section class="panel" v-if="activeSource && !cropMode">
@@ -2183,80 +1960,16 @@ const vWheelAdjust = {
             <span v-if="gradingEdited" class="panel-dot" aria-hidden="true" />
           </span>
         </header>
-        <div class="grading-group">
+        <div v-for="g in GRADING_BANDS" :key="g.band" class="grading-group">
           <div class="grading-header">
-            <span class="grading-dot" :style="{ background: gradingColor('sh') }" />
-            <span>Shadows</span>
+            <span class="grading-dot" :style="{ background: gradingColor(g.band) }" />
+            <span>{{ g.label }}</span>
           </div>
-          <div class="grading-row">
-            <label>H</label>
-            <input type="range" min="-180" max="180" step="1" v-model.number="grading.shH"
-              :style="{ '--track': trackFill(grading.shH, -180, 180) }"
-              @dblclick="grading.shH = 0" title="Double-click to reset" />
-            <input class="slider-number" type="number" min="-180" max="180" step="1" v-model.number="grading.shH" />
-          </div>
-          <div class="grading-row">
-            <label>S</label>
-            <input type="range" min="0" max="100" step="1" v-model.number="grading.shS"
-              :style="{ '--track': trackFill(grading.shS, 0, 100) }"
-              @dblclick="grading.shS = 0" title="Double-click to reset" />
-            <input class="slider-number" type="number" min="0" max="100" step="1" v-model.number="grading.shS" />
-          </div>
+          <SliderRow v-model="grading[g.hueKey]" label="H" row-class="grading-row" :min="-180" :max="180" />
+          <SliderRow v-model="grading[g.satKey]" label="S" row-class="grading-row" :min="0" :max="100" />
         </div>
-        <div class="grading-group">
-          <div class="grading-header">
-            <span class="grading-dot" :style="{ background: gradingColor('md') }" />
-            <span>Midtones</span>
-          </div>
-          <div class="grading-row">
-            <label>H</label>
-            <input type="range" min="-180" max="180" step="1" v-model.number="grading.mdH"
-              :style="{ '--track': trackFill(grading.mdH, -180, 180) }"
-              @dblclick="grading.mdH = 0" title="Double-click to reset" />
-            <input class="slider-number" type="number" min="-180" max="180" step="1" v-model.number="grading.mdH" />
-          </div>
-          <div class="grading-row">
-            <label>S</label>
-            <input type="range" min="0" max="100" step="1" v-model.number="grading.mdS"
-              :style="{ '--track': trackFill(grading.mdS, 0, 100) }"
-              @dblclick="grading.mdS = 0" title="Double-click to reset" />
-            <input class="slider-number" type="number" min="0" max="100" step="1" v-model.number="grading.mdS" />
-          </div>
-        </div>
-        <div class="grading-group">
-          <div class="grading-header">
-            <span class="grading-dot" :style="{ background: gradingColor('hl') }" />
-            <span>Highlights</span>
-          </div>
-          <div class="grading-row">
-            <label>H</label>
-            <input type="range" min="-180" max="180" step="1" v-model.number="grading.hlH"
-              :style="{ '--track': trackFill(grading.hlH, -180, 180) }"
-              @dblclick="grading.hlH = 0" title="Double-click to reset" />
-            <input class="slider-number" type="number" min="-180" max="180" step="1" v-model.number="grading.hlH" />
-          </div>
-          <div class="grading-row">
-            <label>S</label>
-            <input type="range" min="0" max="100" step="1" v-model.number="grading.hlS"
-              :style="{ '--track': trackFill(grading.hlS, 0, 100) }"
-              @dblclick="grading.hlS = 0" title="Double-click to reset" />
-            <input class="slider-number" type="number" min="0" max="100" step="1" v-model.number="grading.hlS" />
-          </div>
-        </div>
-        <div class="slider">
-          <label>Blend</label>
-          <input type="range" min="0" max="100" step="1" v-model.number="grading.blend"
-            :style="{ '--track': trackFill(grading.blend, 0, 100) }"
-            @dblclick="grading.blend = 50" title="Double-click to reset" />
-          <input class="slider-number" type="number" min="0" max="100" step="1" v-model.number="grading.blend" />
-        </div>
-        <div class="slider">
-          <label>Balance</label>
-          <input type="range" min="-100" max="100" step="1" v-model.number="grading.balance"
-            :style="{ '--track': trackFill(grading.balance, -100, 100) }"
-            @dblclick="grading.balance = 0" title="Double-click to reset" />
-          <input class="slider-number" type="number" min="-100" max="100" step="1" v-model.number="grading.balance" />
-        </div>
+        <SliderRow v-model="grading.blend" label="Blend" :min="0" :max="100" :reset-value="50" />
+        <SliderRow v-model="grading.balance" label="Balance" :min="-100" :max="100" />
       </section>
 
       <section class="panel" v-if="activeSource && !cropMode">
@@ -2277,17 +1990,9 @@ const vWheelAdjust = {
 
         <!-- Parametric region + split sliders -->
         <div v-if="curveChannel === 'parametric'" class="curve-params">
-          <div v-for="r in PARAM_REGIONS" :key="r.key" class="slider">
-            <label>{{ r.label }}</label>
-            <input type="range" min="-100" max="100" step="1"
-              :value="paramValue(r.key)"
-              :style="{ '--track': trackFill(paramValue(r.key), -100, 100) }"
-              @input="setParam(r.key, ($event.target as HTMLInputElement).valueAsNumber)"
-              @dblclick="setParam(r.key, 0)" title="Double-click to reset" />
-            <input class="slider-number" type="number" min="-100" max="100" step="1"
-              :value="paramValue(r.key)"
-              @input="setParam(r.key, ($event.target as HTMLInputElement).valueAsNumber)" />
-          </div>
+          <SliderRow v-for="r in PARAM_REGIONS" :key="r.key"
+            :model-value="paramValue(r.key)" @update:model-value="v => setParam(r.key, v)"
+            :label="r.label" :min="-100" :max="100" />
           <div class="curve-splits">
             <span class="curve-splits-label">Range Splits</span>
             <input type="range" min="4" max="96" step="1"
@@ -2313,33 +2018,9 @@ const vWheelAdjust = {
       </section>
     </aside>
 
-    <footer class="filmstrip" v-if="sources.length">
-      <button class="filmstrip-import" type="button" @click="pickFiles">＋ Import</button>
-      <div class="filmstrip-track">
-        <div v-for="source in sources" :key="source.id"
-          class="film-cell" :class="{ 'is-active': source.id === activeId, 'is-invalid': source.invalid }">
-          <button type="button" class="film-cell-main"
-            :title="`${source.name} · ${formatBytes(source.size)}`"
-            @click="selectSource(source.id)">
-            <div class="film-thumb">
-              <img v-if="thumbSrc(source)" :src="thumbSrc(source)" :alt="source.name" />
-              <div v-else class="thumb-skeleton" aria-hidden="true" />
-              <span v-if="source.id === activeId && status === 'rendering'" class="thumb-loading" aria-hidden="true">
-                <span class="spinner" />
-              </span>
-              <span v-if="source.invalid" class="film-badge" title="源文件已失效，请重新导入">失效</span>
-            </div>
-            <span class="film-name">{{ source.name }}</span>
-          </button>
-          <button type="button" class="film-remove" title="从库中移除（不影响磁盘上的原始文件）"
-            aria-label="从库中移除" @click="removeSource(source.id)">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
-              <path d="M6 6l12 12M18 6L6 18" />
-            </svg>
-          </button>
-        </div>
-      </div>
-    </footer>
+    <Filmstrip v-if="sources.length" :sources="sources" :active-id="activeId"
+      :rendering="status === 'rendering'" :thumb-src="thumbSrc"
+      @select="selectSource" @remove="removeSource" @import="pickFiles" />
 
     <input ref="fileInput" type="file" accept=".arw,.dng,.cr2,.cr3,.nef,.raf,.rw2,.orf,.tif,.tiff,.jpg,.jpeg,.png" hidden multiple @change="onFileChange" />
     <transition name="fade"><div v-if="isDragging" class="drag-overlay">Drop to import</div></transition>
