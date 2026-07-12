@@ -715,10 +715,16 @@ function denoisePayload(): { enabled: boolean; model: string; amount: number } {
 
 // Decode `id`'s linear data and render it into the (reused) WebGL pipeline.
 // Returns false if the source can no longer be decoded server-side.
+// Concurrent calls can overlap (rapid filmstrip clicks, a dcp/denoise reload
+// racing a switch); only the newest call may touch renderer/UI state after an
+// await, otherwise the slower decode would land last and show stale pixels.
+let loadSeq = 0;
 async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promise<boolean> {
   const src = sources.value.find(s => s.id === id);
   if (!src) return false;
   currentSourceId = id;
+  const seq = ++loadSeq;
+  const stale = () => seq !== loadSeq;
   status.value = "rendering";
   errorMessage.value = null;
   timing.value = null; // stale timing would mask the live status in the footer
@@ -728,13 +734,16 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ sourceId: id, halfSize: false, maxSize: 2560, dcpCode: dcpCode.value, denoise: denoisePayload() }),
     });
+    if (stale()) return false;
     if (linRes.status === 404) { markInvalid(id); return false; }
     if (!linRes.ok) throw new Error(await linRes.text());
     const linMeta = await linRes.json() as { width: number; height: number; fullWidth?: number; fullHeight?: number; linearUrl: string; colorProfile?: ColorProfileMeta };
     const binRes = await fetch(resolveUrl(linMeta.linearUrl));
+    if (stale()) return false;
     if (binRes.status === 404) { markInvalid(id); return false; }
     if (!binRes.ok) throw new Error("Failed to fetch linear data");
     const linearFloat = new Float32Array(await binRes.arrayBuffer());
+    if (stale()) return false;
 
     hasLinearData = true;
     profileCurveLUT = buildProfileLUT(linMeta.colorProfile);
@@ -745,6 +754,7 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     if (opts.resetView) { zoom.value = 1; pan.x = 0; pan.y = 0; }
 
     await nextTick();
+    if (stale()) return false;
     if (!canvasRef.value) return false;
     if (!webglRenderer) {
       webglRenderer = new PipelineRenderer(canvasRef.value);
@@ -760,14 +770,20 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     timing.value = Math.round(performance.now() - t0);
     return true;
   } catch (err) {
+    if (stale()) return false; // a newer load owns status/errorMessage now
     status.value = "error";
     errorMessage.value = err instanceof Error ? err.message : String(err);
     return false;
   }
 }
 
+let denoiseReloadTimer = 0; // debounce for the denoise watcher below
+
 // Point the live edit + pixels at `id` (does NOT save the outgoing edit).
 function activateSource(id: string): Promise<boolean> {
+  // A pending denoise reload belongs to the outgoing image; firing it after the
+  // switch would re-decode the new image a second time.
+  if (denoiseReloadTimer) { clearTimeout(denoiseReloadTimer); denoiseReloadTimer = 0; }
   activeId.value = id;
   loadEditFromMap(id);
   return loadSource(id, { resetView: true });
@@ -1526,7 +1542,6 @@ watch(dcpCode, async () => {
 // because amount is a slider (the first decode runs inference; later ones hit the
 // worker's cache and only re-blend). The amount slider is hidden while disabled,
 // so a change here always alters the effective output.
-let denoiseReloadTimer = 0;
 watch(denoise, () => {
   if (suppressDcpReload || !currentSourceId) return;
   if (denoiseReloadTimer) clearTimeout(denoiseReloadTimer);
