@@ -720,6 +720,24 @@ function denoisePayload(): { enabled: boolean; model: string; amount: number } {
   return { enabled: denoise.enabled, model: denoise.model, amount: denoise.amount / 100 };
 }
 
+type LinearMeta = { width: number; height: number; fullWidth: number | null; fullHeight: number | null; colorProfile: ColorProfileMeta | null };
+
+// Decode linear data via /render-linear. The response carries the pixels
+// directly: [u32 header length][JSON header, padded so the pixels stay 4-byte
+// aligned][float32 linear RGB]. Returns null on 404 (source evicted server-side).
+async function fetchLinear(body: Record<string, unknown>): Promise<{ meta: LinearMeta; pixels: Float32Array } | null> {
+  const res = await fetch(`${API}/render-linear`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(await res.text());
+  const buf = await res.arrayBuffer();
+  const headerLen = new DataView(buf).getUint32(0);
+  const meta = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 4, headerLen))) as LinearMeta;
+  return { meta, pixels: new Float32Array(buf, 4 + headerLen) };
+}
+
 // Decode `id`'s linear data and render it into the (reused) WebGL pipeline.
 // Returns false if the source can no longer be decoded server-side.
 // Concurrent calls can overlap (rapid filmstrip clicks, a dcp/denoise reload
@@ -737,20 +755,10 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
   timing.value = null; // stale timing would mask the live status in the footer
   const t0 = performance.now();
   try {
-    const linRes = await fetch(`${API}/render-linear`, {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ sourceId: id, halfSize: false, maxSize: 2560, dcpCode: dcpCode.value, denoise: denoisePayload() }),
-    });
+    const lin = await fetchLinear({ sourceId: id, halfSize: false, maxSize: 2560, dcpCode: dcpCode.value, denoise: denoisePayload() });
     if (stale()) return false;
-    if (linRes.status === 404) { markInvalid(id); return false; }
-    if (!linRes.ok) throw new Error(await linRes.text());
-    const linMeta = await linRes.json() as { width: number; height: number; fullWidth?: number; fullHeight?: number; linearUrl: string; colorProfile?: ColorProfileMeta };
-    const binRes = await fetch(resolveUrl(linMeta.linearUrl));
-    if (stale()) return false;
-    if (binRes.status === 404) { markInvalid(id); return false; }
-    if (!binRes.ok) throw new Error("Failed to fetch linear data");
-    const linearFloat = new Float32Array(await binRes.arrayBuffer());
-    if (stale()) return false;
+    if (!lin) { markInvalid(id); return false; }
+    const { meta: linMeta, pixels: linearFloat } = lin;
 
     hasLinearData = true;
     profileCurveLUT = buildProfileLUT(linMeta.colorProfile);
@@ -916,7 +924,7 @@ function buildPipelineParams(): Partial<EditParams> {
 type ColorProfileMeta = { profileToneCurve?: [number, number][] | null };
 let profileCurveLUT: Float32Array | null = null;
 
-function buildProfileLUT(cp: ColorProfileMeta | undefined): Float32Array | null {
+function buildProfileLUT(cp: ColorProfileMeta | null | undefined): Float32Array | null {
   const pts = cp?.profileToneCurve;
   return (pts && pts.length >= 2) ? curveToLUT(pts.map(([x, y]) => ({ x, y }))) : null;
 }
@@ -1714,15 +1722,9 @@ async function exportImage(): Promise<void> {
   let renderer: PipelineRenderer | null = null;
   try {
     // 1. Decode full-resolution linear data (no half-size / no max-size cap)
-    const linRes = await fetch(`${API}/render-linear`, {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ sourceId: currentSourceId, halfSize: false, maxSize: 0, dcpCode: dcpCode.value, denoise: denoisePayload() }),
-    });
-    if (!linRes.ok) throw new Error(await linRes.text());
-    const linMeta = await linRes.json() as { width: number; height: number; linearUrl: string; colorProfile?: ColorProfileMeta };
-    const binRes = await fetch(resolveUrl(linMeta.linearUrl));
-    if (!binRes.ok) throw new Error("Failed to fetch full-resolution data");
-    const linear = new Float32Array(await binRes.arrayBuffer());
+    const lin = await fetchLinear({ sourceId: currentSourceId, halfSize: false, maxSize: 0, dcpCode: dcpCode.value, denoise: denoisePayload() });
+    if (!lin) throw new Error("Source is no longer available server-side");
+    const { meta: linMeta, pixels: linear } = lin;
 
     // 2. Render full-res off-screen with the current edit params + crop, read back as JPEG
     renderer = new PipelineRenderer(document.createElement("canvas"));

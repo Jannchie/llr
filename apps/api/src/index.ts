@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
-import { access, mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { dirname, extname, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -143,12 +143,6 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
     return;
   }
 
-  const linearMatch = pathname.match(/^\/sources\/([\w-]+)\/linear\.bin$/);
-  if (method === "GET" && linearMatch) {
-    streamBinary(response, resolve(sessionsRoot, linearMatch[1], "linear.bin"));
-    return;
-  }
-
   sendJson(response, { error: "Not found", path: pathname }, 404);
 }
 
@@ -253,25 +247,43 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
     return;
   }
 
-  const outputPath = resolve(sessionDir, "linear.bin");
-  const meta = await daemon.send({
-    command: "render-linear",
-    input: sourcePath,
-    output: outputPath,
-    profile: body.profileId ?? "standard",
-    halfSize: body.halfSize ?? true,
-    maxSize: body.maxSize ?? 1600,
-    recipe: { autoTone: false },
-    dcpCode: body.dcpCode,
-    denoise: body.denoise,
-  });
+  // Per-request filename (concurrent renders must not overwrite each other),
+  // deleted right after the read: the linear data goes back in this response
+  // body instead of round-tripping through a second GET.
+  const outputPath = resolve(sessionDir, `linear-${randomUUID()}.bin`);
+  let meta;
+  let data: Buffer;
+  try {
+    meta = await daemon.send({
+      command: "render-linear",
+      input: sourcePath,
+      output: outputPath,
+      profile: body.profileId ?? "standard",
+      halfSize: body.halfSize ?? true,
+      maxSize: body.maxSize ?? 1600,
+      recipe: { autoTone: false },
+      dcpCode: body.dcpCode,
+      denoise: body.denoise,
+    });
+    data = await readFile(outputPath);
+  } finally {
+    await rm(outputPath, { force: true });
+  }
 
-  sendJson(response, {
+  // [u32 header length][JSON header, space-padded so the pixels stay 4-byte
+  // aligned for a zero-copy Float32Array view][float32 linear RGB].
+  let header = Buffer.from(JSON.stringify({
     width: meta.width,
     height: meta.height,
-    linearUrl: `/sources/${body.sourceId}/linear.bin`,
+    fullWidth: meta.fullWidth ?? null,
+    fullHeight: meta.fullHeight ?? null,
     colorProfile: meta.colorProfile ?? null,
-  });
+  }), "utf8");
+  if (header.length % 4) header = Buffer.concat([header, Buffer.alloc(4 - (header.length % 4), 0x20)]);
+  const prefix = Buffer.alloc(4);
+  prefix.writeUInt32BE(header.length, 0);
+  response.writeHead(200, { "content-type": "application/octet-stream", "cache-control": "no-store" });
+  response.end(Buffer.concat([prefix, header, data]));
 }
 
 async function handleExport(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -559,24 +571,6 @@ function streamFile(response: ServerResponse, path: string, onClose?: () => void
     } else {
       sendJson(response, { error: errorMessage(error) }, 500);
     }
-  });
-}
-
-function streamBinary(response: ServerResponse, path: string): void {
-  const stream = createReadStream(path);
-  stream.once("open", () => {
-    response.writeHead(200, {
-      "content-type": "application/octet-stream",
-      "cache-control": "no-store",
-    });
-    stream.pipe(response);
-  });
-  stream.on("error", () => {
-    if (response.headersSent) {
-      response.destroy();
-      return;
-    }
-    response.writeHead(404).end();
   });
 }
 
