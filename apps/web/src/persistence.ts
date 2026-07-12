@@ -4,14 +4,16 @@
 // Backed by IndexedDB: writes are asynchronous (the previous localStorage
 // store serialized the whole session synchronously on the main thread, right
 // in the gaps of a slider drag) and values are structured-cloned, so there is
-// no JSON round-trip and no 5 MB quota shared with the thumbnails. A one-time
-// migration imports any existing localStorage session.
+// no JSON round-trip and no 5 MB quota shared with the thumbnails.
 //
-// Two records, deliberately separated:
-//   - `llr.state.v1`  — small structured session (sources, per-image edits,
-//      view settings). Rewritten on every edit.
-//   - `llr.thumbs.v1` — cached downscaled thumbnails (data URLs). Rewritten only
-//      when a new thumbnail is generated, so the hot edit-save path stays cheap.
+// Layout — one key per record so the hot edit-save path clones only what
+// actually changed (a v1 layout kept every image's edit + history in a single
+// record, so each debounced save structured-cloned the whole library):
+//   - `llr.session.v2` — small index: sources, activeId, view settings.
+//   - `llr.edit.<id>`  — one image's edit (snapshot + capped undo history).
+//   - `llr.thumb.<id>` — one image's downscaled JPEG thumbnail, as a Blob
+//      (v1 stored all thumbnails as base64 data URLs in one record).
+// v1 records (IndexedDB and the older localStorage store) migrate on load.
 //
 // Image pixels are NOT stored here: the RAW files live server-side under
 // tmp/sessions/<id> and are re-decoded on demand by their (persisted) id.
@@ -19,11 +21,15 @@
 const DB_NAME = "llr";
 const DB_VERSION = 1;
 const STORE = "kv";
-const STATE_KEY = "llr.state.v1";
-const THUMBS_KEY = "llr.thumbs.v1";
+const SESSION_KEY = "llr.session.v2";
+const EDIT_PREFIX = "llr.edit.";
+const THUMB_PREFIX = "llr.thumb.";
+// Legacy single-record keys (v1), also used by the pre-IndexedDB localStorage store.
+const STATE_KEY_V1 = "llr.state.v1";
+const THUMBS_KEY_V1 = "llr.thumbs.v1";
 
-// Cap per-image undo history in the persisted payload to keep the session
-// record bounded; the in-memory history is unaffected.
+// Cap per-image undo history in the persisted payload to keep the record
+// bounded; the in-memory history is unaffected.
 const PERSIST_HISTORY_CAP = 50;
 
 export type PersistedSource = {
@@ -39,7 +45,15 @@ export type PersistedEdit<S> = {
   historyIndex: number;
 };
 
-export type PersistedState<S, V> = {
+export type PersistedSession<V> = {
+  version: 2;
+  activeId: string | null;
+  viewSettings: V;
+  sources: PersistedSource[];
+};
+
+// v1 layout, kept only for migration.
+type PersistedStateV1<S, V> = {
   version: 1;
   activeId: string | null;
   viewSettings: V;
@@ -82,6 +96,30 @@ async function idbGet<T>(key: string): Promise<T | null> {
   });
 }
 
+/** All records whose key starts with `prefix`, as an id→value map (prefix stripped). */
+async function idbGetByPrefix<T>(prefix: string): Promise<Map<string, T>> {
+  const db = await openDb();
+  const out = new Map<string, T>();
+  if (!db) return out;
+  return new Promise((resolve) => {
+    try {
+      const store = db.transaction(STORE, "readonly").objectStore(STORE);
+      const range = IDBKeyRange.bound(prefix, `${prefix}￿`);
+      const keysReq = store.getAllKeys(range);
+      const valsReq = store.getAll(range);
+      valsReq.onsuccess = () => {
+        const keys = keysReq.result as string[];
+        const vals = valsReq.result as T[];
+        for (let i = 0; i < keys.length; i++) out.set(keys[i].slice(prefix.length), vals[i]);
+        resolve(out);
+      };
+      valsReq.onerror = () => resolve(out);
+    } catch {
+      resolve(out);
+    }
+  });
+}
+
 async function idbSet(key: string, value: unknown): Promise<boolean> {
   const db = await openDb();
   if (!db) return false;
@@ -98,13 +136,13 @@ async function idbSet(key: string, value: unknown): Promise<boolean> {
   });
 }
 
-async function idbDelete(key: string): Promise<void> {
+async function idbDelete(...keys: string[]): Promise<void> {
   const db = await openDb();
   if (!db) return;
   await new Promise<void>((resolve) => {
     try {
       const tx = db.transaction(STORE, "readwrite");
-      tx.objectStore(STORE).delete(key);
+      for (const key of keys) tx.objectStore(STORE).delete(key);
       tx.oncomplete = () => resolve();
       tx.onerror = () => resolve();
       tx.onabort = () => resolve();
@@ -134,20 +172,46 @@ function dropLegacy(key: string): void {
 
 // --- Session state ---
 
-function isValidState<S, V>(s: PersistedState<S, V> | null): s is PersistedState<S, V> {
+function isValidStateV1<S, V>(s: PersistedStateV1<S, V> | null): s is PersistedStateV1<S, V> {
   return !!s && s.version === 1 && Array.isArray(s.sources);
 }
 
-export async function loadState<S, V>(): Promise<PersistedState<S, V> | null> {
-  const fromDb = await idbGet<PersistedState<S, V>>(STATE_KEY);
-  if (isValidState(fromDb)) return fromDb;
-  // One-time migration from the previous localStorage store.
-  const legacy = readLegacy<PersistedState<S, V>>(STATE_KEY);
-  if (isValidState(legacy)) {
-    void idbSet(STATE_KEY, legacy).then((ok) => { if (ok) dropLegacy(STATE_KEY); });
-    return legacy;
+function isValidSession<V>(s: PersistedSession<V> | null): s is PersistedSession<V> {
+  return !!s && s.version === 2 && Array.isArray(s.sources);
+}
+
+export async function loadSession<S, V>(): Promise<{ session: PersistedSession<V>; edits: Record<string, PersistedEdit<S>> } | null> {
+  const session = await idbGet<PersistedSession<V>>(SESSION_KEY);
+  if (isValidSession(session)) {
+    const stored = await idbGetByPrefix<PersistedEdit<S>>(EDIT_PREFIX);
+    const edits: Record<string, PersistedEdit<S>> = {};
+    const orphans: string[] = [];
+    for (const [id, e] of stored) {
+      if (session.sources.some(s => s.id === id)) edits[id] = e;
+      else orphans.push(EDIT_PREFIX + id); // e.g. a remove persisted the index but the tab died before deleteEdit
+    }
+    if (orphans.length) void idbDelete(...orphans);
+    return { session, edits };
   }
-  return null;
+
+  // One-time migration from the v1 single-record layouts (IndexedDB, then localStorage).
+  const v1 = (await idbGet<PersistedStateV1<S, V>>(STATE_KEY_V1)) ?? readLegacy<PersistedStateV1<S, V>>(STATE_KEY_V1);
+  if (!isValidStateV1(v1)) return null;
+  const migrated: PersistedSession<V> = {
+    version: 2,
+    activeId: v1.activeId,
+    viewSettings: v1.viewSettings,
+    sources: v1.sources,
+  };
+  await saveSession(migrated);
+  for (const [id, e] of Object.entries(v1.edits)) await saveEdit(id, e);
+  await idbDelete(STATE_KEY_V1);
+  dropLegacy(STATE_KEY_V1);
+  return { session: migrated, edits: v1.edits };
+}
+
+export async function saveSession<V>(session: PersistedSession<V>): Promise<void> {
+  await idbSet(SESSION_KEY, session);
 }
 
 function trimEdit<S>(e: PersistedEdit<S>): PersistedEdit<S> {
@@ -160,37 +224,68 @@ function trimEdit<S>(e: PersistedEdit<S>): PersistedEdit<S> {
   };
 }
 
-export async function saveState<S, V>(state: PersistedState<S, V>): Promise<void> {
-  const edits: Record<string, PersistedEdit<S>> = {};
-  for (const [id, e] of Object.entries(state.edits)) edits[id] = trimEdit(e);
-  await idbSet(STATE_KEY, { ...state, edits });
+export async function saveEdit<S>(id: string, edit: PersistedEdit<S>): Promise<void> {
+  await idbSet(EDIT_PREFIX + id, trimEdit(edit));
+}
+
+export async function deleteEdit(id: string): Promise<void> {
+  await idbDelete(EDIT_PREFIX + id);
 }
 
 export async function clearState(): Promise<void> {
-  await idbDelete(STATE_KEY);
-  dropLegacy(STATE_KEY);
+  const edits = await idbGetByPrefix<unknown>(EDIT_PREFIX);
+  await idbDelete(SESSION_KEY, STATE_KEY_V1, ...[...edits.keys()].map(id => EDIT_PREFIX + id));
+  dropLegacy(STATE_KEY_V1);
 }
 
 // --- Thumbnails ---
 
+/** Load all cached thumbnails as displayable URLs (object URLs for Blobs). */
 export async function loadThumbs(): Promise<Record<string, string>> {
-  const fromDb = await idbGet<Record<string, string>>(THUMBS_KEY);
-  if (fromDb) return fromDb;
-  const legacy = readLegacy<Record<string, string>>(THUMBS_KEY);
-  if (legacy) {
-    void idbSet(THUMBS_KEY, legacy).then((ok) => { if (ok) dropLegacy(THUMBS_KEY); });
-    return legacy;
+  const out: Record<string, string> = {};
+  const stored = await idbGetByPrefix<Blob>(THUMB_PREFIX);
+  for (const [id, blob] of stored) {
+    if (blob instanceof Blob) out[id] = URL.createObjectURL(blob);
   }
-  return {};
+  if (Object.keys(out).length) return out;
+
+  // One-time migration from the v1 all-thumbnails-in-one-record data-URL map.
+  const v1 = (await idbGet<Record<string, string>>(THUMBS_KEY_V1)) ?? readLegacy<Record<string, string>>(THUMBS_KEY_V1);
+  if (!v1) return out;
+  for (const [id, dataUrl] of Object.entries(v1)) {
+    out[id] = dataUrl;
+    const blob = dataUrlToBlob(dataUrl);
+    if (blob) await saveThumb(id, blob);
+  }
+  await idbDelete(THUMBS_KEY_V1);
+  dropLegacy(THUMBS_KEY_V1);
+  return out;
 }
 
-export async function saveThumbs(thumbs: Record<string, string>): Promise<void> {
-  await idbSet(THUMBS_KEY, thumbs);
+export async function saveThumb(id: string, blob: Blob): Promise<void> {
+  await idbSet(THUMB_PREFIX + id, blob);
 }
 
-// Downscale an image URL to a compact JPEG data URL for offline thumbnail
-// caching. Returns null if the image can't be loaded/decoded.
-export async function generateThumb(url: string, max = 320): Promise<string | null> {
+export async function deleteThumb(id: string): Promise<void> {
+  await idbDelete(THUMB_PREFIX + id);
+}
+
+function dataUrlToBlob(dataUrl: string): Blob | null {
+  try {
+    const comma = dataUrl.indexOf(",");
+    const mime = /^data:([^;,]+)/.exec(dataUrl)?.[1] ?? "image/jpeg";
+    const bin = atob(dataUrl.slice(comma + 1));
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new Blob([bytes], { type: mime });
+  } catch {
+    return null;
+  }
+}
+
+// Downscale an image URL to a compact JPEG Blob for offline thumbnail caching.
+// Returns null if the image can't be loaded/decoded.
+export async function generateThumb(url: string, max = 320): Promise<Blob | null> {
   try {
     const img = new Image();
     img.crossOrigin = "anonymous";
@@ -206,7 +301,7 @@ export async function generateThumb(url: string, max = 320): Promise<string | nu
     const ctx = cvs.getContext("2d");
     if (!ctx) return null;
     ctx.drawImage(img, 0, 0, w, h);
-    return cvs.toDataURL("image/jpeg", 0.7);
+    return await new Promise<Blob | null>((resolve) => cvs.toBlob(resolve, "image/jpeg", 0.7));
   } catch {
     return null;
   }

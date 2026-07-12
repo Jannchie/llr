@@ -16,8 +16,9 @@ import {
   type CropState, type Rect,
 } from "./rendering/crop";
 import {
-  loadState, saveState, loadThumbs, saveThumbs, generateThumb,
-  type PersistedEdit, type PersistedState,
+  loadSession, saveSession, saveEdit, deleteEdit,
+  loadThumbs, saveThumb, deleteThumb, generateThumb,
+  type PersistedEdit,
 } from "./persistence";
 
 // ── types ──
@@ -630,6 +631,10 @@ initHistory();
 
 type ImageEdit = PersistedEdit<Snapshot>;
 const edits = new Map<string, ImageEdit>();
+// Edits touched since the last persist — only these are written to IndexedDB
+// (each image is its own record; cloning the whole library per save is what
+// made the old single-record layout expensive).
+const dirtyEditIds = new Set<string>();
 
 const thumbs = reactive<Record<string, string>>({});
 
@@ -644,6 +649,7 @@ function syncLiveToMap(id: string | null): void {
     history: history.value.slice(),
     historyIndex: historyIndex.value,
   });
+  dirtyEditIds.add(id);
 }
 
 // Load an image's edit into the live reactive state (defaults if none stored).
@@ -667,16 +673,17 @@ function loadEditFromMap(id: string): void {
 
 function persistNow(): void {
   syncLiveToMap(activeId.value);
-  const editsObj: Record<string, ImageEdit> = {};
-  for (const [id, e] of edits) editsObj[id] = e;
-  const state: PersistedState<Snapshot, typeof viewSettings> = {
-    version: 1,
+  for (const id of dirtyEditIds) {
+    const e = edits.get(id);
+    if (e) void saveEdit(id, e);
+  }
+  dirtyEditIds.clear();
+  void saveSession({
+    version: 2,
     activeId: activeId.value,
     viewSettings: { ...viewSettings },
     sources: sources.value.map(s => ({ id: s.id, name: s.name, size: s.size, embeddedUrl: s.embeddedUrl })),
-    edits: editsObj,
-  };
-  void saveState(state);
+  });
 }
 
 function schedulePersist(): void {
@@ -696,8 +703,8 @@ function thumbSrc(s: Source): string {
 
 async function cacheThumb(s: Source): Promise<void> {
   if (thumbs[s.id] || !s.embeddedUrl) return;
-  const data = await generateThumb(resolveUrl(s.embeddedUrl));
-  if (data) { thumbs[s.id] = data; void saveThumbs({ ...thumbs }); }
+  const blob = await generateThumb(resolveUrl(s.embeddedUrl));
+  if (blob) { thumbs[s.id] = URL.createObjectURL(blob); void saveThumb(s.id, blob); }
 }
 
 function markInvalid(id: string): void {
@@ -807,7 +814,13 @@ async function removeSource(id: string): Promise<void> {
   if (idx < 0) return;
   sources.value = sources.value.filter(s => s.id !== id);
   edits.delete(id);
-  if (thumbs[id]) { delete thumbs[id]; void saveThumbs({ ...thumbs }); }
+  dirtyEditIds.delete(id);
+  void deleteEdit(id);
+  if (thumbs[id]) {
+    if (thumbs[id].startsWith("blob:")) URL.revokeObjectURL(thumbs[id]);
+    delete thumbs[id];
+  }
+  void deleteThumb(id);
   void fetch(`${API}/sources/${id}`, { method: "DELETE" }).catch(() => {});
   let loading: Promise<boolean> | null = null;
   if (id === activeId.value) {
@@ -1596,16 +1609,16 @@ onMounted(async () => {
 // Rehydrate imported images + their edits from localStorage. Returns false if
 // there's nothing to restore (so the caller falls back to the sample).
 async function restoreSession(): Promise<boolean> {
-  const persisted = await loadState<Snapshot, typeof viewSettings>();
-  if (!persisted || !persisted.sources.length) return false;
+  const persisted = await loadSession<Snapshot, typeof viewSettings>();
+  if (!persisted || !persisted.session.sources.length) return false;
 
-  sources.value = persisted.sources.map(s => ({ ...s }));
-  if (persisted.viewSettings) Object.assign(viewSettings, persisted.viewSettings);
+  sources.value = persisted.session.sources.map(s => ({ ...s }));
+  if (persisted.session.viewSettings) Object.assign(viewSettings, persisted.session.viewSettings);
   edits.clear();
   for (const [id, e] of Object.entries(persisted.edits)) edits.set(id, e);
 
-  const targetId = persisted.activeId && sources.value.some(s => s.id === persisted.activeId)
-    ? persisted.activeId
+  const targetId = persisted.session.activeId && sources.value.some(s => s.id === persisted.session.activeId)
+    ? persisted.session.activeId
     : sources.value[0].id;
   await activateSource(targetId);
 
@@ -1652,6 +1665,7 @@ async function uploadFiles(files: File[]): Promise<void> {
       // Each new import starts from a fresh, independent edit.
       const snap = defaultSnapshot();
       edits.set(source.id, { snapshot: snap, history: [snap], historyIndex: 0 });
+      dirtyEditIds.add(source.id);
       void cacheThumb(source);
       lastId = source.id;
     } catch (err) {
