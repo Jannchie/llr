@@ -247,6 +247,17 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
     return;
   }
 
+  // Clamp/coerce what gets forwarded to the Python daemon: a malformed field
+  // would otherwise surface as a worker ValueError → opaque 500.
+  const maxSizeRaw = Number(body.maxSize ?? 1600);
+  const maxSize = Number.isFinite(maxSizeRaw) ? Math.min(16384, Math.max(0, Math.trunc(maxSizeRaw))) : 1600;
+  const denoiseAmount = Number(body.denoise?.amount ?? 1);
+  const denoise = {
+    enabled: body.denoise?.enabled === true,
+    model: typeof body.denoise?.model === "string" ? body.denoise.model : undefined,
+    amount: Number.isFinite(denoiseAmount) ? Math.min(1, Math.max(0, denoiseAmount)) : 1,
+  };
+
   // Per-request filename (concurrent renders must not overwrite each other),
   // deleted right after the read: the linear data goes back in this response
   // body instead of round-tripping through a second GET.
@@ -259,11 +270,11 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
       input: sourcePath,
       output: outputPath,
       profile: body.profileId ?? "standard",
-      halfSize: body.halfSize ?? true,
-      maxSize: body.maxSize ?? 1600,
+      halfSize: typeof body.halfSize === "boolean" ? body.halfSize : true,
+      maxSize,
       recipe: { autoTone: false },
-      dcpCode: body.dcpCode,
-      denoise: body.denoise,
+      dcpCode: typeof body.dcpCode === "string" ? body.dcpCode : undefined,
+      denoise,
     });
     data = await readFile(outputPath);
   } finally {
@@ -548,7 +559,11 @@ async function readJson<T>(request: IncomingMessage): Promise<T> {
   if (!text) {
     return {} as T;
   }
-  return JSON.parse(text) as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new HttpError(400, "Invalid JSON body");
+  }
 }
 
 function streamFile(response: ServerResponse, path: string, onClose?: () => void): void {

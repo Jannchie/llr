@@ -509,9 +509,14 @@ export class PipelineRenderer {
 
     // 3. Queue the 256×4 read-back (16 KB) into a PBO and wait on a fence, so
     //    the copy happens without forcing a full GPU sync on the main thread.
-    if (!this.histoPbo) this.histoPbo = gl.createBuffer()!;
-    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.histoPbo);
-    gl.bufferData(gl.PIXEL_PACK_BUFFER, 256 * 4 * 4 * 4, gl.STREAM_READ);
+    // The PBO is allocated once — the size never changes across reads.
+    if (!this.histoPbo) {
+      this.histoPbo = gl.createBuffer()!;
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.histoPbo);
+      gl.bufferData(gl.PIXEL_PACK_BUFFER, 256 * 4 * 4 * 4, gl.STREAM_READ);
+    } else {
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.histoPbo);
+    }
     gl.readPixels(0, 0, 256, 4, gl.RGBA, gl.FLOAT, 0);
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);

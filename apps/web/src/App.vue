@@ -938,6 +938,28 @@ let hasLinearData = false;
 let histoBusy = false;
 const histoCanvasRef = ref<HTMLCanvasElement | null>(null);
 
+// The histogram redraws at ~11 Hz during slider drags; reading
+// getBoundingClientRect there forces a layout each time, so track the CSS size
+// with a ResizeObserver instead (same pattern as the curve canvas above).
+const histoSize = { w: 0, h: 0 };
+let histoResizeObs: ResizeObserver | null = null;
+watch(histoCanvasRef, (canvas) => {
+  histoResizeObs?.disconnect();
+  histoResizeObs = null;
+  histoSize.w = 0;
+  histoSize.h = 0;
+  if (canvas) {
+    histoResizeObs = new ResizeObserver((entries) => {
+      const r = entries[entries.length - 1]?.contentRect;
+      if (!r) return;
+      histoSize.w = r.width;
+      histoSize.h = r.height;
+      scheduleHistogram();
+    });
+    histoResizeObs.observe(canvas);
+  }
+});
+
 // In the crop editor the canvas renders a padded straighten bbox whose
 // out-of-image fill would be binned as real pixels — hand the histogram the
 // tight crop box instead (it re-renders offscreen with its own transform).
@@ -952,14 +974,15 @@ async function updateHistogram(): Promise<void> {
   const canvas = histoCanvasRef.value;
   if (!canvas || !hasLinearData || !imageW.value || !imageH.value || !webglRenderer) return;
   if (histoBusy) { scheduleHistogram(); return; } // a read is in flight; retry after it
-  const rect = canvas.getBoundingClientRect();
-  let w = rect.width;
-  let h = rect.height;
-  // If canvas not laid out, try parent dimensions; retry next frame as last resort
+  let w = histoSize.w;
+  let h = histoSize.h;
+  // Not observed/laid out yet: fall back to a one-off layout read; the
+  // ResizeObserver reschedules once the canvas gets its real size.
   if (w <= 0 || h <= 0) {
-    const parent = canvas.parentElement;
-    if (parent) { w = parent.clientWidth - 32; h = 80; }
-    if (w <= 0) { requestAnimationFrame(() => void updateHistogram()); return; }
+    const rect = canvas.getBoundingClientRect();
+    w = rect.width;
+    h = rect.height;
+    if (w <= 0 || h <= 0) return;
   }
   histoBusy = true;
   try {
@@ -1587,6 +1610,8 @@ onBeforeUnmount(() => {
   resizeObs?.disconnect();
   curveResizeObs?.disconnect();
   curveResizeObs = null;
+  histoResizeObs?.disconnect();
+  histoResizeObs = null;
   destroyWebGL();
 });
 
