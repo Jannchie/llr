@@ -4,27 +4,24 @@ import { PipelineRenderer, type EditParams } from "./rendering/pipeline-renderer
 import { renderHistogram } from "./rendering/histogram";
 import {
   curveToLUT, buildToneCurveLUT, defaultToneCurve, normalizeToneCurve,
-  renderToneCurve, hitTest, hitTestSplit, regionForX,
-  CURVE_PRESETS, type BasicAdjust, type CurvePoint, type ToneCurve, type ToneChannel, type PointChannel,
+  type BasicAdjust, type ToneCurve,
 } from "./rendering/curve";
 import {
   defaultCrop, cloneCrop, isDefaultCrop, imageDims, buildCropTransform,
-  cropOutputRect, cropOutputSize, straightenedBBox, constrainCrop,
-  applyAspectRatio, resolveAspectRatio, resolveAspectFraction, cropOutputSizeForAspect,
-  rotate90, cornersInsideImage,
-  ASPECT_PRESETS, customAspectKey, parseCustomAspect, ratioToFraction,
-  type CropState, type Rect,
+  cropOutputRect, cropOutputSize, straightenedBBox,
+  applyAspectRatio, resolveAspectFraction, cropOutputSizeForAspect,
+  ASPECT_PRESETS,
+  type CropState,
 } from "./rendering/crop";
-import {
-  loadSession, saveSession, saveEdit, deleteEdit,
-  loadThumbs, saveThumb, deleteThumb, generateThumb,
-  type PersistedEdit,
-} from "./persistence";
+import { type PersistedEdit } from "./persistence";
 import { trackFill, formatBytes, type Source } from "./ui";
 import SliderRow from "./components/SliderRow.vue";
 import Filmstrip from "./components/Filmstrip.vue";
 import { useViewport } from "./composables/useViewport";
 import { useHistory } from "./composables/useHistory";
+import { useToneCurve } from "./composables/useToneCurve";
+import { useCropEditor, DEFAULT_ASPECT } from "./composables/useCropEditor";
+import { useLibrary } from "./composables/useLibrary";
 
 // ── types ──
 
@@ -68,8 +65,6 @@ const SLIDER_DEFAULTS: Record<string, number> = { ...defaultRecipe() };
 
 // ── state ──
 
-const sources = ref<Source[]>([]);
-const activeId = ref<string | null>(null);
 const recipe = reactive<Recipe>(defaultRecipe());
 const status = ref<"idle"|"uploading"|"rendering"|"error">("idle");
 const errorMessage = ref<string | null>(null);
@@ -167,24 +162,21 @@ const {
   recomputeFit, startPan, doPan, stopPan, applyZoom,
   onWheel, zoomIn, zoomOut, fitView, zoomToFull, onDoubleClick,
 } = useViewport({ imageW, imageH, srcW, srcH, srcFullW, srcFullH, cropMode });
-// Aspect lock for the crop box. Defaults to the image's own ratio; part of
-// the per-image snapshot so it survives image switches / undo / persistence.
-const DEFAULT_ASPECT = "orig";
-const cropAspect = ref<string>(DEFAULT_ASPECT);
-// Crop-editor render window (output-frame px) + the canvas scale used to draw it,
-// kept so the overlay can map between screen, output-frame and crop-box space.
-const cropBBox = reactive<Rect>({ x: 0, y: 0, w: 1, h: 1 });
-const cropRenderScale = ref(1);
-const cropOverlayRef = ref<SVGSVGElement | null>(null);
+const {
+  cropAspect, cropBBox, cropRenderScale, cropOverlayRef,
+  currentImageDims, resetCrop,
+  lockedRatio, customAspect, selectAspect, setCustomAspect, swapAspect,
+  setAngle, rotateCrop, flipCropH, flipCropV,
+  cycleCropGuide, cropGuideLines,
+  cropBoxRect, CROP_HANDLES, ofPerScreen, cropViewBox, cropDimPath, cropHandlePos,
+  onCropHandleDown, onCropOverlayDown,
+} = useCropEditor({
+  crop, srcW, srcH, fitScale,
+  onDragEnd: () => flushPendingHistory(),
+});
+
 const WORKSPACE_BG: [number, number, number] = [0.07, 0.07, 0.08];
 const CROP_EDITOR_MAX = 1800; // cap the editor preview's long edge (px)
-
-function setCrop(patch: Partial<CropState>): void {
-  Object.assign(crop, patch);
-}
-function currentImageDims(): [number, number] {
-  return imageDims(srcW.value, srcH.value, crop.orientation);
-}
 
 function hslValue(i: number): number {
   if (hslTab.value === "hue") return hslHue[i];
@@ -215,29 +207,16 @@ function resetHslGrading(): void {
 
 // ── Tone Curve (Lightroom-compatible: parametric + RGB/R/G/B point curves) ──
 
-const toneCurve = ref<ToneCurve>(defaultToneCurve());
-const curveChannel = ref<ToneChannel>("parametric");
-const curveActive = ref(-1);
-const curveHover = ref(-1); // hovered parametric region (0=shadows..3=highlights), -1 = none
-const curveCanvas = ref<HTMLCanvasElement | null>(null);
-
-const CURVE_TABS: { key: ToneChannel; label: string }[] = [
-  { key: "parametric", label: "Param" },
-  { key: "rgb", label: "RGB" },
-  { key: "red", label: "R" },
-  { key: "green", label: "G" },
-  { key: "blue", label: "B" },
-];
-const PARAM_REGIONS: { key: "highlights" | "lights" | "darks" | "shadows"; label: string }[] = [
-  { key: "highlights", label: "Highlights" },
-  { key: "lights", label: "Lights" },
-  { key: "darks", label: "Darks" },
-  { key: "shadows", label: "Shadows" },
-];
-const REGION_BY_INDEX: ("shadows" | "darks" | "lights" | "highlights")[] = ["shadows", "darks", "lights", "highlights"];
-const presetNames = Object.keys(CURVE_PRESETS);
-
-const isPointChannel = (ch: ToneChannel): ch is PointChannel => ch !== "parametric";
+const {
+  toneCurve, curveChannel, curveActive, curveCanvas,
+  CURVE_TABS, PARAM_REGIONS, presetNames,
+  renderCurveCanvas, setCurveChannel, resetCurve, applyCurvePreset,
+  paramValue, setParam,
+  onCurveMouseDown, onCurveHover, onCurveLeave, onCurveDoubleClick,
+} = useToneCurve({
+  onApply: () => applyCurveLUT(),
+  onReset: () => { bakeCurveLUT(); drawWebGL(); }, // immediate, no RAF-batching for reset
+});
 
 // Which rows/groups hold a non-default value. Drives the brightened row text
 // and the accent dot on a group header, so edits are visible without opening
@@ -277,214 +256,6 @@ function applyCurveLUT(): void {
   bakeCurveLUT();
   scheduleWebGLDraw();
 }
-
-function setCurveChannel(ch: ToneChannel): void {
-  curveChannel.value = ch;
-  curveActive.value = -1;
-  curveHover.value = -1;
-  renderCurveCanvas();
-}
-
-function resetCurve(): void {
-  toneCurve.value = defaultToneCurve();
-  curveActive.value = -1;
-  renderCurveCanvas();
-  bakeCurveLUT();
-  drawWebGL(); // immediate, no RAF-batching for reset
-}
-
-function applyCurvePreset(name: string): void {
-  const preset = CURVE_PRESETS[name];
-  if (!preset) return;
-  toneCurve.value = { ...toneCurve.value, rgb: preset.map(p => ({ ...p })) };
-  curveChannel.value = "rgb";
-  curveActive.value = -1;
-  applyCurveLUT();
-  renderCurveCanvas();
-}
-
-// Parametric slider bridge (v-model for the region/split inputs).
-function paramValue(key: keyof ToneCurve["parametric"]): number {
-  return toneCurve.value.parametric[key];
-}
-function setParam(key: keyof ToneCurve["parametric"], v: number): void {
-  toneCurve.value = {
-    ...toneCurve.value,
-    parametric: { ...toneCurve.value.parametric, [key]: v },
-  };
-  applyCurveLUT();
-  renderCurveCanvas();
-}
-
-function renderCurveCanvas(): void {
-  const cvs = curveCanvas.value;
-  if (!cvs) return;
-  const dpr = window.devicePixelRatio || 1;
-  const w = cvs.clientWidth;
-  const h = cvs.clientHeight;
-  cvs.width = w * dpr;
-  cvs.height = h * dpr;
-  const ctx = cvs.getContext("2d");
-  if (!ctx) return;
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  renderToneCurve(ctx, w, h, toneCurve.value, curveChannel.value, curveActive.value, curveHover.value);
-}
-
-// --- pointer interaction ---
-
-type CurveDrag =
-  | { mode: "point"; channel: PointChannel; index: number }
-  | { mode: "split"; index: number }
-  | { mode: "region"; key: "shadows" | "darks" | "lights" | "highlights"; startMy: number; startVal: number; h: number };
-let curveDrag: CurveDrag | null = null;
-
-function curveCoords(e: MouseEvent): { mx: number; my: number; w: number; h: number } | null {
-  const cvs = curveCanvas.value;
-  if (!cvs) return null;
-  const rect = cvs.getBoundingClientRect();
-  const dpr = window.devicePixelRatio || 1;
-  return { mx: e.clientX - rect.left, my: e.clientY - rect.top, w: rect.width / dpr, h: rect.height / dpr };
-}
-
-function setChannelPoints(ch: PointChannel, pts: CurvePoint[]): void {
-  toneCurve.value = { ...toneCurve.value, [ch]: pts };
-}
-
-function onCurveMouseDown(e: MouseEvent): void {
-  const c = curveCoords(e);
-  if (!c) return;
-  const { mx, my, w, h } = c;
-
-  if (curveChannel.value === "parametric") {
-    const param = toneCurve.value.parametric;
-    const split = hitTestSplit(param, w, h, mx, my);
-    if (split >= 0) {
-      curveDrag = { mode: "split", index: split };
-    } else {
-      const region = REGION_BY_INDEX[regionForX(param, clamp(mx / w, 0, 1))];
-      curveDrag = { mode: "region", key: region, startMy: my, startVal: param[region], h };
-    }
-  } else {
-    const ch = curveChannel.value as PointChannel;
-    const pts = toneCurve.value[ch];
-    const idx = hitTest(pts, w, h, mx, my);
-    if (idx >= 0) {
-      curveActive.value = idx;
-      curveDrag = { mode: "point", channel: ch, index: idx };
-    } else {
-      // Insert a new point, keeping x-order.
-      const x = clamp(mx / w, 0, 1);
-      const y = clamp(1 - my / h, 0, 1);
-      const next = [...pts, { x, y }].sort((a, b) => a.x - b.x);
-      const index = next.findIndex(p => p.x === x && p.y === y);
-      setChannelPoints(ch, next);
-      curveActive.value = index;
-      curveDrag = { mode: "point", channel: ch, index };
-      applyCurveLUT();
-    }
-  }
-  renderCurveCanvas();
-  window.addEventListener("mousemove", onCurveMouseMove);
-  window.addEventListener("mouseup", onCurveMouseUp);
-}
-
-function onCurveMouseMove(e: MouseEvent): void {
-  if (!curveDrag) return;
-  const c = curveCoords(e);
-  if (!c) return;
-  const { mx, my, w, h } = c;
-
-  if (curveDrag.mode === "point") {
-    const ch = curveDrag.channel;
-    const pts = [...toneCurve.value[ch]];
-    const i = curveDrag.index;
-    const last = pts.length - 1;
-    let x: number;
-    if (i === 0) x = 0;                       // first endpoint pinned to x=0
-    else if (i === last) x = 1;               // last endpoint pinned to x=1
-    else {
-      const loX = pts[i - 1].x + 1e-3;
-      const hiX = pts[i + 1].x - 1e-3;
-      x = clamp(mx / w, loX, hiX);            // keep order, index stays stable
-    }
-    pts[i] = { x, y: clamp(1 - my / h, 0, 1) };
-    setChannelPoints(ch, pts);
-    applyCurveLUT();
-  } else if (curveDrag.mode === "split") {
-    const p = toneCurve.value.parametric;
-    const keys = ["shadowSplit", "midtoneSplit", "highlightSplit"] as const;
-    const vals = [p.shadowSplit, p.midtoneSplit, p.highlightSplit];
-    const lo = curveDrag.index > 0 ? vals[curveDrag.index - 1] + 4 : 4;
-    const hi = curveDrag.index < 2 ? vals[curveDrag.index + 1] - 4 : 96;
-    setParam(keys[curveDrag.index], Math.round(clamp((mx / w) * 100, lo, hi)));
-    return; // setParam already re-rendered
-  } else {
-    // region: vertical drag adjusts the region slider (full height ≈ 150 units)
-    const delta = ((curveDrag.startMy - my) / curveDrag.h) * 150;
-    setParam(curveDrag.key, Math.round(clamp(curveDrag.startVal + delta, -100, 100)));
-    return;
-  }
-  renderCurveCanvas();
-}
-
-function onCurveMouseUp(): void {
-  curveDrag = null;
-  window.removeEventListener("mousemove", onCurveMouseMove);
-  window.removeEventListener("mouseup", onCurveMouseUp);
-}
-
-function onCurveDoubleClick(e: MouseEvent): void {
-  const c = curveCoords(e);
-  if (!c) return;
-  const { mx, my, w, h } = c;
-  if (curveChannel.value === "parametric") {
-    // Reset the region under the cursor to 0.
-    const region = REGION_BY_INDEX[regionForX(toneCurve.value.parametric, clamp(mx / w, 0, 1))];
-    setParam(region, 0);
-    return;
-  }
-  const ch = curveChannel.value as PointChannel;
-  const pts = toneCurve.value[ch];
-  const idx = hitTest(pts, w, h, mx, my);
-  if (idx > 0 && idx < pts.length - 1) {
-    setChannelPoints(ch, pts.filter((_, i) => i !== idx));
-    curveActive.value = -1;
-    applyCurveLUT();
-    renderCurveCanvas();
-  }
-}
-
-// Hover (parametric only): highlight the tonal range under the cursor that a drag
-// would adjust, mirroring Lightroom's region preview.
-function onCurveHover(e: MouseEvent): void {
-  if (curveDrag) return; // during a drag the affected region is fixed; don't re-pick it
-  if (curveChannel.value !== "parametric") {
-    if (curveHover.value !== -1) { curveHover.value = -1; renderCurveCanvas(); }
-    return;
-  }
-  const c = curveCoords(e);
-  if (!c) return;
-  const region = regionForX(toneCurve.value.parametric, clamp(c.mx / c.w, 0, 1));
-  if (region !== curveHover.value) { curveHover.value = region; renderCurveCanvas(); }
-}
-
-function onCurveLeave(): void {
-  if (curveDrag) return; // keep the band while a region drag is in flight (cursor may exit)
-  if (curveHover.value !== -1) { curveHover.value = -1; renderCurveCanvas(); }
-}
-
-// Init curve canvas. The canvas is torn down/recreated when the panel toggles
-// (crop mode, image switch), so disconnect the previous observer or each
-// round-trip leaks one.
-let curveResizeObs: ResizeObserver | null = null;
-watch(curveCanvas, (cvs) => {
-  curveResizeObs?.disconnect();
-  curveResizeObs = null;
-  if (cvs) {
-    curveResizeObs = new ResizeObserver(() => renderCurveCanvas());
-    curveResizeObs.observe(cvs);
-  }
-});
 
 // ── History (undo / redo) ──
 
@@ -583,32 +354,10 @@ initHistory();
 // incoming one back.
 
 type ImageEdit = PersistedEdit<Snapshot>;
-const edits = new Map<string, ImageEdit>();
-// Edits touched since the last persist — only these are written to IndexedDB
-// (each image is its own record; cloning the whole library per save is what
-// made the old single-record layout expensive).
-const dirtyEditIds = new Set<string>();
 
-const thumbs = reactive<Record<string, string>>({});
-
-let persistTimer = 0;
-const PERSIST_DEBOUNCE = 600;
-
-// Copy the current live edit (snapshot + history) into the map under `id`.
-function syncLiveToMap(id: string | null): void {
-  if (!id) return;
-  edits.set(id, {
-    snapshot: captureSnapshot(),
-    history: history.value.slice(),
-    historyIndex: historyIndex.value,
-  });
-  dirtyEditIds.add(id);
-}
-
-// Load an image's edit into the live reactive state (defaults if none stored).
-// Does not decode/draw — the caller pairs this with loadSource().
-function loadEditFromMap(id: string): void {
-  const e = edits.get(id);
+// Push a stored edit (null = defaults) into the live reactive state.
+// Does not decode/draw — the library pairs this with loadSource().
+function applyStoredEdit(e: ImageEdit | null): void {
   isRestoring = true;
   suppressDcpReload = true;
   if (e) {
@@ -624,48 +373,36 @@ function loadEditFromMap(id: string): void {
   nextTick(() => { isRestoring = false; suppressDcpReload = false; });
 }
 
-function persistNow(): void {
-  syncLiveToMap(activeId.value);
-  for (const id of dirtyEditIds) {
-    const e = edits.get(id);
-    if (e) void saveEdit(id, e);
-  }
-  dirtyEditIds.clear();
-  void saveSession({
-    version: 2,
-    activeId: activeId.value,
-    viewSettings: { ...viewSettings },
-    sources: sources.value.map(s => ({ id: s.id, name: s.name, size: s.size, embeddedUrl: s.embeddedUrl })),
-  });
-}
-
-function schedulePersist(): void {
-  if (isRestoring) return;
-  if (persistTimer) clearTimeout(persistTimer);
-  persistTimer = window.setTimeout(() => { persistTimer = 0; persistNow(); }, PERSIST_DEBOUNCE);
-}
-
-// Resolve a possibly-relative API url to something <img>/fetch can use.
-function resolveUrl(u: string): string { return isAbsoluteUrl(u) ? u : `${API}${u}`; }
-
-// Thumbnail shown in the filmstrip / preview fallback: prefer the locally
-// cached copy (survives server eviction), else the live server preview.
-function thumbSrc(s: Source): string {
-  return thumbs[s.id] ?? (s.embeddedUrl ? resolveUrl(s.embeddedUrl) : "");
-}
-
-async function cacheThumb(s: Source): Promise<void> {
-  if (thumbs[s.id] || !s.embeddedUrl) return;
-  const blob = await generateThumb(resolveUrl(s.embeddedUrl));
-  if (blob) { thumbs[s.id] = URL.createObjectURL(blob); void saveThumb(s.id, blob); }
-}
-
-function markInvalid(id: string): void {
-  const s = sources.value.find(x => x.id === id);
-  if (s) s.invalid = true;
-  status.value = "error";
-  errorMessage.value = "源文件已失效（服务器缓存可能已被清理），请重新导入这张图片。";
-}
+const {
+  sources, activeId, activeSource, thumbs,
+  syncLiveToMap, persistNow, schedulePersist,
+  thumbSrc, cacheThumb, markInvalid,
+  activateSource, selectSource, removeSource,
+  restoreSession, loadThumbCache, uploadFiles,
+} = useLibrary<Snapshot, typeof viewSettings>({
+  api: API,
+  status, errorMessage, cropMode,
+  captureEdit: () => ({ snapshot: captureSnapshot(), history: history.value.slice(), historyIndex: historyIndex.value }),
+  defaultEdit: () => { const snap = defaultSnapshot(); return { snapshot: snap, history: [snap], historyIndex: 0 }; },
+  loadEdit: (e) => applyStoredEdit(e),
+  loadPixels: (id, o) => loadSource(id, o),
+  flushPendingHistory: () => flushPendingHistory(),
+  // A pending denoise reload belongs to the outgoing image; firing it after the
+  // switch would re-decode the new image a second time.
+  beforeActivate: () => { if (denoiseReloadTimer) { clearTimeout(denoiseReloadTimer); denoiseReloadTimer = 0; } },
+  onEmptied: () => {
+    currentSourceId = "";
+    hasLinearData = false;
+    srcW.value = 0;
+    srcH.value = 0;
+    timing.value = null;
+    destroyWebGL({ keepContext: true }); // frees the removed image's GPU texture
+    status.value = "idle";
+    errorMessage.value = null;
+  },
+  isRestoring: () => isRestoring,
+  sessionExtras: { get: () => ({ ...viewSettings }), apply: (v) => Object.assign(viewSettings, v) },
+});
 
 // Denoise params for the render-linear request. amount is normalised to 0..1;
 // disabled (or amount 0) tells the worker to skip inference entirely.
@@ -746,68 +483,6 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
 }
 
 let denoiseReloadTimer = 0; // debounce for the denoise watcher below
-
-// Point the live edit + pixels at `id` (does NOT save the outgoing edit).
-function activateSource(id: string): Promise<boolean> {
-  // A pending denoise reload belongs to the outgoing image; firing it after the
-  // switch would re-decode the new image a second time.
-  if (denoiseReloadTimer) { clearTimeout(denoiseReloadTimer); denoiseReloadTimer = 0; }
-  activeId.value = id;
-  loadEditFromMap(id);
-  return loadSource(id, { resetView: true });
-}
-
-// Switch the active image: stash the current edit, load the target's edit + pixels.
-async function selectSource(id: string): Promise<void> {
-  if (id === activeId.value) return;
-  flushPendingHistory();
-  cropMode.value = false; // leave the crop editor when switching images
-  syncLiveToMap(activeId.value);
-  await activateSource(id);
-  schedulePersist();
-}
-
-// Remove an image from the library: drop its edit, thumbnail and server-side
-// cached copy. The original file on the user's disk is never touched — imports
-// only ever copy bytes into the server cache.
-async function removeSource(id: string): Promise<void> {
-  const idx = sources.value.findIndex(s => s.id === id);
-  if (idx < 0) return;
-  sources.value = sources.value.filter(s => s.id !== id);
-  edits.delete(id);
-  dirtyEditIds.delete(id);
-  void deleteEdit(id);
-  if (thumbs[id]) {
-    if (thumbs[id].startsWith("blob:")) URL.revokeObjectURL(thumbs[id]);
-    delete thumbs[id];
-  }
-  void deleteThumb(id);
-  void fetch(`${API}/sources/${id}`, { method: "DELETE" }).catch(() => {});
-  let loading: Promise<boolean> | null = null;
-  if (id === activeId.value) {
-    cropMode.value = false;
-    const next = sources.value[Math.min(idx, sources.value.length - 1)];
-    if (next) {
-      loading = activateSource(next.id); // synchronously points activeId + live edit at next
-    } else {
-      activeId.value = null;
-      currentSourceId = "";
-      hasLinearData = false;
-      srcW.value = 0;
-      srcH.value = 0;
-      timing.value = null;
-      destroyWebGL({ keepContext: true }); // frees the removed image's GPU texture
-      loadEditFromMap(id); // id is gone from the map -> resets the live edit to defaults
-      status.value = "idle";
-      errorMessage.value = null;
-    }
-  }
-  // Persist the removal now — not after the neighbour's multi-second decode.
-  persistNow();
-  await loading;
-}
-
-const activeSource = computed(() => sources.value.find(s => s.id === activeId.value) ?? null);
 
 // ── WebGL ──
 
@@ -1051,256 +726,6 @@ function toggleCropMode(): void {
   if (cropMode.value) exitCropMode(); else enterCropMode();
 }
 
-function resetCrop(): void {
-  Object.assign(crop, defaultCrop());
-  cropAspect.value = "free";
-}
-
-// ── Crop controls (aspect / straighten / rotate / flip) ──
-
-const lockedRatio = computed(() => resolveAspectRatio(cropAspect.value, srcW.value, srcH.value, crop));
-
-// Custom aspect ("Enter Custom…", Lightroom-style). The two numbers live in the
-// aspect key itself ("custom:16:10") so they persist/undo with the snapshot.
-const customAspect = computed(() => parseCustomAspect(cropAspect.value));
-
-function selectAspect(key: string): void {
-  if (key === "custom") {
-    // Seed the custom inputs from the current lock (or the box shape for free).
-    const [iw, ih] = currentImageDims();
-    const r = lockedRatio.value ?? (crop.w * iw) / (crop.h * ih);
-    const [fw, fh] = ratioToFraction(Math.max(r, 1 / r));
-    key = customAspectKey(fw, fh);
-  }
-  cropAspect.value = key;
-  const ratio = resolveAspectRatio(key, srcW.value, srcH.value, crop);
-  if (ratio != null) Object.assign(crop, applyAspectRatio(crop, ratio, srcW.value, srcH.value));
-}
-
-function setCustomAspect(w: number, h: number): void {
-  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return;
-  selectAspect(customAspectKey(w, h));
-}
-
-// Swap the crop box between landscape/portrait (Lightroom's X). The aspect key
-// is orientation-agnostic, so swapping the box's pixel dims is enough: the
-// locked ratio re-resolves to follow the new orientation.
-function swapAspect(): void {
-  const [iw, ih] = currentImageDims();
-  if (Math.abs(crop.w * iw - crop.h * ih) < 0.5) return; // square box: nothing to swap
-  const next = constrainCrop({ ...crop, w: (crop.h * ih) / iw, h: (crop.w * iw) / ih }, srcW.value, srcH.value);
-  Object.assign(crop, next);
-}
-
-function setAngle(v: number): void {
-  const angle = clamp(v, -45, 45);
-  Object.assign(crop, constrainCrop({ ...crop, angle }, srcW.value, srcH.value));
-}
-
-function rotateCrop(dir: 1 | -1): void {
-  Object.assign(crop, constrainCrop(rotate90(crop, dir), srcW.value, srcH.value));
-}
-
-function flipCropH(): void {
-  Object.assign(crop, constrainCrop({ ...crop, flipH: !crop.flipH, cx: 1 - crop.cx, angle: -crop.angle }, srcW.value, srcH.value));
-}
-function flipCropV(): void {
-  Object.assign(crop, constrainCrop({ ...crop, flipV: !crop.flipV, cy: 1 - crop.cy, angle: -crop.angle }, srcW.value, srcH.value));
-}
-
-// ── Crop overlay (output-frame coordinate space, matches the SVG viewBox) ──
-
-type CropHandle = "l" | "r" | "t" | "b" | "tl" | "tr" | "bl" | "br";
-
-const cropBoxRect = computed<Rect>(() => {
-  const [iw, ih] = currentImageDims();
-  const Wc = crop.w * iw, Hc = crop.h * ih;
-  return { x: crop.cx * iw - Wc / 2, y: crop.cy * ih - Hc / 2, w: Wc, h: Hc };
-});
-
-// Guide overlay inside the crop box (O cycles, Lightroom-style).
-const CROP_GUIDES = ["thirds", "golden", "diagonal", "grid", "off"] as const;
-type CropGuide = (typeof CROP_GUIDES)[number];
-const cropGuide = ref<CropGuide>("thirds");
-
-function cycleCropGuide(): void {
-  const i = CROP_GUIDES.indexOf(cropGuide.value);
-  cropGuide.value = CROP_GUIDES[(i + 1) % CROP_GUIDES.length];
-}
-
-// Guide lines in output-frame coords: fractional v/h lines plus box diagonals.
-const cropGuideLines = computed(() => {
-  const r = cropBoxRect.value;
-  const at = (fs: number[]) => ({
-    v: fs.map((f) => r.x + r.w * f),
-    h: fs.map((f) => r.y + r.h * f),
-    diag: false,
-  });
-  switch (cropGuide.value) {
-    case "thirds": return at([1 / 3, 2 / 3]);
-    case "golden": return at([0.382, 0.618]);
-    case "grid": return at([0.25, 0.5, 0.75]);
-    case "diagonal": return { v: [], h: [], diag: true };
-    default: return { v: [], h: [], diag: false };
-  }
-});
-
-const CROP_HANDLES: { key: CropHandle; fx: number; fy: number; cursor: string }[] = [
-  { key: "tl", fx: 0, fy: 0, cursor: "nwse-resize" }, { key: "t", fx: 0.5, fy: 0, cursor: "ns-resize" }, { key: "tr", fx: 1, fy: 0, cursor: "nesw-resize" },
-  { key: "l", fx: 0, fy: 0.5, cursor: "ew-resize" }, { key: "r", fx: 1, fy: 0.5, cursor: "ew-resize" },
-  { key: "bl", fx: 0, fy: 1, cursor: "nesw-resize" }, { key: "b", fx: 0.5, fy: 1, cursor: "ns-resize" }, { key: "br", fx: 1, fy: 1, cursor: "nwse-resize" },
-];
-
-// Output-frame units per on-screen pixel — keeps overlay strokes/handles a
-// constant size regardless of the editor's fit scale.
-const ofPerScreen = computed(() => {
-  const s = cropRenderScale.value * fitScale.value;
-  return s > 0 ? 1 / s : 1;
-});
-
-// SVG viewBox for the overlay (output-frame coords, matching the rendered bbox).
-const cropViewBox = computed(() => `${cropBBox.x} ${cropBBox.y} ${cropBBox.w} ${cropBBox.h}`);
-
-// Dim everything outside the crop box: full-bbox rect with the crop box punched
-// out via the evenodd fill rule.
-const cropDimPath = computed(() => {
-  const B = cropBBox, r = cropBoxRect.value;
-  return `M${B.x},${B.y}H${B.x + B.w}V${B.y + B.h}H${B.x}Z`
-       + `M${r.x},${r.y}V${r.y + r.h}H${r.x + r.w}V${r.y}Z`;
-});
-
-function cropHandlePos(h: { fx: number; fy: number }): { x: number; y: number } {
-  const r = cropBoxRect.value;
-  return { x: r.x + h.fx * r.w, y: r.y + h.fy * r.h };
-}
-
-type CropDrag =
-  | { mode: "move"; startX: number; startY: number; cx: number; cy: number }
-  | { mode: "resize"; handle: CropHandle; l: number; t: number; r: number; b: number; startRatio: number }
-  | { mode: "rotate"; startPointerDeg: number; startAngle: number };
-let cropDrag: CropDrag | null = null;
-
-function overlayPoint(e: MouseEvent): { x: number; y: number } {
-  const svg = cropOverlayRef.value;
-  if (!svg) return { x: 0, y: 0 };
-  const r = svg.getBoundingClientRect();
-  const fx = (e.clientX - r.left) / r.width;
-  const fy = (e.clientY - r.top) / r.height;
-  return { x: cropBBox.x + fx * cropBBox.w, y: cropBBox.y + fy * cropBBox.h };
-}
-
-function overlayPxPerScreen(): number {
-  const svg = cropOverlayRef.value;
-  if (!svg) return 1;
-  const r = svg.getBoundingClientRect();
-  return r.width ? cropBBox.w / r.width : 1; // output-frame px per screen px
-}
-
-function onCropHandleDown(e: MouseEvent, handle: CropHandle): void {
-  e.preventDefault();
-  e.stopPropagation();
-  const r = cropBoxRect.value;
-  cropDrag = { mode: "resize", handle, l: r.x, t: r.y, r: r.x + r.w, b: r.y + r.h, startRatio: r.w / r.h };
-  attachCropDrag();
-}
-
-function onCropOverlayDown(e: MouseEvent): void {
-  if (e.button !== 0) return;
-  const p = overlayPoint(e);
-  const r = cropBoxRect.value;
-  const inside = p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
-  if (inside) {
-    cropDrag = { mode: "move", startX: p.x, startY: p.y, cx: crop.cx, cy: crop.cy };
-  } else {
-    // Drag in the margin to straighten (rotate the image), Lightroom-style.
-    const [iw, ih] = currentImageDims();
-    const deg = (Math.atan2(p.y - crop.cy * ih, p.x - crop.cx * iw) * 180) / Math.PI;
-    cropDrag = { mode: "rotate", startPointerDeg: deg, startAngle: crop.angle };
-  }
-  attachCropDrag();
-}
-
-function attachCropDrag(): void {
-  window.addEventListener("mousemove", onCropDragMove);
-  window.addEventListener("mouseup", onCropDragUp);
-}
-
-function onCropDragMove(e: MouseEvent): void {
-  if (!cropDrag) return;
-  const p = overlayPoint(e);
-  const [iw, ih] = currentImageDims();
-
-  if (cropDrag.mode === "move") {
-    const dx = (p.x - cropDrag.startX) / iw;
-    const dy = (p.y - cropDrag.startY) / ih;
-    moveCropTo(cropDrag.cx + dx, cropDrag.cy + dy);
-  } else if (cropDrag.mode === "rotate") {
-    const deg = (Math.atan2(p.y - crop.cy * ih, p.x - crop.cx * iw) * 180) / Math.PI;
-    setAngle(cropDrag.startAngle + (deg - cropDrag.startPointerDeg));
-  } else {
-    resizeCropTo(p.x, p.y, cropDrag, e.shiftKey);
-  }
-}
-
-function onCropDragUp(): void {
-  cropDrag = null;
-  window.removeEventListener("mousemove", onCropDragMove);
-  window.removeEventListener("mouseup", onCropDragUp);
-  flushPendingHistory();
-}
-
-// Best-effort axis-clamped move that lets the box slide along an image edge.
-function moveCropTo(ncx: number, ncy: number): void {
-  const [iw, ih] = currentImageDims();
-  const ok = (cx: number, cy: number): boolean => cornersInsideImage({ ...crop, cx, cy }, iw, ih);
-  const solve = (from: number, to: number, test: (v: number) => boolean): number => {
-    if (test(to)) return to;
-    let lo = from, hi = to;
-    for (let i = 0; i < 20; i++) { const m = (lo + hi) / 2; if (test(m)) lo = m; else hi = m; }
-    return lo;
-  };
-  let x = ncx, y = ncy;
-  if (!ok(x, crop.cy)) x = solve(crop.cx, x, (v) => ok(v, crop.cy));
-  if (!ok(x, y)) y = solve(crop.cy, y, (v) => ok(x, v));
-  setCrop({ cx: x, cy: y });
-}
-
-function resizeCropTo(qx: number, qy: number, d: { handle: CropHandle; l: number; t: number; r: number; b: number; startRatio: number }, shift = false): void {
-  const [iw, ih] = currentImageDims();
-  const MIN = Math.max(24, 0.05 * Math.min(iw, ih));
-  let { l, t, r, b } = d;
-  const hasL = d.handle.includes("l"), hasR = d.handle.includes("r");
-  const hasT = d.handle.includes("t"), hasB = d.handle.includes("b");
-  if (hasL) l = Math.min(qx, r - MIN);
-  if (hasR) r = Math.max(qx, l + MIN);
-  if (hasT) t = Math.min(qy, b - MIN);
-  if (hasB) b = Math.max(qy, t + MIN);
-
-  // Shift temporarily locks the box's shape at drag start (Lightroom-style).
-  const ratio = lockedRatio.value ?? (shift ? d.startRatio : null);
-  if (ratio != null) {
-    const corner = (hasL || hasR) && (hasT || hasB);
-    if (corner) {
-      const h = (r - l) / ratio;
-      if (hasT) t = b - h; else b = t + h;
-    } else if (hasL || hasR) {
-      const h = (r - l) / ratio, cy = (t + b) / 2;
-      t = cy - h / 2; b = cy + h / 2;
-    } else {
-      const w = (b - t) * ratio, cx = (l + r) / 2;
-      l = cx - w / 2; r = cx + w / 2;
-    }
-  }
-
-  // Constrain to the image. At angle 0 clamp edges exactly; otherwise reject if
-  // the rotated box would leave the image (the handle stops at the boundary).
-  if (Math.abs(crop.angle) < 1e-3 && ratio == null) {
-    l = Math.max(0, l); t = Math.max(0, t); r = Math.min(iw, r); b = Math.min(ih, b);
-  }
-  const cand: CropState = { ...crop, cx: (l + r) / 2 / iw, cy: (t + b) / 2 / ih, w: (r - l) / iw, h: (b - t) / ih };
-  if (cornersInsideImage(cand, iw, ih)) Object.assign(crop, cand);
-}
-
 function onKeyDown(e: KeyboardEvent): void {
   const ae = document.activeElement as HTMLElement | null;
   const inEditableText = !!ae && (ae.tagName === "TEXTAREA" ||
@@ -1433,8 +858,6 @@ onBeforeUnmount(() => {
   window.removeEventListener('beforeunload', persistOnUnload);
   document.removeEventListener('visibilitychange', persistOnHidden);
   resizeObs?.disconnect();
-  curveResizeObs?.disconnect();
-  curveResizeObs = null;
   histoResizeObs?.disconnect();
   histoResizeObs = null;
   destroyWebGL();
@@ -1448,7 +871,7 @@ onMounted(async () => {
   resizeObs = new ResizeObserver(() => recomputeFit());
   if (viewportRef.value) resizeObs.observe(viewportRef.value);
 
-  Object.assign(thumbs, await loadThumbs());
+  await loadThumbCache();
 
   // Restore a previous session if one exists; otherwise auto-load the sample.
   if (await restoreSession()) return;
@@ -1464,27 +887,6 @@ onMounted(async () => {
   }
 });
 
-// Rehydrate imported images + their edits from localStorage. Returns false if
-// there's nothing to restore (so the caller falls back to the sample).
-async function restoreSession(): Promise<boolean> {
-  const persisted = await loadSession<Snapshot, typeof viewSettings>();
-  if (!persisted || !persisted.session.sources.length) return false;
-
-  sources.value = persisted.session.sources.map(s => ({ ...s }));
-  if (persisted.session.viewSettings) Object.assign(viewSettings, persisted.session.viewSettings);
-  edits.clear();
-  for (const [id, e] of Object.entries(persisted.edits)) edits.set(id, e);
-
-  const targetId = persisted.session.activeId && sources.value.some(s => s.id === persisted.session.activeId)
-    ? persisted.session.activeId
-    : sources.value[0].id;
-  await activateSource(targetId);
-
-  // Backfill any thumbnails missing from the cache (e.g. first run after upgrade).
-  for (const s of sources.value) if (!thumbs[s.id]) void cacheThumb(s);
-  return true;
-}
-
 function pickFiles(): void { fileInput.value?.click(); }
 
 async function onFileChange(e: Event): Promise<void> {
@@ -1499,48 +901,6 @@ async function onDrop(e: DragEvent): Promise<void> {
   isDragging.value = false;
   if (!e.dataTransfer) return;
   await uploadFiles(Array.from(e.dataTransfer.files));
-}
-
-async function uploadFiles(files: File[]): Promise<void> {
-  if (!files.length) return;
-  status.value = "uploading";
-  errorMessage.value = null;
-
-  // Preserve the edit of the image we're leaving before importing new ones.
-  flushPendingHistory();
-  cropMode.value = false; // leave the crop editor when importing
-  syncLiveToMap(activeId.value);
-
-  let lastId: string | null = null;
-  for (const file of files) {
-    const formData = new FormData();
-    formData.append("file", file);
-    try {
-      const res = await fetch(`${API}/sources`, { method: "POST", body: formData });
-      if (!res.ok) throw new Error(await res.text());
-      const source = await res.json() as Source;
-      sources.value = [...sources.value, source];
-      // Each new import starts from a fresh, independent edit.
-      const snap = defaultSnapshot();
-      edits.set(source.id, { snapshot: snap, history: [snap], historyIndex: 0 });
-      dirtyEditIds.add(source.id);
-      void cacheThumb(source);
-      lastId = source.id;
-    } catch (err) {
-      status.value = "error";
-      errorMessage.value = err instanceof Error ? err.message : String(err);
-      return;
-    }
-  }
-
-  // Make the last imported image active and render it (loadSource sets the
-  // final status to idle/error and records the decode timing).
-  if (lastId) {
-    await activateSource(lastId);
-  } else {
-    status.value = "idle";
-  }
-  persistNow();
 }
 
 function resetRecipe(): void { Object.assign(recipe, defaultRecipe()); resetHslGrading(); }

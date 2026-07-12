@@ -4,10 +4,13 @@
 // source, e.g. tmp/sessions was cleared); never persisted.
 export type Source = { id: string; name: string; size: number; embeddedUrl: string; invalid?: boolean };
 
+export function clamp(v: number, lo: number, hi: number): number {
+  return v < lo ? lo : v > hi ? hi : v;
+}
+
 // Build a filled-track gradient for a range input. Bipolar sliders (min<0<max)
 // fill from the center toward the thumb; unipolar fill from the left.
 export function trackFill(value: number, min: number, max: number): string {
-  const clamp = (v: number, lo: number, hi: number): number => (v < lo ? lo : v > hi ? hi : v);
   const p = clamp((value - min) / (max - min), 0, 1) * 100;
   const z = min < 0 && max > 0 ? (-min) / (max - min) * 100 : 0;
   const a = Math.min(p, z);
