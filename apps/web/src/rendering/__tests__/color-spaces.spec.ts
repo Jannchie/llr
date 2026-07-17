@@ -1,8 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { computeWbMatrix, mulMat3, P3_Y, PROPHOTO_TO_P3, PROPHOTO_TO_SRGB, PROPHOTO_Y, REC709_Y } from "../color-spaces";
-
-const ppLuma = (v: readonly [number, number, number]): number =>
-  PROPHOTO_Y[0] * v[0] + PROPHOTO_Y[1] * v[1] + PROPHOTO_Y[2] * v[2];
+import { computeWbMatrix, mulMat3, P3_Y, ppLuma, PROPHOTO_TO_P3, PROPHOTO_TO_SRGB, PROPHOTO_Y, REC709_Y } from "../color-spaces";
 
 /** How the matrix moves white — the WB "gain" in the old diagonal sense. */
 const whiteGain = (temp: number, tint: number): [number, number, number] =>

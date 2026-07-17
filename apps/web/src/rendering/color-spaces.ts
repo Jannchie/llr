@@ -65,6 +65,11 @@ export const SRGB_TO_PROPHOTO: Mat3 = [
 ];
 // ProPhoto(D50) luminance weights (Y row of ProPhoto->XYZ-D50)
 export const PROPHOTO_Y: readonly [number, number, number] = [0.28804020, 0.71187410, 0.00008570];
+
+/** ProPhoto luminance of a linear ProPhoto triple — TS mirror of the GLSL ppLuma. */
+export function ppLuma(v: readonly [number, number, number]): number {
+  return PROPHOTO_Y[0] * v[0] + PROPHOTO_Y[1] * v[1] + PROPHOTO_Y[2] * v[2];
+}
 // Display-linear luminance weights (Y rows of sRGB/Display-P3 -> XYZ-D65).
 // Used for equal-luminance gray in gamut compression — must match the gamut
 // the values are expressed in, or the "neutral" axis picks up a colour cast.
@@ -232,9 +237,11 @@ export function computeWbMatrix(temperature: number, tint: number): Mat3 {
 
 // --- GLSL emission (column-major literal so `NAME * v` == row-major M · v) ---
 
-function f(x: number): string {
+/** Format a number as a GLSL float literal — shared by every TS→GLSL emitter. */
+export function glslFloat(x: number): string {
   return Number.isInteger(x) ? x.toFixed(1) : x.toString();
 }
+const f = glslFloat;
 
 function glslMat3(name: string, m: Mat3): string {
   const col = (j: number) => `${f(m[0][j])}, ${f(m[1][j])}, ${f(m[2][j])}`;

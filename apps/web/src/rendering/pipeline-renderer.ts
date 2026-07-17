@@ -7,6 +7,7 @@
 
 import { MASK_BLUR_SHADER, MASK_DOWNSAMPLE_SHADER, MASK_VERTEX_SHADER, PASSES, VERTEX_SHADER } from "./passes";
 import { computeWbMatrix } from "./color-spaces";
+import { buildToneCurveLUT, defaultToneCurve } from "./curve";
 import type { HistogramBins } from "./histogram";
 
 // Contrast and Blacks are not here: they are display-referred and baked into
@@ -153,15 +154,11 @@ export class PipelineRenderer {
     this.vao = this.createFullScreenQuad();
 
     // Upload identity LUTs as defaults (user tone curve + DCP profile curve).
+    // The curve default comes from the real bake so the RGBA layout has a
+    // single owner (curve.ts) instead of a hand-rolled copy here.
     const identity = new Float32Array(2048);
     for (let i = 0; i < 2048; i++) identity[i] = i / 2047;
-    const identityRGBA = new Float32Array(2048 * 4);
-    for (let i = 0; i < 2048; i++) {
-      const v = i / 2047;
-      identityRGBA[i * 4] = v; identityRGBA[i * 4 + 1] = v;
-      identityRGBA[i * 4 + 2] = v; identityRGBA[i * 4 + 3] = v;
-    }
-    this.uploadCurveLUT(identityRGBA);
+    this.uploadCurveLUT(buildToneCurveLUT(defaultToneCurve()));
     this.profileLutTex = this.makeLutTexture(identity);
 
     const info = gl.getExtension("WEBGL_debug_renderer_info");

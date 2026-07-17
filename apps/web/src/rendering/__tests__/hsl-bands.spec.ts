@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { HSL_CENTERS, HSL_RIGHT_GAP, hslBandWeight } from "../hsl-bands";
+import { HSL_CENTERS, HSL_RIGHT_GAP, hslBandWeight, hueWindow, SKIN_HUE, SKIN_HUE_HALF } from "../hsl-bands";
 
 describe("HSL band weights", () => {
   it("gaps are positive and cover the full hue circle", () => {
@@ -14,6 +14,14 @@ describe("HSL band weights", () => {
       expect(hslBandWeight(k, HSL_CENTERS[(k + 1) % 8])).toBeCloseTo(0, 9);
       expect(hslBandWeight(k, HSL_CENTERS[(k + 7) % 8])).toBeCloseTo(0, 9);
     }
+  });
+
+  it("hueWindow peaks at its centre, hits zero at the half-width, wraps at ±π", () => {
+    expect(hueWindow(SKIN_HUE, SKIN_HUE, SKIN_HUE_HALF)).toBeCloseTo(1, 9);
+    expect(hueWindow(SKIN_HUE + SKIN_HUE_HALF, SKIN_HUE, SKIN_HUE_HALF)).toBeCloseTo(0, 9);
+    expect(hueWindow(SKIN_HUE + Math.PI, SKIN_HUE, SKIN_HUE_HALF)).toBe(0);
+    // Wrap-around: a centre near +π sees hues just past -π as neighbours.
+    expect(hueWindow(-Math.PI + 0.1, Math.PI - 0.1, 0.4)).toBeCloseTo(0.5, 9);
   });
 
   it("forms a partition of unity over the whole hue circle", () => {

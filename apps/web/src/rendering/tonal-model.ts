@@ -11,6 +11,7 @@
  * approximate ACR PV2012's response; the exported XMP carries the raw slider
  * values so Lightroom applies its own exact interpretation.
  */
+import { glslFloat } from "./color-spaces";
 
 export const LOG2_MID = Math.log2(0.18); // middle gray in log2 luminance
 export const LX_WHITE = -LOG2_MID;       // diffuse white, stops above middle gray
@@ -101,8 +102,7 @@ export function clarityShift(pixLx: number, maskLx: number, clarity: number): nu
 
 // --- GLSL emission ---
 
-/** Format a number as a GLSL float literal. */
-const glf = (x: number): string => (Number.isInteger(x) ? x.toFixed(1) : x.toString());
+const glf = glslFloat;
 
 /**
  * GLSL chunk: tonal constants + the exposure shoulder, generated from the TS
