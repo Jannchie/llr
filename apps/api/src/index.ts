@@ -3,10 +3,20 @@ import { randomUUID } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
 import { access, mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { dirname, extname, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
+
+import {
+  SOURCE_ID,
+  buildLinearFrameHeader,
+  clampRenderParams,
+  isLocalOrigin,
+  isValidSourceId,
+  pickExtension,
+  type RenderLinearBody,
+} from "./protocol.js";
 
 const port = Number(process.env.PORT ?? 8790);
 const host = process.env.HOST ?? "127.0.0.1";
@@ -144,29 +154,24 @@ async function handleSourceUpload(request: IncomingMessage, response: ServerResp
   }, 201);
 }
 
-// The one definition of a valid source id (server-minted UUIDs), shared by
-// the route patterns and sessionDirFor so they cannot drift apart.
-const SOURCE_ID = String.raw`[\w-]+`;
 const SOURCE_ROUTE = new RegExp(`^/sources/(${SOURCE_ID})$`);
 const EMBEDDED_ROUTE = new RegExp(`^/sources/(${SOURCE_ID})/embedded\\.jpg$`);
-const SOURCE_ID_RE = new RegExp(`^${SOURCE_ID}$`);
 
-// Reject anything else before it reaches resolve() — a traversal like "../x"
-// or an absolute path would escape sessionsRoot (and /export writes there).
 function sessionDirFor(sourceId: string): string {
-  if (!SOURCE_ID_RE.test(sourceId)) throw new HttpError(400, "Invalid sourceId");
+  if (!isValidSourceId(sourceId)) throw new HttpError(400, "Invalid sourceId");
   return resolve(sessionsRoot, sourceId);
 }
 
+// Backpressure for the heavy decode path: each render buffers tens of MB on
+// disk and occupies one of the daemon's three workers, so an unbounded pile-up
+// (a stuck client in a retry loop, a tab spamming slider changes) would queue
+// memory and worker time without limit. Excess requests get a fast 429; the
+// UI's own sequencing (loadSeq, debounces) keeps it far from this ceiling.
+const RENDER_INFLIGHT_LIMIT = 8;
+let renderInFlight = 0;
+
 async function handleRenderLinear(request: IncomingMessage, response: ServerResponse): Promise<void> {
-  const body = await readJson<{
-    sourceId: string;
-    profileId?: string;
-    halfSize?: boolean;
-    maxSize?: number;
-    dcpCode?: string;
-    denoise?: { enabled?: boolean; model?: string; amount?: number };
-  }>(request);
+  const body = await readJson<RenderLinearBody>(request);
   if (!body.sourceId) {
     sendJson(response, { error: "Missing sourceId" }, 400);
     return;
@@ -178,62 +183,47 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
     return;
   }
 
-  // Clamp/coerce what gets forwarded to the Python daemon: a malformed field
-  // would otherwise surface as a worker ValueError → opaque 500.
-  const maxSizeRaw = Number(body.maxSize ?? 1600);
-  const maxSize = Number.isFinite(maxSizeRaw) ? Math.min(16384, Math.max(0, Math.trunc(maxSizeRaw))) : 1600;
-  const denoiseAmount = Number(body.denoise?.amount ?? 1);
-  const denoise = {
-    enabled: body.denoise?.enabled === true,
-    model: typeof body.denoise?.model === "string" ? body.denoise.model : undefined,
-    amount: Number.isFinite(denoiseAmount) ? Math.min(1, Math.max(0, denoiseAmount)) : 1,
-  };
+  if (renderInFlight >= RENDER_INFLIGHT_LIMIT) {
+    throw new HttpError(429, "Too many concurrent renders");
+  }
+
+  const params = clampRenderParams(body);
 
   // Per-request filename (concurrent renders must not overwrite each other),
   // deleted once the stream closes: the linear data goes back in this response
   // body instead of round-tripping through a second GET.
   const outputPath = resolve(sessionDir, `linear-${randomUUID()}.bin`);
   let meta;
+  renderInFlight += 1;
   try {
     meta = await daemon.send({
       command: "render-linear",
       input: sourcePath,
       output: outputPath,
-      profile: body.profileId ?? "standard",
-      halfSize: typeof body.halfSize === "boolean" ? body.halfSize : true,
-      maxSize,
+      profile: params.profile,
+      halfSize: params.halfSize,
+      maxSize: params.maxSize,
       recipe: { autoTone: false },
-      dcpCode: typeof body.dcpCode === "string" ? body.dcpCode : undefined,
-      denoise,
+      dcpCode: params.dcpCode,
+      denoise: params.denoise,
     });
   } catch (error) {
     await rm(outputPath, { force: true });
     throw error;
+  } finally {
+    renderInFlight -= 1;
   }
 
-  // [u32 header length][JSON header, space-padded so the pixels stay 4-byte
-  // aligned for a zero-copy typed-array view][linear RGB in header.dtype].
   // The pixel payload (tens of MB) is streamed from disk instead of being
-  // buffered whole in memory.
-  let header = Buffer.from(JSON.stringify({
-    width: meta.width,
-    height: meta.height,
-    fullWidth: meta.fullWidth ?? null,
-    fullHeight: meta.fullHeight ?? null,
-    colorProfile: meta.colorProfile ?? null,
-    dtype: typeof meta.dtype === "string" ? meta.dtype : "float32",
-  }), "utf8");
-  if (header.length % 4) header = Buffer.concat([header, Buffer.alloc(4 - (header.length % 4), 0x20)]);
-  const prefix = Buffer.alloc(4);
-  prefix.writeUInt32BE(header.length, 0);
-
+  // buffered whole in memory; see buildLinearFrameHeader for the framing.
+  const frameHeader = buildLinearFrameHeader(meta);
   const pixelBytes = Number(meta.bytesWritten);
   const headers: Record<string, string> = { "content-type": "application/octet-stream", "cache-control": "no-store" };
   if (Number.isFinite(pixelBytes) && pixelBytes >= 0) {
-    headers["content-length"] = String(prefix.length + header.length + pixelBytes);
+    headers["content-length"] = String(frameHeader.length + pixelBytes);
   }
   response.writeHead(200, headers);
-  response.write(Buffer.concat([prefix, header]));
+  response.write(frameHeader);
   const stream = createReadStream(outputPath);
   stream.once("close", () => void rm(outputPath, { force: true }));
   stream.on("error", () => response.destroy());
@@ -543,11 +533,6 @@ function streamFile(response: ServerResponse, path: string, onClose?: () => void
   });
 }
 
-function pickExtension(filename: string): string {
-  const ext = extname(filename).toLowerCase();
-  return ext;
-}
-
 function sendJson(response: ServerResponse, body: unknown, status = 200): void {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
   response.end(JSON.stringify(body, null, 2));
@@ -561,15 +546,6 @@ function setCors(request: IncomingMessage, response: ServerResponse): void {
   response.setHeader("Access-Control-Allow-Origin", origin);
   response.setHeader("Access-Control-Allow-Headers", "content-type");
   response.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
-}
-
-function isLocalOrigin(origin: string): boolean {
-  try {
-    const { hostname } = new URL(origin);
-    return hostname === "localhost" || hostname === "127.0.0.1";
-  } catch {
-    return false;
-  }
 }
 
 function errorMessage(error: unknown): string {

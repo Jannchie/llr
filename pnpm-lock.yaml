@@ -30,7 +30,11 @@ importers:
         specifier: ^10.4.1
         version: 10.4.1(eslint@10.7.0)
 
-  apps/api: {}
+  apps/api:
+    devDependencies:
+      vitest:
+        specifier: ^4.1.10
+        version: 4.1.10(@types/node@22.19.17)(vite@6.4.2(@types/node@22.19.17)(tsx@4.21.0))
 
   apps/web:
     dependencies:

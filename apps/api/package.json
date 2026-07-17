@@ -6,6 +6,10 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
-    "dev": "tsx src/index.ts"
+    "dev": "tsx src/index.ts",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.10"
   }
 }
