@@ -200,26 +200,31 @@ function maxScaleInside(c: CropState, iw: number, ih: number): number {
 }
 
 /**
- * Return a valid crop: clamp the center so the box can fit, then shrink about
- * the center until the (possibly rotated) box is inside the image. Used after
- * straighten/rotate changes and as a safety net.
+ * Return a valid crop: translate the center back so the (possibly rotated) box
+ * fits, shrinking about the image center only when the box is too large to fit
+ * at any position. Used after straighten/rotate changes and as a safety net.
  */
 export function constrainCrop(c: CropState, srcW: number, srcH: number): CropState {
   const [iw, ih] = imageDims(srcW, srcH, c.orientation);
-  let out: CropState = { ...c };
-  // Pull the center toward the image center first so a fit is reachable.
-  out.cx = clamp(out.cx, 0, 1);
-  out.cy = clamp(out.cy, 0, 1);
-  let s = maxScaleInside(out, iw, ih);
-  if (s < 1) {
-    out = { ...out, w: out.w * s, h: out.h * s };
-    // Nudge center toward 0.5 and retry once for off-center boxes.
-    if (!cornersInsideImage(out, iw, ih)) {
-      out.cx = 0.5; out.cy = 0.5;
-      s = maxScaleInside(out, iw, ih);
-      out = { ...out, w: out.w * s, h: out.h * s };
-    }
+  const out: CropState = { ...c };
+  // Half-extents (image px) of the rotated box's axis-aligned bounds; the
+  // corners are inside the image iff the center keeps these margins.
+  const a = (c.angle * Math.PI) / 180;
+  const cos = Math.abs(Math.cos(a));
+  const sin = Math.abs(Math.sin(a));
+  const hx = (c.w * iw * cos + c.h * ih * sin) / 2;
+  const hy = (c.w * iw * sin + c.h * ih * cos) / 2;
+  if (hx * 2 > iw || hy * 2 > ih) {
+    // Too large to fit at any position: center it and shrink.
+    out.cx = 0.5;
+    out.cy = 0.5;
+    const s = maxScaleInside(out, iw, ih);
+    out.w *= s;
+    out.h *= s;
+    return out;
   }
+  out.cx = clamp(out.cx, hx / iw, 1 - hx / iw);
+  out.cy = clamp(out.cy, hy / ih, 1 - hy / ih);
   return out;
 }
 

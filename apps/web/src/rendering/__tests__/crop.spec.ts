@@ -110,10 +110,30 @@ describe("constrainCrop", () => {
     expect(constrainCrop(c, SRC_W, SRC_H)).toEqual(c);
   });
 
-  it("recovers an off-image center", () => {
+  it("recovers an off-image center by translating, not shrinking", () => {
     const c = constrainCrop({ ...defaultCrop(), cx: 1.4, cy: -0.2, w: 0.4, h: 0.4 }, SRC_W, SRC_H);
     const [iw, ih] = imageDims(SRC_W, SRC_H, c.orientation);
     expect(cornersInsideImage(c, iw, ih)).toBe(true);
+    expect(c.w).toBeCloseTo(0.4, 9);
+    expect(c.h).toBeCloseTo(0.4, 9);
+    expect(c.cx).toBeCloseTo(0.8, 9);
+    expect(c.cy).toBeCloseTo(0.2, 9);
+  });
+
+  it("translates a box whose center sits on the image edge", () => {
+    const c = constrainCrop({ ...defaultCrop(), cx: 0, cy: 1, w: 0.4, h: 0.4 }, SRC_W, SRC_H);
+    expect(c.w).toBeCloseTo(0.4, 9);
+    expect(c.h).toBeCloseTo(0.4, 9);
+    expect(c.cx).toBeCloseTo(0.2, 9);
+    expect(c.cy).toBeCloseTo(0.8, 9);
+  });
+
+  it("keeps a rotated edge-hugging box at full size", () => {
+    const c = constrainCrop({ ...defaultCrop(), cx: 0.05, cy: 0.5, w: 0.4, h: 0.4, angle: 10 }, SRC_W, SRC_H);
+    const [iw, ih] = imageDims(SRC_W, SRC_H, c.orientation);
+    expect(cornersInsideImage(c, iw, ih)).toBe(true);
+    expect(c.w).toBeCloseTo(0.4, 9);
+    expect(c.h).toBeCloseTo(0.4, 9);
   });
 });
 
