@@ -11,8 +11,9 @@ pipeline (DCP, edits, export) is untouched. This matches how Lightroom AI
 Denoise / DxO DeepPRIME operate: at the mosaic, where the noise is closest to
 its sensor statistics and not yet correlated by demosaic interpolation.
 
-``torch`` is imported lazily inside the neural backend, so importing this module
-and running the passthrough/classical paths never requires a CUDA build.
+Only sensors with a 2x2 Bayer CFA are supported; other layouts (Fuji X-Trans's
+6x6, monochrome) are detected and skipped so we never write a scrambled mosaic
+back into the file's data.
 """
 
 from __future__ import annotations
@@ -61,6 +62,19 @@ def unpack_bayer(planes: np.ndarray) -> np.ndarray:
     return out
 
 
+def cfa_is_bayer_2x2(raw: Any) -> bool:
+    """True when the sensor uses a plain 2x2 Bayer CFA that pack/unpack handle.
+
+    X-Trans (6x6 ``raw_pattern``) and monochrome sensors fall outside the 2x2
+    assumption baked into :func:`pack_bayer`; running them through it would
+    scramble the mosaic, so callers must skip denoise for them.
+    """
+    pattern = getattr(raw, "raw_pattern", None)
+    if pattern is None:
+        return False
+    return np.asarray(pattern).shape == (2, 2)
+
+
 def _plane_black_levels(raw: Any, row_phase: int = 0, col_phase: int = 0) -> np.ndarray:
     """Black level for each of the 4 packed phases, ordered TL, TR, BL, BR.
 
@@ -76,7 +90,7 @@ def _plane_black_levels(raw: Any, row_phase: int = 0, col_phase: int = 0) -> np.
     pattern = np.asarray(raw.raw_pattern)
     black = np.asarray(raw.black_level_per_channel, dtype=np.float32)
     if pattern.shape != (2, 2) or black.size < 4:
-        # Non-2x2 CFA (X-Trans etc.) is unsupported; fall back to a scalar.
+        # Callers guard on cfa_is_bayer_2x2; scalar fallback kept as a backstop.
         return np.full(4, float(black.reshape(-1)[0]), dtype=np.float32)
     pattern = np.roll(pattern, shift=(-(row_phase % 2), -(col_phase % 2)), axis=(0, 1))
     return black[pattern.reshape(-1)].astype(np.float32)
@@ -166,13 +180,16 @@ def denoise_raw_inplace(
     denoiser: Denoiser,
     *,
     sigma: float | None = None,
-) -> DenoiseStats:
+) -> DenoiseStats | None:
     """Denoise ``raw``'s visible Bayer mosaic in place.
 
     Mutates ``raw.raw_image`` so a subsequent ``raw.postprocess()`` demosaics the
-    cleaned data. Returns stats for logging. Odd trailing row/column (rare) is
-    left untouched so dimensions always stay valid.
+    cleaned data. Returns stats for logging, or ``None`` when the sensor's CFA is
+    not 2x2 Bayer (X-Trans, monochrome) and the mosaic was left untouched. Odd
+    trailing row/column (rare) is left untouched so dimensions always stay valid.
     """
+    if not cfa_is_bayer_2x2(raw):
+        return None
     visible = raw.raw_image_visible  # view into raw.raw_image
     h, w = visible.shape
     he, we = h - (h % 2), w - (w % 2)
@@ -214,12 +231,13 @@ def denoise_raw_inplace(
 
 # ── Registry ───────────────────────────────────────────────────────────────
 
-# Lazily-constructed singletons so we only build/load a model (and import torch)
-# when a recipe actually asks for it.
+# Lazily-constructed singletons so we only build a denoiser when a recipe
+# actually asks for it.
 _DENOISER_CACHE: dict[str, Denoiser] = {}
 
-# Model id -> factory. Neural backends are registered in denoise_models.py to
-# keep the torch dependency out of this module's import path.
+# Model id -> factory. No neural backend ships yet (deferred; must be
+# non-GPL); when one lands it should call register_denoiser() from its own
+# module to keep torch out of this module's import path.
 _FACTORIES: dict[str, Callable[[], Denoiser]] = {
     "passthrough": PassthroughDenoiser,
     "wavelet": WaveletDenoiser,

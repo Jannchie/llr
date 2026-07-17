@@ -358,30 +358,41 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
         return shared_raw
 
     try:
-        prepared = prepare_linear(
-            input_path, recipe, root,
-            dcp_arg=None, disable_dcp=False,
-            half_size=half_size, max_size=max_size,
-            raw_provider=open_raw,
-        )
-
-        # Blend the denoised decode over the noisy one by the requested amount. The
-        # heavy inference happens inside this second prepare_linear and is cached by
-        # cache_key (denoise_model), so amount changes only re-run this cheap lerp.
-        if dn_model is not None:
-            prepared_dn = prepare_linear(
+        if dn_model is not None and dn_amount >= 1.0:
+            # Full-strength denoise: the noisy decode would be blended away
+            # entirely, so skip it and decode only the denoised variant.
+            prepared = prepare_linear(
                 input_path, recipe, root,
                 dcp_arg=None, disable_dcp=False,
                 half_size=half_size, max_size=max_size,
                 denoise_model=dn_model,
                 raw_provider=open_raw,
             )
-            blended = prepared.linear * (1.0 - dn_amount) + prepared_dn.linear * dn_amount
-            prepared = PreparedLinear(
-                linear=blended.astype(np.float32),
-                metadata=prepared.metadata,
-                color_profile=prepared.color_profile,
+        else:
+            prepared = prepare_linear(
+                input_path, recipe, root,
+                dcp_arg=None, disable_dcp=False,
+                half_size=half_size, max_size=max_size,
+                raw_provider=open_raw,
             )
+
+            # Blend the denoised decode over the noisy one by the requested amount. The
+            # heavy inference happens inside this second prepare_linear and is cached by
+            # cache_key (denoise_model), so amount changes only re-run this cheap lerp.
+            if dn_model is not None:
+                prepared_dn = prepare_linear(
+                    input_path, recipe, root,
+                    dcp_arg=None, disable_dcp=False,
+                    half_size=half_size, max_size=max_size,
+                    denoise_model=dn_model,
+                    raw_provider=open_raw,
+                )
+                blended = prepared.linear * (1.0 - dn_amount) + prepared_dn.linear * dn_amount
+                prepared = PreparedLinear(
+                    linear=blended.astype(np.float32),
+                    metadata=prepared.metadata,
+                    color_profile=prepared.color_profile,
+                )
     finally:
         if shared_raw is not None:
             shared_raw.close()
@@ -455,14 +466,17 @@ def daemon_export(request: dict[str, Any], root: Path) -> dict[str, Any]:
 
 
 def copy_exif_provenance(original: Path, target: Path) -> bool:
-    """Copy all camera metadata from the original into the export.
+    """Copy camera metadata from the original into the export.
 
-    Copies every writable tag group (EXIF, GPS, maker notes, IPTC, ...) so no
-    shooting metadata is lost, then overrides the few tags that must describe
+    Copies the writable tag groups (EXIF, maker notes, IPTC, ...) so shooting
+    metadata survives the export, then overrides the few tags that must describe
     the export itself: orientation/rotation is baked into the pixels, the EXIF
     pixel dimensions are the export's, and Software identifies the renderer.
     XMP is excluded because daemon_export injects LLR's own packet, and the
-    source ICC profile would mislabel the rendered (sRGB) colors.
+    source ICC profile would mislabel the rendered (sRGB) colors. Privacy-
+    sensitive tags — GPS location, body/lens serial numbers, owner name — are
+    excluded so sharing an export never leaks where or with whose gear it was
+    shot.
     """
     command = detect_exiftool()
     if command is None:
@@ -477,6 +491,9 @@ def copy_exif_provenance(original: Path, target: Path) -> bool:
                 "-all:all",
                 "--xmp:all",
                 "--icc_profile:all",
+                "--gps:all",
+                "--*serialnumber*",
+                "--ownername",
                 "-tagsFromFile",
                 "@",
                 "-ExifImageWidth<ImageWidth",
@@ -873,8 +890,10 @@ def prepare_linear(
         # RAW-domain denoise: clean the Bayer mosaic in place so the postprocess
         # calls below demosaic the denoised data. Heavy, so it is cached via
         # cache_key (which includes denoise_model) like any other camera RGB.
+        # Returns None (mosaic untouched) on non-2x2 CFAs such as Fuji X-Trans.
+        denoise_skipped = False
         if denoise_model:
-            denoise_raw_inplace(raw, get_denoiser(denoise_model))
+            denoise_skipped = denoise_raw_inplace(raw, get_denoiser(denoise_model)) is None
         dcp_profile, dcp_selection = resolve_dcp_profile(root, dcp_arg, disable_dcp, recipe, metadata)
         if dcp_profile is None:
             # Scene-referred fallback: deliver linear ProPhoto (D50) so the browser
@@ -919,6 +938,9 @@ def prepare_linear(
             linear, dcp_info = apply_dcp_profile(camera_rgb, dcp_profile)
             color_profile = dcp_info.to_json()
             color_profile["selection"] = dcp_selection
+
+    if denoise_skipped:
+        color_profile["denoiseSkipped"] = True
 
     return PreparedLinear(linear=linear, metadata=metadata, color_profile=color_profile)
 
