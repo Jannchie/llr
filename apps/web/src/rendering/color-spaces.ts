@@ -178,6 +178,7 @@ function uvToXy(uv: readonly [number, number]): [number, number] {
  * matching the slider label.
  */
 function whitePointXY(kelvin: number, tint: number): [number, number] {
+  if (tint === 0) return locusXY(kelvin); // skip the normal + uv round-trip
   const uv = xyToUv(locusXY(kelvin));
   // Locus tangent by central difference, normal = tangent rotated 90° onto
   // the green (+v) side of the locus.
@@ -207,6 +208,10 @@ function xyToXYZ(xy: readonly [number, number]): [number, number, number] {
   return [xy[0] / y, 1, (1 - xy[0] - xy[1]) / y];
 }
 
+// Bradford cone response of the 6500 K / 0 reference white — the constant
+// adaptation target every slider position maps back to.
+const WB_REFERENCE_LMS = mulMat3(BRADFORD, xyToXYZ(locusXY(WB_REFERENCE_K)));
+
 /**
  * White-balance adaptation matrix in linear ProPhoto (row-major). The backend
  * already applied the camera (as-shot) WB, so temp/tint are *relative* nudges:
@@ -218,7 +223,7 @@ function xyToXYZ(xy: readonly [number, number]): [number, number, number] {
  */
 export function computeWbMatrix(temperature: number, tint: number): Mat3 {
   const src = mulMat3(BRADFORD, xyToXYZ(whitePointXY(temperature, tint)));
-  const dst = mulMat3(BRADFORD, xyToXYZ(whitePointXY(WB_REFERENCE_K, 0)));
+  const dst = WB_REFERENCE_LMS;
   const scale: Mat3 = [
     [dst[0] / src[0], 0, 0],
     [0, dst[1] / src[1], 0],
@@ -226,8 +231,7 @@ export function computeWbMatrix(temperature: number, tint: number): Mat3 {
   ];
   const cat = matMul3(BRADFORD_INV, matMul3(scale, BRADFORD));
   const m = matMul3(XYZ_D50_TO_PROPHOTO, matMul3(cat, PROPHOTO_TO_XYZ_D50));
-  const w = mulMat3(m, [1, 1, 1]);
-  const k = 1 / Math.max(PROPHOTO_Y[0] * w[0] + PROPHOTO_Y[1] * w[1] + PROPHOTO_Y[2] * w[2], 1e-6);
+  const k = 1 / Math.max(ppLuma(mulMat3(m, [1, 1, 1])), 1e-6);
   return [
     [m[0][0] * k, m[0][1] * k, m[0][2] * k],
     [m[1][0] * k, m[1][1] * k, m[1][2] * k],

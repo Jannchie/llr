@@ -65,6 +65,7 @@ uniform float u_grad_balance;
 // Tone Curve LUT (2048×1 RGB texture) — per-channel point + parametric curves,
 // applied display-referred. .r/.g/.b hold the baked R/G/B channel curves.
 uniform sampler2D u_curve_lut;
+uniform int u_curveActive;      // 0 when the baked LUT is the identity -> skip its 5 fetches
 uniform sampler2D u_profile_lut; // DCP profile tone curve (per-channel), display rendering
 uniform int u_hasProfileCurve;   // 1 if a DCP profile tone curve is available
 uniform int u_viewTransform;    // 0 = Lightroom-style, 1 = AgX
@@ -185,49 +186,47 @@ void main() {
     float lOut = (u_exposure > 0.0)
       ? l + expoShoulder(l + u_exposure) - expoShoulder(l)
       : l + u_exposure;
-    float pixLx = lOut - LOG2_MID;                     // stops from middle gray, post-exposure
-    // Blurred neighborhood log-luma (see MASK_* shaders), shifted for exposure.
-    float maskLx = (u_hasMask == 1)
-      ? texture(u_mask_lum, v_texCoord).r + u_maskShift
-      : pixLx;
-    if (u_tonalActive == 1) {
-      // Highlights responds to a pixel that is bright itself OR sits in a
-      // bright neighborhood (max); Shadows is the mirror (min). This keeps
-      // small speculars/windows responsive (pixel term) while dark texture
-      // inside a bright region moves with the region (mask term) — local
-      // contrast preserved, as in Lightroom. A blended average does neither:
-      // it dilutes small features out of the window and drags region interiors
-      // out of it. Log-domain blurring makes the dark side dominate the mask
-      // near edges, which keeps highlight recovery from bleeding dark halos.
-      float wHi = smoothstep(HI_EDGE0, HI_EDGE1, max(pixLx, maskLx));
-      float wSh = 1.0 - smoothstep(SH_EDGE0, SH_EDGE1, min(pixLx, maskLx));
-      // Only *negative* Whites acts here, on pixel luma: pulling the white
-      // point down means rescuing scene values above 1.0, which the view
-      // transform clamps away — so recovery exists only scene-referred.
-      // Blowing the whites is the opposite case: the profile tone curve
-      // asymptotes below 1.0 and flattens the top stops, so no scene-referred
-      // gain can move the clip point. Positive Whites is a display-referred
-      // white-point scale baked into the curve LUT (curve.ts basicCurve).
-      float wWh = smoothstep(WH_EDGE0, LX_WHITE, pixLx);
-      lOut += (u_highlights >= 0.0 ? HI_GAIN_POS : HI_GAIN_NEG) * u_highlights * wHi
-            + (u_shadows    >= 0.0 ? SH_GAIN_POS : SH_GAIN_NEG) * u_shadows    * wSh
-            + WH_GAIN * min(u_whites, 0.0) * wWh;
-    }
-    // Clarity: local mid-tone contrast — amplify the pixel's deviation from
-    // its blurred neighborhood (clarityShift in TONAL_GLSL; window + midtone
-    // weight keep edges and clip points from haloing/shifting).
-    if (clarityLocal) {
-      lOut += clarityShift(pixLx, maskLx, u_clarity);
+    if (u_tonalActive == 1 || clarityLocal) {
+      float pixLx = lOut - LOG2_MID;                   // stops from middle gray, post-exposure
+      // Blurred neighborhood log-luma (see MASK_* shaders), shifted for
+      // exposure. Guarded by its consumers: an exposure-only edit must not
+      // pay a per-pixel texture fetch it never reads.
+      float maskLx = (u_hasMask == 1)
+        ? texture(u_mask_lum, v_texCoord).r + u_maskShift
+        : pixLx;
+      if (u_tonalActive == 1) {
+        // Highlights responds to a pixel that is bright itself OR sits in a
+        // bright neighborhood (max); Shadows is the mirror (min). This keeps
+        // small speculars/windows responsive (pixel term) while dark texture
+        // inside a bright region moves with the region (mask term) — local
+        // contrast preserved, as in Lightroom. A blended average does neither:
+        // it dilutes small features out of the window and drags region interiors
+        // out of it. Log-domain blurring makes the dark side dominate the mask
+        // near edges, which keeps highlight recovery from bleeding dark halos.
+        float wHi = smoothstep(HI_EDGE0, HI_EDGE1, max(pixLx, maskLx));
+        float wSh = 1.0 - smoothstep(SH_EDGE0, SH_EDGE1, min(pixLx, maskLx));
+        // Only *negative* Whites acts here, on pixel luma: pulling the white
+        // point down means rescuing scene values above 1.0, which the view
+        // transform clamps away — so recovery exists only scene-referred.
+        // Blowing the whites is the opposite case: the profile tone curve
+        // asymptotes below 1.0 and flattens the top stops, so no scene-referred
+        // gain can move the clip point. Positive Whites is a display-referred
+        // white-point scale baked into the curve LUT (curve.ts basicCurve).
+        float wWh = smoothstep(WH_EDGE0, LX_WHITE, pixLx);
+        lOut += (u_highlights >= 0.0 ? HI_GAIN_POS : HI_GAIN_NEG) * u_highlights * wHi
+              + (u_shadows    >= 0.0 ? SH_GAIN_POS : SH_GAIN_NEG) * u_shadows    * wSh
+              + WH_GAIN * min(u_whites, 0.0) * wWh;
+      }
+      // Clarity: local mid-tone contrast — amplify the pixel's deviation from
+      // its blurred neighborhood (clarityShift in TONAL_GLSL; window + midtone
+      // weight keep edges and clip points from haloing/shifting). Without the
+      // mask there is no neighborhood signal, so the slider is inert — same
+      // degradation story as the region weights above falling back per-pixel.
+      if (clarityLocal) {
+        lOut += clarityShift(pixLx, maskLx, u_clarity);
+      }
     }
     c *= exp2(lOut - l);
-  }
-
-  // Clarity fallback when the neighborhood mask is unavailable: the old
-  // per-pixel mid-tone contrast, so the slider still does something.
-  if (u_clarity != 0.0 && u_hasMask == 0) {
-    float lm = ppLuma(c); lm = lm / (lm + 0.18);      // display-ish proxy for masking
-    float midMask = smoothstep(0.05, 0.45, lm) * (1.0 - smoothstep(0.55, 0.95, lm));
-    c = max(c + (c - 0.18) * u_clarity * midMask * 0.6, vec3(0.0));
   }
 
   // --- Dehaze (global contrast + saturation boost) ---
@@ -299,19 +298,21 @@ void main() {
   // skews hue (orange drifts yellow under an S-curve). The R/G/B point curves
   // then apply per channel: crosstalk is their purpose.
   c = clamp(c, 0.0, 1.0);
-  float cvMax = max(c.r, max(c.g, c.b));
-  float cvMin = min(c.r, min(c.g, c.b));
-  float cvMax2 = texture(u_curve_lut, vec2(lutCoord(cvMax), 0.5)).a;
-  float cvMin2 = texture(u_curve_lut, vec2(lutCoord(cvMin), 0.5)).a;
-  c = (cvMax - cvMin > 1e-6)
-    ? cvMin2 + (cvMax2 - cvMin2) * (c - cvMin) / (cvMax - cvMin)
-    : vec3(cvMax2);
-  c = clamp(c, 0.0, 1.0);
-  c = vec3(
-    texture(u_curve_lut, vec2(lutCoord(c.r), 0.5)).r,
-    texture(u_curve_lut, vec2(lutCoord(c.g), 0.5)).g,
-    texture(u_curve_lut, vec2(lutCoord(c.b), 0.5)).b
-  );
+  if (u_curveActive == 1) { // identity bake (default sliders / compare baseline) skips all 5 fetches
+    float cvMax = max(c.r, max(c.g, c.b));
+    float cvMin = min(c.r, min(c.g, c.b));
+    float cvMax2 = texture(u_curve_lut, vec2(lutCoord(cvMax), 0.5)).a;
+    float cvMin2 = texture(u_curve_lut, vec2(lutCoord(cvMin), 0.5)).a;
+    c = (cvMax - cvMin > 1e-6)
+      ? cvMin2 + (cvMax2 - cvMin2) * (c - cvMin) / (cvMax - cvMin)
+      : vec3(cvMax2);
+    c = clamp(c, 0.0, 1.0);
+    c = vec3(
+      texture(u_curve_lut, vec2(lutCoord(c.r), 0.5)).r,
+      texture(u_curve_lut, vec2(lutCoord(c.g), 0.5)).g,
+      texture(u_curve_lut, vec2(lutCoord(c.b), 0.5)).b
+    );
+  }
 
   // --- Color Grading (display-referred split-toning) ---
   // Cascaded blending (each step is a convex mix), so overlapping region
@@ -408,6 +409,6 @@ export const PASSES: PassDef[] = [
     "u_hsl_l[0]","u_hsl_l[1]","u_hsl_l[2]","u_hsl_l[3]","u_hsl_l[4]","u_hsl_l[5]","u_hsl_l[6]","u_hsl_l[7]",
     "u_grad_sh_h","u_grad_sh_s","u_grad_md_h","u_grad_md_s",
     "u_grad_hl_h","u_grad_hl_s","u_grad_blend","u_grad_balance",
-    "u_curve_lut", "u_hasProfileCurve",
+    "u_curve_lut", "u_curveActive", "u_hasProfileCurve",
   ]},
 ];

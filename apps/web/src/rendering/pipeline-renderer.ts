@@ -126,6 +126,14 @@ export class PipelineRenderer {
   private histoPending: Promise<HistogramBins> | null = null;
   private quadBuffers: WebGLBuffer[] = [];
   private destroyed = false;
+  /** Whether the uploaded curve LUT differs from the identity (see uploadCurveLUT). */
+  private curveActive = false;
+  // WB matrix cache: setUniforms runs every draw but temp/tint only change
+  // while their sliders move — skip the locus/Bradford math otherwise. Stored
+  // row-major; uniformMatrix3fv transposes on upload.
+  private wbTemp = Number.NaN;
+  private wbTint = Number.NaN;
+  private readonly wbMat = new Float32Array(9);
   /** Whether the browser exposes a wide-gamut drawing buffer. */
   readonly p3Supported: boolean = false;
 
@@ -322,6 +330,18 @@ export class PipelineRenderer {
    */
   uploadCurveLUT(lut: Float32Array): void {
     const gl = this.gl;
+    // Identity detection (one 8k-float scan per bake): the shader skips the
+    // curve block's 5 LUT fetches per pixel when the bake does nothing — the
+    // default-slider state and the hold-to-compare baseline.
+    this.curveActive = false;
+    for (let i = 0; i < 2048; i++) {
+      const x = i / 2047;
+      if (Math.abs(lut[i * 4] - x) > 1e-6 || Math.abs(lut[i * 4 + 1] - x) > 1e-6
+        || Math.abs(lut[i * 4 + 2] - x) > 1e-6 || Math.abs(lut[i * 4 + 3] - x) > 1e-6) {
+        this.curveActive = true;
+        break;
+      }
+    }
     if (!this.curveLutTex) {
       this.curveLutTex = this.makeLutTexture(lut, 4);
       return;
@@ -724,19 +744,23 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     const s = (n: string, v: number) => { const l = this.uniforms[n]; if (l) gl.uniform1f(l, v); };
     const i = (n: string, v: number) => { const l = this.uniforms[n]; if (l) gl.uniform1i(l, v); };
     // White balance: relative temp/tint -> linear-ProPhoto Bradford adaptation
-    // matrix (identity at 6500/0). Row-major TS -> column-major GL.
-    const wb = computeWbMatrix(p.temperature, p.tint);
+    // matrix (identity at 6500/0), recomputed only when the sliders moved.
     const wbLoc = this.uniforms["u_wbMatrix"];
     if (wbLoc) {
-      gl.uniformMatrix3fv(wbLoc, false, [
-        wb[0][0], wb[1][0], wb[2][0],
-        wb[0][1], wb[1][1], wb[2][1],
-        wb[0][2], wb[1][2], wb[2][2],
-      ]);
+      if (p.temperature !== this.wbTemp || p.tint !== this.wbTint) {
+        this.wbTemp = p.temperature;
+        this.wbTint = p.tint;
+        const wb = computeWbMatrix(p.temperature, p.tint);
+        for (let r = 0; r < 3; r++) {
+          for (let col = 0; col < 3; col++) this.wbMat[r * 3 + col] = wb[r][col];
+        }
+      }
+      gl.uniformMatrix3fv(wbLoc, true, this.wbMat); // transpose: row-major in
     }
     i("u_viewTransform", p.viewTransform);
     i("u_displayGamut", p.displayGamut);
     i("u_hasProfileCurve", this.hasProfileCurve ? 1 : 0);
+    i("u_curveActive", this.curveActive ? 1 : 0);
     s("u_exposure", p.exposure); s("u_highlights", p.highlights);
     s("u_shadows", p.shadows); s("u_whites", p.whites);
     s("u_vibrance", p.vibrance); s("u_saturation", p.saturation);
