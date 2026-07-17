@@ -67,15 +67,42 @@ export function buildLinearFrameHeader(meta: Record<string, unknown>): Buffer {
   return Buffer.concat([prefix, header]);
 }
 
-// CORS is limited to local origins: this is a localhost development tool and
-// the API carries the user's original files.
+function isLocalHostname(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "127.0.0.1";
+}
+
+// Requests are limited to local origins: this is a localhost development tool
+// and the API carries the user's original files. Withholding the CORS headers
+// is not enough — a page the user happens to visit can still fire a
+// simple-request POST and take the side effects — so this gates the request.
 export function isLocalOrigin(origin: string): boolean {
   try {
-    const { hostname } = new URL(origin);
-    return hostname === "localhost" || hostname === "127.0.0.1";
+    return isLocalHostname(new URL(origin).hostname);
   } catch {
     return false;
   }
+}
+
+// The one thing the origin gate cannot see is DNS rebinding: a page on a
+// hostname that has been re-pointed at 127.0.0.1 is *same-origin* with the API,
+// so its requests carry no Origin at all. The Host header still names the
+// attacker's domain, which is what makes it separable from a real client.
+export function isAllowedHost(hostHeader: string | undefined, bindHost: string): boolean {
+  // Only HTTP/1.0 clients omit Host; no browser can be made to.
+  if (hostHeader === undefined) return true;
+  try {
+    const { hostname } = new URL(`http://${hostHeader}`);
+    return isLocalHostname(hostname) || hostname === bindHost;
+  } catch {
+    return false;
+  }
+}
+
+// Not just validation: application/json is not a CORS-simple content type, so
+// requiring it forces a cross-origin POST through a preflight the origin gate
+// answers before any body is read.
+export function isJsonContentType(value: string | undefined): boolean {
+  return value?.split(";", 1)[0]?.trim().toLowerCase() === "application/json";
 }
 
 export function pickExtension(filename: string): string {

@@ -6,12 +6,15 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { dirname, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 
 import {
   SOURCE_ID,
   buildLinearFrameHeader,
   clampRenderParams,
+  isAllowedHost,
+  isJsonContentType,
   isLocalOrigin,
   isValidSourceId,
   pickExtension,
@@ -46,6 +49,12 @@ const SUPPORTED_EXTENSIONS = new Set([
 const JSON_BODY_LIMIT = 10 * 1024 * 1024;
 const FORM_BODY_LIMIT = 512 * 1024 * 1024;
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+// linear-*.bin / export-*.jpg are per-request scratch that the request itself
+// deletes. Anything still there (the API died mid-render) is orphaned inside a
+// session dir whose mtime every later render refreshes, so the dir-level TTL
+// will never reach it. Well above the daemon's request timeout.
+const SCRATCH_TTL_MS = 60 * 60 * 1000;
+const SCRATCH_FILE = /^(?:linear-[\w-]+\.bin|export-[\w-]+\.jpg)$/;
 
 class HttpError extends Error {
   constructor(readonly status: number, message: string) {
@@ -54,6 +63,10 @@ class HttpError extends Error {
 }
 
 const server = createServer((request, response) => {
+  if (!isTrustedRequest(request)) {
+    sendJson(response, { error: "Forbidden" }, 403);
+    return;
+  }
   setCors(request, response);
   if (request.method === "OPTIONS") {
     response.writeHead(204).end();
@@ -61,6 +74,13 @@ const server = createServer((request, response) => {
   }
 
   void route(request, response).catch((error: unknown) => {
+    // A client that walks away mid-response is routine (any tab reload during a
+    // render), and pipeline surfaces it as an error; logging it would drown the
+    // failures that do mean something.
+    if (isClientAbort(error)) {
+      response.destroy();
+      return;
+    }
     console.error(error);
     if (!response.headersSent) {
       sendJson(response, { error: errorMessage(error) }, error instanceof HttpError ? error.status : 500);
@@ -104,7 +124,7 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
 
   const embeddedId = pathname.match(EMBEDDED_ROUTE)?.[1];
   if (method === "GET" && embeddedId) {
-    streamFile(response, resolve(sessionDirFor(embeddedId), "embedded.jpg"));
+    await streamFile(response, resolve(sessionDirFor(embeddedId), "embedded.jpg"));
     return;
   }
 
@@ -168,7 +188,6 @@ function sessionDirFor(sourceId: string): string {
 // memory and worker time without limit. Excess requests get a fast 429; the
 // UI's own sequencing (loadSeq, debounces) keeps it far from this ceiling.
 const RENDER_INFLIGHT_LIMIT = 8;
-let renderInFlight = 0;
 
 async function handleRenderLinear(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const body = await readJson<RenderLinearBody>(request);
@@ -183,18 +202,17 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
     return;
   }
 
-  if (renderInFlight >= RENDER_INFLIGHT_LIMIT) {
+  if (daemon.outstanding("render-linear") >= RENDER_INFLIGHT_LIMIT) {
     throw new HttpError(429, "Too many concurrent renders");
   }
 
   const params = clampRenderParams(body);
 
   // Per-request filename (concurrent renders must not overwrite each other),
-  // deleted once the stream closes: the linear data goes back in this response
-  // body instead of round-tripping through a second GET.
+  // deleted once the response is done with it: the linear data goes back in
+  // this response body instead of round-tripping through a second GET.
   const outputPath = resolve(sessionDir, `linear-${randomUUID()}.bin`);
   let meta;
-  renderInFlight += 1;
   try {
     meta = await daemon.send({
       command: "render-linear",
@@ -210,8 +228,6 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
   } catch (error) {
     await rm(outputPath, { force: true });
     throw error;
-  } finally {
-    renderInFlight -= 1;
   }
 
   // The pixel payload (tens of MB) is streamed from disk instead of being
@@ -222,12 +238,13 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
   if (Number.isFinite(pixelBytes) && pixelBytes >= 0) {
     headers["content-length"] = String(frameHeader.length + pixelBytes);
   }
-  response.writeHead(200, headers);
-  response.write(frameHeader);
-  const stream = createReadStream(outputPath);
-  stream.once("close", () => void rm(outputPath, { force: true }));
-  stream.on("error", () => response.destroy());
-  stream.pipe(response);
+  try {
+    response.writeHead(200, headers);
+    response.write(frameHeader);
+    await pipeline(createReadStream(outputPath), response);
+  } finally {
+    await rm(outputPath, { force: true });
+  }
 }
 
 async function handleExport(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -271,11 +288,10 @@ async function handleExport(request: IncomingMessage, response: ServerResponse):
       settings: meta.settings ?? {},
       stripPrivate: meta.stripPrivate === true
     });
-  } catch (error) {
+    await streamFile(response, exportPath);
+  } finally {
     await rm(exportPath, { force: true });
-    throw error;
   }
-  streamFile(response, exportPath, () => void rm(exportPath, { force: true }));
 }
 
 async function cleanupSessions(): Promise<void> {
@@ -298,9 +314,24 @@ async function cleanupSessions(): Promise<void> {
       const stats = await stat(dir);
       if (now - stats.mtimeMs > SESSION_TTL_MS) {
         await rm(dir, { recursive: true, force: true });
+        continue;
       }
+      await sweepScratch(dir, now);
     } catch (error) {
       console.warn(`session cleanup failed for ${dir}: ${errorMessage(error)}`);
+    }
+  }
+}
+
+async function sweepScratch(dir: string, now: number): Promise<void> {
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    if (!entry.isFile() || !SCRATCH_FILE.test(entry.name)) {
+      continue;
+    }
+    const path = resolve(dir, entry.name);
+    const stats = await stat(path);
+    if (now - stats.mtimeMs > SCRATCH_TTL_MS) {
+      await rm(path, { force: true });
     }
   }
 }
@@ -320,9 +351,23 @@ async function findSource(sessionDir: string): Promise<string | null> {
 
 type DaemonResponse = Record<string, unknown> & { ok?: boolean; error?: string };
 
+type DaemonHandler = { resolve: (value: DaemonResponse) => void; reject: (error: Error) => void };
+
+type InflightRequest = {
+  command: string;
+  // Files the Python side writes. Needed once a caller has given up: nothing
+  // else knows the path of a file that does not exist yet.
+  outputs: string[];
+  // null once the caller has timed out and stopped waiting for the reply.
+  handler: DaemonHandler | null;
+};
+
 class WorkerDaemon {
   private child: ChildProcessWithoutNullStreams | null = null;
-  private readonly pending = new Map<string, { resolve: (value: DaemonResponse) => void; reject: (error: Error) => void }>();
+  // Every request written to the daemon that has not replied — including ones
+  // whose caller has given up, because the Python side cannot be cancelled and
+  // is still holding a worker.
+  private readonly inflight = new Map<string, InflightRequest>();
   private readonly cwd: string;
   private booting: Promise<void> | null = null;
 
@@ -330,15 +375,40 @@ class WorkerDaemon {
     this.cwd = cwd;
   }
 
+  outstanding(command: string): number {
+    let count = 0;
+    for (const request of this.inflight.values()) {
+      if (request.command === command) count += 1;
+    }
+    return count;
+  }
+
   async send(payload: Record<string, unknown>, timeoutMs = 120_000): Promise<DaemonResponse> {
-    await this.ensureRunning();
     const id = randomUUID();
+    const request: InflightRequest = {
+      command: typeof payload.command === "string" ? payload.command : "",
+      outputs: [payload.output, payload.target].filter((value): value is string => typeof value === "string"),
+      handler: null
+    };
+    // Registered before the boot await so outstanding() already counts it: a
+    // caller checks the limit and calls send() with nothing awaited between.
+    this.inflight.set(id, request);
+    try {
+      await this.ensureRunning();
+    } catch (error) {
+      this.inflight.delete(id);
+      throw error;
+    }
     return new Promise<DaemonResponse>((resolvePromise, rejectPromise) => {
       const timer = setTimeout(() => {
-        this.pending.delete(id);
+        // A timeout cannot cancel the Python side (a running thread cannot be
+        // killed), so the request stays in flight: it still occupies a worker,
+        // and it will still write its output — which handleLine then deletes,
+        // since the caller has already rm'd the path it knew about.
+        request.handler = null;
         rejectPromise(new Error(`worker daemon request timed out after ${timeoutMs}ms`));
       }, timeoutMs);
-      this.pending.set(id, {
+      request.handler = {
         resolve: (value) => {
           clearTimeout(timer);
           resolvePromise(value);
@@ -347,11 +417,11 @@ class WorkerDaemon {
           clearTimeout(timer);
           rejectPromise(error);
         }
-      });
+      };
       const child = this.child;
       if (!child) {
         clearTimeout(timer);
-        this.pending.delete(id);
+        this.inflight.delete(id);
         rejectPromise(new Error("worker daemon is not running"));
         return;
       }
@@ -405,10 +475,13 @@ class WorkerDaemon {
       if (cleaned) return; // exit + error can both fire for the same child;
       cleaned = true;      // a late second event must not reset a newer boot
       rejectReady(cause);
-      for (const [, handler] of this.pending) {
-        handler.reject(cause);
+      for (const [, request] of this.inflight) {
+        // A dead child writes nothing more, so an abandoned request's output is
+        // whatever it managed to leave behind.
+        if (request.handler) request.handler.reject(cause);
+        else discardOutputs(request);
       }
-      this.pending.clear();
+      this.inflight.clear();
       if (this.child === child) this.child = null;
       this.booting = null;
     };
@@ -439,16 +512,31 @@ class WorkerDaemon {
     if (!id) {
       return;
     }
-    const handler = this.pending.get(id);
-    if (!handler) {
+    const request = this.inflight.get(id);
+    if (!request) {
       return;
     }
-    this.pending.delete(id);
-    if (payload.ok === false) {
-      handler.reject(new Error(typeof payload.error === "string" ? payload.error : "worker error"));
-    } else {
-      handler.resolve(payload);
+    this.inflight.delete(id);
+    if (!request.handler) {
+      discardOutputs(request);
+      return;
     }
+    if (payload.ok === false) {
+      request.handler.reject(new Error(typeof payload.error === "string" ? payload.error : "worker error"));
+    } else {
+      request.handler.resolve(payload);
+    }
+  }
+}
+
+// The file a timed-out request finally produced. Its caller is long gone and
+// rm'd the path before the daemon re-created it, so this is the last chance:
+// nothing else in the system holds the name.
+function discardOutputs(request: InflightRequest): void {
+  for (const output of request.outputs) {
+    void rm(output, { force: true }).catch((error: unknown) => {
+      console.warn(`failed to discard ${output}: ${errorMessage(error)}`);
+    });
   }
 }
 
@@ -491,6 +579,9 @@ async function readFormData(request: IncomingMessage): Promise<FormData> {
 }
 
 async function readJson<T>(request: IncomingMessage): Promise<T> {
+  if (!isJsonContentType(request.headers["content-type"])) {
+    throw new HttpError(415, "Expected content-type: application/json");
+  }
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of request) {
@@ -511,32 +602,49 @@ async function readJson<T>(request: IncomingMessage): Promise<T> {
   }
 }
 
-function streamFile(response: ServerResponse, path: string, onClose?: () => void): void {
+// pipeline, not pipe: pipe() only *unpipes* its source when the destination
+// closes, so an aborted client would leave the read stream — and its fd, which
+// pins the file's disk space for this process's lifetime even once unlinked —
+// open forever.
+async function streamFile(response: ServerResponse, path: string): Promise<void> {
   const stream = createReadStream(path);
-  if (onClose) stream.once("close", onClose);
-  stream.once("open", () => {
-    response.writeHead(200, {
-      "content-type": "image/jpeg",
-      "cache-control": "no-store"
+  try {
+    // Wait for the open so a missing file is still a JSON error rather than a
+    // truncated 200.
+    await new Promise<void>((resolveOpen, rejectOpen) => {
+      stream.once("open", () => resolveOpen());
+      stream.once("error", rejectOpen);
     });
-    stream.pipe(response);
-  });
-  stream.on("error", (error: NodeJS.ErrnoException) => {
-    if (response.headersSent) {
-      response.destroy();
-      return;
-    }
-    if (error.code === "ENOENT") {
+  } catch (error) {
+    stream.destroy();
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       sendJson(response, { error: "Not found" }, 404);
     } else {
       sendJson(response, { error: errorMessage(error) }, 500);
     }
+    return;
+  }
+  response.writeHead(200, {
+    "content-type": "image/jpeg",
+    "cache-control": "no-store"
   });
+  await pipeline(stream, response);
 }
 
 function sendJson(response: ServerResponse, body: unknown, status = 200): void {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
   response.end(JSON.stringify(body, null, 2));
+}
+
+// Runs before anything reads the body: a hostile page's request must not land
+// its side effects (a 512MB upload in tmp/sessions, attacker bytes handed to
+// LibRaw's parser) just because the reply it gets back is opaque to it.
+function isTrustedRequest(request: IncomingMessage): boolean {
+  const origin = request.headers.origin;
+  if (typeof origin === "string" && !isLocalOrigin(origin)) {
+    return false;
+  }
+  return isAllowedHost(request.headers.host, host);
 }
 
 function setCors(request: IncomingMessage, response: ServerResponse): void {
@@ -547,6 +655,12 @@ function setCors(request: IncomingMessage, response: ServerResponse): void {
   response.setHeader("Access-Control-Allow-Origin", origin);
   response.setHeader("Access-Control-Allow-Headers", "content-type");
   response.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
+}
+
+// The destination end of a pipeline() failing once the client is gone.
+function isClientAbort(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === "ERR_STREAM_PREMATURE_CLOSE" || code === "ECONNRESET" || code === "EPIPE";
 }
 
 function errorMessage(error: unknown): string {

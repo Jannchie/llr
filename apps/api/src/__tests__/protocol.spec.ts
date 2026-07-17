@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import {
   buildLinearFrameHeader,
   clampRenderParams,
+  isAllowedHost,
+  isJsonContentType,
   isLocalOrigin,
   isValidSourceId,
   pickExtension,
@@ -101,6 +103,48 @@ describe("isLocalOrigin", () => {
   it("rejects other hosts, lookalikes, and garbage", () => {
     for (const origin of ["http://example.com", "http://localhost.evil.com", "http://[::1]:5173", "not a url", ""]) {
       expect(isLocalOrigin(origin), origin).toBe(false);
+    }
+  });
+});
+
+describe("isLocalOrigin", () => {
+  it("keeps the cross-origin dev setup working", () => {
+    // The web dev server is on 5180 and the API on 8790, so normal development
+    // is cross-origin and must not be gated out.
+    expect(isLocalOrigin("http://localhost:5180")).toBe(true);
+  });
+
+  it("rejects the origins a hostile page would send", () => {
+    expect(isLocalOrigin("http://evil.example")).toBe(false);
+    expect(isLocalOrigin("null")).toBe(false); // sandboxed iframe / file://
+  });
+});
+
+describe("isAllowedHost", () => {
+  it("accepts local hosts and the configured bind host", () => {
+    expect(isAllowedHost("127.0.0.1:8790", "127.0.0.1")).toBe(true);
+    expect(isAllowedHost("localhost:8790", "127.0.0.1")).toBe(true);
+    expect(isAllowedHost("dev.box:8790", "dev.box")).toBe(true);
+    expect(isAllowedHost(undefined, "127.0.0.1")).toBe(true); // HTTP/1.0 clients
+  });
+
+  it("rejects a rebound hostname pointed at the bind address", () => {
+    expect(isAllowedHost("evil.example:8790", "127.0.0.1")).toBe(false);
+    expect(isAllowedHost("localhost.evil.example", "127.0.0.1")).toBe(false);
+    expect(isAllowedHost("", "127.0.0.1")).toBe(false);
+  });
+});
+
+describe("isJsonContentType", () => {
+  it("accepts what the real client sends", () => {
+    expect(isJsonContentType("application/json")).toBe(true);
+    expect(isJsonContentType("application/json; charset=utf-8")).toBe(true);
+    expect(isJsonContentType("Application/JSON")).toBe(true);
+  });
+
+  it("rejects the CORS-simple types that dodge a preflight", () => {
+    for (const value of ["text/plain", "multipart/form-data", "application/x-www-form-urlencoded", undefined, ""]) {
+      expect(isJsonContentType(value), String(value)).toBe(false);
     }
   });
 });
