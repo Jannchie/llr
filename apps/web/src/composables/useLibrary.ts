@@ -55,6 +55,9 @@ export function useLibrary<S, V>(opts: {
   // (each image is its own record; cloning the whole library per save is what
   // made the old single-record layout expensive).
   const dirtyEditIds = new Set<string>();
+  // Images this tab removed. The session index is unioned with whatever another
+  // tab stored, so a removal has to be called out or it comes back.
+  const removedIds = new Set<string>();
 
   const thumbs = reactive<Record<string, string>>({});
 
@@ -62,8 +65,12 @@ export function useLibrary<S, V>(opts: {
   const PERSIST_DEBOUNCE = 600;
 
   // Copy the current live edit (snapshot + history) into the map under `id`.
+  // Commits the debounced history entry first: captureEdit() pairs the live
+  // snapshot with the committed history, so capturing mid-debounce would store
+  // a snapshot that no history entry holds — undo would then jump two steps.
   function syncLiveToMap(id: string | null): void {
     if (!id) return;
+    opts.flushPendingHistory();
     edits.set(id, opts.captureEdit());
     dirtyEditIds.add(id);
   }
@@ -75,6 +82,7 @@ export function useLibrary<S, V>(opts: {
   }
 
   function persistNow(): void {
+    if (persistTimer) { clearTimeout(persistTimer); persistTimer = 0; }
     syncLiveToMap(activeId.value);
     for (const id of dirtyEditIds) {
       const e = edits.get(id);
@@ -86,7 +94,7 @@ export function useLibrary<S, V>(opts: {
       activeId: activeId.value,
       viewSettings: opts.sessionExtras.get(),
       sources: sources.value.map(s => ({ id: s.id, name: s.name, size: s.size, embeddedUrl: s.embeddedUrl })),
-    });
+    }, removedIds);
   }
 
   function schedulePersist(): void {
@@ -128,7 +136,6 @@ export function useLibrary<S, V>(opts: {
   // Switch the active image: stash the current edit, load the target's edit + pixels.
   async function selectSource(id: string): Promise<void> {
     if (id === activeId.value) return;
-    opts.flushPendingHistory();
     cropMode.value = false; // leave the crop editor when switching images
     syncLiveToMap(activeId.value);
     await activateSource(id);
@@ -144,6 +151,7 @@ export function useLibrary<S, V>(opts: {
     sources.value = sources.value.filter(s => s.id !== id);
     edits.delete(id);
     dirtyEditIds.delete(id);
+    removedIds.add(id);
     void deleteEdit(id);
     if (thumbs[id]) {
       if (thumbs[id].startsWith("blob:")) URL.revokeObjectURL(thumbs[id]);
@@ -208,10 +216,7 @@ export function useLibrary<S, V>(opts: {
     status.value = "uploading";
     errorMessage.value = null;
 
-    // Preserve the edit of the image we're leaving before importing new ones.
-    opts.flushPendingHistory();
     cropMode.value = false; // leave the crop editor when importing
-    syncLiveToMap(activeId.value);
 
     let lastId: string | null = null;
     for (const file of files) {
@@ -235,8 +240,11 @@ export function useLibrary<S, V>(opts: {
     }
 
     // Make the last imported image active and render it (loadPixels sets the
-    // final status to idle/error and records the decode timing).
+    // final status to idle/error and records the decode timing). The edit of
+    // the image we're leaving is captured here rather than before the uploads:
+    // those take seconds, and the user goes on editing it meanwhile.
     if (lastId) {
+      syncLiveToMap(activeId.value);
       await activateSource(lastId);
     } else {
       status.value = "idle";
