@@ -85,16 +85,16 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
 
   // Remove the server-side cached copy of an import. Only ever touches
   // tmp/sessions — the user's original file never enters this system.
-  const sourceMatch = pathname.match(/^\/sources\/([\w-]+)$/);
+  const sourceMatch = pathname.match(SOURCE_ROUTE);
   if (method === "DELETE" && sourceMatch) {
-    await rm(resolve(sessionsRoot, sourceMatch[1]), { recursive: true, force: true });
+    await rm(sessionDirFor(sourceMatch[1]), { recursive: true, force: true });
     sendJson(response, { ok: true });
     return;
   }
 
-  const embeddedMatch = pathname.match(/^\/sources\/([\w-]+)\/embedded\.jpg$/);
+  const embeddedMatch = pathname.match(EMBEDDED_ROUTE);
   if (method === "GET" && embeddedMatch) {
-    streamFile(response, resolve(sessionsRoot, embeddedMatch[1], "embedded.jpg"));
+    streamFile(response, resolve(sessionDirFor(embeddedMatch[1]), "embedded.jpg"));
     return;
   }
 
@@ -144,11 +144,17 @@ async function handleSourceUpload(request: IncomingMessage, response: ServerResp
   }, 201);
 }
 
-// Session ids are server-minted UUIDs; reject anything else before it reaches
-// resolve() — a traversal like "../x" or an absolute path would escape
-// sessionsRoot (and /export writes there). Same shape the GET/DELETE routes match.
+// The one definition of a valid source id (server-minted UUIDs), shared by
+// the route patterns and sessionDirFor so they cannot drift apart.
+const SOURCE_ID = String.raw`[\w-]+`;
+const SOURCE_ROUTE = new RegExp(`^/sources/(${SOURCE_ID})$`);
+const EMBEDDED_ROUTE = new RegExp(`^/sources/(${SOURCE_ID})/embedded\\.jpg$`);
+const SOURCE_ID_RE = new RegExp(`^${SOURCE_ID}$`);
+
+// Reject anything else before it reaches resolve() — a traversal like "../x"
+// or an absolute path would escape sessionsRoot (and /export writes there).
 function sessionDirFor(sourceId: string): string {
-  if (!/^[\w-]+$/.test(sourceId)) throw new HttpError(400, "Invalid sourceId");
+  if (!SOURCE_ID_RE.test(sourceId)) throw new HttpError(400, "Invalid sourceId");
   return resolve(sessionsRoot, sourceId);
 }
 
@@ -371,7 +377,9 @@ class WorkerDaemon {
       process.stderr.write(`[worker] ${chunk}`);
     });
 
-    const ready = new Promise<void>((resolveReady, rejectReady) => {
+    let rejectReady!: (error: Error) => void;
+    const ready = new Promise<void>((resolveReady, reject) => {
+      rejectReady = reject;
       const onReady = (chunk: string): void => {
         if (chunk.includes("daemon ready")) {
           child.stderr.off("data", onReady);
@@ -379,23 +387,21 @@ class WorkerDaemon {
         }
       };
       child.stderr.on("data", onReady);
-      child.once("error", rejectReady);
-      child.once("exit", (code) => {
-        rejectReady(new Error(`worker daemon exited before ready (code ${code ?? "null"})`));
-      });
     });
 
     const reader = createInterface({ input: child.stdout });
     reader.on("line", (line: string) => this.handleLine(line));
 
-    // One cleanup for every way the child can die. A failed spawn fires
-    // `error` with no matching `exit` (the old exit-only cleanup left a dead
-    // child cached forever), and writing to a dead stdin surfaces as an async
-    // `error` event that would crash the whole process if unhandled.
+    // The single death path for this child. A failed spawn fires `error` with
+    // no matching `exit` (an exit-only cleanup would cache a dead child
+    // forever), and writing to a dead stdin surfaces as an async `error`
+    // event that would crash the whole process if unhandled. Rejecting
+    // `ready` here also fails a boot in progress (a no-op once resolved).
     let cleaned = false;
     const cleanup = (cause: Error): void => {
       if (cleaned) return; // exit + error can both fire for the same child;
       cleaned = true;      // a late second event must not reset a newer boot
+      rejectReady(cause);
       for (const [, handler] of this.pending) {
         handler.reject(cause);
       }
@@ -407,13 +413,7 @@ class WorkerDaemon {
     child.on("error", (error) => cleanup(new Error(`worker daemon failed: ${error.message}`)));
     child.stdin.on("error", (error) => cleanup(new Error(`worker daemon stdin error: ${error.message}`)));
 
-    try {
-      await ready;
-    } catch (error) {
-      child.kill();
-      cleanup(error instanceof Error ? error : new Error(String(error)));
-      throw error;
-    }
+    await ready;
     // Publish only a daemon that reached ready; ensureRunning treats a
     // non-null child as usable.
     this.child = child;
