@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
-import { PipelineRenderer, type EditParams, type LinearPixels } from "./rendering/pipeline-renderer";
-import { renderHistogram } from "./rendering/histogram";
+import { PipelineRenderer, type EditParams } from "./rendering/pipeline-renderer";
 import {
   curveToLUT, buildToneCurveLUT, defaultToneCurve, normalizeToneCurve,
   type BasicAdjust, type ToneCurve,
@@ -13,6 +12,7 @@ import {
   ASPECT_PRESETS,
   type CropState,
 } from "./rendering/crop";
+import { API, fetchLinear, type ColorProfileMeta } from "./api";
 import { type PersistedEdit } from "./persistence";
 import { trackFill, formatBytes, clamp } from "./ui";
 import SliderRow from "./components/SliderRow.vue";
@@ -22,6 +22,8 @@ import { useHistory } from "./composables/useHistory";
 import { useToneCurve } from "./composables/useToneCurve";
 import { useCropEditor, DEFAULT_ASPECT } from "./composables/useCropEditor";
 import { useLibrary } from "./composables/useLibrary";
+import { useHistogram } from "./composables/useHistogram";
+import { useExport, type ExportPlan } from "./composables/useExport";
 
 // ── types ──
 
@@ -29,8 +31,6 @@ type RecipeKey = "exposure"|"contrast"|"highlights"|"shadows"|"whites"|"blacks"|
 type Recipe = Record<RecipeKey, number>;
 type SliderSpec = { key: RecipeKey; label: string; min: number; max: number; step: number };
 type SliderGroup = { title: string; items: SliderSpec[] };
-
-const API = (import.meta.env.VITE_API_URL as string | undefined) ?? "/api";
 
 const defaultRecipe = (): Recipe => ({
   exposure: 0, contrast: 0, highlights: 0, shadows: 0,
@@ -79,7 +79,6 @@ const dcpCode = ref("");  // empty = auto-detect
 const defaultDenoise = () => ({ enabled: false, model: "wavelet", amount: 100 });
 const denoise = reactive(defaultDenoise());
 const denoiseBusy = ref(false);
-const exporting = ref(false);
 // Hold-to-compare: while true we draw the unedited original (baseline params +
 // identity tone curve) so the before/after is easy to eyeball; release restores
 // the live edit. crop/denoise/DCP are baked into linear.bin, so they stay applied.
@@ -90,13 +89,6 @@ let webglRenderer: PipelineRenderer | null = null;
 const p3Supported = ref(false);
 let rafId = 0;
 let drawPending = false;
-// Histogram updates are throttled and always deferred off the synchronous
-// draw/decode path: the read-back stalls the main thread, and at 60fps it would
-// recompute far more often than anyone can read. ~11 Hz with a trailing update
-// keeps it responsive without taxing slider drags or inflating decode timing.
-let histoTimer = 0;
-let histoLast = 0;
-const HISTO_MIN_MS = 90;
 
 // ── Pan / Zoom state ──
 // imageW/imageH are the *displayed output* dims (the crop result in normal mode,
@@ -411,32 +403,6 @@ function denoisePayload(d: typeof denoise = denoise): { enabled: boolean; model:
   return { enabled: d.enabled, model: d.model, amount: d.amount / 100 };
 }
 
-type LinearMeta = {
-  width: number; height: number; fullWidth: number | null; fullHeight: number | null;
-  colorProfile: ColorProfileMeta | null; dtype?: string;
-};
-
-// Decode linear data via /render-linear. The response carries the pixels
-// directly: [u32 header length][JSON header, padded so the pixels stay 4-byte
-// aligned][linear RGB in header.dtype]. float16 payloads (half the bytes of
-// float32) stay as Uint16Array and upload straight into an RGB16F texture.
-// Returns null on 404 (source evicted server-side).
-async function fetchLinear(body: Record<string, unknown>): Promise<{ meta: LinearMeta; pixels: LinearPixels } | null> {
-  const res = await fetch(`${API}/render-linear`, {
-    method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (res.status === 404) return null;
-  if (!res.ok) throw new Error(await res.text());
-  const buf = await res.arrayBuffer();
-  const headerLen = new DataView(buf).getUint32(0);
-  const meta = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 4, headerLen))) as LinearMeta;
-  const pixels = meta.dtype === "float16"
-    ? new Uint16Array(buf, 4 + headerLen)
-    : new Float32Array(buf, 4 + headerLen);
-  return { meta, pixels };
-}
-
 // Decode `id`'s linear data and render it into the (reused) WebGL pipeline.
 // Returns false if the source can no longer be decoded server-side.
 // Concurrent calls can overlap (rapid filmstrip clicks, a dcp/denoise reload
@@ -535,7 +501,6 @@ function buildPipelineParams(s?: Snapshot): Partial<EditParams> {
 
 // ── DCP profile tone curve (camera display rendering, applied in the view transform) ──
 
-type ColorProfileMeta = { profileToneCurve?: [number, number][] | null };
 let profileCurveLUT: Float32Array | null = null;
 
 function buildProfileLUT(cp: ColorProfileMeta | null | undefined): Float32Array | null {
@@ -546,33 +511,9 @@ function buildProfileLUT(cp: ColorProfileMeta | null | undefined): Float32Array 
 // ── Histogram ──
 
 // Whether the renderer holds decoded pixels (histogram guard). The decoded
-// Float32Array itself lives on the GPU after upload — keeping a JS reference
+// pixel array itself lives on the GPU after upload — keeping a JS reference
 // here would pin ~50 MB per image for nothing.
 let hasLinearData = false;
-let histoBusy = false;
-const histoCanvasRef = ref<HTMLCanvasElement | null>(null);
-
-// The histogram redraws at ~11 Hz during slider drags; reading
-// getBoundingClientRect there forces a layout each time, so track the CSS size
-// with a ResizeObserver instead (same pattern as the curve canvas above).
-const histoSize = { w: 0, h: 0 };
-let histoResizeObs: ResizeObserver | null = null;
-watch(histoCanvasRef, (canvas) => {
-  histoResizeObs?.disconnect();
-  histoResizeObs = null;
-  histoSize.w = 0;
-  histoSize.h = 0;
-  if (canvas) {
-    histoResizeObs = new ResizeObserver((entries) => {
-      const r = entries[entries.length - 1]?.contentRect;
-      if (!r) return;
-      histoSize.w = r.width;
-      histoSize.h = r.height;
-      scheduleHistogram();
-    });
-    histoResizeObs.observe(canvas);
-  }
-});
 
 // In the crop editor the canvas renders a padded straighten bbox whose
 // out-of-image fill would be binned as real pixels — hand the histogram the
@@ -584,50 +525,17 @@ function cropHistogramView(): { width: number; height: number; texXform: Float32
   return { width: ow, height: oh, texXform: buildCropTransform(crop, srcW.value, srcH.value, rect) };
 }
 
-async function updateHistogram(): Promise<void> {
-  const canvas = histoCanvasRef.value;
-  if (!canvas || !hasLinearData || !imageW.value || !imageH.value || !webglRenderer) return;
-  if (histoBusy) { scheduleHistogram(); return; } // a read is in flight; retry after it
-  let w = histoSize.w;
-  let h = histoSize.h;
-  // Not observed/laid out yet: fall back to a one-off layout read; the
-  // ResizeObserver reschedules once the canvas gets its real size.
-  if (w <= 0 || h <= 0) {
-    const rect = canvas.getBoundingClientRect();
-    w = rect.width;
-    h = rect.height;
-    if (w <= 0 || h <= 0) return;
-  }
-  histoBusy = true;
-  try {
-    const bins = await webglRenderer.readHistogram(cropMode.value ? cropHistogramView() : undefined);
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    const dpr = window.devicePixelRatio || 1;
-    // Assigning width/height resets the canvas even when unchanged — skip it.
-    const bw = Math.round(w * dpr);
-    const bh = Math.round(h * dpr);
-    if (canvas.width !== bw) canvas.width = bw;
-    if (canvas.height !== bh) canvas.height = bh;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    renderHistogram(ctx, w, h, bins);
-  } catch {
-    // Best-effort overlay: a failed read-back (context loss mid-frame) just
-    // leaves the previous histogram on screen instead of rejecting unhandled.
-  } finally {
-    histoBusy = false;
-  }
-}
-
-function scheduleHistogram(): void {
-  if (histoTimer) return; // a trailing update is already pending
-  const wait = Math.max(0, HISTO_MIN_MS - (performance.now() - histoLast));
-  histoTimer = window.setTimeout(() => {
-    histoTimer = 0;
-    histoLast = performance.now();
-    void updateHistogram();
-  }, wait);
-}
+// Histogram updates are throttled and always deferred off the synchronous
+// draw/decode path: the read-back stalls the main thread, and at 60fps it would
+// recompute far more often than anyone can read. ~11 Hz with a trailing update
+// keeps it responsive without taxing slider drags or inflating decode timing.
+const histogram = useHistogram({
+  renderer: () => webglRenderer,
+  ready: () => hasLinearData && !!imageW.value && !!imageH.value,
+  view: () => (cropMode.value ? cropHistogramView() : undefined),
+});
+const histoCanvasRef = histogram.canvasRef;
+const scheduleHistogram = histogram.schedule;
 
 function scheduleWebGLDraw(): void {
   if (drawPending) return;
@@ -696,7 +604,7 @@ function onContextRestored(): void {
 // context was lost via destroy() can never get another one).
 function destroyWebGL(opts: { keepContext?: boolean } = {}): void {
   if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
-  if (histoTimer) { clearTimeout(histoTimer); histoTimer = 0; }
+  histogram.cancel();
   drawPending = false;
   if (webglRenderer) {
     if (opts.keepContext) webglRenderer.release();
@@ -906,8 +814,7 @@ onBeforeUnmount(() => {
   canvasRef.value?.removeEventListener('webglcontextlost', onContextLost);
   canvasRef.value?.removeEventListener('webglcontextrestored', onContextRestored);
   resizeObs?.disconnect();
-  histoResizeObs?.disconnect();
-  histoResizeObs = null;
+  histogram.dispose();
   releaseThumbs();
   destroyWebGL();
 });
@@ -963,79 +870,38 @@ function exportFilename(): string {
   return `${name.replace(/\.[^.]+$/, "")}.jpg`;
 }
 
-function downloadBlob(blob: Blob, filename: string): void {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 4000);
-}
-
-// Re-render at full resolution, read pixels back, embed edit settings as XMP, download.
-async function exportImage(): Promise<void> {
-  if (!currentSourceId || !activeSource.value || exporting.value) return;
-  exporting.value = true;
-  errorMessage.value = null;
-  status.value = "rendering";
-  // Freeze the edit state up front: the full-res decode below takes seconds
-  // and the filmstrip stays clickable, so everything past an await must read
-  // from this one snapshot — deriving it all from `settings` also guarantees
-  // the rendered pixels and the embedded XMP cannot drift apart.
-  const sourceId = currentSourceId;
-  const filename = exportFilename();
+// Freeze the edit state into an export plan: the full-res decode takes seconds
+// and the filmstrip stays clickable, so everything past an await must read from
+// this one snapshot — deriving it all from `settings` also guarantees the
+// rendered pixels and the embedded XMP cannot drift apart. The fetch/render/
+// embed/download mechanics live in useExport.
+function buildExportPlan(): ExportPlan | null {
+  if (!currentSourceId || !activeSource.value) return null;
   const settings = captureSnapshot();
   const cropSnap = settings.crop;
-  const params = buildPipelineParams(settings);
-  const curveLUT = buildToneCurveLUT(settings.curve, currentBasic(settings.recipe));
-  const denoiseReq = denoisePayload(settings.denoise);
-  let renderer: PipelineRenderer | null = null;
-  try {
-    // 1. Decode full-resolution linear data (no half-size / no max-size cap)
-    const lin = await fetchLinear({ sourceId, halfSize: false, maxSize: 0, dcpCode: settings.dcp, denoise: denoiseReq });
-    if (!lin) throw new Error("Source is no longer available server-side");
-    const { meta: linMeta, pixels: linear } = lin;
-
-    // 2. Render full-res off-screen with the captured edit params + crop, read back as JPEG
-    renderer = new PipelineRenderer(document.createElement("canvas"));
-    renderer.uploadImage(linear, linMeta.width, linMeta.height);
-    renderer.uploadCurveLUT(curveLUT);
-    renderer.uploadProfileCurveLUT(buildProfileLUT(linMeta.colorProfile));
-    const [iw, ih] = imageDims(linMeta.width, linMeta.height, cropSnap.orientation);
-    const rect = cropOutputRect(cropSnap, iw, ih);
-    // Snap the output dims to the locked aspect so e.g. a 4:3 crop exports at
-    // an exact 4:3 pixel size instead of each axis rounding independently.
-    const fraction = resolveAspectFraction(settings.aspect ?? "free", linMeta.width, linMeta.height, cropSnap);
-    const [ow, oh] = cropOutputSizeForAspect(cropSnap, linMeta.width, linMeta.height, fraction);
-    renderer.setOutput(ow, oh, buildCropTransform(cropSnap, linMeta.width, linMeta.height, rect), WORKSPACE_BG);
-    renderer.draw(params);
-    // quality 1.0 also disables the browser encoder's 4:2:0 chroma subsampling
-    const blob = await renderer.toBlob("image/jpeg", 1.0);
-
-    // 3. Embed edit settings (llr:* XMP + lossless LLR JSON) into the JPEG server-side
-    const fd = new FormData();
-    fd.append("file", blob, "export.jpg");
-    fd.append("meta", JSON.stringify({ sourceId, settings }));
-    const exRes = await fetch(`${API}/export`, { method: "POST", body: fd });
-    if (!exRes.ok) throw new Error(await exRes.text());
-
-    // 4. Download the finished file
-    downloadBlob(await exRes.blob(), filename);
-    // Don't stomp the status of a decode the user started mid-export.
-    if (status.value === "rendering") status.value = "idle";
-  } catch (err) {
-    // Same ownership rule as the success path: status may belong to a decode
-    // the user started mid-export; the error banner is enough on its own.
-    if (status.value === "rendering") status.value = "error";
-    errorMessage.value = err instanceof Error ? err.message : String(err);
-    console.error("[export] failed:", err);
-  } finally {
-    renderer?.destroy();
-    exporting.value = false;
-  }
+  return {
+    sourceId: currentSourceId,
+    filename: exportFilename(),
+    settings,
+    dcpCode: settings.dcp,
+    denoise: denoisePayload(settings.denoise),
+    params: buildPipelineParams(settings),
+    curveLUT: buildToneCurveLUT(settings.curve, currentBasic(settings.recipe)),
+    profileLUT: (meta) => buildProfileLUT(meta.colorProfile),
+    output: (meta) => {
+      const [iw, ih] = imageDims(meta.width, meta.height, cropSnap.orientation);
+      const rect = cropOutputRect(cropSnap, iw, ih);
+      // Snap the output dims to the locked aspect so e.g. a 4:3 crop exports at
+      // an exact 4:3 pixel size instead of each axis rounding independently.
+      const fraction = resolveAspectFraction(settings.aspect ?? "free", meta.width, meta.height, cropSnap);
+      const [width, height] = cropOutputSizeForAspect(cropSnap, meta.width, meta.height, fraction);
+      return { width, height, texXform: buildCropTransform(cropSnap, meta.width, meta.height, rect) };
+    },
+    background: WORKSPACE_BG,
+  };
 }
+
+const { exporting, exportImage } = useExport({ status, errorMessage, plan: buildExportPlan });
 
 // White balance reads as a colour axis, not an amount: an accent fill growing
 // from the left would say "this is set" on a slider sitting at its default.
