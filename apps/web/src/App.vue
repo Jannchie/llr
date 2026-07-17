@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
-import { PipelineRenderer, type EditParams } from "./rendering/pipeline-renderer";
+import { PipelineRenderer, type EditParams, type LinearPixels } from "./rendering/pipeline-renderer";
 import { renderHistogram } from "./rendering/histogram";
 import {
   curveToLUT, buildToneCurveLUT, defaultToneCurve, normalizeToneCurve,
@@ -411,12 +411,17 @@ function denoisePayload(d: typeof denoise = denoise): { enabled: boolean; model:
   return { enabled: d.enabled, model: d.model, amount: d.amount / 100 };
 }
 
-type LinearMeta = { width: number; height: number; fullWidth: number | null; fullHeight: number | null; colorProfile: ColorProfileMeta | null };
+type LinearMeta = {
+  width: number; height: number; fullWidth: number | null; fullHeight: number | null;
+  colorProfile: ColorProfileMeta | null; dtype?: string;
+};
 
 // Decode linear data via /render-linear. The response carries the pixels
 // directly: [u32 header length][JSON header, padded so the pixels stay 4-byte
-// aligned][float32 linear RGB]. Returns null on 404 (source evicted server-side).
-async function fetchLinear(body: Record<string, unknown>): Promise<{ meta: LinearMeta; pixels: Float32Array } | null> {
+// aligned][linear RGB in header.dtype]. float16 payloads (half the bytes of
+// float32) stay as Uint16Array and upload straight into an RGB16F texture.
+// Returns null on 404 (source evicted server-side).
+async function fetchLinear(body: Record<string, unknown>): Promise<{ meta: LinearMeta; pixels: LinearPixels } | null> {
   const res = await fetch(`${API}/render-linear`, {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
@@ -426,7 +431,10 @@ async function fetchLinear(body: Record<string, unknown>): Promise<{ meta: Linea
   const buf = await res.arrayBuffer();
   const headerLen = new DataView(buf).getUint32(0);
   const meta = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 4, headerLen))) as LinearMeta;
-  return { meta, pixels: new Float32Array(buf, 4 + headerLen) };
+  const pixels = meta.dtype === "float16"
+    ? new Uint16Array(buf, 4 + headerLen)
+    : new Float32Array(buf, 4 + headerLen);
+  return { meta, pixels };
 }
 
 // Decode `id`'s linear data and render it into the (reused) WebGL pipeline.

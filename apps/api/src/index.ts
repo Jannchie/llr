@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
-import { access, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { dirname, extname, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -190,11 +190,10 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
   };
 
   // Per-request filename (concurrent renders must not overwrite each other),
-  // deleted right after the read: the linear data goes back in this response
+  // deleted once the stream closes: the linear data goes back in this response
   // body instead of round-tripping through a second GET.
   const outputPath = resolve(sessionDir, `linear-${randomUUID()}.bin`);
   let meta;
-  let data: Buffer;
   try {
     meta = await daemon.send({
       command: "render-linear",
@@ -207,25 +206,38 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
       dcpCode: typeof body.dcpCode === "string" ? body.dcpCode : undefined,
       denoise,
     });
-    data = await readFile(outputPath);
-  } finally {
+  } catch (error) {
     await rm(outputPath, { force: true });
+    throw error;
   }
 
   // [u32 header length][JSON header, space-padded so the pixels stay 4-byte
-  // aligned for a zero-copy Float32Array view][float32 linear RGB].
+  // aligned for a zero-copy typed-array view][linear RGB in header.dtype].
+  // The pixel payload (tens of MB) is streamed from disk instead of being
+  // buffered whole in memory.
   let header = Buffer.from(JSON.stringify({
     width: meta.width,
     height: meta.height,
     fullWidth: meta.fullWidth ?? null,
     fullHeight: meta.fullHeight ?? null,
     colorProfile: meta.colorProfile ?? null,
+    dtype: typeof meta.dtype === "string" ? meta.dtype : "float32",
   }), "utf8");
   if (header.length % 4) header = Buffer.concat([header, Buffer.alloc(4 - (header.length % 4), 0x20)]);
   const prefix = Buffer.alloc(4);
   prefix.writeUInt32BE(header.length, 0);
-  response.writeHead(200, { "content-type": "application/octet-stream", "cache-control": "no-store" });
-  response.end(Buffer.concat([prefix, header, data]));
+
+  const pixelBytes = Number(meta.bytesWritten);
+  const headers: Record<string, string> = { "content-type": "application/octet-stream", "cache-control": "no-store" };
+  if (Number.isFinite(pixelBytes) && pixelBytes >= 0) {
+    headers["content-length"] = String(prefix.length + header.length + pixelBytes);
+  }
+  response.writeHead(200, headers);
+  response.write(Buffer.concat([prefix, header]));
+  const stream = createReadStream(outputPath);
+  stream.once("close", () => void rm(outputPath, { force: true }));
+  stream.on("error", () => response.destroy());
+  stream.pipe(response);
 }
 
 async function handleExport(request: IncomingMessage, response: ServerResponse): Promise<void> {

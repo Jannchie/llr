@@ -301,6 +301,20 @@ _LINEAR_CACHE: OrderedDict[tuple[Any, ...], tuple[np.ndarray, dict[str, Any]]] =
 _LINEAR_CACHE_MAX = 8
 
 
+def _write_linear_f16(linear_arr: np.ndarray, output_path: Path) -> int:
+    """Write scene-linear pixels as float16, halving the transfer size.
+
+    The browser uploads the payload straight into an RGB16F texture, so f16 is
+    the precision the render actually uses; its ~11-bit relative mantissa sits
+    below sensor noise for 12–14-bit RAW data. The in-memory caches stay
+    float32 so repeated DCP/denoise blends never accumulate quantisation.
+    """
+    out = linear_arr.astype(np.float16)
+    with open(output_path, "wb") as f:
+        out.tofile(f)
+    return out.nbytes
+
+
 def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     """Decode RAW + DCP, return raw float32 linear data (no JPEG)."""
     input_path = resolve_path(root, request["input"])
@@ -330,8 +344,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
             _LINEAR_CACHE.move_to_end(cache_key)
     if cached_linear is not None:
         linear_arr, color_profile = cached_linear
-        with open(output_path, "wb") as f:
-            linear_arr.tofile(f)
+        bytes_written = _write_linear_f16(linear_arr, output_path)
         return {
             "width": linear_arr.shape[1],
             "height": linear_arr.shape[0],
@@ -339,7 +352,8 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
             "fullHeight": color_profile.get("fullHeight"),
             "output": str(output_path),
             "colorProfile": color_profile,
-            "bytesWritten": linear_arr.nbytes,
+            "dtype": "float16",
+            "bytesWritten": bytes_written,
         }
 
     recipe = merge_recipe(PROFILES[profile_id], {})
@@ -415,8 +429,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
             while len(_LINEAR_CACHE) > _LINEAR_CACHE_MAX:
                 _LINEAR_CACHE.popitem(last=False)
 
-    with open(output_path, "wb") as f:
-        linear_arr.tofile(f)
+    bytes_written = _write_linear_f16(linear_arr, output_path)
 
     return {
         "width": prepared.linear.shape[1],
@@ -425,7 +438,8 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
         "fullHeight": prepared.metadata.full_height,
         "output": str(output_path),
         "colorProfile": prepared.color_profile,
-        "bytesWritten": linear_arr.nbytes,
+        "dtype": "float16",
+        "bytesWritten": bytes_written,
     }
 
 
@@ -468,15 +482,17 @@ def daemon_export(request: dict[str, Any], root: Path) -> dict[str, Any]:
 def copy_exif_provenance(original: Path, target: Path) -> bool:
     """Copy camera metadata from the original into the export.
 
-    Copies the writable tag groups (EXIF, maker notes, IPTC, ...) so shooting
-    metadata survives the export, then overrides the few tags that must describe
-    the export itself: orientation/rotation is baked into the pixels, the EXIF
+    Copies the writable tag groups (EXIF, IPTC, ...) so shooting metadata
+    survives the export, then overrides the few tags that must describe the
+    export itself: orientation/rotation is baked into the pixels, the EXIF
     pixel dimensions are the export's, and Software identifies the renderer.
     XMP is excluded because daemon_export injects LLR's own packet, and the
     source ICC profile would mislabel the rendered (sRGB) colors. Privacy-
-    sensitive tags — GPS location, body/lens serial numbers, owner name — are
-    excluded so sharing an export never leaks where or with whose gear it was
-    shot.
+    sensitive tags — GPS location, serial numbers, owner name — are excluded
+    so sharing an export never leaks where or with whose gear it was shot;
+    maker notes go as a whole because serials hide inside the binary blob
+    where they cannot be excluded individually (Lightroom likewise drops
+    maker notes on export).
     """
     command = detect_exiftool()
     if command is None:
@@ -492,6 +508,9 @@ def copy_exif_provenance(original: Path, target: Path) -> bool:
                 "--xmp:all",
                 "--icc_profile:all",
                 "--gps:all",
+                # The block tag (no :all) — member-tag exclusions cannot reach
+                # inside the copied binary blob where serials live.
+                "--makernotes",
                 "--*serialnumber*",
                 "--ownername",
                 "-tagsFromFile",

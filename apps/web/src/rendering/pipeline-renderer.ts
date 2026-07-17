@@ -31,6 +31,12 @@ export interface EditParams {
 const HSL_ZERO = [0, 0, 0, 0, 0, 0, 0, 0];
 
 /**
+ * Scene-linear RGB payload for uploadImage: float32, or IEEE half floats
+ * packed in a Uint16Array (the worker's wire format — uploaded as RGB16F).
+ */
+export type LinearPixels = Float32Array | Uint16Array;
+
+/**
  * Override for the histogram's render window: logical output dims plus the
  * output→source-texcoord transform (see setOutput). Lets the crop editor bin
  * the tight crop box while the canvas shows the padded straighten bbox.
@@ -173,16 +179,29 @@ export class PipelineRenderer {
     if (info) console.log("[pipeline] GPU:", gl.getParameter(info.UNMASKED_RENDERER_WEBGL));
   }
 
-  uploadImage(pixels: Float32Array, width: number, height: number): void {
+  uploadImage(pixels: LinearPixels, width: number, height: number): void {
     const gl = this.gl;
     this.texWidth = width; this.texHeight = height;
     if (this.sourceTex) gl.deleteTexture(this.sourceTex);
     const tex = gl.createTexture()!;
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB32F, width, height, 0, gl.RGB, gl.FLOAT, pixels);
-    // LINEAR for smooth straighten/crop resampling (NEAREST is identical at 1:1).
-    const filter = this.floatLinear ? gl.LINEAR : gl.NEAREST;
+    // A Uint16Array carries IEEE half floats from the worker: upload as RGB16F
+    // (odd widths make f16 rows 2-byte aligned, hence UNPACK_ALIGNMENT). Reset
+    // both pixel-store params after — they are context-global and would
+    // otherwise leak into every later texture upload (LUTs, histogram).
+    const half = pixels instanceof Uint16Array;
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, half ? 2 : 4);
+    if (half) {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB16F, width, height, 0, gl.RGB, gl.HALF_FLOAT, pixels);
+    } else {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB32F, width, height, 0, gl.RGB, gl.FLOAT, pixels);
+    }
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    // LINEAR for smooth straighten/crop resampling (NEAREST is identical at
+    // 1:1). RGB16F is filterable in core WebGL2; RGB32F needs the extension.
+    const filter = half || this.floatLinear ? gl.LINEAR : gl.NEAREST;
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
