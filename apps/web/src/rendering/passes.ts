@@ -8,6 +8,7 @@
  */
 
 import { COLOR_GLSL, PROPHOTO_Y } from "./color-spaces";
+import { HSL_GLSL } from "./hsl-bands";
 import { TONAL_GLSL } from "./tonal-model";
 
 export const VERTEX_SHADER = `#version 300 es
@@ -72,6 +73,7 @@ uniform vec3 u_bgColor;         // display-encoded fill for areas outside the im
 
 ${COLOR_GLSL}
 ${TONAL_GLSL}
+${HSL_GLSL}
 
 // Sample a 2048-entry LUT: entry i holds the output for input i/2047, so map
 // x onto texel centers ((x*2047 + 0.5)/2048) — sampling at x directly is off
@@ -256,13 +258,12 @@ void main() {
     float C = length(lab.yz);
     if (C > 1e-4) {
       float h = atan(lab.z, lab.y);                    // Oklab hue, radians
-      // Band hue centres (Oklab): Red, Orange, Yellow, Green, Aqua, Blue, Purple, Magenta
-      float centers[8] = float[8](0.5101, 0.9210, 1.9160, 2.4873, -2.8833, -1.6745, -1.1558, -0.5523);
+      // Triangular partition-of-unity band weights (HSL_GLSL, hsl-bands.ts):
+      // adjacent band values interpolate exactly, with no dead zones between
+      // widely spaced centres and no overshoot where bands used to overlap.
       float hAdj = 0.0, sAdj = 0.0, lAdj = 0.0;
       for (int k = 0; k < 8; k++) {
-        float d = h - centers[k];
-        d = atan(sin(d), cos(d));                      // wrap to [-pi, pi]
-        float m = max(0.0, 1.0 - abs(d) / 0.7);        // ~40deg half-width, linear falloff
+        float m = hslBandWeight(k, h);
         hAdj += m * u_hsl_h[k];
         sAdj += m * u_hsl_s[k];
         lAdj += m * u_hsl_l[k];
