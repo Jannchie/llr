@@ -120,8 +120,10 @@ export function normalizeToneCurve(raw: unknown): ToneCurve {
 
 function validPoints(pts: unknown): CurvePoint[] {
   if (!Array.isArray(pts) || pts.length < 2) return defaultCurve();
+  // isFinite, not typeof: a NaN from corrupt persisted data passes typeof and
+  // would poison the whole baked LUT.
   const out = pts
-    .filter((p): p is CurvePoint => p != null && typeof (p as CurvePoint).x === "number" && typeof (p as CurvePoint).y === "number")
+    .filter((p): p is CurvePoint => p != null && Number.isFinite((p as CurvePoint).x) && Number.isFinite((p as CurvePoint).y))
     .map(p => ({ x: clamp01(p.x), y: clamp01(p.y) }));
   return out.length >= 2 ? out : defaultCurve();
 }
