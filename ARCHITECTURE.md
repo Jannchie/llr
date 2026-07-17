@@ -34,12 +34,16 @@ per full parameter set → repeat requests skip everything.
 
 ## Render: web (`apps/web`)
 
-`rendering/pipeline-renderer.ts` owns a single fused WebGL2 shader pass: white
-balance (Bradford CAT), exposure, tonal model (PV2012-style), HSL, color
-grading, tone curves (as baked LUT textures), clarity/dehaze over a blurred
-log-luminance mask, then the view transform (Lightroom-style or AgX, sRGB or
-P3). Uniform-only edits redraw in real time; Contrast/Blacks re-bake the curve
-LUT; crop/denoise/DCP changes re-request linear data.
+`rendering/pipeline-renderer.ts` owns a single fused WebGL2 shader pass, split
+by the view transform. Scene-referred: white balance (Bradford CAT), exposure,
+tonal model (PV2012-style) and clarity — the latter two over a blurred
+log-luminance mask — then dehaze, vibrance/saturation, HSL. The view transform
+(Lightroom-style or AgX) then takes the pixel display-referred, and the tone
+curves (as baked LUT textures) and color grading run *after* it, on [0,1], as
+does the final gamut map and sRGB/P3 encode. Uniform-only edits redraw in real
+time; Contrast/Blacks are display-referred and re-bake the curve LUT; crop is a
+per-frame affine on the sampling UVs (`u_texXform`), no re-decode; denoise/DCP
+changes re-request linear data.
 
 `App.vue` holds the editing state; the mechanics live in composables
 (`useLibrary`, `useHistory`, `useViewport`, `useCropEditor`, `useToneCurve`,
