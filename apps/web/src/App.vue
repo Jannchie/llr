@@ -233,8 +233,8 @@ const gradingEdited = computed(() => Object.values(grading).some(v => v !== 0));
 // it in).
 let bakedBasic: BasicAdjust | null = { contrast: 0, blacks: 0, whites: 0 };
 
-function currentBasic(): BasicAdjust {
-  return { contrast: recipe.contrast, blacks: recipe.blacks, whites: recipe.whites };
+function currentBasic(r: Recipe = recipe): BasicAdjust {
+  return { contrast: r.contrast, blacks: r.blacks, whites: r.whites };
 }
 
 function sameBasic(a: BasicAdjust, b: BasicAdjust): boolean {
@@ -407,8 +407,8 @@ const {
 
 // Denoise params for the render-linear request. amount is normalised to 0..1;
 // disabled (or amount 0) tells the worker to skip inference entirely.
-function denoisePayload(): { enabled: boolean; model: string; amount: number } {
-  return { enabled: denoise.enabled, model: denoise.model, amount: denoise.amount / 100 };
+function denoisePayload(d: typeof denoise = denoise): { enabled: boolean; model: string; amount: number } {
+  return { enabled: d.enabled, model: d.model, amount: d.amount / 100 };
 }
 
 type LinearMeta = { width: number; height: number; fullWidth: number | null; fullHeight: number | null; colorProfile: ColorProfileMeta | null };
@@ -487,26 +487,32 @@ let denoiseReloadTimer = 0; // debounce for the denoise watcher below
 
 // ── WebGL ──
 
-function buildPipelineParams(): Partial<EditParams> {
+// Live reactive state by default; pass a Snapshot to derive the params from a
+// frozen edit instead (export). viewSettings stays live either way — it is
+// view-only state and not part of a per-image snapshot.
+function buildPipelineParams(s?: Snapshot): Partial<EditParams> {
+  const r = s?.recipe ?? recipe;
+  const [hue, sat, lum] = s ? [s.hslHue, s.hslSat, s.hslLum] : [hslHue, hslSat, hslLum];
+  const g = s?.grading ?? grading;
   return {
-    exposure: recipe.exposure,
-    saturation: 1 + recipe.saturation / 100,
-    highlights: recipe.highlights / 100,
-    shadows: recipe.shadows / 100,
-    whites: recipe.whites / 100,
-    vibrance: 1 + recipe.vibrance / 100,
-    clarity: recipe.clarity,
-    dehaze: recipe.dehaze,
-    temperature: recipe.temperature,
-    tint: recipe.tint,
-    hslH: hslHue.map(v => v / 100),
-    hslS: hslSat.map(v => v / 100),
-    hslL: hslLum.map(v => v / 100),
-    gradShH: grading.shH / 180, gradShS: grading.shS / 100,
-    gradMdH: grading.mdH / 180, gradMdS: grading.mdS / 100,
-    gradHlH: grading.hlH / 180, gradHlS: grading.hlS / 100,
-    gradBlend: grading.blend / 100,
-    gradBalance: grading.balance / 100,
+    exposure: r.exposure,
+    saturation: 1 + r.saturation / 100,
+    highlights: r.highlights / 100,
+    shadows: r.shadows / 100,
+    whites: r.whites / 100,
+    vibrance: 1 + r.vibrance / 100,
+    clarity: r.clarity,
+    dehaze: r.dehaze,
+    temperature: r.temperature,
+    tint: r.tint,
+    hslH: hue.map(v => v / 100),
+    hslS: sat.map(v => v / 100),
+    hslL: lum.map(v => v / 100),
+    gradShH: g.shH / 180, gradShS: g.shS / 100,
+    gradMdH: g.mdH / 180, gradMdS: g.mdS / 100,
+    gradHlH: g.hlH / 180, gradHlS: g.hlS / 100,
+    gradBlend: g.blend / 100,
+    gradBalance: g.balance / 100,
     viewTransform: viewSettings.viewTransform,
     displayGamut: viewSettings.displayGamut,
   };
@@ -930,17 +936,17 @@ async function exportImage(): Promise<void> {
   exporting.value = true;
   errorMessage.value = null;
   status.value = "rendering";
-  // Freeze the edit state up front: the full-res decode below takes seconds and
-  // the filmstrip stays clickable, so everything past an await must read these
-  // captures — the live reactive state may already belong to another image.
+  // Freeze the edit state up front: the full-res decode below takes seconds
+  // and the filmstrip stays clickable, so everything past an await must read
+  // from this one snapshot — deriving it all from `settings` also guarantees
+  // the rendered pixels and the embedded XMP cannot drift apart.
   const sourceId = currentSourceId;
   const filename = exportFilename();
   const settings = captureSnapshot();
-  const cropSnap = settings.crop; // captureSnapshot clones the crop
-  const aspect = cropAspect.value;
-  const params = buildPipelineParams();
-  const curveLUT = buildToneCurveLUT(toneCurve.value, currentBasic());
-  const denoiseReq = denoisePayload();
+  const cropSnap = settings.crop;
+  const params = buildPipelineParams(settings);
+  const curveLUT = buildToneCurveLUT(settings.curve, currentBasic(settings.recipe));
+  const denoiseReq = denoisePayload(settings.denoise);
   let renderer: PipelineRenderer | null = null;
   try {
     // 1. Decode full-resolution linear data (no half-size / no max-size cap)
@@ -957,7 +963,7 @@ async function exportImage(): Promise<void> {
     const rect = cropOutputRect(cropSnap, iw, ih);
     // Snap the output dims to the locked aspect so e.g. a 4:3 crop exports at
     // an exact 4:3 pixel size instead of each axis rounding independently.
-    const fraction = resolveAspectFraction(aspect, linMeta.width, linMeta.height, cropSnap);
+    const fraction = resolveAspectFraction(settings.aspect ?? "free", linMeta.width, linMeta.height, cropSnap);
     const [ow, oh] = cropOutputSizeForAspect(cropSnap, linMeta.width, linMeta.height, fraction);
     renderer.setOutput(ow, oh, buildCropTransform(cropSnap, linMeta.width, linMeta.height, rect), WORKSPACE_BG);
     renderer.draw(params);
@@ -976,7 +982,9 @@ async function exportImage(): Promise<void> {
     // Don't stomp the status of a decode the user started mid-export.
     if (status.value === "rendering") status.value = "idle";
   } catch (err) {
-    status.value = "error";
+    // Same ownership rule as the success path: status may belong to a decode
+    // the user started mid-export; the error banner is enough on its own.
+    if (status.value === "rendering") status.value = "error";
     errorMessage.value = err instanceof Error ? err.message : String(err);
     console.error("[export] failed:", err);
   } finally {
