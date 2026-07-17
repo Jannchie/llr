@@ -41,6 +41,51 @@ const COL_G = "#46be55";
 const COL_B = "#466eeb";
 
 /**
+ * Robust max: ignore the clipping bins (0 and 255). A pure-black or blown-out
+ * background piles an enormous count there that would otherwise flatten every
+ * visible tone. Edge bars are drawn clamped to the top instead of setting the
+ * scale.
+ */
+export function robustMax(bins: HistogramBins): number {
+  let maxCount = 1;
+  for (let i = 1; i < 255; i++) {
+    maxCount = Math.max(maxCount, bins.r[i], bins.g[i], bins.b[i], bins.l[i]);
+  }
+  return maxCount;
+}
+
+/** Bin count → [0, 1] bar height for the given vertical-axis compression. */
+export function binScaler(scale: HistogramScale, maxCount: number): (c: number) => number {
+  const logDenom = Math.log1p(maxCount);
+  return (c: number): number => {
+    if (c <= 0) return 0;
+    if (scale === "log") return Math.min(1, Math.log1p(c) / logDenom);
+    const v = Math.min(1, c / maxCount);
+    return scale === "sqrt" ? Math.sqrt(v) : v;
+  };
+}
+
+/**
+ * Clipping-indicator colours for the two edges, or null when the railed pixel
+ * count stays below threshold. The colour encodes *which* channels rail
+ * (white = all three, yellow = R+G, …), so it distinguishes overall over/
+ * under-exposure from a single channel saturating.
+ */
+export function clipIndicators(bins: HistogramBins): { shadow: string | null; highlight: string | null } {
+  const total = bins.l.reduce((s, v) => s + v, 0);
+  const thr = Math.max(CLIP_MIN_PX, total * CLIP_FRACTION);
+  const color = (rc: number, gc: number, bc: number): string | null => {
+    const r = rc > thr, g = gc > thr, b = bc > thr;
+    if (!r && !g && !b) return null;
+    return `rgb(${r ? 255 : 0}, ${g ? 255 : 0}, ${b ? 255 : 0})`;
+  };
+  return {
+    shadow: color(bins.r[0], bins.g[0], bins.b[0]),
+    highlight: color(bins.r[255], bins.g[255], bins.b[255]),
+  };
+}
+
+/**
  * Render histogram bins to a 2D canvas.
  */
 export function renderHistogram(
@@ -50,23 +95,7 @@ export function renderHistogram(
   bins: HistogramBins,
   opts: HistogramOptions = {},
 ): void {
-  const scale = opts.scale ?? "sqrt";
-
-  // Robust max: ignore the clipping bins (0 and 255). A pure-black or blown-out
-  // background piles an enormous count there that would otherwise flatten every
-  // visible tone. Edge bars are drawn clamped to the top instead of setting the
-  // scale.
-  let maxCount = 1;
-  for (let i = 1; i < 255; i++) {
-    maxCount = Math.max(maxCount, bins.r[i], bins.g[i], bins.b[i], bins.l[i]);
-  }
-  const logDenom = Math.log1p(maxCount);
-  const norm = (c: number): number => {
-    if (c <= 0) return 0;
-    if (scale === "log") return Math.min(1, Math.log1p(c) / logDenom);
-    const v = Math.min(1, c / maxCount);
-    return scale === "sqrt" ? Math.sqrt(v) : v;
-  };
+  const norm = binScaler(opts.scale ?? "sqrt", robustMax(bins));
 
   const barW = w / 256;
 
@@ -116,18 +145,8 @@ export function renderHistogram(
   ctx.stroke();
   ctx.globalAlpha = 1;
 
-  // Clipping warnings — thresholded and channel-aware. The triangle's colour
-  // encodes *which* channels rail (white = all three, yellow = R+G, …), so it
-  // distinguishes overall over/under-exposure from a single channel saturating.
-  const total = bins.l.reduce((s, v) => s + v, 0);
-  const thr = Math.max(CLIP_MIN_PX, total * CLIP_FRACTION);
-  const clipColor = (rc: number, gc: number, bc: number): string | null => {
-    const r = rc > thr, g = gc > thr, b = bc > thr;
-    if (!r && !g && !b) return null;
-    return `rgb(${r ? 255 : 0}, ${g ? 255 : 0}, ${b ? 255 : 0})`;
-  };
-
-  const shadow = clipColor(bins.r[0], bins.g[0], bins.b[0]);
+  // Clipping warnings — thresholded and channel-aware (see clipIndicators).
+  const { shadow, highlight } = clipIndicators(bins);
   if (shadow) {
     ctx.fillStyle = shadow;
     ctx.beginPath();
@@ -137,7 +156,6 @@ export function renderHistogram(
     ctx.closePath();
     ctx.fill();
   }
-  const highlight = clipColor(bins.r[255], bins.g[255], bins.b[255]);
   if (highlight) {
     ctx.fillStyle = highlight;
     ctx.beginPath();
