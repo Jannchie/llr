@@ -243,7 +243,16 @@ void main() {
     vec3 lab = proPhotoToOklab(c);
     float C = length(lab.yz);
     float w = 1.0 - smoothstep(0.0, 0.35, C);          // boost low-chroma (vibrance) more
-    float scale = u_saturation * (1.0 + (u_vibrance - 1.0) * w);
+    // Skin protection (vibrance only, as in Lightroom — the Saturation slider
+    // stays global): damp the vibrance term inside a skin-tone window, an
+    // orange hue wedge at the low-to-moderate chroma skin occupies. Very
+    // saturated oranges (fruit, sunsets) sit past the chroma window and keep
+    // the full effect. Heuristic bounds, not calibrated data.
+    float h = atan(lab.z, lab.y);
+    float dSkin = atan(sin(h - 0.96), cos(h - 0.96));  // ~55° Oklab, skin hue centre
+    float skinW = max(0.0, 1.0 - abs(dSkin) / 0.55)
+                * smoothstep(0.02, 0.06, C) * (1.0 - smoothstep(0.16, 0.30, C));
+    float scale = u_saturation * (1.0 + (u_vibrance - 1.0) * w * (1.0 - 0.7 * skinW));
     lab.yz *= scale;
     c = max(oklabToProPhoto(lab), 0.0);
   }
