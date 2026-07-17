@@ -62,6 +62,15 @@ function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
 }
 
+/**
+ * Clamp a normalized box center on one axis, given the box's normalized
+ * half-extent on it. An axis with no slack left (the box spans it) has exactly
+ * one legal center, so don't let float noise in `half` push the box out.
+ */
+function clampCenter(v: number, half: number): number {
+  return half >= 0.5 ? 0.5 : clamp(v, half, 1 - half);
+}
+
 export type Rect = { x: number; y: number; w: number; h: number };
 
 /** Crop box center & size in image-space pixels. */
@@ -212,19 +221,22 @@ export function constrainCrop(c: CropState, srcW: number, srcH: number): CropSta
   const a = (c.angle * Math.PI) / 180;
   const cos = Math.abs(Math.cos(a));
   const sin = Math.abs(Math.sin(a));
-  const hx = (c.w * iw * cos + c.h * ih * sin) / 2;
-  const hy = (c.w * iw * sin + c.h * ih * cos) / 2;
+  const halfExtents = (): [number, number] => [
+    (out.w * iw * cos + out.h * ih * sin) / 2,
+    (out.w * iw * sin + out.h * ih * cos) / 2,
+  ];
+  let [hx, hy] = halfExtents();
   if (hx * 2 > iw || hy * 2 > ih) {
-    // Too large to fit at any position: center it and shrink.
-    out.cx = 0.5;
-    out.cy = 0.5;
-    const s = maxScaleInside(out, iw, ih);
+    // Too large to fit at any position: search the scale from the image center
+    // (the only place an oversized box can fit), then hand the shrunken box back
+    // to the translation clamp so the axis that had room keeps its position.
+    const s = maxScaleInside({ ...out, cx: 0.5, cy: 0.5 }, iw, ih);
     out.w *= s;
     out.h *= s;
-    return out;
+    [hx, hy] = halfExtents();
   }
-  out.cx = clamp(out.cx, hx / iw, 1 - hx / iw);
-  out.cy = clamp(out.cy, hy / ih, 1 - hy / ih);
+  out.cx = clampCenter(out.cx, hx / iw);
+  out.cy = clampCenter(out.cy, hy / ih);
   return out;
 }
 
@@ -378,11 +390,17 @@ export function applyAspectRatio(c: CropState, ratio: number, srcW: number, srcH
 
 /** Rotate the orientation by ±90°, swapping crop box dims to keep the framing. */
 export function rotate90(c: CropState, dir: 1 | -1): CropState {
+  // Image space is F(R_orient(source)): a single mirror conjugates the
+  // orientation step into its inverse, so a lone flip reverses the turn the user
+  // sees. Two flips are a 180° turn, which commutes — direction is unaffected.
+  const d = c.flipH !== c.flipV ? -dir : dir;
   const order: Orientation[] = [0, 90, 180, 270];
   const idx = order.indexOf(c.orientation);
-  const next = order[(idx + (dir === 1 ? 1 : 3)) % 4];
+  const next = order[(idx + (d === 1 ? 1 : 3)) % 4];
   // Swapping orientation between portrait/landscape swaps image dims, so swap
   // the normalized box dims too and rotate the center to track the same region.
+  // The box lives in image space (what the user sees turning), so it follows
+  // `dir` even where the orientation step had to be conjugated.
   return {
     ...c,
     orientation: next,

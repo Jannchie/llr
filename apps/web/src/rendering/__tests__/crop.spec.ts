@@ -17,6 +17,12 @@ function applyXform(m: Float32Array, px: number, py: number): [number, number] {
   ];
 }
 
+/** Source texcoord shown at output-normalized (px,py) of the committed crop. */
+function probe(c: CropState, px: number, py: number): [number, number] {
+  const [iw, ih] = imageDims(SRC_W, SRC_H, c.orientation);
+  return applyXform(buildCropTransform(c, SRC_W, SRC_H, cropOutputRect(c, iw, ih)), px, py);
+}
+
 describe("imageDims", () => {
   it("keeps dims upright at 0/180 and swaps at 90/270", () => {
     expect(imageDims(SRC_W, SRC_H, 0)).toEqual([SRC_W, SRC_H]);
@@ -90,6 +96,54 @@ describe("rotate90", () => {
     const roundTrip = rotate90(rotate90(c, 1), -1);
     expect(roundTrip).toEqual(c);
   });
+
+  const FLIPS = [
+    { flipH: false, flipV: false }, { flipH: true, flipV: false },
+    { flipH: false, flipV: true }, { flipH: true, flipV: true },
+  ];
+
+  it("turns the displayed content the asked-for way under every flip", () => {
+    for (const flips of FLIPS) {
+      for (const dir of [1, -1] as const) {
+        const c: CropState = { ...defaultCrop(), ...flips };
+        const turned = rotate90(c, dir);
+        for (const [px, py] of [[0, 0], [1, 0], [0, 1], [1, 1], [0.25, 0.75]] as const) {
+          // Turning the display by `dir` sends the old point (ox,oy) to
+          // (1-oy,ox) clockwise / (oy,1-ox) counter-clockwise; both views must
+          // show the same source pixel there.
+          const [ox, oy] = dir === 1 ? [py, 1 - px] : [1 - py, px];
+          const [eu, ev] = probe(c, ox, oy);
+          const [u, v] = probe(turned, px, py);
+          expect(u).toBeCloseTo(eu, 6);
+          expect(v).toBeCloseTo(ev, 6);
+        }
+      }
+    }
+  });
+
+  it("keeps an off-center crop box on the same region under every flip", () => {
+    for (const flips of FLIPS) {
+      for (const dir of [1, -1] as const) {
+        const c: CropState = { ...defaultCrop(), ...flips, cx: 0.2, cy: 0.2, w: 0.4, h: 0.3 };
+        const turned = rotate90(c, dir);
+        for (const [px, py] of [[0, 0], [1, 0], [0, 1], [1, 1], [0.25, 0.75]] as const) {
+          const [ox, oy] = dir === 1 ? [py, 1 - px] : [1 - py, px];
+          const [eu, ev] = probe(c, ox, oy);
+          const [u, v] = probe(turned, px, py);
+          expect(u).toBeCloseTo(eu, 6);
+          expect(v).toBeCloseTo(ev, 6);
+        }
+      }
+    }
+  });
+
+  it("conjugates the orientation step, but not the box, under a single mirror", () => {
+    const c: CropState = { ...defaultCrop(), flipH: true, cx: 0.2, cy: 0.2, w: 0.4, h: 0.3 };
+    const turned = rotate90(c, 1);
+    expect(turned.orientation).toBe(270);
+    expect(turned.cx).toBeCloseTo(0.8, 9);
+    expect(turned.cy).toBeCloseTo(0.2, 9);
+  });
 });
 
 describe("constrainCrop", () => {
@@ -126,6 +180,17 @@ describe("constrainCrop", () => {
     expect(c.h).toBeCloseTo(0.4, 9);
     expect(c.cx).toBeCloseTo(0.2, 9);
     expect(c.cy).toBeCloseTo(0.8, 9);
+  });
+
+  it("keeps the roomy axis in place while shrinking for the overflowing one", () => {
+    // A full-height box: any nonzero angle makes it too tall, but x has room.
+    for (const angle of [0.5, 5, 20]) {
+      const c = constrainCrop({ ...defaultCrop(), cx: 0.25, cy: 0.5, w: 0.25, h: 1, angle }, SRC_W, SRC_H);
+      const [iw, ih] = imageDims(SRC_W, SRC_H, c.orientation);
+      expect(cornersInsideImage(c, iw, ih)).toBe(true);
+      expect(c.cx).toBeCloseTo(0.25, 2);
+      expect(c.h).toBeLessThan(1);
+    }
   });
 
   it("keeps a rotated edge-hugging box at full size", () => {
