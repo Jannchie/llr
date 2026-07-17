@@ -7,7 +7,8 @@
 
 import { MASK_BLUR_SHADER, MASK_DOWNSAMPLE_SHADER, MASK_VERTEX_SHADER, PASSES, VERTEX_SHADER } from "./passes";
 import { computeWbMatrix } from "./color-spaces";
-import { buildToneCurveLUT, defaultToneCurve } from "./curve";
+import { LUT_SIZE, buildToneCurveLUT, defaultToneCurve } from "./curve";
+import { LOG2_MID } from "./tonal-model";
 import type { HistogramBins } from "./histogram";
 
 // Contrast and Blacks are not here: they are display-referred and baked into
@@ -77,6 +78,10 @@ export class PipelineRenderer {
   private uniforms: Record<string, WebGLUniformLocation | null> = {};
   private vao: WebGLVertexArrayObject;
   private sourceTex: WebGLTexture | null = null;
+  // The min/mag filter uploadImage settled on for sourceTex. The histogram read
+  // forces NEAREST minification and must put *this* back, not re-derive it:
+  // whether LINEAR is even legal depends on the uploaded pixel format.
+  private sourceFilter = 0;
   private curveLutTex: WebGLTexture | null = null;
   private profileLutTex: WebGLTexture | null = null;
   private hasProfileCurve = false;
@@ -170,8 +175,8 @@ export class PipelineRenderer {
     // Upload identity LUTs as defaults (user tone curve + DCP profile curve).
     // The curve default comes from the real bake so the RGBA layout has a
     // single owner (curve.ts) instead of a hand-rolled copy here.
-    const identity = new Float32Array(2048);
-    for (let i = 0; i < 2048; i++) identity[i] = i / 2047;
+    const identity = new Float32Array(LUT_SIZE);
+    for (let i = 0; i < LUT_SIZE; i++) identity[i] = i / (LUT_SIZE - 1);
     this.uploadCurveLUT(buildToneCurveLUT(defaultToneCurve()));
     this.profileLutTex = this.makeLutTexture(identity);
 
@@ -181,6 +186,17 @@ export class PipelineRenderer {
 
   uploadImage(pixels: LinearPixels, width: number, height: number): void {
     const gl = this.gl;
+    // texImage2D past MAX_TEXTURE_SIZE only raises GL_INVALID_VALUE: the draw
+    // then "succeeds" against an empty texture and the export encodes black.
+    // The preview is capped well below any real limit, but export decodes the
+    // full sensor resolution — and a software fallback (blocklisted GPU) caps
+    // at 8192, under a 61 MP frame's long edge. Fail loudly instead.
+    const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
+    if (width > maxTex || height > maxTex) {
+      throw new Error(
+        `Image is ${width}×${height}px, but this device's graphics limit is ${maxTex}px per side. `
+        + "Export at a smaller size, or enable hardware acceleration.");
+    }
     this.texWidth = width; this.texHeight = height;
     if (this.sourceTex) gl.deleteTexture(this.sourceTex);
     const tex = gl.createTexture()!;
@@ -202,6 +218,7 @@ export class PipelineRenderer {
     // LINEAR for smooth straighten/crop resampling (NEAREST is identical at
     // 1:1). RGB16F is filterable in core WebGL2; RGB32F needs the extension.
     const filter = half || this.floatLinear ? gl.LINEAR : gl.NEAREST;
+    this.sourceFilter = filter;
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -327,9 +344,9 @@ export class PipelineRenderer {
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
     if (channels === 4) {
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 2048, 1, 0, gl.RGBA, gl.FLOAT, lut);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, LUT_SIZE, 1, 0, gl.RGBA, gl.FLOAT, lut);
     } else {
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, 2048, 1, 0, gl.RED, gl.FLOAT, lut);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, LUT_SIZE, 1, 0, gl.RED, gl.FLOAT, lut);
     }
     // Prefer LINEAR for smooth interpolation; fall back to NEAREST if float-linear not available
     const filter = this.floatLinear ? gl.LINEAR : gl.NEAREST;
@@ -341,7 +358,7 @@ export class PipelineRenderer {
   }
 
   /**
-   * Upload an interleaved RGBA tone-curve LUT (length 2048*4: per-channel
+   * Upload an interleaved RGBA tone-curve LUT (length LUT_SIZE*4: per-channel
    * point curves in .rgb, the film-like master stack in .a — see
    * buildToneCurveLUT). The texture is created once and updated in place
    * (texSubImage2D): this is re-run every rAF while dragging Contrast/Blacks,
@@ -353,8 +370,8 @@ export class PipelineRenderer {
     // curve block's 5 LUT fetches per pixel when the bake does nothing — the
     // default-slider state and the hold-to-compare baseline.
     this.curveActive = false;
-    for (let i = 0; i < 2048; i++) {
-      const x = i / 2047;
+    for (let i = 0; i < LUT_SIZE; i++) {
+      const x = i / (LUT_SIZE - 1);
       if (Math.abs(lut[i * 4] - x) > 1e-6 || Math.abs(lut[i * 4 + 1] - x) > 1e-6
         || Math.abs(lut[i * 4 + 2] - x) > 1e-6 || Math.abs(lut[i * 4 + 3] - x) > 1e-6) {
         this.curveActive = true;
@@ -367,7 +384,7 @@ export class PipelineRenderer {
     }
     gl.bindTexture(gl.TEXTURE_2D, this.curveLutTex);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 2048, 1, gl.RGBA, gl.FLOAT, lut);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, LUT_SIZE, 1, gl.RGBA, gl.FLOAT, lut);
   }
 
   /**
@@ -379,15 +396,15 @@ export class PipelineRenderer {
     const gl = this.gl;
     let data = lut;
     if (!data) {
-      data = new Float32Array(2048);
-      for (let i = 0; i < 2048; i++) data[i] = i / 2047;
+      data = new Float32Array(LUT_SIZE);
+      for (let i = 0; i < LUT_SIZE; i++) data[i] = i / (LUT_SIZE - 1);
     }
     if (!this.profileLutTex) {
       this.profileLutTex = this.makeLutTexture(data);
     } else {
       gl.bindTexture(gl.TEXTURE_2D, this.profileLutTex);
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 2048, 1, gl.RED, gl.FLOAT, data);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, LUT_SIZE, 1, gl.RED, gl.FLOAT, data);
     }
     this.hasProfileCurve = lut != null;
   }
@@ -491,7 +508,7 @@ export class PipelineRenderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     this.renderPass(this.histoFbo, w, h, this.lastParams, view?.texXform);
     gl.bindTexture(gl.TEXTURE_2D, this.sourceTex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, this.floatLinear ? gl.LINEAR : gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, this.sourceFilter);
     const n = w * h;
     const buf = new Uint8Array(n * 4);
     gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
@@ -524,7 +541,7 @@ export class PipelineRenderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     this.renderPass(this.histoFbo, w, h, this.lastParams, view?.texXform);
     gl.bindTexture(gl.TEXTURE_2D, this.sourceTex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, this.floatLinear ? gl.LINEAR : gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, this.sourceFilter);
 
     // 2. Scatter every pixel into 256 bins × 4 rows (R,G,B,L) via additive float
     //    blending — a full-image histogram computed entirely on the GPU.
@@ -801,7 +818,7 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     // weight). The WB matrix is luminance-normalized, so it contributes no
     // shift of its own.
     i("u_hasMask", this.maskTex ? 1 : 0);
-    s("u_maskShift", p.exposure - Math.log2(0.18));
+    s("u_maskShift", p.exposure - LOG2_MID);
     // HSL
     for (let band = 0; band < 8; band++) {
       s(`u_hsl_h[${band}]`, p.hslH?.[band] ?? 0);

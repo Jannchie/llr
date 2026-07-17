@@ -12,6 +12,8 @@
  *     out_c = pointChannel_c( pointRGB( parametric( in_c ) ) )   for c in {R,G,B}
  */
 
+import { glslFloat } from "./color-spaces";
+
 export interface CurvePoint {
   x: number; // 0-1 input
   y: number; // 0-1 output
@@ -65,7 +67,24 @@ export function isDefaultBasic(b: BasicAdjust): boolean {
   return b.contrast === 0 && b.blacks === 0 && b.whites <= 0;
 }
 
-const LUT_SIZE = 2048;
+/**
+ * Entries in every baked LUT — the bake, the GPU texture and the shader's fetch
+ * domain all derive from this one value (see LUT_GLSL).
+ */
+export const LUT_SIZE = 2048;
+
+/**
+ * GLSL chunk: the LUT sampling helper, generated from LUT_SIZE. Inject once near
+ * the top of a fragment shader that fetches a baked LUT, so the shader's fetch
+ * domain cannot drift from the table this module produces.
+ */
+export const LUT_GLSL = `
+const float LUT_SIZE = ${glslFloat(LUT_SIZE)};
+
+// Entry i holds the output for input i/(LUT_SIZE-1), so map x onto texel centers
+// — sampling at x directly is off by up to half a texel across the range.
+float lutCoord(float x) { return (x * (LUT_SIZE - 1.0) + 0.5) / LUT_SIZE; }
+`;
 
 const clamp = (v: number, lo: number, hi: number) => (v < lo ? lo : v > hi ? hi : v);
 const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);

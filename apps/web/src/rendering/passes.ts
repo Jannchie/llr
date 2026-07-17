@@ -7,9 +7,22 @@
  * not applied here.
  */
 
-import { COLOR_GLSL, PROPHOTO_Y } from "./color-spaces";
+import { COLOR_GLSL, PROPHOTO_Y, glslFloat } from "./color-spaces";
+import { LUT_GLSL } from "./curve";
 import { HSL_GLSL } from "./hsl-bands";
 import { TONAL_GLSL } from "./tonal-model";
+
+// Color Grading region edges, on display luma. Balance slides both pairs by up
+// to ±GRAD_BAL_SPAN. That span is capped at 0.15 because the graded colour is
+// clamped to [0,1] before the block, so its luma is too: shift an edge pair any
+// further and it leaves the axis entirely, making that wheel a silent no-op —
+// silent because the Midtones weight (1-shW)(1-hlW) then expands over the
+// vacated range and the user still sees a tint, from the wrong wheel.
+export const GRAD_SH_EDGE0 = 0.15;
+export const GRAD_SH_EDGE1 = 0.45;
+export const GRAD_HL_EDGE0 = 0.55;
+export const GRAD_HL_EDGE1 = 0.85;
+export const GRAD_BAL_SPAN = Math.min(GRAD_SH_EDGE0, 1 - GRAD_HL_EDGE1);
 
 export const VERTEX_SHADER = `#version 300 es
 precision highp float;
@@ -62,8 +75,8 @@ uniform float u_grad_hl_h;
 uniform float u_grad_hl_s;
 uniform float u_grad_blend;
 uniform float u_grad_balance;
-// Tone Curve LUT (2048×1 RGB texture) — per-channel point + parametric curves,
-// applied display-referred. .r/.g/.b hold the baked R/G/B channel curves.
+// Tone Curve LUT (LUT_SIZE×1 RGBA texture) — per-channel point + parametric
+// curves, applied display-referred. .r/.g/.b hold the baked R/G/B channel curves.
 uniform sampler2D u_curve_lut;
 uniform int u_curveActive;      // 0 when the baked LUT is the identity -> skip its 5 fetches
 uniform sampler2D u_profile_lut; // DCP profile tone curve (per-channel), display rendering
@@ -75,11 +88,7 @@ uniform vec3 u_bgColor;         // display-encoded fill for areas outside the im
 ${COLOR_GLSL}
 ${TONAL_GLSL}
 ${HSL_GLSL}
-
-// Sample a 2048-entry LUT: entry i holds the output for input i/2047, so map
-// x onto texel centers ((x*2047 + 0.5)/2048) — sampling at x directly is off
-// by up to half a texel across the range.
-float lutCoord(float x) { return (x * 2047.0 + 0.5) / 2048.0; }
+${LUT_GLSL}
 
 // ===== View transforms: scene-linear ProPhoto -> display-linear ProPhoto [0,1] =====
 
@@ -141,6 +150,12 @@ vec3 gamutMap(vec3 c, vec3 Yw) {
 }
 
 // --- Color Grading helper ---
+
+const float GRAD_SH_EDGE0 = ${glslFloat(GRAD_SH_EDGE0)};
+const float GRAD_SH_EDGE1 = ${glslFloat(GRAD_SH_EDGE1)};
+const float GRAD_HL_EDGE0 = ${glslFloat(GRAD_HL_EDGE0)};
+const float GRAD_HL_EDGE1 = ${glslFloat(GRAD_HL_EDGE1)};
+const float GRAD_BAL_SPAN = ${glslFloat(GRAD_BAL_SPAN)};
 
 vec3 hsvToRgb(float h, float s) {
   h = fract(h) * 6.0;
@@ -321,9 +336,11 @@ void main() {
   // not exposure — a naive multiply darkens by the tint's luma.
   if (u_grad_blend > 0.001) {
     float lg = ppLuma(c);
-    float bal = u_grad_balance * 0.5;
-    float shW = 1.0 - smoothstep(0.15 + bal, 0.45 + bal, lg);
-    float hlW = smoothstep(0.55 + bal, 0.85 + bal, lg);
+    // Balance right slides both edge pairs *down*, so the Highlights region
+    // grows and the Shadows region shrinks — the direction the label promises.
+    float bal = -u_grad_balance * GRAD_BAL_SPAN;
+    float shW = 1.0 - smoothstep(GRAD_SH_EDGE0 + bal, GRAD_SH_EDGE1 + bal, lg);
+    float hlW = smoothstep(GRAD_HL_EDGE0 + bal, GRAD_HL_EDGE1 + bal, lg);
     float mdW = (1.0 - shW) * (1.0 - hlW);
     vec3 t = c;
     t = mix(t, t * hsvToRgb(u_grad_sh_h, u_grad_sh_s), shW);

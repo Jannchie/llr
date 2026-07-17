@@ -14,6 +14,7 @@ import {
 } from "./rendering/crop";
 import { API, fetchLinear, type ColorProfileMeta } from "./api";
 import { type PersistedEdit } from "./persistence";
+import { gradingHueToTurns, gradingHueDeg } from "./rendering/grading";
 import { trackFill, formatBytes, clamp } from "./ui";
 import SliderRow from "./components/SliderRow.vue";
 import Filmstrip from "./components/Filmstrip.vue";
@@ -186,9 +187,7 @@ function gradingColor(key: string): string {
   const g = grading as Record<string, number>;
   const h = g[key + "H"] ?? 0;
   const s = g[key + "S"] ?? 0;
-  // Convert hue [-180,180] + sat [0,100] to CSS hsl
-  const hueDeg = ((h % 360) + 360) % 360;
-  return `hsl(${hueDeg}, ${s}%, 50%)`;
+  return `hsl(${gradingHueDeg(h)}, ${s}%, 50%)`;
 }
 function resetHslGrading(): void {
   for (let i = 0; i < 8; i++) { hslHue[i] = 0; hslSat[i] = 0; hslLum[i] = 0; }
@@ -219,7 +218,10 @@ const isEdited = (key: RecipeKey): boolean => recipe[key] !== SLIDER_DEFAULTS[ke
 const groupEdited = (group: SliderGroup): boolean => group.items.some(s => isEdited(s.key));
 const hslEdited = computed(() =>
   hslHue.some(v => v !== 0) || hslSat.some(v => v !== 0) || hslLum.some(v => v !== 0));
-const gradingEdited = computed(() => Object.values(grading).some(v => v !== 0));
+const gradingEdited = computed(() => {
+  const d = defaultGrading() as Record<string, number>;
+  return Object.entries(grading).some(([k, v]) => v !== d[k]);
+});
 
 // Basic-panel values currently baked into the GPU curve LUT (Contrast, Blacks
 // and positive Whites are display-referred stages of the LUT chain, not shader
@@ -241,6 +243,14 @@ function sameBasic(a: BasicAdjust, b: BasicAdjust): boolean {
 /** Rebake + upload the curve LUT with the live tone curve and Basic values. */
 function bakeCurveLUT(): void {
   if (!webglRenderer) return;
+  // While hold-to-compare is on, the GPU LUT must stay identity: a rebake from a
+  // mid-hold re-decode or reset would otherwise leak Contrast/Blacks/the curve
+  // into the 'before' view, with nothing to restore it until the key is released.
+  if (showOriginal.value) {
+    webglRenderer.uploadCurveLUT(IDENTITY_CURVE_LUT);
+    bakedBasic = null;
+    return;
+  }
   const basic = currentBasic();
   webglRenderer.uploadCurveLUT(buildToneCurveLUT(toneCurve.value, basic));
   bakedBasic = basic;
@@ -491,9 +501,9 @@ function buildPipelineParams(s?: Snapshot): Partial<EditParams> {
     hslH: hue.map(v => v / 100),
     hslS: sat.map(v => v / 100),
     hslL: lum.map(v => v / 100),
-    gradShH: g.shH / 180, gradShS: g.shS / 100,
-    gradMdH: g.mdH / 180, gradMdS: g.mdS / 100,
-    gradHlH: g.hlH / 180, gradHlS: g.hlS / 100,
+    gradShH: gradingHueToTurns(g.shH), gradShS: g.shS / 100,
+    gradMdH: gradingHueToTurns(g.mdH), gradMdS: g.mdS / 100,
+    gradHlH: gradingHueToTurns(g.hlH), gradHlS: g.hlS / 100,
     gradBlend: g.blend / 100,
     gradBalance: g.balance / 100,
     viewTransform: viewSettings.viewTransform,
@@ -726,20 +736,23 @@ function onKeyUp(e: KeyboardEvent): void {
   if (e.key === "\\") showOriginal.value = false; // release the hold-to-compare view
 }
 
+// Alt-Tab (or Cmd+backslash) mid-hold sends the keyup to the newly focused
+// window, so onKeyUp never fires and the 'before' view would stick on forever.
+function onWindowBlur(): void {
+  showOriginal.value = false;
+}
+
 // ── upload ──
 
 // Auto-redraw on edit. Suppressed during restore/switch so we don't flash the
 // previous image with the new params before loadSource() uploads the pixels.
 // Hold-to-compare swaps the tone-curve LUT (a GPU texture, not a draw param) for
 // identity while previewing the original, restoring the live curve on release.
-watch(showOriginal, (v) => {
+watch(showOriginal, () => {
+  // bakeCurveLUT owns the rule: it swaps in identity while showOriginal is on
+  // and restores the live curve when it clears, so the watcher only has to bake.
   if (!webglRenderer) return;
-  if (v) {
-    webglRenderer.uploadCurveLUT(IDENTITY_CURVE_LUT);
-    bakedBasic = null; // GPU LUT no longer matches the live bake
-  } else {
-    bakeCurveLUT();
-  }
+  bakeCurveLUT();
   scheduleWebGLDraw();
 });
 
@@ -811,6 +824,7 @@ function persistOnHidden(): void { if (document.visibilityState === "hidden") pe
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeyDown);
   window.removeEventListener('keyup', onKeyUp);
+  window.removeEventListener('blur', onWindowBlur);
   window.removeEventListener('beforeunload', persistOnUnload);
   document.removeEventListener('visibilitychange', persistOnHidden);
   canvasRef.value?.removeEventListener('webglcontextlost', onContextLost);
@@ -824,6 +838,7 @@ onBeforeUnmount(() => {
 onMounted(async () => {
   window.addEventListener('keydown', onKeyDown);
   window.addEventListener('keyup', onKeyUp);
+  window.addEventListener('blur', onWindowBlur);
   window.addEventListener('beforeunload', persistOnUnload);
   document.addEventListener('visibilitychange', persistOnHidden);
   canvasRef.value?.addEventListener('webglcontextlost', onContextLost);
