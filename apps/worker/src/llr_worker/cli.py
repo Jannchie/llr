@@ -461,8 +461,9 @@ def daemon_export(request: dict[str, Any], root: Path) -> dict[str, Any]:
     input_path = resolve_path(root, request["input"])
     target_path = resolve_path(root, request["target"])
     settings = request.get("settings") or {}
+    strip_private = bool(request.get("stripPrivate", False))
 
-    exif_copied = copy_exif_provenance(input_path, target_path)
+    exif_copied = copy_exif_provenance(input_path, target_path, strip_private=strip_private)
 
     payloads, xmp_bytes = build_xmp_segments(settings)
     data = embed_xmp_app1(target_path.read_bytes(), payloads)
@@ -471,20 +472,27 @@ def daemon_export(request: dict[str, Any], root: Path) -> dict[str, Any]:
     return {"output": str(target_path), "exifCopied": exif_copied, "xmpBytes": xmp_bytes}
 
 
-def copy_exif_provenance(original: Path, target: Path) -> bool:
-    """Copy camera metadata from the original into the export.
+# Exclusions applied only when the user asks for a privacy strip: GPS
+# location, serial numbers, and owner name. Maker notes go as a whole block
+# (no :all) because serials hide inside the copied binary blob where
+# member-tag exclusions cannot reach.
+PRIVATE_TAG_EXCLUSIONS = ["--gps:all", "--makernotes", "--*serialnumber*", "--ownername"]
 
-    Copies the writable tag groups (EXIF, IPTC, ...) so shooting metadata
-    survives the export, then overrides the few tags that must describe the
-    export itself: orientation/rotation is baked into the pixels, the EXIF
+
+def copy_exif_provenance(original: Path, target: Path, strip_private: bool = False) -> bool:
+    """Copy all camera metadata from the original into the export.
+
+    Copies every writable tag group (EXIF, GPS, maker notes, IPTC, ...) so no
+    shooting metadata is lost, then overrides the few tags that must describe
+    the export itself: orientation/rotation is baked into the pixels, the EXIF
     pixel dimensions are the export's, and Software identifies the renderer.
     XMP is excluded because daemon_export injects LLR's own packet, and the
-    source ICC profile would mislabel the rendered (sRGB) colors. Privacy-
-    sensitive tags — GPS location, serial numbers, owner name — are excluded
-    so sharing an export never leaks where or with whose gear it was shot;
-    maker notes go as a whole because serials hide inside the binary blob
-    where they cannot be excluded individually (Lightroom likewise drops
-    maker notes on export).
+    source ICC profile would mislabel the rendered (sRGB) colors.
+
+    With ``strip_private`` the privacy-sensitive tags (GPS location, serial
+    numbers, owner name, maker notes) are excluded, so a shared export does
+    not reveal where or with whose gear it was shot. Off by default: the
+    export carries full provenance unless the user opts out.
     """
     command = detect_exiftool()
     if command is None:
@@ -499,12 +507,7 @@ def copy_exif_provenance(original: Path, target: Path) -> bool:
                 "-all:all",
                 "--xmp:all",
                 "--icc_profile:all",
-                "--gps:all",
-                # The block tag (no :all) — member-tag exclusions cannot reach
-                # inside the copied binary blob where serials live.
-                "--makernotes",
-                "--*serialnumber*",
-                "--ownername",
+                *(PRIVATE_TAG_EXCLUSIONS if strip_private else []),
                 "-tagsFromFile",
                 "@",
                 "-ExifImageWidth<ImageWidth",

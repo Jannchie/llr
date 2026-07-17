@@ -138,7 +138,9 @@ const GRADING_BANDS = [
 ] as const;
 
 // View settings (not part of the per-image recipe): tone-mapping look + display gamut.
-const viewSettings = reactive({ viewTransform: 0, displayGamut: 0 });
+// exportStripPrivate: exports copy the RAW's full EXIF by default; 1 opts into
+// stripping GPS/serials/owner/maker notes for exports meant to be shared.
+const viewSettings = reactive({ viewTransform: 0, displayGamut: 0, exportStripPrivate: 0 });
 
 // ── Crop & Straighten ──
 //
@@ -883,6 +885,7 @@ function buildExportPlan(): ExportPlan | null {
     sourceId: currentSourceId,
     filename: exportFilename(),
     settings,
+    stripPrivate: viewSettings.exportStripPrivate === 1,
     dcpCode: settings.dcp,
     denoise: denoisePayload(settings.denoise),
     params: buildPipelineParams(settings),
@@ -1191,6 +1194,14 @@ const vWheelAdjust = {
           <select v-model.number="viewSettings.displayGamut" class="control-select">
             <option :value="0">sRGB</option>
             <option :value="1">Display-P3 (wide)</option>
+          </select>
+        </div>
+        <div class="control-row" v-if="activeSource">
+          <label class="control-label">Export EXIF</label>
+          <select v-model.number="viewSettings.exportStripPrivate" class="control-select"
+            title="Full keeps everything from the RAW; Private-safe strips GPS, serial numbers, owner name, and maker notes">
+            <option :value="0">Full metadata</option>
+            <option :value="1">Private-safe (no GPS/serials)</option>
           </select>
         </div>
       </section>

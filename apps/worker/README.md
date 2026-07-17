@@ -19,7 +19,8 @@ Commands: `ping`, `extract-preview`, `render-linear`, `export`.
 ## Modules
 
 - `cli.py` — daemon loop, decode/cache orchestration, XMP building and JPEG
-  APP1 embedding, camera-crop math.
+  APP1 embedding, camera-crop math. Exports copy the RAW's full EXIF; the
+  `stripPrivate` export flag excludes GPS/serials/owner/maker notes instead.
 - `dcp.py` — Adobe DCP (classic-TIFF) parsing and application: color matrix,
   ProfileHueSatMap, ProfileLookTable, profile tone curve, in linear ProPhoto.
 - `denoise.py` — Bayer-mosaic denoise before demosaic (wavelet default;

@@ -50,11 +50,11 @@ Sessions, per-image edits, and thumbnails persist in IndexedDB
 ## Export
 
 Export re-renders at **full resolution in WebGL** from a frozen edit snapshot
-(`useExport.ts`), then POSTs the JPEG to the worker, which copies provenance
-EXIF from the RAW (stripping GPS, serials, owner name, and maker notes) and
-embeds the edit recipe as XMP: structured `llr:*` fields plus a lossless JSON
-blob, spilling into Extended-XMP chunks when a heavy edit overflows the 64 KB
-APP1 limit.
+(`useExport.ts`), then POSTs the JPEG to the worker, which copies the RAW's
+full provenance EXIF (an opt-in "private-safe" mode strips GPS, serials,
+owner name, and maker notes instead) and embeds the edit recipe as XMP:
+structured `llr:*` fields plus a lossless JSON blob, spilling into
+Extended-XMP chunks when a heavy edit overflows the 64 KB APP1 limit.
 
 ## Testing
 

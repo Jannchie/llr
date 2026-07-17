@@ -239,9 +239,9 @@ async function handleExport(request: IncomingMessage, response: ServerResponse):
     return;
   }
 
-  let meta: { sourceId?: string; settings?: unknown };
+  let meta: { sourceId?: string; settings?: unknown; stripPrivate?: boolean };
   try {
-    meta = JSON.parse(typeof metaRaw === "string" ? metaRaw : "{}") as { sourceId?: string; settings?: unknown };
+    meta = JSON.parse(typeof metaRaw === "string" ? metaRaw : "{}") as typeof meta;
   } catch {
     sendJson(response, { error: "Invalid meta field" }, 400);
     return;
@@ -268,7 +268,8 @@ async function handleExport(request: IncomingMessage, response: ServerResponse):
       command: "export",
       input: sourcePath,
       target: exportPath,
-      settings: meta.settings ?? {}
+      settings: meta.settings ?? {},
+      stripPrivate: meta.stripPrivate === true
     });
   } catch (error) {
     await rm(exportPath, { force: true });

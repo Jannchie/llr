@@ -13,6 +13,8 @@ export interface ExportPlan {
   filename: string;
   /** The full edit snapshot, embedded server-side as llr:* XMP + JSON. */
   settings: unknown;
+  /** Exclude GPS/serials/owner/maker notes from the copied EXIF (opt-in). */
+  stripPrivate: boolean;
   dcpCode: string | undefined;
   denoise: { enabled: boolean; model: string; amount: number };
   params: Partial<EditParams>;
@@ -68,7 +70,7 @@ export function useExport(opts: {
       // 3. Embed edit settings (llr:* XMP + lossless LLR JSON) into the JPEG server-side
       const fd = new FormData();
       fd.append("file", blob, "export.jpg");
-      fd.append("meta", JSON.stringify({ sourceId: plan.sourceId, settings: plan.settings }));
+      fd.append("meta", JSON.stringify({ sourceId: plan.sourceId, settings: plan.settings, stripPrivate: plan.stripPrivate }));
       const exRes = await fetch(`${API}/export`, { method: "POST", body: fd });
       if (!exRes.ok) throw new Error(await exRes.text());
 
