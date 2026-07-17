@@ -388,18 +388,35 @@ class WorkerDaemon {
     const reader = createInterface({ input: child.stdout });
     reader.on("line", (line: string) => this.handleLine(line));
 
-    child.on("exit", (code) => {
-      const error = new Error(`worker daemon exited with code ${code ?? "null"}`);
+    // One cleanup for every way the child can die. A failed spawn fires
+    // `error` with no matching `exit` (the old exit-only cleanup left a dead
+    // child cached forever), and writing to a dead stdin surfaces as an async
+    // `error` event that would crash the whole process if unhandled.
+    let cleaned = false;
+    const cleanup = (cause: Error): void => {
+      if (cleaned) return; // exit + error can both fire for the same child;
+      cleaned = true;      // a late second event must not reset a newer boot
       for (const [, handler] of this.pending) {
-        handler.reject(error);
+        handler.reject(cause);
       }
       this.pending.clear();
-      this.child = null;
+      if (this.child === child) this.child = null;
       this.booting = null;
-    });
+    };
+    child.on("exit", (code) => cleanup(new Error(`worker daemon exited with code ${code ?? "null"}`)));
+    child.on("error", (error) => cleanup(new Error(`worker daemon failed: ${error.message}`)));
+    child.stdin.on("error", (error) => cleanup(new Error(`worker daemon stdin error: ${error.message}`)));
 
+    try {
+      await ready;
+    } catch (error) {
+      child.kill();
+      cleanup(error instanceof Error ? error : new Error(String(error)));
+      throw error;
+    }
+    // Publish only a daemon that reached ready; ensureRunning treats a
+    // non-null child as usable.
     this.child = child;
-    await ready;
     this.booting = null;
   }
 
