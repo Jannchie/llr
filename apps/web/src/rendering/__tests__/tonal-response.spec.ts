@@ -7,7 +7,7 @@
  *   PRINT_TABLES=1 npx vitest run --disable-console-intercept
  */
 import { describe, expect, it } from "vitest";
-import { LOG2_MID, LX_WHITE, expoShoulder, tonalLuma, type TonalParams } from "../tonal-model";
+import { CLAR_MID1, CLAR_SIGMA, LOG2_MID, LX_WHITE, clarityShift, expoShoulder, tonalLuma, type TonalParams } from "../tonal-model";
 import { basicCurve, buildToneCurveLUT, defaultToneCurve, srgbDecode, srgbEncode } from "../curve";
 
 // basicCurve is linear-in/linear-out but acts on the perceptual axis, so the
@@ -260,3 +260,30 @@ if (PRINT_TABLES) {
     });
   });
 }
+
+describe("clarity (local mid-tone contrast)", () => {
+  it("is zero when the pixel matches its neighborhood", () => {
+    for (const lx of [-3, 0, 2]) expect(clarityShift(lx, lx, 1)).toBe(0);
+  });
+
+  it("amplifies detail in the slider's direction and scales with it", () => {
+    // Pixel half a stop above its neighborhood, mid-gray region.
+    expect(clarityShift(0.5, 0, 1)).toBeGreaterThan(0);
+    expect(clarityShift(-0.5, 0, 1)).toBeLessThan(0);
+    // Negative clarity softens: pushes the pixel toward the neighborhood.
+    expect(clarityShift(0.5, 0, -1)).toBeLessThan(0);
+    expect(Math.abs(clarityShift(0.5, 0, 0.5))).toBeCloseTo(Math.abs(clarityShift(0.5, 0, 1)) / 2, 9);
+  });
+
+  it("suppresses large edges (halo guard)", () => {
+    // Per added stop of detail, a 4σ edge must get far less gain than texture.
+    const texture = clarityShift(0.5, 0, 1) / 0.5;
+    const edge = clarityShift(4 * CLAR_SIGMA, 0, 1) / (4 * CLAR_SIGMA);
+    expect(edge).toBeLessThan(texture * 0.05);
+  });
+
+  it("fades out away from the midtones", () => {
+    expect(clarityShift(0.5, CLAR_MID1 + 1, 1)).toBeCloseTo(0, 12);
+    expect(clarityShift(0.5, -(CLAR_MID1 + 1), 1)).toBeCloseTo(0, 12);
+  });
+});

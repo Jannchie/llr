@@ -30,6 +30,15 @@ export const SH_EDGE0 = -3.5;
 export const SH_EDGE1 = 0.5;
 export const WH_EDGE0 = -1.5;
 
+// Clarity: local mid-tone contrast on log2 luminance. The detail amplitude
+// d = pixel − blurred neighborhood (stops); the Gaussian window suppresses
+// amplification where |d| is large — an edge, not texture — which is the
+// halo guard from the local-laplacian remap family (LR PV2012's Clarity).
+export const CLAR_GAIN = 0.4;   // added stops per stop of detail at ±100
+export const CLAR_SIGMA = 1.2;  // detail window width (stops)
+export const CLAR_MID0 = 2.0;   // midtone weight: full within ±2 stops of mid gray
+export const CLAR_MID1 = 4.0;   //   fading to zero by ±4 stops
+
 /** Soft highlight shoulder in log2 luminance: identity below the knee, slope decaying to 0 above. */
 export function expoShoulder(x: number): number {
   return x <= EXPO_KNEE
@@ -78,6 +87,18 @@ export function tonalLuma(Y: number, p: TonalParams, maskLx?: number): number {
   return 2 ** lOut;
 }
 
+/**
+ * Clarity's log2-luminance shift. `pixLx`/`maskLx` are the pixel and blurred
+ * neighborhood in stops from middle gray; `clarity` is -1..1. Mirrors the
+ * GLSL clarityShift in TONAL_GLSL below.
+ */
+export function clarityShift(pixLx: number, maskLx: number, clarity: number): number {
+  const d = pixLx - maskLx;
+  const amp = Math.exp(-(d * d) / (2 * CLAR_SIGMA * CLAR_SIGMA));
+  const mid = 1 - smoothstep(CLAR_MID0, CLAR_MID1, Math.abs(maskLx));
+  return clarity * CLAR_GAIN * d * amp * mid;
+}
+
 // --- GLSL emission ---
 
 /** Format a number as a GLSL float literal. */
@@ -103,11 +124,23 @@ const float HI_EDGE1 = ${glf(HI_EDGE1)};
 const float SH_EDGE0 = ${glf(SH_EDGE0)};
 const float SH_EDGE1 = ${glf(SH_EDGE1)};
 const float WH_EDGE0 = ${glf(WH_EDGE0)};
+const float CLAR_GAIN = ${glf(CLAR_GAIN)};
+const float CLAR_SIGMA = ${glf(CLAR_SIGMA)};
+const float CLAR_MID0 = ${glf(CLAR_MID0)};
+const float CLAR_MID1 = ${glf(CLAR_MID1)};
 
 // Soft highlight shoulder in log2 luminance: identity below the knee, slope
 // decaying to 0 above it (ceiling at EXPO_KNEE + EXPO_P). Monotone, C1.
 float expoShoulder(float x) {
   return x <= EXPO_KNEE ? x
        : EXPO_KNEE + EXPO_P * (1.0 - exp(-(x - EXPO_KNEE) / EXPO_P));
+}
+
+// Clarity's log2-luminance shift (mirrors clarityShift in tonal-model.ts).
+float clarityShift(float pixLx, float maskLx, float clarity) {
+  float d = pixLx - maskLx;
+  float amp = exp(-d * d / (2.0 * CLAR_SIGMA * CLAR_SIGMA));
+  float mid = 1.0 - smoothstep(CLAR_MID0, CLAR_MID1, abs(maskLx));
+  return clarity * CLAR_GAIN * d * amp * mid;
 }
 `;

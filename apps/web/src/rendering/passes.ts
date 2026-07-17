@@ -183,8 +183,12 @@ void main() {
     float lOut = (u_exposure > 0.0)
       ? l + expoShoulder(l + u_exposure) - expoShoulder(l)
       : l + u_exposure;
+    float pixLx = lOut - LOG2_MID;                     // stops from middle gray, post-exposure
+    // Blurred neighborhood log-luma (see MASK_* shaders), shifted for exposure.
+    float maskLx = (u_hasMask == 1)
+      ? texture(u_mask_lum, v_texCoord).r + u_maskShift
+      : pixLx;
     if (u_tonalActive == 1) {
-      float pixLx = lOut - LOG2_MID;                   // stops from middle gray, post-exposure
       // Highlights responds to a pixel that is bright itself OR sits in a
       // bright neighborhood (max); Shadows is the mirror (min). This keeps
       // small speculars/windows responsive (pixel term) while dark texture
@@ -193,9 +197,6 @@ void main() {
       // it dilutes small features out of the window and drags region interiors
       // out of it. Log-domain blurring makes the dark side dominate the mask
       // near edges, which keeps highlight recovery from bleeding dark halos.
-      float maskLx = (u_hasMask == 1)
-        ? texture(u_mask_lum, v_texCoord).r + u_maskShift
-        : pixLx;
       float wHi = smoothstep(HI_EDGE0, HI_EDGE1, max(pixLx, maskLx));
       float wSh = 1.0 - smoothstep(SH_EDGE0, SH_EDGE1, min(pixLx, maskLx));
       // Only *negative* Whites acts here, on pixel luma: pulling the white
@@ -210,11 +211,18 @@ void main() {
             + (u_shadows    >= 0.0 ? SH_GAIN_POS : SH_GAIN_NEG) * u_shadows    * wSh
             + WH_GAIN * min(u_whites, 0.0) * wWh;
     }
+    // Clarity: local mid-tone contrast — amplify the pixel's deviation from
+    // its blurred neighborhood (clarityShift in TONAL_GLSL; window + midtone
+    // weight keep edges and clip points from haloing/shifting).
+    if (clarityLocal) {
+      lOut += clarityShift(pixLx, maskLx, u_clarity);
+    }
     c *= exp2(lOut - l);
   }
 
-  // --- Clarity (local mid-tone contrast, scene-linear around mid gray) ---
-  if (u_clarity != 0.0) {
+  // Clarity fallback when the neighborhood mask is unavailable: the old
+  // per-pixel mid-tone contrast, so the slider still does something.
+  if (u_clarity != 0.0 && u_hasMask == 0) {
     float lm = ppLuma(c); lm = lm / (lm + 0.18);      // display-ish proxy for masking
     float midMask = smoothstep(0.05, 0.45, lm) * (1.0 - smoothstep(0.55, 0.95, lm));
     c = max(c + (c - 0.18) * u_clarity * midMask * 0.6, vec3(0.0));
