@@ -12,11 +12,12 @@ import sys
 import threading
 import traceback
 from collections import OrderedDict
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 import rawpy
@@ -190,10 +191,7 @@ def render_preview(args: argparse.Namespace, root: Path) -> None:
     input_path = resolve_path(root, args.input)
     output_path = resolve_path(root, args.output)
 
-    if is_raw(input_path):
-        image = extract_preview_image(input_path)
-    else:
-        image = open_rgb(input_path)
+    image = extract_preview_image(input_path) if is_raw(input_path) else open_rgb(input_path)
 
     image.thumbnail((2400, 2400), Image.Resampling.LANCZOS)
     save_jpeg(image, output_path, quality=86)
@@ -250,7 +248,7 @@ def daemon_worker(request: dict[str, Any], root: Path) -> None:
         response["id"] = request_id
         response["ok"] = True
         emit_response(response)
-    except Exception as error:  # noqa: BLE001
+    except Exception as error:
         traceback.print_exc(file=sys.stderr)
         emit_response({"id": request_id, "ok": False, "error": str(error)})
 
@@ -288,13 +286,7 @@ def _linear_cache_key(
         base = (str(input_path), st.st_size, int(st.st_mtime_ns))
     except OSError:
         base = (str(input_path),)
-    return base + (
-        bool(half_size),
-        int(max_size or 0),
-        dcp_code or "",
-        denoise_model or "",
-        round(float(denoise_amount), 3),
-    )
+    return (*base, bool(half_size), int(max_size or 0), dcp_code or "", denoise_model or "", round(float(denoise_amount), 3))
 
 
 _LINEAR_CACHE: OrderedDict[tuple[Any, ...], tuple[np.ndarray, dict[str, Any]]] = OrderedDict()
@@ -306,7 +298,7 @@ def _write_linear_f16(linear_arr: np.ndarray, output_path: Path) -> int:
 
     The browser uploads the payload straight into an RGB16F texture, so f16 is
     the precision the render actually uses; its ~11-bit relative mantissa sits
-    below sensor noise for 12–14-bit RAW data. The in-memory caches stay
+    below sensor noise for 12-14-bit RAW data. The in-memory caches stay
     float32 so repeated DCP/denoise blends never accumulate quantisation.
     """
     out = linear_arr.astype(np.float16)
@@ -535,7 +527,7 @@ def _num(source: dict[str, Any], key: str, default: float = 0.0) -> float:
         return default
 
 
-def build_llr_attrs(settings: dict[str, Any]) -> "OrderedDict[str, str]":
+def build_llr_attrs(settings: dict[str, Any]) -> OrderedDict[str, str]:
     """Structured llr:* fields mirroring LLR's own parameter model.
 
     Names and units follow the internal recipe (not Adobe's), so the schema can
@@ -550,23 +542,23 @@ def build_llr_attrs(settings: dict[str, Any]) -> "OrderedDict[str, str]":
         ("whites", "Whites"), ("blacks", "Blacks"), ("clarity", "Clarity"),
         ("dehaze", "Dehaze"), ("vibrance", "Vibrance"), ("saturation", "Saturation"),
     ):
-        attrs[f"llr:{name}"] = f"{int(round(_num(recipe, key)))}"
-    attrs["llr:Temperature"] = f"{int(round(_num(recipe, 'temperature', 6500)))}"
-    attrs["llr:Tint"] = f"{int(round(_num(recipe, 'tint')))}"
+        attrs[f"llr:{name}"] = f"{round(_num(recipe, key))}"
+    attrs["llr:Temperature"] = f"{round(_num(recipe, 'temperature', 6500))}"
+    attrs["llr:Tint"] = f"{round(_num(recipe, 'tint'))}"
 
     # Parametric (region) tone curve.
     parametric = _curve_settings(settings).get("parametric", {}) or {}
-    attrs["llr:ParametricShadows"] = f"{int(round(_num(parametric, 'shadows')))}"
-    attrs["llr:ParametricDarks"] = f"{int(round(_num(parametric, 'darks')))}"
-    attrs["llr:ParametricLights"] = f"{int(round(_num(parametric, 'lights')))}"
-    attrs["llr:ParametricHighlights"] = f"{int(round(_num(parametric, 'highlights')))}"
-    attrs["llr:ParametricShadowSplit"] = f"{int(round(_num(parametric, 'shadowSplit', 25)))}"
-    attrs["llr:ParametricMidtoneSplit"] = f"{int(round(_num(parametric, 'midtoneSplit', 50)))}"
-    attrs["llr:ParametricHighlightSplit"] = f"{int(round(_num(parametric, 'highlightSplit', 75)))}"
+    attrs["llr:ParametricShadows"] = f"{round(_num(parametric, 'shadows'))}"
+    attrs["llr:ParametricDarks"] = f"{round(_num(parametric, 'darks'))}"
+    attrs["llr:ParametricLights"] = f"{round(_num(parametric, 'lights'))}"
+    attrs["llr:ParametricHighlights"] = f"{round(_num(parametric, 'highlights'))}"
+    attrs["llr:ParametricShadowSplit"] = f"{round(_num(parametric, 'shadowSplit', 25))}"
+    attrs["llr:ParametricMidtoneSplit"] = f"{round(_num(parametric, 'midtoneSplit', 50))}"
+    attrs["llr:ParametricHighlightSplit"] = f"{round(_num(parametric, 'highlightSplit', 75))}"
 
     # HSL: 8 channels (red→magenta), comma-joined in channel order.
     def joined(values: Any) -> str:
-        return ",".join(f"{int(round(float(v)))}" for v in (values or []))
+        return ",".join(f"{round(float(v))}" for v in (values or []))
 
     for key, name in (("hslHue", "HslHue"), ("hslSat", "HslSaturation"), ("hslLum", "HslLuminance")):
         if settings.get(key):
@@ -576,16 +568,16 @@ def build_llr_attrs(settings: dict[str, Any]) -> "OrderedDict[str, str]":
     grading = settings.get("grading", {}) or {}
 
     def hue360(value: float) -> int:
-        return int(round(((value % 360) + 360) % 360))
+        return round(((value % 360) + 360) % 360)
 
     attrs["llr:GradingShadowHue"] = f"{hue360(_num(grading, 'shH'))}"
-    attrs["llr:GradingShadowSaturation"] = f"{int(round(_num(grading, 'shS')))}"
+    attrs["llr:GradingShadowSaturation"] = f"{round(_num(grading, 'shS'))}"
     attrs["llr:GradingMidtoneHue"] = f"{hue360(_num(grading, 'mdH'))}"
-    attrs["llr:GradingMidtoneSaturation"] = f"{int(round(_num(grading, 'mdS')))}"
+    attrs["llr:GradingMidtoneSaturation"] = f"{round(_num(grading, 'mdS'))}"
     attrs["llr:GradingHighlightHue"] = f"{hue360(_num(grading, 'hlH'))}"
-    attrs["llr:GradingHighlightSaturation"] = f"{int(round(_num(grading, 'hlS')))}"
-    attrs["llr:GradingBlend"] = f"{int(round(_num(grading, 'blend', 50)))}"
-    attrs["llr:GradingBalance"] = f"{int(round(_num(grading, 'balance')))}"
+    attrs["llr:GradingHighlightSaturation"] = f"{round(_num(grading, 'hlS'))}"
+    attrs["llr:GradingBlend"] = f"{round(_num(grading, 'blend', 50))}"
+    attrs["llr:GradingBalance"] = f"{round(_num(grading, 'balance'))}"
 
     dcp = settings.get("dcp")
     if dcp:
@@ -593,13 +585,13 @@ def build_llr_attrs(settings: dict[str, Any]) -> "OrderedDict[str, str]":
     denoise = settings.get("denoise") or {}
     if denoise.get("enabled"):
         attrs["llr:DenoiseModel"] = str(denoise.get("model", ""))
-        attrs["llr:DenoiseAmount"] = f"{int(round(_num(denoise, 'amount', 100)))}"
+        attrs["llr:DenoiseAmount"] = f"{round(_num(denoise, 'amount', 100))}"
 
     _add_crop_attrs(attrs, settings.get("crop") or {})
     return attrs
 
 
-def _add_crop_attrs(attrs: "OrderedDict[str, str]", crop: dict[str, Any]) -> None:
+def _add_crop_attrs(attrs: OrderedDict[str, str], crop: dict[str, Any]) -> None:
     """Crop/recompose fields, written only when the crop has an effect.
 
     The exported JPEG is already cropped/straightened in pixels; these record
@@ -850,7 +842,7 @@ def _raw_cache_key(
         base = (str(input_path), bool(half_size), int(max_size or 0), stat.st_size, int(stat.st_mtime_ns))
     except OSError:
         base = (str(input_path), bool(half_size), int(max_size or 0))
-    return base + (denoise_model or "",)
+    return (*base, denoise_model or "")
 
 
 def prepare_linear(
@@ -970,8 +962,8 @@ def downsample_linear(linear: np.ndarray, max_size: int) -> np.ndarray:
     if long_edge <= max_size:
         return linear
     scale = max_size / float(long_edge)
-    new_w = max(1, int(round(width * scale)))
-    new_h = max(1, int(round(height * scale)))
+    new_w = max(1, round(width * scale))
+    new_h = max(1, round(height * scale))
     channels = linear.shape[2]
     out = np.empty((new_h, new_w, channels), dtype=np.float32)
     for channel in range(channels):
@@ -1044,10 +1036,10 @@ def apply_camera_crop(
     ah, aw = arr.shape[:2]
     sx = aw / fw
     sy = ah / fh
-    x0 = min(max(int(round(x * sx)), 0), aw - 1)
-    y0 = min(max(int(round(y * sy)), 0), ah - 1)
-    x1 = min(max(int(round((x + w) * sx)), x0 + 1), aw)
-    y1 = min(max(int(round((y + h) * sy)), y0 + 1), ah)
+    x0 = min(max(round(x * sx), 0), aw - 1)
+    y0 = min(max(round(y * sy), 0), ah - 1)
+    x1 = min(max(round((x + w) * sx), x0 + 1), aw)
+    y1 = min(max(round((y + h) * sy), y0 + 1), ah)
     if x0 == 0 and y0 == 0 and x1 == aw and y1 == ah:
         return arr
     return np.ascontiguousarray(arr[y0:y1, x0:x1])
@@ -1323,7 +1315,7 @@ def save_jpeg(image: Image.Image, output_path: Path, quality: int) -> None:
 
 
 def run_capture(command: list[str], env: dict[str, str] | None = None) -> str:
-    result = subprocess.run(command, check=True, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result = subprocess.run(command, check=True, env=env, text=True, capture_output=True)
     return result.stdout
 
 

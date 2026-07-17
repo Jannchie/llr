@@ -95,16 +95,16 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
 
   // Remove the server-side cached copy of an import. Only ever touches
   // tmp/sessions — the user's original file never enters this system.
-  const sourceMatch = pathname.match(SOURCE_ROUTE);
-  if (method === "DELETE" && sourceMatch) {
-    await rm(sessionDirFor(sourceMatch[1]), { recursive: true, force: true });
+  const sourceId = pathname.match(SOURCE_ROUTE)?.[1];
+  if (method === "DELETE" && sourceId) {
+    await rm(sessionDirFor(sourceId), { recursive: true, force: true });
     sendJson(response, { ok: true });
     return;
   }
 
-  const embeddedMatch = pathname.match(EMBEDDED_ROUTE);
-  if (method === "GET" && embeddedMatch) {
-    streamFile(response, resolve(sessionDirFor(embeddedMatch[1]), "embedded.jpg"));
+  const embeddedId = pathname.match(EMBEDDED_ROUTE)?.[1];
+  if (method === "GET" && embeddedId) {
+    streamFile(response, resolve(sessionDirFor(embeddedId), "embedded.jpg"));
     return;
   }
 

@@ -1,6 +1,7 @@
 # LLR
 
-LLR is a pnpm monorepo for a Lightroom-like RAW editor.
+LLR is a pnpm monorepo for a Lightroom-like RAW editor. See
+[ARCHITECTURE.md](ARCHITECTURE.md) for how the three apps fit together.
 
 The editing loop:
 
@@ -34,6 +35,9 @@ pnpm dev:web
 pnpm worker -- extract-preview ./samples/photo.ARW ./tmp/embedded.jpg
 pnpm worker -- preview ./samples/photo.ARW ./tmp/photo.jpg
 ```
+
+`samples/` is gitignored — drop your own RAW files there (the commands above
+assume a `./samples/photo.ARW` you provide).
 
 Camera color: rawpy uses the camera white balance and camera color data from
 LibRaw. The Standard profile auto-selects a local DCP from the RAW metadata,

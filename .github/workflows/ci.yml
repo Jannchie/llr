@@ -7,7 +7,7 @@ on:
 
 jobs:
   web:
-    name: TypeScript (check + test + lint)
+    name: TypeScript (check + test + build + lint)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,14 +19,18 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm -r check
       - run: pnpm -r test
+      - run: pnpm -r build
       - run: pnpm exec eslint .
 
   worker:
-    name: Python worker (compile + lint)
+    name: Python worker (test + lint)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
       - run: uv sync --project apps/worker
       - run: uv run --project apps/worker python -m compileall -q apps/worker/src
-      - run: uv run --project apps/worker ruff check apps/worker/src
+      - run: uv run --project apps/worker pytest -q apps/worker/tests
+      - run: uv run --project apps/worker ruff check apps/worker
