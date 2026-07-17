@@ -930,39 +930,51 @@ async function exportImage(): Promise<void> {
   exporting.value = true;
   errorMessage.value = null;
   status.value = "rendering";
+  // Freeze the edit state up front: the full-res decode below takes seconds and
+  // the filmstrip stays clickable, so everything past an await must read these
+  // captures — the live reactive state may already belong to another image.
+  const sourceId = currentSourceId;
+  const filename = exportFilename();
+  const settings = captureSnapshot();
+  const cropSnap = settings.crop; // captureSnapshot clones the crop
+  const aspect = cropAspect.value;
+  const params = buildPipelineParams();
+  const curveLUT = buildToneCurveLUT(toneCurve.value, currentBasic());
+  const denoiseReq = denoisePayload();
   let renderer: PipelineRenderer | null = null;
   try {
     // 1. Decode full-resolution linear data (no half-size / no max-size cap)
-    const lin = await fetchLinear({ sourceId: currentSourceId, halfSize: false, maxSize: 0, dcpCode: dcpCode.value, denoise: denoisePayload() });
+    const lin = await fetchLinear({ sourceId, halfSize: false, maxSize: 0, dcpCode: settings.dcp, denoise: denoiseReq });
     if (!lin) throw new Error("Source is no longer available server-side");
     const { meta: linMeta, pixels: linear } = lin;
 
-    // 2. Render full-res off-screen with the current edit params + crop, read back as JPEG
+    // 2. Render full-res off-screen with the captured edit params + crop, read back as JPEG
     renderer = new PipelineRenderer(document.createElement("canvas"));
     renderer.uploadImage(linear, linMeta.width, linMeta.height);
-    renderer.uploadCurveLUT(buildToneCurveLUT(toneCurve.value, currentBasic()));
+    renderer.uploadCurveLUT(curveLUT);
     renderer.uploadProfileCurveLUT(buildProfileLUT(linMeta.colorProfile));
-    const [iw, ih] = imageDims(linMeta.width, linMeta.height, crop.orientation);
-    const rect = cropOutputRect(crop, iw, ih);
+    const [iw, ih] = imageDims(linMeta.width, linMeta.height, cropSnap.orientation);
+    const rect = cropOutputRect(cropSnap, iw, ih);
     // Snap the output dims to the locked aspect so e.g. a 4:3 crop exports at
     // an exact 4:3 pixel size instead of each axis rounding independently.
-    const fraction = resolveAspectFraction(cropAspect.value, linMeta.width, linMeta.height, crop);
-    const [ow, oh] = cropOutputSizeForAspect(crop, linMeta.width, linMeta.height, fraction);
-    renderer.setOutput(ow, oh, buildCropTransform(crop, linMeta.width, linMeta.height, rect), WORKSPACE_BG);
-    renderer.draw(buildPipelineParams());
+    const fraction = resolveAspectFraction(aspect, linMeta.width, linMeta.height, cropSnap);
+    const [ow, oh] = cropOutputSizeForAspect(cropSnap, linMeta.width, linMeta.height, fraction);
+    renderer.setOutput(ow, oh, buildCropTransform(cropSnap, linMeta.width, linMeta.height, rect), WORKSPACE_BG);
+    renderer.draw(params);
     // quality 1.0 also disables the browser encoder's 4:2:0 chroma subsampling
     const blob = await renderer.toBlob("image/jpeg", 1.0);
 
     // 3. Embed edit settings (llr:* XMP + lossless LLR JSON) into the JPEG server-side
     const fd = new FormData();
     fd.append("file", blob, "export.jpg");
-    fd.append("meta", JSON.stringify({ sourceId: currentSourceId, settings: captureSnapshot() }));
+    fd.append("meta", JSON.stringify({ sourceId, settings }));
     const exRes = await fetch(`${API}/export`, { method: "POST", body: fd });
     if (!exRes.ok) throw new Error(await exRes.text());
 
     // 4. Download the finished file
-    downloadBlob(await exRes.blob(), exportFilename());
-    status.value = "idle";
+    downloadBlob(await exRes.blob(), filename);
+    // Don't stomp the status of a decode the user started mid-export.
+    if (status.value === "rendering") status.value = "idle";
   } catch (err) {
     status.value = "error";
     errorMessage.value = err instanceof Error ? err.message : String(err);
