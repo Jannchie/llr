@@ -379,7 +379,7 @@ const {
   persistNow, schedulePersist,
   thumbSrc, markInvalid,
   selectSource, removeSource,
-  restoreSession, loadThumbCache, uploadFiles,
+  restoreSession, loadThumbCache, releaseThumbs, uploadFiles,
 } = useLibrary<Snapshot, typeof viewSettings>({
   api: API,
   status, errorMessage, cropMode,
@@ -471,7 +471,14 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     if (stale()) return false;
     if (!canvasRef.value) return false;
     if (!webglRenderer) {
-      webglRenderer = new PipelineRenderer(canvasRef.value);
+      // WebGL2 missing is a whole-app condition, not a per-image decode error:
+      // surface the dedicated unsupported state instead of an error toast.
+      try {
+        webglRenderer = new PipelineRenderer(canvasRef.value);
+      } catch (err) {
+        webglUnsupported.value = true;
+        throw err;
+      }
       p3Supported.value = webglRenderer.p3Supported;
     }
     webglRenderer.uploadImage(linearFloat, linMeta.width, linMeta.height);
@@ -604,6 +611,9 @@ async function updateHistogram(): Promise<void> {
     if (canvas.height !== bh) canvas.height = bh;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     renderHistogram(ctx, w, h, bins);
+  } catch {
+    // Best-effort overlay: a failed read-back (context loss mid-frame) just
+    // leaves the previous histogram on screen instead of rejecting unhandled.
   } finally {
     histoBusy = false;
   }
@@ -659,6 +669,27 @@ function drawWebGL(): void {
 
 function startCompare(): void { if (activeSource.value && !cropMode.value) showOriginal.value = true; }
 function endCompare(): void { showOriginal.value = false; }
+
+// ── WebGL context loss ──
+//
+// A GPU reset, mobile tab backgrounding, or context-slot eviction kills every
+// GL object. preventDefault() opts into the browser's restorable path; on
+// restore the renderer is rebuilt from scratch and the active image reloaded
+// (deleting the dead handles via release() is a safe no-op on a lost context).
+const webglUnsupported = ref(false);
+
+function onContextLost(e: Event): void {
+  e.preventDefault();
+  destroyWebGL({ keepContext: true });
+  status.value = "error";
+  errorMessage.value = "Graphics context lost — recovering…";
+}
+
+function onContextRestored(): void {
+  errorMessage.value = null;
+  status.value = "idle";
+  if (currentSourceId) void loadSource(currentSourceId, { resetView: false });
+}
 
 // keepContext: release GL objects but keep the canvas's context usable, so the
 // persistent preview canvas can host a new renderer later (a canvas whose
@@ -872,9 +903,12 @@ onBeforeUnmount(() => {
   window.removeEventListener('keyup', onKeyUp);
   window.removeEventListener('beforeunload', persistOnUnload);
   document.removeEventListener('visibilitychange', persistOnHidden);
+  canvasRef.value?.removeEventListener('webglcontextlost', onContextLost);
+  canvasRef.value?.removeEventListener('webglcontextrestored', onContextRestored);
   resizeObs?.disconnect();
   histoResizeObs?.disconnect();
   histoResizeObs = null;
+  releaseThumbs();
   destroyWebGL();
 });
 
@@ -883,6 +917,8 @@ onMounted(async () => {
   window.addEventListener('keyup', onKeyUp);
   window.addEventListener('beforeunload', persistOnUnload);
   document.addEventListener('visibilitychange', persistOnHidden);
+  canvasRef.value?.addEventListener('webglcontextlost', onContextLost);
+  canvasRef.value?.addEventListener('webglcontextrestored', onContextRestored);
   resizeObs = new ResizeObserver(() => recomputeFit());
   if (viewportRef.value) resizeObs.observe(viewportRef.value);
 
@@ -1167,8 +1203,12 @@ const vWheelAdjust = {
         <img v-show="activeSource && !activeSource.invalid && !webglRenderer && status !== 'rendering'" class="preview" :style="{ transform: displayTransform }" :src="activeSource ? thumbSrc(activeSource) : ''" alt="preview" />
         <div v-if="activeSource?.invalid" class="invalid-state">
           <img v-if="activeSource && thumbSrc(activeSource)" :src="thumbSrc(activeSource)" :alt="activeSource.name" />
-          <p class="invalid-title">源文件已失效</p>
-          <p class="invalid-sub">服务器缓存可能已被清理，请重新导入这张图片</p>
+          <p class="invalid-title">Source file no longer available</p>
+          <p class="invalid-sub">The server cache may have been cleared — re-import this photo</p>
+        </div>
+        <div v-if="webglUnsupported" class="invalid-state">
+          <p class="invalid-title">WebGL2 unavailable</p>
+          <p class="invalid-sub">LLR renders entirely on the GPU — enable hardware acceleration or use a browser with WebGL2 support</p>
         </div>
       </div>
 
@@ -1407,7 +1447,7 @@ const vWheelAdjust = {
     <input ref="fileInput" type="file" accept=".arw,.dng,.cr2,.cr3,.nef,.raf,.rw2,.orf,.tif,.tiff,.jpg,.jpeg,.png" hidden multiple @change="onFileChange" />
     <transition name="fade"><div v-if="isDragging" class="drag-overlay">Drop to import</div></transition>
     <transition name="fade">
-      <div v-if="errorMessage && !activeSource?.invalid" class="error-toast" @click="errorMessage = null" title="点击关闭">
+      <div v-if="errorMessage && !activeSource?.invalid" class="error-toast" @click="errorMessage = null" title="Click to dismiss">
         {{ errorMessage }}
       </div>
     </transition>

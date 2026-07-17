@@ -114,7 +114,7 @@ export function useLibrary<S, V>(opts: {
     const s = sources.value.find(x => x.id === id);
     if (s) s.invalid = true;
     status.value = "error";
-    errorMessage.value = "源文件已失效（服务器缓存可能已被清理），请重新导入这张图片。";
+    errorMessage.value = "Source file no longer available (the server cache may have been cleared) — re-import this photo.";
   }
 
   // Point the live edit + pixels at `id` (does NOT save the outgoing edit).
@@ -193,6 +193,16 @@ export function useLibrary<S, V>(opts: {
     Object.assign(thumbs, await loadThumbs());
   }
 
+  // Revoke every thumbnail object URL (component teardown). removeSource
+  // already revokes per-image; this catches the rest so a long-lived page
+  // that mounts the app repeatedly doesn't accumulate blob references.
+  function releaseThumbs(): void {
+    for (const [id, url] of Object.entries(thumbs)) {
+      if (url.startsWith("blob:")) URL.revokeObjectURL(url);
+      delete thumbs[id];
+    }
+  }
+
   async function uploadFiles(files: File[]): Promise<void> {
     if (!files.length) return;
     status.value = "uploading";
@@ -239,6 +249,6 @@ export function useLibrary<S, V>(opts: {
     syncLiveToMap, loadEditFromMap, persistNow, schedulePersist,
     resolveUrl, thumbSrc, cacheThumb, markInvalid,
     activateSource, selectSource, removeSource,
-    restoreSession, loadThumbCache, uploadFiles,
+    restoreSession, loadThumbCache, releaseThumbs, uploadFiles,
   };
 }

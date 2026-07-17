@@ -32,12 +32,12 @@ defineEmits<{
             <span v-if="source.id === activeId && rendering" class="thumb-loading" aria-hidden="true">
               <span class="spinner" />
             </span>
-            <span v-if="source.invalid" class="film-badge" title="源文件已失效，请重新导入">失效</span>
+            <span v-if="source.invalid" class="film-badge" title="Source file no longer available — re-import it">Stale</span>
           </div>
           <span class="film-name">{{ source.name }}</span>
         </button>
-        <button type="button" class="film-remove" title="从库中移除（不影响磁盘上的原始文件）"
-          aria-label="从库中移除" @click="$emit('remove', source.id)">
+        <button type="button" class="film-remove" title="Remove from library (the original file on disk is untouched)"
+          aria-label="Remove from library" @click="$emit('remove', source.id)">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
             <path d="M6 6l12 12M18 6L6 18" />
           </svg>
