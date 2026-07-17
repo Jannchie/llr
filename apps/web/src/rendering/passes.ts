@@ -306,17 +306,23 @@ void main() {
   );
 
   // --- Color Grading (display-referred split-toning) ---
+  // Cascaded blending (each step is a convex mix), so overlapping region
+  // weights can never sum past 1 and spike brightness at extreme balance.
+  // The tint multiply is then luminance-renormalized: grading shifts color,
+  // not exposure — a naive multiply darkens by the tint's luma.
   if (u_grad_blend > 0.001) {
     float lg = ppLuma(c);
     float bal = u_grad_balance * 0.5;
-    float shW = clamp(1.0 - smoothstep(0.15 + bal, 0.45 + bal, lg), 0.0, 1.0);
-    float hlW = clamp(smoothstep(0.55 + bal, 0.85 + bal, lg), 0.0, 1.0);
-    float mdW = clamp(1.0 - shW - hlW, 0.0, 1.0);
-    vec3 shC = hsvToRgb(u_grad_sh_h, u_grad_sh_s);
-    vec3 mdC = hsvToRgb(u_grad_md_h, u_grad_md_s);
-    vec3 hlC = hsvToRgb(u_grad_hl_h, u_grad_hl_s);
-    vec3 tinted = c * shC * shW + c * mdC * mdW + c * hlC * hlW;
-    c = mix(c, tinted, u_grad_blend);
+    float shW = 1.0 - smoothstep(0.15 + bal, 0.45 + bal, lg);
+    float hlW = smoothstep(0.55 + bal, 0.85 + bal, lg);
+    float mdW = (1.0 - shW) * (1.0 - hlW);
+    vec3 t = c;
+    t = mix(t, t * hsvToRgb(u_grad_sh_h, u_grad_sh_s), shW);
+    t = mix(t, t * hsvToRgb(u_grad_hl_h, u_grad_hl_s), hlW);
+    t = mix(t, t * hsvToRgb(u_grad_md_h, u_grad_md_s), mdW);
+    float lt = ppLuma(t);
+    if (lt > 1e-6) t *= lg / lt;
+    c = max(mix(c, t, u_grad_blend), 0.0);
   }
 
   // ===== Display: ProPhoto -> target gamut -> compress -> encode =====
