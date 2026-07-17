@@ -6,7 +6,7 @@
  */
 
 import { MASK_BLUR_SHADER, MASK_DOWNSAMPLE_SHADER, MASK_VERTEX_SHADER, PASSES, VERTEX_SHADER } from "./passes";
-import { computeWbGain, PROPHOTO_Y } from "./color-spaces";
+import { computeWbMatrix } from "./color-spaces";
 import type { HistogramBins } from "./histogram";
 
 // Contrast and Blacks are not here: they are display-referred and baked into
@@ -724,10 +724,17 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     const gl = this.gl;
     const s = (n: string, v: number) => { const l = this.uniforms[n]; if (l) gl.uniform1f(l, v); };
     const i = (n: string, v: number) => { const l = this.uniforms[n]; if (l) gl.uniform1i(l, v); };
-    // White balance: relative temp/tint -> linear-ProPhoto gain (unit at 6500/0).
-    const wb = computeWbGain(p.temperature, p.tint);
-    const wbLoc = this.uniforms["u_wbGain"];
-    if (wbLoc) gl.uniform3f(wbLoc, wb[0], wb[1], wb[2]);
+    // White balance: relative temp/tint -> linear-ProPhoto Bradford adaptation
+    // matrix (identity at 6500/0). Row-major TS -> column-major GL.
+    const wb = computeWbMatrix(p.temperature, p.tint);
+    const wbLoc = this.uniforms["u_wbMatrix"];
+    if (wbLoc) {
+      gl.uniformMatrix3fv(wbLoc, false, [
+        wb[0][0], wb[1][0], wb[2][0],
+        wb[0][1], wb[1][1], wb[2][1],
+        wb[0][2], wb[1][2], wb[2][2],
+      ]);
+    }
     i("u_viewTransform", p.viewTransform);
     i("u_displayGamut", p.displayGamut);
     i("u_hasProfileCurve", this.hasProfileCurve ? 1 : 0);
@@ -746,13 +753,13 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
       || (p.hslL?.some((v) => v !== 0) ?? false);
     i("u_tonalActive", tonalActive ? 1 : 0);
     i("u_hslActive", hslActive ? 1 : 0);
-    // The blurred log-luma mask is static per image; WB and exposure reach it
-    // as an additive log2 shift (scalar WB luma gain + the linear part of
-    // exposure — the shoulder is ignored, which only makes the mask read
-    // slightly bright inside compressed highlights, softening a soft weight).
+    // The blurred log-luma mask is static per image; exposure reaches it as an
+    // additive log2 shift (the shoulder is ignored, which only makes the mask
+    // read slightly bright inside compressed highlights, softening a soft
+    // weight). The WB matrix is luminance-normalized, so it contributes no
+    // shift of its own.
     i("u_hasMask", this.maskTex ? 1 : 0);
-    const wbLuma = PROPHOTO_Y[0] * wb[0] + PROPHOTO_Y[1] * wb[1] + PROPHOTO_Y[2] * wb[2];
-    s("u_maskShift", Math.log2(Math.max(wbLuma, 1e-6)) + p.exposure - Math.log2(0.18));
+    s("u_maskShift", p.exposure - Math.log2(0.18));
     // HSL
     for (let band = 0; band < 8; band++) {
       s(`u_hsl_h[${band}]`, p.hslH?.[band] ?? 0);

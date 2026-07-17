@@ -30,7 +30,7 @@ precision highp float;
 in vec2 v_texCoord;
 out vec4 outColor;
 uniform sampler2D u_input;
-uniform vec3 u_wbGain;          // relative white-balance gain (linear ProPhoto)
+uniform mat3 u_wbMatrix;        // relative WB: Bradford adaptation in linear ProPhoto
 uniform float u_exposure;
 uniform float u_highlights;
 uniform float u_shadows;
@@ -164,16 +164,17 @@ void main() {
   // Input is scene-linear ProPhoto (D50). Edit here in wide-gamut scene-linear.
   vec3 c = max(texture(u_input, v_texCoord).rgb, 0.0);
 
-  // --- White Balance (relative gain, unit at temp=6500 / tint=0) ---
-  c *= u_wbGain;
+  // --- White Balance (Bradford adaptation, identity at temp=6500 / tint=0) ---
+  c = max(u_wbMatrix * c, 0.0);
 
-  // === Exposure (highlight-shouldered) + tonal region gains ===
+  // === Exposure (highlight-shouldered) + tonal region gains + Clarity ===
   // One log-luminance block, applied to RGB as a single hue-preserving ratio.
   // With everything at defaults the block is an identity multiply, so skip it.
   // The branch is on uniforms — coherent across every pixel, no divergence —
   // and it avoids a needless luma round-trip on untouched frames.
   // (Contrast and Blacks are display-referred and live in the curve LUT bake.)
-  if (u_exposure != 0.0 || u_tonalActive == 1) {
+  bool clarityLocal = (u_clarity != 0.0 && u_hasMask == 1);
+  if (u_exposure != 0.0 || u_tonalActive == 1 || clarityLocal) {
     float Y0 = max(ppLuma(c), 1e-6);
     float l = log2(Y0);
     // Exposure: mids move exactly +E; the stops added above EXPO_KNEE compress
@@ -361,7 +362,7 @@ export interface PassDef {
 export const PASSES: PassDef[] = [
   { name: "process", fsSource: PROCESS_SHADER, uniforms: [
     "u_texXform", "u_bgColor",
-    "u_wbGain", "u_exposure", "u_viewTransform", "u_displayGamut",
+    "u_wbMatrix", "u_exposure", "u_viewTransform", "u_displayGamut",
     "u_highlights", "u_shadows", "u_whites",
     "u_vibrance", "u_saturation", "u_clarity", "u_dehaze",
     "u_tonalActive", "u_hslActive", "u_maskShift", "u_hasMask",

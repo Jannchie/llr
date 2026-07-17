@@ -1,32 +1,59 @@
 import { describe, expect, it } from "vitest";
-import { computeWbGain, mulMat3, P3_Y, PROPHOTO_TO_P3, PROPHOTO_TO_SRGB, PROPHOTO_Y, REC709_Y } from "../color-spaces";
+import { computeWbMatrix, mulMat3, P3_Y, PROPHOTO_TO_P3, PROPHOTO_TO_SRGB, PROPHOTO_Y, REC709_Y } from "../color-spaces";
 
-describe("computeWbGain", () => {
-  it("is the unit gain at the 6500K / 0 reference", () => {
-    const g = computeWbGain(6500, 0);
-    expect(g[0]).toBeCloseTo(1, 6);
-    expect(g[1]).toBeCloseTo(1, 6);
-    expect(g[2]).toBeCloseTo(1, 6);
+const ppLuma = (v: readonly [number, number, number]): number =>
+  PROPHOTO_Y[0] * v[0] + PROPHOTO_Y[1] * v[1] + PROPHOTO_Y[2] * v[2];
+
+/** How the matrix moves white — the WB "gain" in the old diagonal sense. */
+const whiteGain = (temp: number, tint: number): [number, number, number] =>
+  mulMat3(computeWbMatrix(temp, tint), [1, 1, 1]);
+
+describe("computeWbMatrix", () => {
+  it("is the identity at the 6500K / 0 reference", () => {
+    const m = computeWbMatrix(6500, 0);
+    for (let r = 0; r < 3; r++) {
+      for (let cIdx = 0; cIdx < 3; cIdx++) {
+        expect(m[r][cIdx]).toBeCloseTo(r === cIdx ? 1 : 0, 6);
+      }
+    }
   });
 
-  it("higher temperature warms (more red, less blue), green stays normalised", () => {
-    const g = computeWbGain(9000, 0);
+  it("higher temperature warms (more red, less blue)", () => {
+    const g = whiteGain(9000, 0);
     expect(g[0]).toBeGreaterThan(1);
     expect(g[2]).toBeLessThan(1);
-    expect(g[1]).toBeCloseTo(1, 6);
   });
 
   it("lower temperature cools (less red, more blue)", () => {
-    const g = computeWbGain(4000, 0);
+    const g = whiteGain(4000, 0);
     expect(g[0]).toBeLessThan(1);
     expect(g[2]).toBeGreaterThan(1);
   });
 
-  it("positive tint shifts toward magenta (green gain drops)", () => {
-    const g = computeWbGain(6500, 50);
-    expect(g[1]).toBeLessThan(1);
-    expect(g[0]).toBeGreaterThan(g[1]);
-    expect(g[2]).toBeGreaterThan(g[1]);
+  it("positive tint renders magenta (green drops), negative renders green", () => {
+    const magenta = whiteGain(6500, 50);
+    expect(magenta[1]).toBeLessThan(1);
+    expect(magenta[0]).toBeGreaterThan(magenta[1]);
+    expect(magenta[2]).toBeGreaterThan(magenta[1]);
+    const green = whiteGain(6500, -50);
+    expect(green[1]).toBeGreaterThan(1);
+  });
+
+  it("preserves white's luminance across the temp and tint range", () => {
+    for (const [t, tn] of [[2500, 0], [4000, 0], [9000, 0], [20000, 0], [6500, 100], [6500, -100], [3200, 60]] as const) {
+      expect(ppLuma(whiteGain(t, tn))).toBeCloseTo(1, 6);
+    }
+  });
+
+  it("is continuous across the Planck/daylight cross-fade (3700–4300 K)", () => {
+    // Steps inside the cross-fade must stay within the loci's natural slope
+    // (~0.035 per 25 K at the blackbody end) — no jump where they meet.
+    let prev = whiteGain(3600, 0);
+    for (let k = 3625; k <= 4400; k += 25) {
+      const g = whiteGain(k, 0);
+      for (let i = 0; i < 3; i++) expect(Math.abs(g[i] - prev[i])).toBeLessThan(0.04);
+      prev = g;
+    }
   });
 });
 

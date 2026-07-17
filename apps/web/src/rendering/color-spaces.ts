@@ -87,7 +87,28 @@ export function mulMat3(m: Mat3, v: readonly [number, number, number]): [number,
   ];
 }
 
-// --- White balance (relative temp/tint -> linear-ProPhoto gain) ---
+/** Row-major A · B. */
+export function matMul3(a: Mat3, b: Mat3): Mat3 {
+  const row = (i: number): [number, number, number] => [
+    a[i][0] * b[0][0] + a[i][1] * b[1][0] + a[i][2] * b[2][0],
+    a[i][0] * b[0][1] + a[i][1] * b[1][1] + a[i][2] * b[2][1],
+    a[i][0] * b[0][2] + a[i][1] * b[1][2] + a[i][2] * b[2][2],
+  ];
+  return [row(0), row(1), row(2)];
+}
+
+/** Row-major matrix inverse (adjugate / determinant). */
+export function mat3Inverse(m: Mat3): Mat3 {
+  const [[a, b, c], [d, e, f], [g, h, i]] = m;
+  const A = e * i - f * h, B = c * h - b * i, C = b * f - c * e;
+  const D = f * g - d * i, E = a * i - c * g, F = c * d - a * f;
+  const G = d * h - e * g, H = b * g - a * h, I = a * e - b * d;
+  const det = a * A + b * D + c * G;
+  const s = 1 / det;
+  return [[A * s, B * s, C * s], [D * s, E * s, F * s], [G * s, H * s, I * s]];
+}
+
+// --- White balance (relative temp/tint -> linear-ProPhoto adaptation matrix) ---
 
 /** Planckian locus chromaticity (Kim et al. 2002), valid ~1667–25000 K. */
 function planckianXY(kelvin: number): [number, number] {
@@ -107,30 +128,106 @@ function planckianXY(kelvin: number): [number, number] {
   return [x, y];
 }
 
-const WB_REFERENCE_K = 6500;
+/** CIE daylight locus chromaticity, defined for 4000–25000 K. */
+function daylightXY(kelvin: number): [number, number] {
+  const t = Math.min(Math.max(kelvin, 4000), 25000);
+  const t2 = t * t;
+  const t3 = t2 * t;
+  const x = t <= 7000
+    ? -4.6070e9 / t3 + 2.9678e6 / t2 + 0.09911e3 / t + 0.244063
+    : -2.0064e9 / t3 + 1.9018e6 / t2 + 0.24748e3 / t + 0.237040;
+  return [x, -3 * x * x + 2.87 * x - 0.275];
+}
 
 /**
- * White-balance gain in linear ProPhoto. The backend already applied the camera
- * (as-shot) WB, so temp/tint are *relative* nudges: temperature == 6500 K and
- * tint == 0 yield unit gain (1,1,1). Higher temperature -> warmer (more red, less
- * blue), matching Lightroom's slider direction. von Kries-style ratio in ProPhoto;
- * an approximation (a few ΔE off Lightroom at temperature extremes), see the plan.
+ * The temperature slider's locus: Planck below 4000 K, the CIE daylight locus
+ * above — the scale Lightroom/DNG follow (D65 is a daylight white, not a
+ * 6500 K blackbody). Cross-faded over 3700–4300 K so the slider has no step
+ * where the loci diverge (Δx ≈ 0.002 at 4000 K).
  */
-export function computeWbGain(temperature: number, tint: number): [number, number, number] {
-  const toProPhoto = (xy: [number, number]): [number, number, number] => {
-    const [x, y] = xy;
-    const yy = Math.max(y, 1e-4);
-    return mulMat3(XYZ_D50_TO_PROPHOTO, [x / yy, 1, (1 - x - y) / yy]);
-  };
-  const ref = toProPhoto(planckianXY(WB_REFERENCE_K));
-  const tgt = toProPhoto(planckianXY(temperature));
-  // ref/tgt so a warmer (lower-x, higher-K is bluer) target *adds* warmth.
-  let gain: [number, number, number] = [ref[0] / tgt[0], ref[1] / tgt[1], ref[2] / tgt[2]];
-  const g = gain[1] || 1; // normalise on green to preserve overall brightness
-  gain = [gain[0] / g, 1, gain[2] / g];
-  // Tint: green<->magenta axis. tint > 0 = magenta (reduce green).
-  const t = (tint / 100) * 0.30;
-  return [gain[0] * (1 + t * 0.5), gain[1] * (1 - t), gain[2] * (1 + t * 0.5)];
+function locusXY(kelvin: number): [number, number] {
+  if (kelvin <= 3700) return planckianXY(kelvin);
+  if (kelvin >= 4300) return daylightXY(kelvin);
+  const w = (kelvin - 3700) / 600;
+  const p = planckianXY(kelvin);
+  const d = daylightXY(kelvin);
+  return [p[0] + (d[0] - p[0]) * w, p[1] + (d[1] - p[1]) * w];
+}
+
+// CIE 1960 uv — the space where tint is defined (DNG isotherms are normals to
+// the locus here, and the tint unit is a uv distance).
+function xyToUv(xy: readonly [number, number]): [number, number] {
+  const d = 12 * xy[1] - 2 * xy[0] + 3;
+  return [(4 * xy[0]) / d, (6 * xy[1]) / d];
+}
+function uvToXy(uv: readonly [number, number]): [number, number] {
+  const d = 2 * uv[0] - 8 * uv[1] + 4;
+  return [(3 * uv[0]) / d, (2 * uv[1]) / d];
+}
+
+/**
+ * Slider white point in xy: the locus point stepped along the isotherm (the
+ * locus normal in CIE 1960 uv). One tint unit = 1/3000 uv — DNG's kTintScale,
+ * so the slider shares Lightroom's scale. Positive tint models a *greener*
+ * assumed illuminant; the adaptation below then renders the image magenta,
+ * matching the slider label.
+ */
+function whitePointXY(kelvin: number, tint: number): [number, number] {
+  const uv = xyToUv(locusXY(kelvin));
+  // Locus tangent by central difference, normal = tangent rotated 90° onto
+  // the green (+v) side of the locus.
+  const lo = xyToUv(locusXY(kelvin * 0.99));
+  const hi = xyToUv(locusXY(kelvin * 1.01));
+  let nu = -(hi[1] - lo[1]);
+  let nv = hi[0] - lo[0];
+  const len = Math.hypot(nu, nv) || 1;
+  nu /= len; nv /= len;
+  if (nv < 0) { nu = -nu; nv = -nv; }
+  return uvToXy([uv[0] + (tint / 3000) * nu, uv[1] + (tint / 3000) * nv]);
+}
+
+// Bradford cone response (Lindbloom / DNG SDK MapWhiteMatrix).
+const BRADFORD: Mat3 = [
+  [0.8951, 0.2664, -0.1614],
+  [-0.7502, 1.7135, 0.0367],
+  [0.0389, -0.0685, 1.0296],
+];
+const BRADFORD_INV = mat3Inverse(BRADFORD);
+const PROPHOTO_TO_XYZ_D50 = mat3Inverse(XYZ_D50_TO_PROPHOTO);
+
+const WB_REFERENCE_K = 6500;
+
+function xyToXYZ(xy: readonly [number, number]): [number, number, number] {
+  const y = Math.max(xy[1], 1e-4);
+  return [xy[0] / y, 1, (1 - xy[0] - xy[1]) / y];
+}
+
+/**
+ * White-balance adaptation matrix in linear ProPhoto (row-major). The backend
+ * already applied the camera (as-shot) WB, so temp/tint are *relative* nudges:
+ * 6500 K / 0 is the identity. Bradford CAT from the slider's assumed white
+ * point back to the reference — a diagonal von Kries in Bradford cone space
+ * (not in ProPhoto primaries, which skews hue at the extremes) — normalized so
+ * white keeps its ProPhoto luminance: neither temperature nor tint drifts
+ * overall brightness.
+ */
+export function computeWbMatrix(temperature: number, tint: number): Mat3 {
+  const src = mulMat3(BRADFORD, xyToXYZ(whitePointXY(temperature, tint)));
+  const dst = mulMat3(BRADFORD, xyToXYZ(whitePointXY(WB_REFERENCE_K, 0)));
+  const scale: Mat3 = [
+    [dst[0] / src[0], 0, 0],
+    [0, dst[1] / src[1], 0],
+    [0, 0, dst[2] / src[2]],
+  ];
+  const cat = matMul3(BRADFORD_INV, matMul3(scale, BRADFORD));
+  const m = matMul3(XYZ_D50_TO_PROPHOTO, matMul3(cat, PROPHOTO_TO_XYZ_D50));
+  const w = mulMat3(m, [1, 1, 1]);
+  const k = 1 / Math.max(PROPHOTO_Y[0] * w[0] + PROPHOTO_Y[1] * w[1] + PROPHOTO_Y[2] * w[2], 1e-6);
+  return [
+    [m[0][0] * k, m[0][1] * k, m[0][2] * k],
+    [m[1][0] * k, m[1][1] * k, m[1][2] * k],
+    [m[2][0] * k, m[2][1] * k, m[2][2] * k],
+  ];
 }
 
 // --- GLSL emission (column-major literal so `NAME * v` == row-major M · v) ---
