@@ -6,8 +6,9 @@
   "type": "module",
   "scripts": {
     "build": "pnpm -r build",
-    "check": "pnpm -r check && pnpm -r test && pnpm lint && uv run --project apps/worker python -m compileall -q apps/worker/src",
-    "lint": "eslint . && uv run --project apps/worker ruff check apps/worker/src",
+    "check": "pnpm -r check && pnpm -r test && pnpm test:worker && pnpm lint && uv run --project apps/worker python -m compileall -q apps/worker/src",
+    "test:worker": "uv run --project apps/worker pytest -q apps/worker/tests",
+    "lint": "eslint . && uv run --project apps/worker ruff check apps/worker",
     "dev": "pnpm --parallel --filter @llr/api --filter @llr/web dev",
     "dev:api": "pnpm --filter @llr/api dev",
     "dev:web": "pnpm --filter @llr/web dev",
