@@ -72,48 +72,17 @@ _FALLBACK_CACHE: OrderedDict[tuple[Any, ...], tuple[np.ndarray, RawMetadata, dic
 _FALLBACK_CACHE_MAX = 6
 
 
-NEUTRAL_RECIPE: dict[str, Any] = {
-    "profileId": "neutral",
-    "autoTone": False,
-    "exposure": 0.0,
-    "contrast": 0.0,
-    "highlights": 0.0,
-    "shadows": 0.0,
-    "whites": 0.0,
-    "blacks": 0.0,
-    "vibrance": 0.0,
-    "saturation": 0.0,
-    "clarity": 0.0,
-    "dehaze": 0.0,
-    "sharpen": 0.0,
-    "toneCurve": [
-        {"x": 0.0, "y": 0.0},
-        {"x": 255.0, "y": 255.0},
-    ],
+# The worker only decodes; the browser owns every pixel operation, so a profile
+# carries no tone/sharpen values here. `profileId` gates the DCP lookup ("neutral"
+# means the libraw-matrix fallback) and daemon_linear layers `dcpCode` on top.
+PROFILES: dict[str, dict[str, Any]] = {
+    "neutral": {"profileId": "neutral"},
+    "standard": {"profileId": "standard"},
 }
 
-PROFILES: dict[str, dict[str, Any]] = {
-    "neutral": NEUTRAL_RECIPE,
-    "standard": {
-        **NEUTRAL_RECIPE,
-        "profileId": "standard",
-        "autoTone": False,
-        "exposure": 0.0,
-        "contrast": 0.0,
-        "highlights": 0.0,
-        "shadows": 0.0,
-        "vibrance": 0.0,
-        "saturation": 0.0,
-        "sharpen": 18.0,
-        "toneCurve": [
-            {"x": 0.0, "y": 0.0},
-            {"x": 32.0, "y": 22.0},
-            {"x": 128.0, "y": 130.0},
-            {"x": 224.0, "y": 236.0},
-            {"x": 255.0, "y": 255.0},
-        ],
-    },
-}
+
+class UnsupportedSourceError(ValueError):
+    """The input is not a format LibRaw can decode for editing."""
 
 
 def main() -> None:
@@ -208,6 +177,14 @@ DAEMON_MAX_WORKERS = 3
 
 _STDOUT_LOCK = threading.Lock()
 _CACHE_LOCK = threading.Lock()
+
+
+def _remember(cache: OrderedDict[Any, Any], key: Any, value: Any, cap: int) -> None:
+    """Insert into an LRU cache under the shared lock, evicting oldest past `cap`."""
+    with _CACHE_LOCK:
+        cache[key] = value
+        while len(cache) > cap:
+            cache.popitem(last=False)
 _SOURCE_LOCKS: dict[str, threading.Lock] = {}
 _SOURCE_LOCKS_GUARD = threading.Lock()
 
@@ -275,6 +252,7 @@ def handle_daemon_request(request: dict[str, Any], root: Path) -> dict[str, Any]
 
 def _linear_cache_key(
     input_path: Path,
+    profile_id: str,
     half_size: bool,
     max_size: int | None,
     dcp_code: str | None,
@@ -286,7 +264,7 @@ def _linear_cache_key(
         base = (str(input_path), st.st_size, int(st.st_mtime_ns))
     except OSError:
         base = (str(input_path),)
-    return (*base, bool(half_size), int(max_size or 0), dcp_code or "", denoise_model or "", round(float(denoise_amount), 3))
+    return (*base, profile_id, bool(half_size), int(max_size or 0), dcp_code or "", denoise_model or "", round(float(denoise_amount), 3))
 
 
 _LINEAR_CACHE: OrderedDict[tuple[Any, ...], tuple[np.ndarray, dict[str, Any]]] = OrderedDict()
@@ -329,7 +307,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
         dn_model = str(denoise_req.get("model") or DEFAULT_MODEL)
 
     # Check processed sRGB cache first
-    cache_key = _linear_cache_key(input_path, half_size, max_size, dcp_code, dn_model, dn_amount)
+    cache_key = _linear_cache_key(input_path, profile_id, half_size, max_size, dcp_code, dn_model, dn_amount)
     with _CACHE_LOCK:
         cached_linear = _LINEAR_CACHE.get(cache_key)
         if cached_linear is not None:
@@ -363,6 +341,11 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
             shared_raw = rawpy.imread(str(input_path))
         return shared_raw
 
+    # Same reasoning as the _LINEAR_CACHE gate below: a full-resolution export
+    # decode must not be pinned in any cache, so the intent is passed down to
+    # the decode caches rather than re-derived there.
+    store_cache = half_size or bool(max_size)
+
     try:
         if dn_model is not None and dn_amount >= 1.0:
             # Full-strength denoise: the noisy decode would be blended away
@@ -373,6 +356,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
                 half_size=half_size, max_size=max_size,
                 denoise_model=dn_model,
                 raw_provider=open_raw,
+                store_cache=store_cache,
             )
         else:
             prepared = prepare_linear(
@@ -380,6 +364,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
                 dcp_arg=None, disable_dcp=False,
                 half_size=half_size, max_size=max_size,
                 raw_provider=open_raw,
+                store_cache=store_cache,
             )
 
             # Blend the denoised decode over the noisy one by the requested amount. The
@@ -392,6 +377,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
                     half_size=half_size, max_size=max_size,
                     denoise_model=dn_model,
                     raw_provider=open_raw,
+                    store_cache=store_cache,
                 )
                 blended = prepared.linear * (1.0 - dn_amount) + prepared_dn.linear * dn_amount
                 prepared = PreparedLinear(
@@ -415,11 +401,8 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     # Skip caching full-resolution exports (half_size off and no max_size cap): a
     # single entry can be hundreds of MB and exports are one-off, so caching them
     # would pin gigabytes with no reuse. Previews (half/max-size capped) still cache.
-    if half_size or max_size:
-        with _CACHE_LOCK:
-            _LINEAR_CACHE[cache_key] = (linear_arr, prepared.color_profile)
-            while len(_LINEAR_CACHE) > _LINEAR_CACHE_MAX:
-                _LINEAR_CACHE.popitem(last=False)
+    if store_cache:
+        _remember(_LINEAR_CACHE, cache_key, (linear_arr, prepared.color_profile), _LINEAR_CACHE_MAX)
 
     bytes_written = _write_linear_f16(linear_arr, output_path)
 
@@ -485,9 +468,12 @@ def copy_exif_provenance(original: Path, target: Path, strip_private: bool = Fal
     Copies every writable tag group (EXIF, GPS, maker notes, IPTC, ...) so no
     shooting metadata is lost, then overrides the few tags that must describe
     the export itself: orientation/rotation is baked into the pixels, the EXIF
-    pixel dimensions are the export's, and Software identifies the renderer.
-    XMP is excluded because daemon_export injects LLR's own packet, and the
-    source ICC profile would mislabel the rendered (sRGB) colors.
+    pixel dimensions are the export's, the colorspace is the encode's (sRGB),
+    and Software identifies the renderer. XMP is excluded because daemon_export
+    injects LLR's own packet, and the source ICC profile would mislabel the
+    rendered (sRGB) colors. IFD1 is excluded because its embedded thumbnail
+    shows the original composition — file managers and gallery grids prefer it
+    over the real pixels, so a copied one shows the photo uncropped and unedited.
 
     With ``strip_private`` the privacy-sensitive tags (GPS location, serial
     numbers, owner name, maker notes) are excluded, so a shared export does
@@ -507,12 +493,14 @@ def copy_exif_provenance(original: Path, target: Path, strip_private: bool = Fal
                 "-all:all",
                 "--xmp:all",
                 "--icc_profile:all",
+                "--ifd1:all",
                 *(PRIVATE_TAG_EXCLUSIONS if strip_private else []),
                 "-tagsFromFile",
                 "@",
                 "-ExifImageWidth<ImageWidth",
                 "-ExifImageHeight<ImageHeight",
                 "-Orientation#=1",
+                "-ColorSpace#=1",
                 "-Software=LLR",
                 str(target),
             ],
@@ -858,6 +846,7 @@ def prepare_linear(
     max_size: int | None = None,
     denoise_model: str | None = None,
     raw_provider: Callable[[], rawpy.RawPy] | None = None,
+    store_cache: bool = True,
 ) -> PreparedLinear:
     """Decode RAW into linear working-space RGB (cached per variant).
 
@@ -866,7 +855,16 @@ def prepare_linear(
     re-unpacking the RAW per variant. The provider owns the handle's lifetime;
     it is only invoked on a cache miss. A denoise variant mutates the shared
     handle's Bayer data in place, so decode the noisy variant first.
+
+    `store_cache=False` decodes without populating the decode caches: a
+    full-resolution export is hundreds of MB and one-off, so caching it would
+    pin gigabytes with no reuse and evict the cheap preview entries.
     """
+    if not is_raw(input_path):
+        raise UnsupportedSourceError(
+            f"{input_path.suffix or input_path.name} is not a RAW format LLR can edit"
+        )
+
     cache_key = _raw_cache_key(input_path, half_size, max_size, denoise_model)
 
     # Cache hit: re-apply DCP on cached camera RGB without re-decoding RAW
@@ -905,56 +903,59 @@ def prepare_linear(
         # calls below demosaic the denoised data. Heavy, so it is cached via
         # cache_key (which includes denoise_model) like any other camera RGB.
         # Returns None (mosaic untouched) on non-2x2 CFAs such as Fuji X-Trans.
-        denoise_skipped = False
         if denoise_model:
-            denoise_skipped = denoise_raw_inplace(raw, get_denoiser(denoise_model)) is None
+            denoise_raw_inplace(raw, get_denoiser(denoise_model))
         dcp_profile, dcp_selection = resolve_dcp_profile(root, dcp_arg, disable_dcp, recipe, metadata)
         if dcp_profile is None:
             # Scene-referred fallback: deliver linear ProPhoto (D50) so the browser
             # edits in the same wide-gamut working space as the DCP path. LibRaw
             # still normalises the white level, so this path does not carry true
             # >1.0 highlight headroom (acceptable for a no-profile fallback).
-            linear = raw.postprocess(
-                use_camera_wb=True,
-                no_auto_bright=True,
-                output_color=rawpy.ColorSpace.ProPhoto,
-                gamma=(1, 1),
-                output_bps=16,
-                half_size=half_size,
-            ).astype(np.float32) / 65535.0
+            # np.divide with an explicit dtype scales straight from the uint16
+            # postprocess output into one float32 buffer; an .astype() first
+            # would leave a second full-resolution copy live.
+            linear = np.divide(
+                raw.postprocess(
+                    use_camera_wb=True,
+                    no_auto_bright=True,
+                    output_color=rawpy.ColorSpace.ProPhoto,
+                    gamma=(1, 1),
+                    output_bps=16,
+                    half_size=half_size,
+                ),
+                65535.0,
+                dtype=np.float32,
+            )
             linear = apply_camera_crop(linear, metadata.camera_crop)
             if max_size:
                 linear = downsample_linear(linear, max_size)
             color_profile = libraw_color_profile_info()
-            with _CACHE_LOCK:
-                _FALLBACK_CACHE[cache_key] = (linear, metadata, color_profile)
-                while len(_FALLBACK_CACHE) > _FALLBACK_CACHE_MAX:
-                    _FALLBACK_CACHE.popitem(last=False)
+            if store_cache:
+                _remember(_FALLBACK_CACHE, cache_key, (linear, metadata, color_profile), _FALLBACK_CACHE_MAX)
         else:
-            camera_rgb = raw.postprocess(
-                use_camera_wb=True,
-                no_auto_bright=True,
-                output_color=rawpy.ColorSpace.raw,
-                gamma=(1, 1),
-                output_bps=16,
-                half_size=half_size,
-            ).astype(np.float32) / 65535.0
+            camera_rgb = np.divide(
+                raw.postprocess(
+                    use_camera_wb=True,
+                    no_auto_bright=True,
+                    output_color=rawpy.ColorSpace.raw,
+                    gamma=(1, 1),
+                    output_bps=16,
+                    half_size=half_size,
+                ),
+                65535.0,
+                dtype=np.float32,
+            )
             camera_rgb = apply_camera_crop(camera_rgb, metadata.camera_crop)
             if camera_rgb.shape[-1] != 3:
                 raise ValueError("DCP rendering currently supports only three-channel camera RGB data")
             if max_size:
                 camera_rgb = downsample_linear(camera_rgb, max_size)
             # Cache camera RGB so DCP code changes skip RAW re-decode
-            with _CACHE_LOCK:
-                RAW_CAMERA_CACHE[cache_key] = (camera_rgb, metadata)
-                while len(RAW_CAMERA_CACHE) > RAW_CAMERA_CACHE_MAX:
-                    RAW_CAMERA_CACHE.popitem(last=False)
+            if store_cache:
+                _remember(RAW_CAMERA_CACHE, cache_key, (camera_rgb, metadata), RAW_CAMERA_CACHE_MAX)
             linear, dcp_info = apply_dcp_profile(camera_rgb, dcp_profile)
             color_profile = dcp_info.to_json()
             color_profile["selection"] = dcp_selection
-
-    if denoise_skipped:
-        color_profile["denoiseSkipped"] = True
 
     return PreparedLinear(linear=linear, metadata=metadata, color_profile=color_profile)
 
@@ -1136,22 +1137,6 @@ def exiftool_env() -> dict[str, str]:
     return env
 
 
-def metadata_to_json(metadata: RawMetadata | None) -> dict[str, Any] | None:
-    if metadata is None:
-        return None
-    return {
-        "make": metadata.make,
-        "model": metadata.model,
-        "lensModel": metadata.lens_model,
-        "creativeStyle": metadata.creative_style,
-        "whiteBalance": metadata.white_balance,
-        "cameraWhiteBalance": metadata.camera_white_balance,
-        "blackLevel": metadata.black_level,
-        "whiteLevel": metadata.white_level,
-        "rgbXyzMatrix": metadata.rgb_xyz_matrix,
-    }
-
-
 def resolve_dcp_profile(
     root: Path, dcp_arg: str | None, disable_dcp: bool, recipe: dict[str, Any], metadata: RawMetadata
 ) -> tuple[DcpProfile | None, dict[str, Any] | None]:
@@ -1290,10 +1275,6 @@ def normalize_profile_name(value: str | None) -> str:
     if value is None:
         return ""
     return "".join(char.lower() for char in value if char.isalnum())
-
-
-def is_dcp_color_profile(color_profile: dict[str, Any] | None) -> bool:
-    return bool(color_profile and color_profile.get("kind") == "dcp")
 
 
 def libraw_color_profile_info() -> dict[str, Any]:

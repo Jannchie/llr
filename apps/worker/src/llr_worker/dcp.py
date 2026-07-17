@@ -68,6 +68,22 @@ PROPHOTO_TO_XYZ_D50 = np.array(
 
 XYZ_D50_TO_PROPHOTO = np.linalg.inv(PROPHOTO_TO_XYZ_D50).astype(np.float32)
 
+# The working space's reference white, taken from the primaries themselves so a
+# neutral adapted to it lands on exactly R=G=B in linear ProPhoto.
+D50_WHITE_XYZ = PROPHOTO_TO_XYZ_D50.sum(axis=1).astype(np.float32)
+
+# Bradford cone response (Lindbloom), matching the CAT the web renderer uses.
+BRADFORD = np.array(
+    [
+        [0.8951, 0.2664, -0.1614],
+        [-0.7502, 1.7135, 0.0367],
+        [0.0389, -0.0685, 1.0296],
+    ],
+    dtype=np.float32,
+)
+
+BRADFORD_INV = np.linalg.inv(BRADFORD).astype(np.float32)
+
 ENCODING_LINEAR = 0
 ENCODING_SRGB = 1
 HSV_TABLE_CHUNK_PIXELS = 500_000
@@ -228,11 +244,34 @@ def camera_to_xyz_matrix(profile: DcpProfile) -> tuple[str, np.ndarray]:
         return "ForwardMatrix2", profile.forward_matrix_2.astype(np.float32)
 
     if profile.color_matrix_1 is not None:
-        return "inverse(ColorMatrix1)", np.linalg.inv(profile.color_matrix_1).astype(np.float32)
+        return "inverse(ColorMatrix1)", camera_to_xyz_d50_from_color_matrix(profile.color_matrix_1)
     if profile.color_matrix_2 is not None:
-        return "inverse(ColorMatrix2)", np.linalg.inv(profile.color_matrix_2).astype(np.float32)
+        return "inverse(ColorMatrix2)", camera_to_xyz_d50_from_color_matrix(profile.color_matrix_2)
 
     raise ValueError(f"{profile.path} does not contain a usable DCP color matrix")
+
+
+def camera_to_xyz_d50_from_color_matrix(color_matrix: np.ndarray) -> np.ndarray:
+    """DNG's camera -> XYZ(D50) construction for a profile carrying no ForwardMatrix.
+
+    ColorMatrix maps XYZ under the profile's calibration illuminant to camera
+    native, so inverse(ColorMatrix) lands on that illuminant's white rather than
+    D50 and renders every neutral with a cast. The camera RGB reaching us is
+    already white balanced (LibRaw's use_camera_wb), so the reference neutral is
+    (1, 1, 1); adapt the white it maps to onto D50. A ForwardMatrix's rows sum to
+    the D50 white by definition, so this puts both paths in the same space.
+    """
+    camera_to_xyz = np.linalg.inv(color_matrix).astype(np.float32)
+    neutral_xyz = camera_to_xyz @ np.ones(3, dtype=np.float32)
+    return (chromatic_adaptation_matrix(neutral_xyz, D50_WHITE_XYZ) @ camera_to_xyz).astype(np.float32)
+
+
+def chromatic_adaptation_matrix(source_white_xyz: np.ndarray, target_white_xyz: np.ndarray) -> np.ndarray:
+    """von Kries adaptation in Bradford cone space: source white -> target white."""
+    source_lms = BRADFORD @ np.asarray(source_white_xyz, dtype=np.float32)
+    target_lms = BRADFORD @ np.asarray(target_white_xyz, dtype=np.float32)
+    scale = np.diag(target_lms / source_lms)
+    return (BRADFORD_INV @ scale @ BRADFORD).astype(np.float32)
 
 
 def select_hue_sat_map(profile: DcpProfile) -> DcpHueSatMap | None:

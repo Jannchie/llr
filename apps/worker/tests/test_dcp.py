@@ -1,5 +1,6 @@
 """DCP TIFF parsing and the HueSatMap/LookTable sampling math."""
 
+import dataclasses
 import struct
 from pathlib import Path
 
@@ -7,14 +8,23 @@ import numpy as np
 import pytest
 
 from llr_worker.dcp import (
+    D50_WHITE_XYZ,
+    XYZ_D50_TO_PROPHOTO,
     DcpHueSatMap,
+    apply_dcp_profile,
     apply_hsv_table,
     camera_to_xyz_matrix,
+    chromatic_adaptation_matrix,
     hue_sat_map_from_tags,
     load_dcp_profile,
     read_tiff_tags,
     sample_hsv_table,
     tone_curve_from_tag,
+)
+
+VENDORED_DCP = (
+    Path(__file__).resolve().parents[3]
+    / "vendor/adobe-camera-profiles/Camera/Sony ILCE-7CM2/Sony ILCE-7CM2 Camera PT.dcp"
 )
 
 # ── Minimal DCP/TIFF writer (little- or big-endian, magic 0x4352) ──────────
@@ -115,7 +125,9 @@ def test_matrix_preference_order() -> None:
 
     name, matrix = camera_to_xyz_matrix(DcpProfile(**base))
     assert name == "inverse(ColorMatrix1)"
-    assert np.allclose(matrix, np.eye(3) * 0.5)
+    # inverse() of a grey-scaled ColorMatrix puts the neutral on white E, so the
+    # fallback's adaptation to D50 is what the matrix carries beyond the inverse.
+    assert np.allclose(matrix, chromatic_adaptation_matrix(np.full(3, 0.5), D50_WHITE_XYZ) * 0.5)
 
     fwd = np.array(FORWARD9, dtype=np.float32).reshape(3, 3)
     name, matrix = camera_to_xyz_matrix(DcpProfile(**{**base, "forward_matrix_1": fwd}))
@@ -124,6 +136,40 @@ def test_matrix_preference_order() -> None:
 
     with pytest.raises(ValueError, match="usable DCP color matrix"):
         camera_to_xyz_matrix(DcpProfile(**{**base, "color_matrix_1": None}))
+
+
+@pytest.mark.skipif(not VENDORED_DCP.exists(), reason="vendored camera profiles are not checked out")
+def test_color_matrix_fallback_keeps_a_neutral_neutral() -> None:
+    """Every vendored profile carries a ForwardMatrix, so only a user-supplied
+    profile dropped into vendor/adobe-camera-profiles/Camera/<model>/ reaches the
+    fallback — which is exactly why it needs pinning here."""
+    profile = load_dcp_profile(VENDORED_DCP)
+    assert profile.forward_matrix_1 is not None and profile.color_matrix_1 is not None
+    color_matrix_only = dataclasses.replace(profile, forward_matrix_1=None, forward_matrix_2=None)
+
+    neutral = np.full((1, 1, 3), 0.5, dtype=np.float32)
+    forward, _ = apply_dcp_profile(neutral, profile)
+    fallback, info = apply_dcp_profile(neutral, color_matrix_only)
+    assert info.matrix == "inverse(ColorMatrix1)"
+
+    # inverse(ColorMatrix1) without the D50 adaptation lands on the calibration
+    # illuminant's white: R/G ~ 2.25 and B/G ~ 2.0, a heavy magenta cast.
+    unadapted = neutral @ np.linalg.inv(profile.color_matrix_1).T @ XYZ_D50_TO_PROPHOTO.T
+    assert unadapted[0, 0, 0] / unadapted[0, 0, 1] > 2.0
+    assert unadapted[0, 0, 2] / unadapted[0, 0, 1] > 1.9
+
+    assert np.allclose(fallback, 0.5, atol=1e-4)
+    # Both paths must land in the same space, or preview colour would depend on
+    # which matrix a profile happens to ship.
+    assert np.allclose(fallback, forward, atol=1e-3)
+
+
+def test_chromatic_adaptation_maps_source_white_onto_target() -> None:
+    matrix = chromatic_adaptation_matrix(np.array([0.9, 1.0, 1.2]), D50_WHITE_XYZ)
+    assert np.allclose(matrix @ np.array([0.9, 1.0, 1.2]), D50_WHITE_XYZ, atol=1e-5)
+    assert np.allclose(chromatic_adaptation_matrix(D50_WHITE_XYZ, D50_WHITE_XYZ), np.eye(3), atol=1e-5)
+    # D50 is the working space's own white: it must be exactly grey in ProPhoto.
+    assert np.allclose(D50_WHITE_XYZ @ XYZ_D50_TO_PROPHOTO.T, 1.0, atol=1e-6)
 
 
 def test_tone_curve_is_sorted_and_padded_to_endpoints() -> None:
