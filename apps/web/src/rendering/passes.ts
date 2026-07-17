@@ -271,10 +271,24 @@ void main() {
   // ===== View transform: scene-linear -> display-referred ProPhoto [0,1] =====
   c = viewTransform(c);
 
-  // --- Tone Curve (basic + parametric + per-channel point curves, display-referred) ---
-  // Lightroom applies the tone curve per channel, so contrast also shifts
-  // saturation. The LUT bakes basic (Contrast/Blacks) -> parametric ->
-  // RGB master -> per-channel.
+  // --- Tone Curve (display-referred). LUT layout (curve.ts buildToneCurveLUT):
+  // .a = master stack (Basic Contrast/Blacks/Whites -> parametric -> RGB
+  // curve), .r/.g/.b = the per-channel point curves.
+  //
+  // The master stack applies film-like (Adobe's RGBTone): the max and min
+  // channels go through the curve and the middle channel is re-interpolated at
+  // its original relative position between them. Saturation still rises with
+  // contrast, but the RGB-HSV hue is held exactly — a per-channel application
+  // skews hue (orange drifts yellow under an S-curve). The R/G/B point curves
+  // then apply per channel: crosstalk is their purpose.
+  c = clamp(c, 0.0, 1.0);
+  float cvMax = max(c.r, max(c.g, c.b));
+  float cvMin = min(c.r, min(c.g, c.b));
+  float cvMax2 = texture(u_curve_lut, vec2(lutCoord(cvMax), 0.5)).a;
+  float cvMin2 = texture(u_curve_lut, vec2(lutCoord(cvMin), 0.5)).a;
+  c = (cvMax - cvMin > 1e-6)
+    ? cvMin2 + (cvMax2 - cvMin2) * (c - cvMin) / (cvMax - cvMin)
+    : vec3(cvMax2);
   c = clamp(c, 0.0, 1.0);
   c = vec3(
     texture(u_curve_lut, vec2(lutCoord(c.r), 0.5)).r,

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   basicCurve, buildToneCurveLUT, curveToLUT, defaultParametric, defaultToneCurve,
-  parametricToLUT, srgbDecode, srgbEncode, type CurvePoint,
+  normalizeToneCurve, parametricToLUT, srgbDecode, srgbEncode, type CurvePoint,
 } from "../curve";
 
 const LUT_SIZE = 2048;
@@ -106,22 +106,47 @@ describe("basicCurve", () => {
 });
 
 describe("buildToneCurveLUT", () => {
-  it("defaults produce an identity RGB LUT", () => {
+  it("defaults produce an identity RGBA LUT", () => {
     const lut = buildToneCurveLUT(defaultToneCurve());
-    // Entry i holds the output for input i/(LUT_SIZE-1).
+    // Entry i holds the output for input i/(LUT_SIZE-1); .a is the master
+    // stack, .rgb the per-channel point curves.
     for (const i of [0, 512, 1024, 1536, LUT_SIZE - 1]) {
       const x = i / (LUT_SIZE - 1);
-      expect(lut[i * 3 + 0]).toBeCloseTo(x, 4);
-      expect(lut[i * 3 + 1]).toBeCloseTo(x, 4);
-      expect(lut[i * 3 + 2]).toBeCloseTo(x, 4);
+      for (let ch = 0; ch < 4; ch++) expect(lut[i * 4 + ch]).toBeCloseTo(x, 4);
     }
   });
 
-  it("bakes Basic contrast into every channel", () => {
+  it("bakes Basic contrast into the master channel only", () => {
     const lut = buildToneCurveLUT(defaultToneCurve(), { contrast: 100, blacks: 0, whites: 0 });
     const dark = srgbDecode(0.2);
     const i = Math.round(dark * (LUT_SIZE - 1));
-    expect(lut[i * 3]).toBeLessThan(dark);
+    expect(lut[i * 4 + 3]).toBeLessThan(dark);   // master: S-curve pushed darks down
+    expect(lut[i * 4 + 0]).toBeCloseTo(dark, 3); // point curves stay identity (LUT quantized)
+  });
+
+  it("keeps a per-channel point curve out of the master", () => {
+    const tc = { ...defaultToneCurve(), red: [{ x: 0, y: 0.2 }, { x: 1, y: 1 }] };
+    const lut = buildToneCurveLUT(tc);
+    expect(lut[0 * 4 + 0]).toBeCloseTo(0.2, 4); // red lifted
+    expect(lut[0 * 4 + 1]).toBeCloseTo(0, 4);   // green untouched
+    expect(lut[0 * 4 + 3]).toBeCloseTo(0, 4);   // master untouched
+  });
+});
+
+describe("normalizeToneCurve robustness", () => {
+  it("drops NaN points from corrupt persisted data instead of baking them", () => {
+    const tc = normalizeToneCurve({
+      rgb: [{ x: 0, y: 0 }, { x: NaN, y: 0.5 }, { x: 1, y: 1 }],
+    });
+    // The NaN point is filtered; the survivors keep the curve usable.
+    expect(tc.rgb).toHaveLength(2);
+    const lut = buildToneCurveLUT(tc);
+    for (let i = 0; i < lut.length; i++) expect(Number.isFinite(lut[i])).toBe(true);
+  });
+
+  it("falls back to the default curve when too few finite points survive", () => {
+    const tc = normalizeToneCurve({ rgb: [{ x: NaN, y: NaN }, { x: 1, y: 1 }] });
+    expect(tc.rgb).toEqual([{ x: 0, y: 0 }, { x: 1, y: 1 }]);
   });
 });
 

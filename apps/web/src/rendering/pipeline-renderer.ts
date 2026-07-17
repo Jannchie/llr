@@ -155,12 +155,13 @@ export class PipelineRenderer {
     // Upload identity LUTs as defaults (user tone curve + DCP profile curve).
     const identity = new Float32Array(2048);
     for (let i = 0; i < 2048; i++) identity[i] = i / 2047;
-    const identityRGB = new Float32Array(2048 * 3);
+    const identityRGBA = new Float32Array(2048 * 4);
     for (let i = 0; i < 2048; i++) {
       const v = i / 2047;
-      identityRGB[i * 3] = v; identityRGB[i * 3 + 1] = v; identityRGB[i * 3 + 2] = v;
+      identityRGBA[i * 4] = v; identityRGBA[i * 4 + 1] = v;
+      identityRGBA[i * 4 + 2] = v; identityRGBA[i * 4 + 3] = v;
     }
-    this.uploadCurveLUT(identityRGB);
+    this.uploadCurveLUT(identityRGBA);
     this.profileLutTex = this.makeLutTexture(identity);
 
     const info = gl.getExtension("WEBGL_debug_renderer_info");
@@ -296,13 +297,13 @@ export class PipelineRenderer {
     this.previewScale = Math.min(1, Math.max(0.05, scale));
   }
 
-  private makeLutTexture(lut: Float32Array, channels: 1 | 3 = 1): WebGLTexture {
+  private makeLutTexture(lut: Float32Array, channels: 1 | 4 = 1): WebGLTexture {
     const gl = this.gl;
     const tex = gl.createTexture()!;
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
-    if (channels === 3) {
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB32F, 2048, 1, 0, gl.RGB, gl.FLOAT, lut);
+    if (channels === 4) {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 2048, 1, 0, gl.RGBA, gl.FLOAT, lut);
     } else {
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, 2048, 1, 0, gl.RED, gl.FLOAT, lut);
     }
@@ -316,20 +317,21 @@ export class PipelineRenderer {
   }
 
   /**
-   * Upload an interleaved RGB tone-curve LUT (length 2048*3, per-channel).
-   * The texture is created once and updated in place (texSubImage2D): this is
-   * re-run every rAF while dragging Contrast/Blacks, so delete+create would
-   * churn a fresh GPU allocation per frame.
+   * Upload an interleaved RGBA tone-curve LUT (length 2048*4: per-channel
+   * point curves in .rgb, the film-like master stack in .a — see
+   * buildToneCurveLUT). The texture is created once and updated in place
+   * (texSubImage2D): this is re-run every rAF while dragging Contrast/Blacks,
+   * so delete+create would churn a fresh GPU allocation per frame.
    */
   uploadCurveLUT(lut: Float32Array): void {
     const gl = this.gl;
     if (!this.curveLutTex) {
-      this.curveLutTex = this.makeLutTexture(lut, 3);
+      this.curveLutTex = this.makeLutTexture(lut, 4);
       return;
     }
     gl.bindTexture(gl.TEXTURE_2D, this.curveLutTex);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 2048, 1, gl.RGB, gl.FLOAT, lut);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 2048, 1, gl.RGBA, gl.FLOAT, lut);
   }
 
   /**

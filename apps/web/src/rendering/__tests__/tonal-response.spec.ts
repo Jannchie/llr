@@ -172,15 +172,20 @@ describe("basic curve (display-referred contrast + blacks)", () => {
       expect(basicCurve(1, { contrast: cv, blacks: 0, whites: 0 })).toBeCloseTo(1, 9);
     }
   });
-  it("bakes into the LUT chain head", () => {
+  it("bakes into the LUT master channel (.a)", () => {
     const lut = buildToneCurveLUT(defaultToneCurve(), { contrast: 0, blacks: -100, whites: 0 });
     const crushed = srgbDecode(0.10); // below the 0.12 on-screen crush point
-    expect(lut[Math.round(crushed * 2047) * 3]).toBe(0);
-    expect(lut[2047 * 3]).toBeCloseTo(1, 5); // white pinned
+    expect(lut[Math.round(crushed * 2047) * 4 + 3]).toBe(0);
+    expect(lut[2047 * 4 + 3]).toBeCloseTo(1, 5); // white pinned
+    // Per-channel point curves stay identity — Basic never leaks into them.
+    for (const i of [0, 1024, 2047]) expect(lut[i * 4]).toBeCloseTo(i / 2047, 5);
   });
   it("the identity bake is unchanged by the gamma round-trip", () => {
     const lut = buildToneCurveLUT(defaultToneCurve(), { contrast: 0, blacks: 0, whites: 0 });
-    for (const i of [0, 512, 1024, 2047]) expect(lut[i * 3]).toBeCloseTo(i / 2047, 5);
+    for (const i of [0, 512, 1024, 2047]) {
+      expect(lut[i * 4]).toBeCloseTo(i / 2047, 5);
+      expect(lut[i * 4 + 3]).toBeCloseTo(i / 2047, 5);
+    }
   });
 });
 

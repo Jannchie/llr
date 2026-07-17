@@ -291,11 +291,15 @@ function sampleLUT(lut: Float32Array, x: number): number {
 }
 
 /**
- * Bake the full Lightroom curve stack into one interleaved RGB LUT
- * (length 2048*3). Each entry i holds the output for input i/(2047), per channel:
- *   out_c = pointChannel_c( pointRGB( parametric( basic( x ) ) ) )
- * `basic` is the Basic panel's display-referred stage (Contrast + Blacks),
- * applied ahead of the Tone Curve panel exactly as in Lightroom.
+ * Bake the full Lightroom curve stack into one interleaved RGBA LUT
+ * (length 2048*4). Entry i holds, for input i/2047:
+ *   .a       — the master stack: basic (Contrast/Blacks/Whites) → parametric
+ *              → RGB master curve. The shader applies it film-like (max/min
+ *              channels through the curve, middle channel re-interpolated), so
+ *              it must stay a single scalar curve rather than being pre-composed
+ *              per channel.
+ *   .r/.g/.b — the per-channel point curves, applied per channel after the
+ *              master (their input is the master's output).
  */
 export function buildToneCurveLUT(tc: ToneCurve, basic: BasicAdjust = DEFAULT_BASIC): Float32Array {
   const param = parametricToLUT(tc.parametric);
@@ -304,14 +308,14 @@ export function buildToneCurveLUT(tc: ToneCurve, basic: BasicAdjust = DEFAULT_BA
   const green = curveToLUT(tc.green);
   const blue = curveToLUT(tc.blue);
   const applyBasic = !isDefaultBasic(basic);
-  const out = new Float32Array(LUT_SIZE * 3);
+  const out = new Float32Array(LUT_SIZE * 4);
   for (let i = 0; i < LUT_SIZE; i++) {
     const x = i / (LUT_SIZE - 1);
     const xb = applyBasic ? basicCurve(x, basic) : x;
-    const master = sampleLUT(rgb, sampleLUT(param, xb));
-    out[i * 3 + 0] = sampleLUT(red, master);
-    out[i * 3 + 1] = sampleLUT(green, master);
-    out[i * 3 + 2] = sampleLUT(blue, master);
+    out[i * 4 + 0] = red[i];
+    out[i * 4 + 1] = green[i];
+    out[i * 4 + 2] = blue[i];
+    out[i * 4 + 3] = sampleLUT(rgb, sampleLUT(param, xb));
   }
   return out;
 }
