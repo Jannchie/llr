@@ -144,6 +144,14 @@ async function handleSourceUpload(request: IncomingMessage, response: ServerResp
   }, 201);
 }
 
+// Session ids are server-minted UUIDs; reject anything else before it reaches
+// resolve() — a traversal like "../x" or an absolute path would escape
+// sessionsRoot (and /export writes there). Same shape the GET/DELETE routes match.
+function sessionDirFor(sourceId: string): string {
+  if (!/^[\w-]+$/.test(sourceId)) throw new HttpError(400, "Invalid sourceId");
+  return resolve(sessionsRoot, sourceId);
+}
+
 async function handleRenderLinear(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const body = await readJson<{
     sourceId: string;
@@ -157,7 +165,7 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
     sendJson(response, { error: "Missing sourceId" }, 400);
     return;
   }
-  const sessionDir = resolve(sessionsRoot, body.sourceId);
+  const sessionDir = sessionDirFor(body.sourceId);
   const sourcePath = await findSource(sessionDir);
   if (!sourcePath) {
     sendJson(response, { error: "Unknown sourceId" }, 404);
@@ -235,7 +243,7 @@ async function handleExport(request: IncomingMessage, response: ServerResponse):
     return;
   }
 
-  const sessionDir = resolve(sessionsRoot, meta.sourceId);
+  const sessionDir = sessionDirFor(meta.sourceId);
   const sourcePath = await findSource(sessionDir);
   if (!sourcePath) {
     sendJson(response, { error: "Unknown sourceId" }, 404);
