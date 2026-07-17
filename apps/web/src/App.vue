@@ -339,7 +339,9 @@ function setEditState(s: Snapshot): void {
 function applySnapshot(s: Snapshot): void {
   isRestoring = true;
   setEditState(s); // setting dcpCode here may trigger a re-decode (intended for undo/redo)
-  scheduleWebGLDraw();
+  // Full re-render, not just a redraw: the snapshot may carry a different crop,
+  // and the crop watcher that would re-render it is suspended while isRestoring.
+  scheduleCropRender();
   nextTick(() => { isRestoring = false; });
 }
 
