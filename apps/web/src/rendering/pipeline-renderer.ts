@@ -6,6 +6,7 @@
  */
 
 import { MASK_BLUR_SHADER, MASK_DOWNSAMPLE_SHADER, MASK_VERTEX_SHADER, PASSES, VERTEX_SHADER } from "./passes";
+import { LENS_IDENTITY, LENS_KNOTS } from "./lens";
 import { computeWbMatrix } from "./color-spaces";
 import { LUT_SIZE, buildToneCurveLUT, defaultToneCurve } from "./curve";
 import { LOG2_MID } from "./tonal-model";
@@ -28,6 +29,10 @@ export interface EditParams {
   gradBlend: number; gradBalance: number;
   // View transform: 0 = Lightroom-style, 1 = AgX. Display gamut: 0 = sRGB, 1 = P3.
   viewTransform: number; displayGamut: number;
+  // Lens corrections: canonical 16-knot factor tables with the slider amounts
+  // already mixed in (all-1 = identity), plus the pincushion fill scale.
+  // Built in App.vue from colorProfile.lensCorr via lens.ts.
+  lensDist: number[]; lensVig: number[]; lensScale: number;
 }
 
 const HSL_ZERO = [0, 0, 0, 0, 0, 0, 0, 0];
@@ -71,6 +76,7 @@ export const DEFAULT_PARAMS: EditParams = {
   gradShTint: [1, 1, 1], gradMdTint: [1, 1, 1], gradHlTint: [1, 1, 1],
   gradBlend: 0, gradBalance: 0,
   viewTransform: 0, displayGamut: 0,
+  lensDist: [...LENS_IDENTITY], lensVig: [...LENS_IDENTITY], lensScale: 1,
 };
 
 export class PipelineRenderer {
@@ -834,6 +840,23 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     v3("u_grad_md_tint", p.gradMdTint ?? [1, 1, 1]);
     v3("u_grad_hl_tint", p.gradHlTint ?? [1, 1, 1]);
     s("u_grad_blend", p.gradBlend ?? 0); s("u_grad_balance", p.gradBalance ?? 0);
+    // Lens corrections: skip the per-knot uploads entirely at identity — the
+    // shader never reads the tables when u_lensActive is 0.
+    const lensActive = (p.lensDist?.some((v) => v !== 1) ?? false)
+      || (p.lensVig?.some((v) => v !== 1) ?? false);
+    i("u_lensActive", lensActive ? 1 : 0);
+    if (lensActive) {
+      for (let k = 0; k < LENS_KNOTS; k++) {
+        s(`u_lensDist[${k}]`, p.lensDist?.[k] ?? 1);
+        s(`u_lensVig[${k}]`, p.lensVig?.[k] ?? 1);
+      }
+      s("u_lensScale", p.lensScale ?? 1);
+      const normLoc = this.uniforms["u_lensNorm"];
+      if (normLoc) {
+        const diag = Math.hypot(this.texWidth, this.texHeight) || 1;
+        gl.uniform2f(normLoc, (2 * this.texWidth) / diag, (2 * this.texHeight) / diag);
+      }
+    }
   }
 
   private compileProgram(fsSource: string): WebGLProgram {

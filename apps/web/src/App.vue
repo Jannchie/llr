@@ -15,6 +15,7 @@ import {
 import { API, fetchLinear, type ColorProfileMeta } from "./api";
 import { type PersistedEdit } from "./persistence";
 import { gradingTint, gradingHueDeg } from "./rendering/grading";
+import { parseLensCorr, mixLensTable, lensFillScale, LENS_IDENTITY, type LensCorr } from "./rendering/lens";
 import { trackFill, formatBytes, clamp } from "./ui";
 import SliderRow from "./components/SliderRow.vue";
 import Filmstrip from "./components/Filmstrip.vue";
@@ -28,15 +29,19 @@ import { useExport, type ExportPlan } from "./composables/useExport";
 
 // ── types ──
 
-type RecipeKey = "exposure"|"contrast"|"highlights"|"shadows"|"whites"|"blacks"|"vibrance"|"saturation"|"temperature"|"tint"|"clarity"|"dehaze";
+type RecipeKey = "exposure"|"contrast"|"highlights"|"shadows"|"whites"|"blacks"|"vibrance"|"saturation"|"temperature"|"tint"|"clarity"|"dehaze"|"lensDistortion"|"lensVignetting";
 type Recipe = Record<RecipeKey, number>;
 type SliderSpec = { key: RecipeKey; label: string; min: number; max: number; step: number };
 type SliderGroup = { title: string; items: SliderSpec[] };
 
+// Lens corrections default to fully applied: the per-shot tables reproduce the
+// manufacturer's intended (in-camera / Lightroom-mandatory) rendering, and
+// without them mirrorless glass shows its raw distortion and falloff.
 const defaultRecipe = (): Recipe => ({
   exposure: 0, contrast: 0, highlights: 0, shadows: 0,
   whites: 0, blacks: 0, vibrance: 0, saturation: 0,
   temperature: 6500, tint: 0, clarity: 0, dehaze: 0,
+  lensDistortion: 100, lensVignetting: 100,
 });
 
 const groups: SliderGroup[] = [
@@ -57,6 +62,10 @@ const groups: SliderGroup[] = [
     { key: "tint", label: "Tint", min: -100, max: 100, step: 1 },
     { key: "vibrance", label: "Vibrance", min: -100, max: 100, step: 1 },
     { key: "saturation", label: "Saturation", min: -100, max: 100, step: 1 },
+  ]},
+  { title: "Lens Corrections", items: [
+    { key: "lensDistortion", label: "Distortion", min: 0, max: 100, step: 1 },
+    { key: "lensVignetting", label: "Vignetting", min: 0, max: 100, step: 1 },
   ]},
 ];
 
@@ -326,7 +335,9 @@ function captureSnapshot(): Snapshot {
 // Push a snapshot into the live reactive edit state (no draw scheduling — the
 // caller decides whether to redraw or re-decode).
 function setEditState(s: Snapshot): void {
-  Object.assign(recipe, s.recipe);
+  // Layer over defaults: snapshots persisted before a recipe key existed (e.g.
+  // the lens corrections) must reset it, not inherit the previous image's value.
+  Object.assign(recipe, defaultRecipe(), s.recipe);
   for (let i = 0; i < 8; i++) { hslHue[i] = s.hslHue[i]; hslSat[i] = s.hslSat[i]; hslLum[i] = s.hslLum[i]; }
   Object.assign(grading, s.grading);
   toneCurve.value = normalizeToneCurve(s.curve);
@@ -403,6 +414,7 @@ const {
   onEmptied: () => {
     currentSourceId = "";
     hasLinearData = false;
+    lensCorr = null;
     srcW.value = 0;
     srcH.value = 0;
     timing.value = null;
@@ -450,6 +462,7 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
 
     hasLinearData = true;
     profileCurveLUT = buildProfileLUT(linMeta.colorProfile);
+    lensCorr = parseLensCorr(linMeta.colorProfile?.lensCorr);
     srcW.value = linMeta.width;
     srcH.value = linMeta.height;
     srcFullW.value = linMeta.fullWidth ?? linMeta.width;
@@ -498,7 +511,12 @@ function buildPipelineParams(s?: Snapshot): Partial<EditParams> {
   const r = s?.recipe ?? recipe;
   const [hue, sat, lum] = s ? [s.hslHue, s.hslSat, s.hslLum] : [hslHue, hslSat, hslLum];
   const g = s?.grading ?? grading;
+  // Per-shot lens tables with the slider amounts mixed in. The fill scale
+  // tracks the mixed distortion so easing the slider eases the crop-in too.
+  const lensDist = lensCorr ? mixLensTable(lensCorr.distortion, (r.lensDistortion ?? 100) / 100) : [...LENS_IDENTITY];
+  const lensVig = lensCorr ? mixLensTable(lensCorr.vignetting, (r.lensVignetting ?? 100) / 100) : [...LENS_IDENTITY];
   return {
+    lensDist, lensVig, lensScale: lensFillScale(lensDist),
     exposure: r.exposure,
     saturation: 1 + r.saturation / 100,
     highlights: r.highlights / 100,
@@ -525,6 +543,10 @@ function buildPipelineParams(s?: Snapshot): Partial<EditParams> {
 // ── DCP profile tone curve (camera display rendering, applied in the view transform) ──
 
 let profileCurveLUT: Float32Array | null = null;
+
+// Per-image lens correction tables (canonical 16-knot grid), parsed from the
+// decode response in loadSource. null = the RAW carries no correction data.
+let lensCorr: LensCorr | null = null;
 
 function buildProfileLUT(cp: ColorProfileMeta | null | undefined): Float32Array | null {
   const pts = cp?.profileToneCurve;

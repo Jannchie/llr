@@ -90,6 +90,17 @@ uniform int u_hasProfileCurve;   // 1 if a DCP profile tone curve is available
 uniform int u_viewTransform;    // 0 = Lightroom-style, 1 = AgX
 uniform int u_displayGamut;     // 0 = sRGB, 1 = Display-P3
 uniform vec3 u_bgColor;         // display-encoded fill for areas outside the image (crop editor)
+// Lens corrections (per-shot radial tables from the RAW's metadata; lens.ts).
+// Both tables sit on knots (i+0.5)/15 in radius normalised to the source
+// half-diagonal. u_lensDist is the sampling factor toward the recorded frame
+// (corrected r fetches r*f), u_lensVig the linear-light gain at the recorded
+// radius. u_lensScale is the pincushion fill scale (lens.ts lensFillScale),
+// u_lensNorm = 2*(w,h)/diagonal so the frame corner lands at radius 1.
+uniform int u_lensActive;
+uniform float u_lensDist[16];
+uniform float u_lensVig[16];
+uniform float u_lensScale;
+uniform vec2 u_lensNorm;
 
 ${COLOR_GLSL}
 ${TONAL_GLSL}
@@ -164,6 +175,15 @@ const float GRAD_HL_EDGE1 = ${glslFloat(GRAD_HL_EDGE1)};
 const float GRAD_BAL_SPAN = ${glslFloat(GRAD_BAL_SPAN)};
 const float GRAD_RENORM_CAP = ${glslFloat(GRAD_RENORM_CAP)};
 
+// Evaluate a 16-knot lens table at normalised radius r. Knots at (i+0.5)/15;
+// outside the knot range clamp to the nearest knot (lens.ts lensInterp is the
+// tested TS mirror of this function).
+float lensInterp(float table[16], float r) {
+  float t = clamp(r * 15.0 - 0.5, 0.0, 15.0);
+  int i = int(min(t, 14.0));
+  return mix(table[i], table[i + 1], t - float(i));
+}
+
 void main() {
   // Outside the source image (rotated/straightened corners in the crop editor):
   // paint the workspace background instead of smearing edge texels.
@@ -172,8 +192,22 @@ void main() {
     return;
   }
 
+  // --- Lens corrections: radial distortion warp + vignette gain ---
+  // v_texCoord is full-source UV (post crop transform), so the warp is anchored
+  // to the optical centre regardless of crop. The vignette gain is indexed by
+  // the radius of the *fetched* (recorded-frame) position — vignetting is a
+  // property of the recorded pixel, not of where correction displays it.
+  vec2 lensUV = v_texCoord;
+  float lensGain = 1.0;
+  if (u_lensActive == 1) {
+    vec2 d = (v_texCoord - 0.5) * u_lensNorm * u_lensScale;
+    d *= lensInterp(u_lensDist, length(d));
+    lensGain = lensInterp(u_lensVig, length(d));
+    lensUV = 0.5 + d / u_lensNorm;
+  }
+
   // Input is scene-linear ProPhoto (D50). Edit here in wide-gamut scene-linear.
-  vec3 c = max(texture(u_input, v_texCoord).rgb, 0.0);
+  vec3 c = max(texture(u_input, lensUV).rgb, 0.0) * lensGain;
 
   // --- White Balance (Bradford adaptation, identity at temp=6500 / tint=0) ---
   c = max(u_wbMatrix * c, 0.0);
@@ -200,7 +234,7 @@ void main() {
       // exposure. Guarded by its consumers: an exposure-only edit must not
       // pay a per-pixel texture fetch it never reads.
       float maskLx = (u_hasMask == 1)
-        ? texture(u_mask_lum, v_texCoord).r + u_maskShift
+        ? texture(u_mask_lum, lensUV).r + u_maskShift   // mask lives in recorded-frame UV: track the lens warp
         : pixLx;
       if (u_tonalActive == 1) {
         // Highlights responds to a pixel that is bright itself OR sits in a
@@ -425,5 +459,8 @@ export const PASSES: PassDef[] = [
     "u_grad_sh_tint","u_grad_md_tint","u_grad_hl_tint",
     "u_grad_blend","u_grad_balance",
     "u_curve_lut", "u_curveActive", "u_hasProfileCurve",
+    "u_lensActive", "u_lensScale", "u_lensNorm",
+    ...Array.from({ length: 16 }, (_, k) => `u_lensDist[${k}]`),
+    ...Array.from({ length: 16 }, (_, k) => `u_lensVig[${k}]`),
   ]},
 ];

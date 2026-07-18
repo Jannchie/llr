@@ -49,6 +49,9 @@ class RawMetadata:
     # Camera-intended crop (DNG DefaultCropOrigin/Size) mapped into the
     # postprocess output frame: ((x, y, w, h), (frame_w, frame_h)), or None.
     camera_crop: tuple[tuple[int, int, int, int], tuple[int, int]] | None = None
+    # Per-shot lens correction splines from the RAW's maker notes, mapped to
+    # vendor-neutral factor tables (see sony_lens_corrections), or None.
+    lens_corr: dict[str, Any] | None = None
 
 
 @dataclass
@@ -393,6 +396,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     # the _LINEAR_CACHE-hit path above can report zoom relative to the original.
     prepared.color_profile["fullWidth"] = prepared.metadata.full_width
     prepared.color_profile["fullHeight"] = prepared.metadata.full_height
+    prepared.color_profile["lensCorr"] = prepared.metadata.lens_corr
 
     # Cache processed sRGB so switching back to this DCP code is instant. The
     # decode/DCP/downsample paths already yield C-contiguous float32, so this is a
@@ -536,6 +540,8 @@ def build_llr_attrs(settings: dict[str, Any]) -> OrderedDict[str, str]:
         attrs[f"llr:{name}"] = f"{round(_num(recipe, key))}"
     attrs["llr:Temperature"] = f"{round(_num(recipe, 'temperature', 6500))}"
     attrs["llr:Tint"] = f"{round(_num(recipe, 'tint'))}"
+    attrs["llr:LensDistortion"] = f"{round(_num(recipe, 'lensDistortion', 100))}"
+    attrs["llr:LensVignetting"] = f"{round(_num(recipe, 'lensVignetting', 100))}"
 
     # Parametric (region) tone curve.
     parametric = _curve_settings(settings).get("parametric", {}) or {}
@@ -1071,7 +1077,56 @@ def read_raw_metadata(input_path: Path, raw: rawpy.RawPy) -> RawMetadata:
         full_width=full_width,
         full_height=full_height,
         camera_crop=camera_crop,
+        lens_corr=sony_lens_corrections(exif),
     )
+
+
+def _exif_int_list(value: Any) -> list[int] | None:
+    # exiftool -j renders int16u arrays as a space-separated string.
+    if isinstance(value, str):
+        try:
+            return [int(token) for token in value.split()]
+        except ValueError:
+            return None
+    if isinstance(value, list):
+        try:
+            return [int(v) for v in value]
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def sony_lens_corrections(exif: dict[str, Any]) -> dict[str, Any] | None:
+    """Map Sony's per-shot correction splines (SubIFD DistortionCorrParams /
+    VignettingCorrParams / ChromaticAberrationCorrParams) to vendor-neutral
+    factor tables. Each array is `nc` followed by nc int16 knot values (CA: 2*nc,
+    R then B), knots evenly spaced in radius normalised to the frame's
+    half-diagonal: knots[i] = (i + 0.5) / (nc - 1). Fixed-point scales are the
+    community-documented ones (exiftool / darktable's reverse engineering):
+    distortion sampling factor p*2^-14 + 1 (corrected position -> distorted
+    source position), vignetting gain 1 / 2^(0.5 - 2^(p*2^-13 - 1)), lateral CA
+    per-channel radial factor p*2^-21 + 1.
+
+    The output frames these as "sample the recorded frame at factor*r and
+    multiply by gain(r)", which is exactly the form the WebGL sampler consumes.
+    """
+    dist = _exif_int_list(exif.get("DistortionCorrParams"))
+    vig = _exif_int_list(exif.get("VignettingCorrParams"))
+    ca = _exif_int_list(exif.get("ChromaticAberrationCorrParams"))
+    if not dist or not vig:
+        return None
+    nc = dist[0]
+    if nc < 2 or nc > 16 or len(dist) < nc + 1 or vig[0] != nc or len(vig) < nc + 1:
+        return None
+    out: dict[str, Any] = {
+        "knots": [(i + 0.5) / (nc - 1) for i in range(nc)],
+        "distortion": [dist[i + 1] * 2**-14 + 1 for i in range(nc)],
+        "vignetting": [1 / 2 ** (0.5 - 2 ** (vig[i + 1] * 2**-13 - 1)) for i in range(nc)],
+    }
+    if ca and ca[0] == 2 * nc and len(ca) >= 2 * nc + 1:
+        out["caR"] = [ca[i + 1] * 2**-21 + 1 for i in range(nc)]
+        out["caB"] = [ca[nc + i + 1] * 2**-21 + 1 for i in range(nc)]
+    return out
 
 
 def read_exiftool_metadata(input_path: Path) -> dict[str, Any]:
@@ -1104,6 +1159,9 @@ def _read_exiftool_metadata_cached(path: str, size: int, mtime_ns: int) -> dict[
                 "-WhiteBalance",
                 "-DefaultCropOrigin",
                 "-DefaultCropSize",
+                "-DistortionCorrParams",
+                "-VignettingCorrParams",
+                "-ChromaticAberrationCorrParams",
                 str(input_path),
             ],
             env=exiftool_env(),
@@ -1114,7 +1172,13 @@ def _read_exiftool_metadata_cached(path: str, size: int, mtime_ns: int) -> dict[
     records = json.loads(output)
     record = records[0] if records else {}
     out: dict[str, Any] = {key: string_or_none(record.get(key)) for key in ["Make", "Model", "LensModel", "CreativeStyle", "WhiteBalance"]}
-    for key in ["DefaultCropOrigin", "DefaultCropSize"]:
+    for key in [
+        "DefaultCropOrigin",
+        "DefaultCropSize",
+        "DistortionCorrParams",
+        "VignettingCorrParams",
+        "ChromaticAberrationCorrParams",
+    ]:
         out[key] = record.get(key)
     return out
 

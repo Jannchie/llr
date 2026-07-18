@@ -7,7 +7,12 @@ import type { LinearPixels } from "./rendering/pipeline-renderer";
 
 export const API = (import.meta.env.VITE_API_URL as string | undefined) ?? "/api";
 
-export type ColorProfileMeta = { profileToneCurve?: [number, number][] | null };
+export type ColorProfileMeta = {
+  profileToneCurve?: [number, number][] | null;
+  // Per-shot lens correction splines from the RAW's maker notes (vendor-neutral
+  // factor tables; see rendering/lens.ts parseLensCorr for the shape).
+  lensCorr?: unknown;
+};
 
 export type LinearMeta = {
   width: number; height: number; fullWidth: number | null; fullHeight: number | null;
