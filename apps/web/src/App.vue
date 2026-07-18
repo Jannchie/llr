@@ -14,7 +14,7 @@ import {
 } from "./rendering/crop";
 import { API, fetchLinear, type ColorProfileMeta } from "./api";
 import { type PersistedEdit } from "./persistence";
-import { gradingHueToTurns, gradingHueDeg } from "./rendering/grading";
+import { gradingTint, gradingHueDeg } from "./rendering/grading";
 import { trackFill, formatBytes, clamp } from "./ui";
 import SliderRow from "./components/SliderRow.vue";
 import Filmstrip from "./components/Filmstrip.vue";
@@ -501,9 +501,9 @@ function buildPipelineParams(s?: Snapshot): Partial<EditParams> {
     hslH: hue.map(v => v / 100),
     hslS: sat.map(v => v / 100),
     hslL: lum.map(v => v / 100),
-    gradShH: gradingHueToTurns(g.shH), gradShS: g.shS / 100,
-    gradMdH: gradingHueToTurns(g.mdH), gradMdS: g.mdS / 100,
-    gradHlH: gradingHueToTurns(g.hlH), gradHlS: g.hlS / 100,
+    gradShTint: gradingTint(g.shH, g.shS / 100),
+    gradMdTint: gradingTint(g.mdH, g.mdS / 100),
+    gradHlTint: gradingTint(g.hlH, g.hlS / 100),
     gradBlend: g.blend / 100,
     gradBalance: g.balance / 100,
     viewTransform: viewSettings.viewTransform,

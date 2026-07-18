@@ -64,5 +64,8 @@ describe("color grading balance", () => {
   it("shader and mirror share one definition of the block", () => {
     expect(PROCESS_SHADER).toContain("float bal = -u_grad_balance * GRAD_BAL_SPAN;");
     expect(PROCESS_SHADER).toContain(`const float GRAD_BAL_SPAN = ${GRAD_BAL_SPAN};`);
+    // The luminance renorm must stay capped: uncapped, saturated cool tints
+    // blow past the gamut map and the wheels read as warm-only (see grading.ts).
+    expect(PROCESS_SHADER).toContain("min(lg / lt, GRAD_RENORM_CAP)");
   });
 });

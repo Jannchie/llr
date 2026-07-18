@@ -23,6 +23,12 @@ export const GRAD_SH_EDGE1 = 0.45;
 export const GRAD_HL_EDGE0 = 0.55;
 export const GRAD_HL_EDGE1 = 0.85;
 export const GRAD_BAL_SPAN = Math.min(GRAD_SH_EDGE0, 1 - GRAD_HL_EDGE1);
+// Ceiling on the luminance-renorm gain (lg/lt) after the tint multiply. The
+// orange-yellow warm axis tops out around x2.7 and never hits it; saturated
+// cool tints would otherwise demand x14+ (sRGB blue's display luma is 0.0722)
+// and clip straight through the gamut map. Past the cap the wheel trades luma
+// for chroma; deep primaries (red/magenta) brush it only above ~S=75.
+export const GRAD_RENORM_CAP = 4;
 
 export const VERTEX_SHADER = `#version 300 es
 precision highp float;
@@ -66,13 +72,13 @@ uniform int u_hslActive;        // 1 if any HSL band adjustment is non-zero
 uniform float u_hsl_h[8];
 uniform float u_hsl_s[8];
 uniform float u_hsl_l[8];
-// Color Grading
-uniform float u_grad_sh_h;
-uniform float u_grad_sh_s;
-uniform float u_grad_md_h;
-uniform float u_grad_md_s;
-uniform float u_grad_hl_h;
-uniform float u_grad_hl_s;
+// Color Grading. Wheel tints arrive as linear-ProPhoto multipliers, built on
+// the CPU in grading.ts from the display-referred wheel colour (identity =
+// vec3(1) at S=0). Routing them through sRGB there is what keeps the luminance
+// renorm below sane — see grading.ts.
+uniform vec3 u_grad_sh_tint;
+uniform vec3 u_grad_md_tint;
+uniform vec3 u_grad_hl_tint;
 uniform float u_grad_blend;
 uniform float u_grad_balance;
 // Tone Curve LUT (LUT_SIZE×1 RGBA texture) — per-channel point + parametric
@@ -149,27 +155,14 @@ vec3 gamutMap(vec3 c, vec3 Yw) {
   return clamp(mix(vec3(l), c, s), 0.0, 1.0);
 }
 
-// --- Color Grading helper ---
+// --- Color Grading constants ---
 
 const float GRAD_SH_EDGE0 = ${glslFloat(GRAD_SH_EDGE0)};
 const float GRAD_SH_EDGE1 = ${glslFloat(GRAD_SH_EDGE1)};
 const float GRAD_HL_EDGE0 = ${glslFloat(GRAD_HL_EDGE0)};
 const float GRAD_HL_EDGE1 = ${glslFloat(GRAD_HL_EDGE1)};
 const float GRAD_BAL_SPAN = ${glslFloat(GRAD_BAL_SPAN)};
-
-vec3 hsvToRgb(float h, float s) {
-  h = fract(h) * 6.0;
-  float c = s;
-  float x = c * (1.0 - abs(mod(h, 2.0) - 1.0));
-  vec3 rgb;
-  if (h < 1.0)      rgb = vec3(c, x, 0.0);
-  else if (h < 2.0) rgb = vec3(x, c, 0.0);
-  else if (h < 3.0) rgb = vec3(0.0, c, x);
-  else if (h < 4.0) rgb = vec3(0.0, x, c);
-  else if (h < 5.0) rgb = vec3(x, 0.0, c);
-  else              rgb = vec3(c, 0.0, x);
-  return rgb + (1.0 - c);
-}
+const float GRAD_RENORM_CAP = ${glslFloat(GRAD_RENORM_CAP)};
 
 void main() {
   // Outside the source image (rotated/straightened corners in the crop editor):
@@ -343,11 +336,16 @@ void main() {
     float hlW = smoothstep(GRAD_HL_EDGE0 + bal, GRAD_HL_EDGE1 + bal, lg);
     float mdW = (1.0 - shW) * (1.0 - hlW);
     vec3 t = c;
-    t = mix(t, t * hsvToRgb(u_grad_sh_h, u_grad_sh_s), shW);
-    t = mix(t, t * hsvToRgb(u_grad_hl_h, u_grad_hl_s), hlW);
-    t = mix(t, t * hsvToRgb(u_grad_md_h, u_grad_md_s), mdW);
+    t = mix(t, t * u_grad_sh_tint, shW);
+    t = mix(t, t * u_grad_hl_tint, hlW);
+    t = mix(t, t * u_grad_md_tint, mdW);
+    // Renorm gain is capped: a saturated cool tint carries little luma, and an
+    // uncapped lg/lt boost just shoves the pixel out of gamut for the gamut map
+    // to desaturate — the slider would read as broken (more S, less colour).
+    // Past the cap, luma yields instead: deep blues darken, like film toning.
+    // The orange-yellow warm axis never reaches the cap.
     float lt = ppLuma(t);
-    if (lt > 1e-6) t *= lg / lt;
+    if (lt > 1e-6) t *= min(lg / lt, GRAD_RENORM_CAP);
     c = max(mix(c, t, u_grad_blend), 0.0);
   }
 
@@ -424,8 +422,8 @@ export const PASSES: PassDef[] = [
     "u_hsl_h[0]","u_hsl_h[1]","u_hsl_h[2]","u_hsl_h[3]","u_hsl_h[4]","u_hsl_h[5]","u_hsl_h[6]","u_hsl_h[7]",
     "u_hsl_s[0]","u_hsl_s[1]","u_hsl_s[2]","u_hsl_s[3]","u_hsl_s[4]","u_hsl_s[5]","u_hsl_s[6]","u_hsl_s[7]",
     "u_hsl_l[0]","u_hsl_l[1]","u_hsl_l[2]","u_hsl_l[3]","u_hsl_l[4]","u_hsl_l[5]","u_hsl_l[6]","u_hsl_l[7]",
-    "u_grad_sh_h","u_grad_sh_s","u_grad_md_h","u_grad_md_s",
-    "u_grad_hl_h","u_grad_hl_s","u_grad_blend","u_grad_balance",
+    "u_grad_sh_tint","u_grad_md_tint","u_grad_hl_tint",
+    "u_grad_blend","u_grad_balance",
     "u_curve_lut", "u_curveActive", "u_hasProfileCurve",
   ]},
 ];

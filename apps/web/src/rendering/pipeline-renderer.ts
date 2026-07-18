@@ -20,10 +20,11 @@ export interface EditParams {
   vibrance: number; clarity: number; dehaze: number;
   // HSL (8 ranges, each [-1, 1])
   hslH: number[]; hslS: number[]; hslL: number[];
-  // Color Grading (all [-1, 1] except blend [0, 1])
-  gradShH: number; gradShS: number;
-  gradMdH: number; gradMdS: number;
-  gradHlH: number; gradHlS: number;
+  // Color Grading: per-wheel linear-ProPhoto tint multipliers built by
+  // grading.ts gradingTint() ([1,1,1] = identity); blend [0,1], balance [-1,1].
+  gradShTint: [number, number, number];
+  gradMdTint: [number, number, number];
+  gradHlTint: [number, number, number];
   gradBlend: number; gradBalance: number;
   // View transform: 0 = Lightroom-style, 1 = AgX. Display gamut: 0 = sRGB, 1 = P3.
   viewTransform: number; displayGamut: number;
@@ -67,8 +68,8 @@ export const DEFAULT_PARAMS: EditParams = {
   highlights: 0, shadows: 0, whites: 0,
   vibrance: 1, clarity: 0, dehaze: 0,
   hslH: [...HSL_ZERO], hslS: [...HSL_ZERO], hslL: [...HSL_ZERO],
-  gradShH: 0, gradShS: 0, gradMdH: 0, gradMdS: 0,
-  gradHlH: 0, gradHlS: 0, gradBlend: 0, gradBalance: 0,
+  gradShTint: [1, 1, 1], gradMdTint: [1, 1, 1], gradHlTint: [1, 1, 1],
+  gradBlend: 0, gradBalance: 0,
   viewTransform: 0, displayGamut: 0,
 };
 
@@ -826,9 +827,12 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
       s(`u_hsl_l[${band}]`, p.hslL?.[band] ?? 0);
     }
     // Color Grading
-    s("u_grad_sh_h", p.gradShH ?? 0); s("u_grad_sh_s", p.gradShS ?? 0);
-    s("u_grad_md_h", p.gradMdH ?? 0); s("u_grad_md_s", p.gradMdS ?? 0);
-    s("u_grad_hl_h", p.gradHlH ?? 0); s("u_grad_hl_s", p.gradHlS ?? 0);
+    const v3 = (n: string, v: readonly [number, number, number]) => {
+      const l = this.uniforms[n]; if (l) gl.uniform3f(l, v[0], v[1], v[2]);
+    };
+    v3("u_grad_sh_tint", p.gradShTint ?? [1, 1, 1]);
+    v3("u_grad_md_tint", p.gradMdTint ?? [1, 1, 1]);
+    v3("u_grad_hl_tint", p.gradHlTint ?? [1, 1, 1]);
     s("u_grad_blend", p.gradBlend ?? 0); s("u_grad_balance", p.gradBalance ?? 0);
   }
 
