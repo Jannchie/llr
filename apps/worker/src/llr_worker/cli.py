@@ -541,7 +541,7 @@ def build_llr_attrs(settings: dict[str, Any]) -> OrderedDict[str, str]:
     attrs["llr:Temperature"] = f"{round(_num(recipe, 'temperature', 6500))}"
     attrs["llr:Tint"] = f"{round(_num(recipe, 'tint'))}"
     attrs["llr:LensDistortion"] = f"{round(_num(recipe, 'lensDistortion', 100))}"
-    attrs["llr:LensVignetting"] = f"{round(_num(recipe, 'lensVignetting', 100))}"
+    attrs["llr:LensVignetting"] = f"{round(_num(recipe, 'lensVignetting', 0))}"
 
     # Parametric (region) tone curve.
     parametric = _curve_settings(settings).get("parametric", {}) or {}

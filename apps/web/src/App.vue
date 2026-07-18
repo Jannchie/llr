@@ -34,14 +34,15 @@ type Recipe = Record<RecipeKey, number>;
 type SliderSpec = { key: RecipeKey; label: string; min: number; max: number; step: number };
 type SliderGroup = { title: string; items: SliderSpec[] };
 
-// Lens corrections default to fully applied: the per-shot tables reproduce the
-// manufacturer's intended (in-camera / Lightroom-mandatory) rendering, and
-// without them mirrorless glass shows its raw distortion and falloff.
+// Distortion correction defaults to fully applied (mirrorless glass is designed
+// around it — uncorrected geometry reads as broken). Vignetting stays off by
+// default: natural falloff is often part of the look, so brightening the
+// corners is an opt-in, not a baseline.
 const defaultRecipe = (): Recipe => ({
   exposure: 0, contrast: 0, highlights: 0, shadows: 0,
   whites: 0, blacks: 0, vibrance: 0, saturation: 0,
   temperature: 6500, tint: 0, clarity: 0, dehaze: 0,
-  lensDistortion: 100, lensVignetting: 100,
+  lensDistortion: 100, lensVignetting: 0,
 });
 
 const groups: SliderGroup[] = [
