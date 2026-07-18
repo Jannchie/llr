@@ -4,6 +4,8 @@
  * framing of /render-linear responses, and CORS origin checks.
  */
 
+import { isIP } from "node:net";
+
 // The one definition of a valid source id (server-minted UUIDs), shared by
 // the route patterns and sessionDirFor so they cannot drift apart.
 export const SOURCE_ID = String.raw`[\w-]+`;
@@ -67,8 +69,32 @@ export function buildLinearFrameHeader(meta: Record<string, unknown>): Buffer {
   return Buffer.concat([prefix, header]);
 }
 
+// Private address space, i.e. what a LAN client of the dev server can be:
+// loopback, RFC1918, link-local, and CGNAT (100.64/10, which Tailscale hands
+// out). Octet comparison, so 172.19.x is in but 172.32.x is out.
+function isPrivateIPv4(ip: string): boolean {
+  const [a, b] = ip.split(".").map(Number);
+  return (
+    a === 127 ||
+    a === 10 ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 169 && b === 254) ||
+    (a === 100 && b >= 64 && b <= 127)
+  );
+}
+
+// Vite binds 0.0.0.0 precisely so the app can be opened from another machine
+// (the Windows side of WSL, a phone on the LAN) by IP, and that page's origin
+// is the IP it was opened at. An IP-literal origin in private address space
+// can only be a page served from this network, so it gets the same trust as
+// localhost. DNS names stay rejected: a hostile page on the internet carries
+// its own domain, and a rebound domain is still a domain.
 function isLocalHostname(hostname: string): boolean {
-  return hostname === "localhost" || hostname === "127.0.0.1";
+  if (hostname === "localhost") return true;
+  if (isIP(hostname) === 4) return isPrivateIPv4(hostname);
+  // WHATWG URL keeps the brackets on an IPv6 hostname.
+  return hostname === "[::1]";
 }
 
 // Requests are limited to local origins: this is a localhost development tool

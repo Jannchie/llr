@@ -98,10 +98,31 @@ describe("isLocalOrigin", () => {
   it("allows localhost and 127.0.0.1 on any port", () => {
     expect(isLocalOrigin("http://localhost:5173")).toBe(true);
     expect(isLocalOrigin("http://127.0.0.1:8790")).toBe(true);
+    expect(isLocalOrigin("http://[::1]:5173")).toBe(true);
   });
 
-  it("rejects other hosts, lookalikes, and garbage", () => {
-    for (const origin of ["http://example.com", "http://localhost.evil.com", "http://[::1]:5173", "not a url", ""]) {
+  it("allows private-network IP literals (vite --host 0.0.0.0 opened by LAN IP)", () => {
+    for (const origin of [
+      "http://172.19.63.184:5180", // WSL seen from the Windows browser
+      "http://192.168.1.10:5180",
+      "http://10.255.255.254:5180",
+      "http://100.100.7.7:5180", // Tailscale
+    ]) {
+      expect(isLocalOrigin(origin), origin).toBe(true);
+    }
+  });
+
+  it("rejects public IPs, DNS lookalikes, and garbage", () => {
+    for (const origin of [
+      "http://example.com",
+      "http://localhost.evil.com",
+      "http://10.evil.com", // DNS name, not an IP literal
+      "http://8.8.8.8:5180",
+      "http://172.32.0.1:5180", // one past RFC1918's 172.16/12
+      "http://100.128.0.1:5180", // one past CGNAT's 100.64/10
+      "not a url",
+      "",
+    ]) {
       expect(isLocalOrigin(origin), origin).toBe(false);
     }
   });
