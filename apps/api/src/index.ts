@@ -90,6 +90,14 @@ const server = createServer((request, response) => {
   });
 });
 
+// Destroy sockets with no traffic in either direction for 5 minutes. The WSL2
+// localhost relay drops its Windows half without RST-ing the Linux half, so a
+// client that vanishes mid-stream leaves the response pipeline (and its
+// finally-rm of linear-*.bin / export-*.jpg scratch) pinned forever. Five
+// minutes clears any real transfer stall while staying far above the longest
+// daemon wait a response idles through (full-res decode + denoise).
+server.setTimeout(5 * 60 * 1000);
+
 server.listen(port, host, () => {
   console.log(`LLR API listening on http://${host}:${port}`);
   console.log(`Workspace root: ${repoRoot}`);
