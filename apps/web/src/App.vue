@@ -84,6 +84,11 @@ const denoiseBusy = ref(false);
 // identity tone curve) so the before/after is easy to eyeball; release restores
 // the live edit. crop/denoise/DCP are baked into linear.bin, so they stay applied.
 const showOriginal = ref(false);
+// Hold-to-compare against the camera's own JPEG (the preview embedded in the
+// RAW). Unlike showOriginal this overlays a real <img> instead of re-rendering:
+// the camera JPEG went through the manufacturer's tone pipeline, so it's a
+// genuinely different reference from the neutral baseline render.
+const showEmbedded = ref(false);
 let currentSourceId = "";  // server id of the image currently in the renderer
 
 let webglRenderer: PipelineRenderer | null = null;
@@ -381,7 +386,7 @@ function applyStoredEdit(e: ImageEdit | null): void {
 const {
   sources, activeId, activeSource,
   persistNow, schedulePersist,
-  thumbSrc, markInvalid,
+  thumbSrc, resolveUrl, markInvalid,
   selectSource, removeSource,
   restoreSession, loadThumbCache, releaseThumbs, uploadFiles,
 } = useLibrary<Snapshot, typeof viewSettings>({
@@ -408,6 +413,12 @@ const {
   isRestoring: () => isRestoring,
   sessionExtras: { get: () => ({ ...viewSettings }), apply: (v) => Object.assign(viewSettings, v) },
 });
+
+// Full-res camera JPEG for the embedded-preview compare. Bound to the overlay
+// <img> whenever a source is active, so the browser has it fetched before the
+// first hold (thumbSrc may serve a 320px cache — too small to compare against).
+const embeddedSrc = computed(() =>
+  activeSource.value?.embeddedUrl ? resolveUrl(activeSource.value.embeddedUrl) : "");
 
 // Denoise params for the render-linear request. amount is normalised to 0..1;
 // disabled (or amount 0) tells the worker to skip inference entirely.
@@ -589,6 +600,10 @@ function drawWebGL(): void {
 
 function startCompare(): void { if (activeSource.value && !cropMode.value) showOriginal.value = true; }
 function endCompare(): void { showOriginal.value = false; }
+function startCompareEmbedded(): void {
+  if (activeSource.value && !cropMode.value && embeddedSrc.value) showEmbedded.value = true;
+}
+function endCompareEmbedded(): void { showEmbedded.value = false; }
 
 // ── WebGL context loss ──
 //
@@ -670,6 +685,9 @@ function enterCropMode(): void {
   if (!activeSource.value || cropMode.value) return;
   flushPendingHistory();
   cropMode.value = true;
+  // A compare hold can't be released once the crop editor owns the keys/view.
+  showOriginal.value = false;
+  showEmbedded.value = false;
   zoom.value = 1; pan.x = 0; pan.y = 0;
   // Untouched image with an aspect lock (e.g. the 4:3 default): propose the
   // largest centered box of that ratio, so the lock and the box agree.
@@ -720,6 +738,13 @@ function onKeyDown(e: KeyboardEvent): void {
     return;
   }
 
+  // Shift+Backslash ("|") holds the camera-JPEG view (the RAW's embedded preview).
+  if (!inEditableText && e.key === "|" && activeSource.value && !cropMode.value) {
+    e.preventDefault();
+    if (embeddedSrc.value) showEmbedded.value = true;
+    return;
+  }
+
   if (!imageW.value || !imageH.value) return;
   if (cropMode.value) return; // crop editor owns the view; no pan/zoom shortcuts
   if (e.ctrlKey || e.metaKey) {
@@ -734,12 +759,16 @@ function onKeyDown(e: KeyboardEvent): void {
 
 function onKeyUp(e: KeyboardEvent): void {
   if (e.key === "\\") showOriginal.value = false; // release the hold-to-compare view
+  // Releasing Shift before the key makes the keyup report "\" instead of "|",
+  // so either key ends the camera-JPEG hold.
+  if (e.key === "\\" || e.key === "|") showEmbedded.value = false;
 }
 
 // Alt-Tab (or Cmd+backslash) mid-hold sends the keyup to the newly focused
 // window, so onKeyUp never fires and the 'before' view would stick on forever.
 function onWindowBlur(): void {
   showOriginal.value = false;
+  showEmbedded.value = false;
 }
 
 // ── upload ──
@@ -1004,6 +1033,15 @@ const vWheelAdjust = {
             <path d="M12 5v14" />
           </svg>
         </button>
+        <button class="icon-btn" :class="{ 'is-on': showEmbedded }" :disabled="!activeSource || cropMode || !embeddedSrc"
+          @mousedown="startCompareEmbedded" @mouseup="endCompareEmbedded" @mouseleave="endCompareEmbedded"
+          @touchstart.prevent="startCompareEmbedded" @touchend.prevent="endCompareEmbedded" @touchcancel="endCompareEmbedded"
+          title="Hold to compare camera JPEG ( | )" aria-label="Compare with camera JPEG">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M20 19H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h3l2-2.5h6L17 7h3a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2z" />
+            <circle cx="12" cy="13" r="3.5" />
+          </svg>
+        </button>
       </div>
       <div class="meta-summary">
         <template v-if="activeSource">
@@ -1053,6 +1091,14 @@ const vWheelAdjust = {
           <span>Importing…</span>
         </div>
         <canvas v-show="webglRenderer != null && activeSource && !activeSource.invalid" ref="canvasRef" class="preview" :style="{ transform: displayTransform, width: imageW + 'px', height: imageH + 'px' }" />
+        <!-- Camera-JPEG compare: opaque overlay in the canvas's exact box. The
+             src stays bound while a source is active so the JPEG is already
+             fetched when the hold starts; contain-fit letterboxes it when the
+             edit's crop changed the aspect ratio. -->
+        <img v-show="showEmbedded && webglRenderer != null && activeSource && !activeSource.invalid"
+          class="preview compare-embedded"
+          :style="{ transform: displayTransform, width: imageW + 'px', height: imageH + 'px' }"
+          :src="embeddedSrc || undefined" alt="Camera JPEG preview" />
         <div v-show="activeSource && webglRenderer && (status === 'rendering' || status === 'uploading')"
           class="viewport-busy" aria-live="polite">
           <span class="spinner" aria-hidden="true" />

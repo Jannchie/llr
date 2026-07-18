@@ -302,6 +302,14 @@ button {
   filter: brightness(0.85);
 }
 
+/* Camera-JPEG hold-to-compare: covers the canvas box; the opaque background
+   fills the letterbox when the edited crop's aspect differs from the full
+   frame, so the edit underneath never bleeds into the comparison. */
+.preview.compare-embedded {
+  object-fit: contain;
+  background: var(--viewport-bg);
+}
+
 .preview-loading {
   position: absolute;
   inset: 0;
