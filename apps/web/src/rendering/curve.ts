@@ -12,7 +12,11 @@
  *     out_c = pointChannel_c( pointRGB( parametric( in_c ) ) )   for c in {R,G,B}
  */
 
-import { glslFloat } from "./color-spaces";
+import { glslFloat, srgbDecode, srgbEncode } from "./color-spaces";
+
+// Re-exported: this module was their original home, and grading.ts plus the
+// render tests import them from here.
+export { srgbDecode, srgbEncode };
 
 export interface CurvePoint {
   x: number; // 0-1 input
@@ -246,12 +250,6 @@ export function parametricToLUT(p: ParametricCurve): Float32Array {
   return lut;
 }
 
-// sRGB transfer function (shared by Display-P3). Must match the GLSL
-// srgbEncode in color-spaces.ts.
-export const srgbEncode = (c: number): number =>
-  c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
-export const srgbDecode = (c: number): number =>
-  c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
 
 /**
  * Display-referred Basic-panel curve: Contrast S-curve, then the two endpoint

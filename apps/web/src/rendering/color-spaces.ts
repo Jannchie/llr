@@ -13,6 +13,19 @@ export type Mat3 = readonly [
   readonly [number, number, number],
 ];
 
+/**
+ * sRGB transfer function (Display-P3 shares it). Kept here, beside the GLSL
+ * `srgbEncode`/`srgbDecode` this file emits, because the two must agree exactly
+ * — a copy living anywhere else is invisible to that contract.
+ *
+ * Unlike the GLSL pair these do not clamp: callers that need it clamp at the
+ * call site, and the LUT bake relies on the unclamped form.
+ */
+export const srgbEncode = (c: number): number =>
+  c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+export const srgbDecode = (c: number): number =>
+  c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+
 // linear ProPhoto(D50) <-> Oklab LMS (pre-multiplied through XYZ-D50→D65→Oklab M1)
 export const PROPHOTO_LINEAR_TO_LMS: Mat3 = [
   [0.71538716, 0.35280861, -0.06826407],
