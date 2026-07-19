@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 import { PipelineRenderer, type EditParams } from "./rendering/pipeline-renderer";
 import {
   curveToLUT, buildToneCurveLUT, defaultToneCurve, normalizeToneCurve,
+  DEFAULT_BASIC, sameBasic,
   type BasicAdjust, type ToneCurve,
 } from "./rendering/curve";
 import {
@@ -239,20 +240,13 @@ const gradingEdited = computed(() => {
 });
 
 // Basic-panel values currently baked into the GPU curve LUT (Contrast, Blacks
-// and positive Whites are display-referred stages of the LUT chain, not shader
+// and Whites are all display-referred stages of the LUT chain, not shader
 // uniforms). null = the LUT holds the identity curve (hold-to-compare swapped
 // it in).
-let bakedBasic: BasicAdjust | null = { contrast: 0, blacks: 0, whites: 0 };
+let bakedBasic: BasicAdjust | null = DEFAULT_BASIC;
 
 function currentBasic(r: Recipe = recipe): BasicAdjust {
   return { contrast: r.contrast, blacks: r.blacks, whites: r.whites };
-}
-
-function sameBasic(a: BasicAdjust, b: BasicAdjust): boolean {
-  // Negative Whites is a shader uniform, not part of the bake — clamp both
-  // sides so dragging it below zero doesn't rebake the LUT every frame.
-  return a.contrast === b.contrast && a.blacks === b.blacks
-    && Math.max(a.whites, 0) === Math.max(b.whites, 0);
 }
 
 /** Rebake + upload the curve LUT with the live tone curve and Basic values. */
@@ -522,7 +516,6 @@ function buildPipelineParams(s?: Snapshot): Partial<EditParams> {
     saturation: 1 + r.saturation / 100,
     highlights: r.highlights / 100,
     shadows: r.shadows / 100,
-    whites: r.whites / 100,
     vibrance: 1 + r.vibrance / 100,
     clarity: r.clarity,
     dehaze: r.dehaze,
@@ -611,7 +604,7 @@ function computePreviewScale(): number {
 
 function drawWebGL(): void {
   if (!webglRenderer) return;
-  // Contrast/Blacks/+Whites live in the curve LUT bake, not shader uniforms.
+  // Contrast/Blacks/Whites all live in the curve LUT bake, not shader uniforms.
   // Draws are rAF-coalesced (scheduleWebGLDraw), so this rebakes at most once
   // per frame during a slider drag (sub-millisecond on the CPU).
   if (!showOriginal.value && (bakedBasic === null || !sameBasic(bakedBasic, currentBasic()))) {

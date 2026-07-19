@@ -85,10 +85,12 @@ describe("basicCurve", () => {
     for (const x of [0, 0.18, 0.5, 0.9, 1]) expect(basicCurve(x, ident)).toBeCloseTo(x, 6);
   });
 
-  it("blacks -100 crushes everything below the 0.12 encoded threshold", () => {
-    const xBelow = srgbDecode(0.1);
+  it("blacks -100 crushes everything below the 0.235 encoded threshold", () => {
+    const xBelow = srgbDecode(0.2);
     expect(basicCurve(xBelow, { ...ident, blacks: -100 })).toBe(0);
+    // Above the crush the pull fades out toward white.
     expect(basicCurve(0.5, { ...ident, blacks: -100 })).toBeLessThan(0.5);
+    expect(basicCurve(0.5, { ...ident, blacks: -100 })).toBeGreaterThan(0.4);
   });
 
   it("whites +100 clips everything above the 0.85 encoded threshold", () => {

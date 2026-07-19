@@ -55,20 +55,29 @@ export interface BasicAdjust {
   contrast: number; // -100..100
   blacks: number;   // -100..100
   /**
-   * Only the positive half acts here. The camera profile's tone curve
-   * asymptotes below 1.0 and flattens the top stops, so a scene-referred gain
-   * can never push the white point to clip — blowing the whites has to happen
-   * display-referred. Pulling them back is the opposite: display values above
-   * white are already clamped, so recovery only exists scene-referred, and
-   * negative Whites stays in the shader.
+   * Both halves act here. The negative half used to be a scene-referred log
+   * gain in the shader, on the reasoning that recovering blown highlights needs
+   * values above 1.0 — but an additive shift cannot share the highlight range
+   * with the Highlights compressor without inverting the tone order there (see
+   * tonalLuma). Highlights already does the scene-referred rescue; Whites is
+   * the display-referred white point, on both sides.
    */
   whites: number;   // -100..100
 }
 
 export const DEFAULT_BASIC: BasicAdjust = { contrast: 0, blacks: 0, whites: 0 };
 
+/**
+ * Field-wise equality. The one place the BasicAdjust field list is enumerated
+ * for comparison — the LUT rebake's dirty check used to keep its own copy, and
+ * a stale clamp in it silently disabled negative Whites.
+ */
+export function sameBasic(a: BasicAdjust, b: BasicAdjust): boolean {
+  return a.contrast === b.contrast && a.blacks === b.blacks && a.whites === b.whites;
+}
+
 export function isDefaultBasic(b: BasicAdjust): boolean {
-  return b.contrast === 0 && b.blacks === 0 && b.whites <= 0;
+  return sameBasic(b, DEFAULT_BASIC);
 }
 
 /**
@@ -92,6 +101,61 @@ float lutCoord(float x) { return (x * (LUT_SIZE - 1.0) + 0.5) / LUT_SIZE; }
 
 const clamp = (v: number, lo: number, hi: number) => (v < lo ? lo : v > hi ? hi : v);
 const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
+
+/**
+ * Displacement kernel for the Whites/Blacks remaps, on the encoded (on-screen)
+ * axis: A·yᵖ·(1−y)^q, a bump pinned to zero at both ends and peaking at
+ * p/(p+q).
+ *
+ * The shape matters more than the amplitude here. An endpoint slider is *not*
+ * an affine stretch of the whole range (y/(1−t)) — that is a second exposure
+ * slider wearing an endpoint's name, and it was what made these four feel
+ * unlike every other editor. It is also not the timid mids-never-move control
+ * the name suggests: measured against ACR, Whites +100 displaces the upper mids
+ * by ~0.25 and Blacks −100 the mids by ~0.15. What makes it read as an endpoint
+ * is that the displacement decays to zero at the *opposite* end and drives its
+ * own end into clip.
+ *
+ * Exponents fitted to the ACR-derived response tables. Keeping the four kernels
+ * as one table is what makes them comparable — and re-fittable — at a glance.
+ */
+interface Kernel { amp: number; p: number; q: number }
+
+/** Peak displacement / where it peaks, per kernel (see each use site). */
+const WHITES_UP: Kernel = { amp: 3.33, p: 2.6, q: 1.4 };   // +0.25 at y≈0.65
+const WHITES_DN: Kernel = { amp: -0.599, p: 4, q: 0.6 };   // -0.10 at y≈0.87
+const BLACKS_DN: Kernel = { amp: -0.338, p: 0, q: 1.35 };  // monotone decay from black
+const BLACKS_UP: Kernel = { amp: 0.491, p: 0.81, q: 2.2 }; // +0.085 at y≈0.27
+
+function bump(y: number, k: Kernel): number {
+  return k.amp * Math.pow(y, k.p) * Math.pow(1 - y, k.q);
+}
+
+/**
+ * On-screen value at which Whites `w` drives the image into clip: the first y
+ * where the bump exhausts the remaining headroom (≈0.845 at +100).
+ *
+ * Clamping the displacement with min(·, 1-y) alone is not enough — the bump's
+ * tail decays faster than the headroom does, so past y≈0.94 it would fall back
+ * under 1 and invert the tone order. Everything above the crossing clips, so
+ * solve for it once and flatten the top outright. Memoised on w: the bake calls
+ * basicCurve 2048 times with the same slider value.
+ */
+let whitePointCache: { w: number; y: number } | null = null;
+function whitePointFor(w: number): number {
+  if (whitePointCache?.w === w) return whitePointCache.y;
+  let lo = WHITES_UP.p / (WHITES_UP.p + WHITES_UP.q); // the peak — the crossing is above it
+  let hi = 1;
+  // 20 halvings of [0.65, 1] resolve ~3e-7, three orders below the LUT's own
+  // 1/2047 quantization.
+  for (let i = 0; i < 20; i++) {
+    const mid = (lo + hi) / 2;
+    if (bump(mid, WHITES_UP) * w >= 1 - mid) hi = mid;
+    else lo = mid;
+  }
+  whitePointCache = { w, y: hi };
+  return hi;
+}
 
 // --- defaults ---
 
@@ -269,32 +333,44 @@ export function basicCurve(x: number, basic: BasicAdjust): number {
   let y = srgbEncode(clamp01(x));
   const cv = clamp(basic.contrast / 100, -1, 1);
   if (cv !== 0) {
-    // Power-pair S-curve: C1 at the pivot with slope 1.45^cv, endpoints pinned.
-    // k>1 gives an S (deeper toe/shoulder); k<1 the flattening inverse.
+    // Overlay of the value against a pivot-to-self blend of itself. At d=0 the
+    // blend is flat at the pivot and overlay is the identity; at d=1 it is the
+    // value against itself, the classic hard S. Endpoints pinned, slope at the
+    // pivot 1+d.
+    //
+    // Generalized to pivot at mid gray rather than at 0.5: overlay's fixed
+    // point is its pivot, and anchoring it anywhere else lets Contrast drag mid
+    // gray, which Lightroom's does not do.
+    //
+    // The negative half is halved because the operator is not symmetric —
+    // un-halved, -100 flattens far harder than +100 steepens.
     const P = 0.435; // ≈ middle gray on the encoded axis
-    const k = Math.pow(1.45, cv);
-    y = y <= P
-      ? P * Math.pow(y / P, k)
-      : 1 - (1 - P) * Math.pow((1 - y) / (1 - P), k);
+    const d = cv < 0 ? cv * 0.5 : cv;
+    const c = P + (y - P) * d;
+    y = y <= P ? (y * c) / P : 1 - ((1 - y) * (1 - c)) / (1 - P);
   }
-  const w = clamp(basic.whites / 100, 0, 1); // negative Whites lives in the shader
-  if (w > 0) {
-    // White-point scale — the exact mirror of the Blacks crush below
-    // (x/(1-t) is (x-t)/(1-t) reflected through x→1-x). +100 clips everything
-    // above 0.85 on screen; black point untouched. Pitched a little stronger
-    // than the crush, matching how Whites outweighs Blacks in Lightroom.
-    const t = 0.15 * w;
-    y = Math.min(y / (1 - t), 1);
+  const w = clamp(basic.whites / 100, -1, 1);
+  if (w < 0) {
+    // Whites -100: peak displacement -0.10 at y≈0.87, ~0 by mid gray — far more
+    // top-weighted than the positive half, which peaks at 0.65 and is 2.5x
+    // larger. That asymmetry is real: blowing the whites is a broad move,
+    // pulling them back is a narrow one.
+    y += bump(y, WHITES_DN) * -w;
+  } else if (w > 0) {
+    // Whites +100: peak displacement +0.25 at y≈0.65, ~0 in the deep shadows,
+    // clipping from y≈0.845 up.
+    y = y >= whitePointFor(w) ? 1 : y + bump(y, WHITES_UP) * w;
   }
   const b = clamp(basic.blacks / 100, -1, 1);
   if (b < 0) {
-    // Black-point crush: remap [t,1] → [0,1]; -100 clips everything below 0.12.
-    const t = 0.12 * -b;
-    y = Math.max((y - t) / (1 - t), 0);
+    // Blacks -100: -0.34·(1-y)^1.35, clamped by -y so it cannot go below black.
+    // The clamp binds up to y≈0.235 — that crushed foot *is* the black point,
+    // the mirror of the Whites saturation above.
+    y += Math.max(bump(y, BLACKS_DN) * -b, -y);
   } else if (b > 0) {
-    // Fog lift — gentler than the crush, white point untouched.
-    const t = 0.08 * b;
-    y = t + y * (1 - t);
+    // Blacks +100: peak +0.085 at y≈0.27 — a shadow lift, not a flat fog
+    // offset, so the deepest tones keep some separation and white is pinned.
+    y += bump(y, BLACKS_UP) * b;
   }
   return srgbDecode(clamp01(y));
 }

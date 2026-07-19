@@ -54,12 +54,11 @@ uniform mat3 u_wbMatrix;        // relative WB: Bradford adaptation in linear Pr
 uniform float u_exposure;
 uniform float u_highlights;
 uniform float u_shadows;
-uniform float u_whites;
 uniform float u_vibrance;
 uniform float u_saturation;
 uniform float u_clarity;
 uniform float u_dehaze;
-uniform int u_tonalActive;      // 1 if any highlights/shadows/whites is non-zero
+uniform int u_tonalActive;      // 1 if highlights or shadows is non-zero
 // Blurred log2 source luminance (see MASK_* shaders below): drives the
 // Highlights/Shadows region weights so a pixel moves with its *neighborhood*
 // — local contrast survives, as in Lightroom. Built once per uploaded image;
@@ -237,27 +236,26 @@ void main() {
         ? texture(u_mask_lum, lensUV).r + u_maskShift   // mask lives in recorded-frame UV: track the lens warp
         : pixLx;
       if (u_tonalActive == 1) {
-        // Highlights responds to a pixel that is bright itself OR sits in a
-        // bright neighborhood (max); Shadows is the mirror (min). This keeps
-        // small speculars/windows responsive (pixel term) while dark texture
-        // inside a bright region moves with the region (mask term) — local
-        // contrast preserved, as in Lightroom. A blended average does neither:
-        // it dilutes small features out of the window and drags region interiors
-        // out of it. Log-domain blurring makes the dark side dominate the mask
+        // Whites is display-referred on both halves now (curve.ts basicCurve);
+        // see the note on tonalLuma for why its old scene-referred log gain
+        // could not coexist with the compressor below.
+        //
+        // Highlights/Shadows: one endpoint-fixed invertible compressor, its
+        // amount weighted by local tone (toneRegions in TONAL_GLSL). Highlights
+        // weighs on max(pixel, neighborhood) and Shadows on min, so a small
+        // specular stays responsive (pixel term) while dark texture inside a
+        // bright region moves with the region (mask term) — local contrast
+        // preserved. Log-domain blurring makes the dark side dominate the mask
         // near edges, which keeps highlight recovery from bleeding dark halos.
-        float wHi = smoothstep(HI_EDGE0, HI_EDGE1, max(pixLx, maskLx));
-        float wSh = 1.0 - smoothstep(SH_EDGE0, SH_EDGE1, min(pixLx, maskLx));
-        // Only *negative* Whites acts here, on pixel luma: pulling the white
-        // point down means rescuing scene values above 1.0, which the view
-        // transform clamps away — so recovery exists only scene-referred.
-        // Blowing the whites is the opposite case: the profile tone curve
-        // asymptotes below 1.0 and flattens the top stops, so no scene-referred
-        // gain can move the clip point. Positive Whites is a display-referred
-        // white-point scale baked into the curve LUT (curve.ts basicCurve).
-        float wWh = smoothstep(WH_EDGE0, LX_WHITE, pixLx);
-        lOut += (u_highlights >= 0.0 ? HI_GAIN_POS : HI_GAIN_NEG) * u_highlights * wHi
-              + (u_shadows    >= 0.0 ? SH_GAIN_POS : SH_GAIN_NEG) * u_shadows    * wSh
-              + WH_GAIN * min(u_whites, 0.0) * wWh;
+        //
+        // u_tonalActive is exactly (highlights != 0 || shadows != 0), so this
+        // needs no further guard of its own.
+        float Y = exp2(lOut);
+        // exp2 is monotone, so max/min over the log values and over the linear
+        // ones pick the same side; comparing here costs one exp2, not two.
+        float Ym = (u_hasMask == 1) ? exp2(maskLx + LOG2_MID) : Y;
+        lOut = log2(max(toneRegions(Y, u_highlights, u_shadows,
+                                    max(Y, Ym), min(Y, Ym)), 1e-6));
       }
       // Clarity: local mid-tone contrast — amplify the pixel's deviation from
       // its blurred neighborhood (clarityShift in TONAL_GLSL; window + midtone
@@ -450,7 +448,7 @@ export const PASSES: PassDef[] = [
   { name: "process", fsSource: PROCESS_SHADER, uniforms: [
     "u_texXform", "u_bgColor",
     "u_wbMatrix", "u_exposure", "u_viewTransform", "u_displayGamut",
-    "u_highlights", "u_shadows", "u_whites",
+    "u_highlights", "u_shadows",
     "u_vibrance", "u_saturation", "u_clarity", "u_dehaze",
     "u_tonalActive", "u_hslActive", "u_maskShift", "u_hasMask",
     "u_hsl_h[0]","u_hsl_h[1]","u_hsl_h[2]","u_hsl_h[3]","u_hsl_h[4]","u_hsl_h[5]","u_hsl_h[6]","u_hsl_h[7]",

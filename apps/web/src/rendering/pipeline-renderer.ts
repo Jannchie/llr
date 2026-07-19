@@ -17,7 +17,7 @@ import type { HistogramBins } from "./histogram";
 export interface EditParams {
   exposure: number; saturation: number;
   temperature: number; tint: number;
-  highlights: number; shadows: number; whites: number;
+  highlights: number; shadows: number;
   vibrance: number; clarity: number; dehaze: number;
   // HSL (8 ranges, each [-1, 1])
   hslH: number[]; hslS: number[]; hslL: number[];
@@ -70,7 +70,7 @@ const MASK_LONG = 256;
 export const DEFAULT_PARAMS: EditParams = {
   exposure: 0, saturation: 1,
   temperature: 6500, tint: 0,
-  highlights: 0, shadows: 0, whites: 0,
+  highlights: 0, shadows: 0,
   vibrance: 1, clarity: 0, dehaze: 0,
   hslH: [...HSL_ZERO], hslS: [...HSL_ZERO], hslL: [...HSL_ZERO],
   gradShTint: [1, 1, 1], gradMdTint: [1, 1, 1], gradHlTint: [1, 1, 1],
@@ -805,15 +805,15 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     i("u_hasProfileCurve", this.hasProfileCurve ? 1 : 0);
     i("u_curveActive", this.curveActive ? 1 : 0);
     s("u_exposure", p.exposure); s("u_highlights", p.highlights);
-    s("u_shadows", p.shadows); s("u_whites", p.whites);
+    s("u_shadows", p.shadows);
     s("u_vibrance", p.vibrance); s("u_saturation", p.saturation);
     s("u_clarity", p.clarity / 100);
     s("u_dehaze", p.dehaze / 100);
     // Activity flags let the shader skip its two costliest blocks (luma region/
     // contrast and the Oklab HSL mixer) when they are at their identity defaults.
-    // Positive Whites is display-referred (baked into the curve LUT), so only
-    // its negative half engages the shader's tonal block.
-    const tonalActive = p.highlights !== 0 || p.shadows !== 0 || p.whites < 0;
+    // Whites is display-referred on both halves now (baked into the curve LUT),
+    // so it no longer engages the shader's tonal block at all.
+    const tonalActive = p.highlights !== 0 || p.shadows !== 0;
     const hslActive = (p.hslH?.some((v) => v !== 0) ?? false)
       || (p.hslS?.some((v) => v !== 0) ?? false)
       || (p.hslL?.some((v) => v !== 0) ?? false);
