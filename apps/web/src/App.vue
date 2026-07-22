@@ -11,13 +11,14 @@ import {
   cropOutputRect, cropOutputSize, straightenedBBox,
   applyAspectRatio, resolveAspectFraction, cropOutputSizeForAspect,
   ASPECT_PRESETS,
-  type CropState,
+  type AspectPreset, type CropState,
 } from "./rendering/crop";
 import { API, fetchLinear, type ColorProfileMeta } from "./api";
 import { type PersistedEdit } from "./persistence";
 import { gradingTint, gradingHueDeg } from "./rendering/grading";
 import { parseLensCorr, mixLensTable, lensFillScale, LENS_IDENTITY, type LensCorr } from "./rendering/lens";
-import { trackFill, formatBytes, clamp } from "./ui";
+import { trackFill, formatBytes, clamp, IMPORT_ACCEPT, IMPORT_FORMAT_HINT } from "./ui";
+import { t, locale, setLocale, LOCALES, type Locale } from "./i18n";
 import SliderRow from "./components/SliderRow.vue";
 import Filmstrip from "./components/Filmstrip.vue";
 import { useViewport } from "./composables/useViewport";
@@ -32,8 +33,11 @@ import { useExport, type ExportPlan } from "./composables/useExport";
 
 type RecipeKey = "exposure"|"contrast"|"highlights"|"shadows"|"whites"|"blacks"|"vibrance"|"saturation"|"temperature"|"tint"|"clarity"|"dehaze"|"lensDistortion"|"lensVignetting";
 type Recipe = Record<RecipeKey, number>;
-type SliderSpec = { key: RecipeKey; label: string; min: number; max: number; step: number };
-type SliderGroup = { title: string; items: SliderSpec[] };
+// Labels are not stored: a slider's caption is always `slider.<key>` and a
+// group's is `panel.<title>`, so the catalog can't drift from the controls.
+type SliderSpec = { key: RecipeKey; min: number; max: number; step: number };
+// rawOnly: the group's controls read per-shot tables that only a RAW carries.
+type SliderGroup = { title: "tone" | "presence" | "color" | "lens"; items: SliderSpec[]; rawOnly?: boolean };
 
 // Distortion correction defaults to fully applied (mirrorless glass is designed
 // around it — uncorrected geometry reads as broken). Vignetting stays off by
@@ -47,29 +51,33 @@ const defaultRecipe = (): Recipe => ({
 });
 
 const groups: SliderGroup[] = [
-  { title: "Tone", items: [
-    { key: "exposure", label: "Exposure", min: -5, max: 5, step: 0.1 },
-    { key: "contrast", label: "Contrast", min: -100, max: 100, step: 1 },
-    { key: "highlights", label: "Highlights", min: -100, max: 100, step: 1 },
-    { key: "shadows", label: "Shadows", min: -100, max: 100, step: 1 },
-    { key: "whites", label: "Whites", min: -100, max: 100, step: 1 },
-    { key: "blacks", label: "Blacks", min: -100, max: 100, step: 1 },
+  { title: "tone", items: [
+    { key: "exposure", min: -5, max: 5, step: 0.1 },
+    { key: "contrast", min: -100, max: 100, step: 1 },
+    { key: "highlights", min: -100, max: 100, step: 1 },
+    { key: "shadows", min: -100, max: 100, step: 1 },
+    { key: "whites", min: -100, max: 100, step: 1 },
+    { key: "blacks", min: -100, max: 100, step: 1 },
   ]},
-  { title: "Presence", items: [
-    { key: "clarity", label: "Clarity", min: -100, max: 100, step: 1 },
-    { key: "dehaze", label: "Dehaze", min: -100, max: 100, step: 1 },
+  { title: "presence", items: [
+    { key: "clarity", min: -100, max: 100, step: 1 },
+    { key: "dehaze", min: -100, max: 100, step: 1 },
   ]},
-  { title: "Color", items: [
-    { key: "temperature", label: "Temp", min: 2000, max: 12000, step: 50 },
-    { key: "tint", label: "Tint", min: -100, max: 100, step: 1 },
-    { key: "vibrance", label: "Vibrance", min: -100, max: 100, step: 1 },
-    { key: "saturation", label: "Saturation", min: -100, max: 100, step: 1 },
+  { title: "color", items: [
+    { key: "temperature", min: 2000, max: 12000, step: 50 },
+    { key: "tint", min: -100, max: 100, step: 1 },
+    { key: "vibrance", min: -100, max: 100, step: 1 },
+    { key: "saturation", min: -100, max: 100, step: 1 },
   ]},
-  { title: "Lens Corrections", items: [
-    { key: "lensDistortion", label: "Distortion", min: 0, max: 100, step: 1 },
-    { key: "lensVignetting", label: "Vignetting", min: 0, max: 100, step: 1 },
+  { title: "lens", rawOnly: true, items: [
+    { key: "lensDistortion", min: 0, max: 100, step: 1 },
+    { key: "lensVignetting", min: 0, max: 100, step: 1 },
   ]},
 ];
+
+function aspectLabel(a: AspectPreset): string {
+  return a.labelKey ? t(a.labelKey) : a.label;
+}
 
 // Derived from defaultRecipe so the two can't drift (double-click reset and
 // isEdited both compare against these).
@@ -85,6 +93,16 @@ const fileInput = ref<HTMLInputElement | null>(null);
 const canvasRef = ref<HTMLCanvasElement | null>(null);
 const timing = ref<number | null>(null);
 const dcpCode = ref("");  // empty = auto-detect
+// False for already-rendered sources (JPEG/PNG/TIFF), which the worker decodes
+// into the same linear ProPhoto working space but which carry no mosaic, no
+// camera profile and no embedded preview. Gates the controls that need those.
+const isRawSource = ref(true);
+// Fitted camera-match table (see worker fit_profile.py): pulls the DCP render
+// toward the camera's own JPEG. On by default — it is the point of the profile —
+// but toggleable to compare against Adobe's uncorrected look. Only meaningful
+// when a table exists for this body+style (hasCameraMatch), else the row hides.
+const cameraMatch = ref(true);
+const hasCameraMatch = ref(false);
 // AI RAW denoise. Applied in the worker on the Bayer mosaic before demosaic, so
 // changing it re-decodes linear.bin (like dcpCode) rather than re-running the
 // WebGL shader. amount is 0..100 (normalised to 0..1 for the API).
@@ -124,15 +142,15 @@ let resizeObs: ResizeObserver | null = null;
 // ── HSL & Color Grading state ──
 
 const HSL_RANGES = [
-  { name: "Red",     color: "#e04040" },
-  { name: "Orange",  color: "#e08040" },
-  { name: "Yellow",  color: "#c0b030" },
-  { name: "Green",   color: "#40b040" },
-  { name: "Aqua",    color: "#40a0a0" },
-  { name: "Blue",    color: "#4060d0" },
-  { name: "Purple",  color: "#8040c0" },
-  { name: "Magenta", color: "#c04090" },
-];
+  { key: "red",     color: "#e04040" },
+  { key: "orange",  color: "#e08040" },
+  { key: "yellow",  color: "#c0b030" },
+  { key: "green",   color: "#40b040" },
+  { key: "aqua",    color: "#40a0a0" },
+  { key: "blue",    color: "#4060d0" },
+  { key: "purple",  color: "#8040c0" },
+  { key: "magenta", color: "#c04090" },
+] as const;
 
 const hslHue = reactive([0, 0, 0, 0, 0, 0, 0, 0]);
 const hslSat = reactive([0, 0, 0, 0, 0, 0, 0, 0]);
@@ -149,9 +167,9 @@ const defaultGrading = () => ({
 const grading = reactive(defaultGrading());
 
 const GRADING_BANDS = [
-  { band: "sh", label: "Shadows", hueKey: "shH", satKey: "shS" },
-  { band: "md", label: "Midtones", hueKey: "mdH", satKey: "mdS" },
-  { band: "hl", label: "Highlights", hueKey: "hlH", satKey: "hlS" },
+  { band: "sh", hueKey: "shH", satKey: "shS" },
+  { band: "md", hueKey: "mdH", satKey: "mdS" },
+  { band: "hl", hueKey: "hlH", satKey: "hlS" },
 ] as const;
 
 // View settings (not part of the per-image recipe): tone-mapping look + display gamut.
@@ -410,6 +428,8 @@ const {
     currentSourceId = "";
     hasLinearData = false;
     lensCorr = null;
+    isRawSource.value = true;
+    hasCameraMatch.value = false;
     srcW.value = 0;
     srcH.value = 0;
     timing.value = null;
@@ -421,11 +441,48 @@ const {
   sessionExtras: { get: () => ({ ...viewSettings }), apply: (v) => Object.assign(viewSettings, v) },
 });
 
+// Camera style names are the manufacturer's own product names (Sony's Creative
+// Style menu), so they stay in English in every locale — translating them would
+// stop them matching what the camera body shows.
+const DCP_STYLE_NAMES: Record<string, string> = {
+  ST: "Standard", PT: "Portrait", LD: "Landscape", VV: "Vivid", VV2: "Vivid 2",
+  FL: "Film", IN: "Instant", SH: "Soft Highkey", BW: "Black & White",
+  SE: "Sepia", NT: "Neutral",
+};
+// Styles this camera actually ships, from the worker. Empty for a body we have
+// no profiles for, which hides the picker rather than offering dead options.
+const dcpStyles = ref<string[]>([]);
+
+function dcpStyleLabel(code: string): string {
+  return DCP_STYLE_NAMES[code] ? `${DCP_STYLE_NAMES[code]} (${code})` : code;
+}
+
+// Mirror the worker's choice into the picker. There is no "auto" entry: the
+// style the metadata resolved to is simply the selected one, so the control
+// always reads as what is actually applied. Assigning dcpCode here must not
+// re-trigger the decode watcher — this *is* the result of that decode.
+function applyDcpSelection(selection: ColorProfileMeta["selection"]): void {
+  dcpStyles.value = selection?.availableCodes ?? [];
+  const matched = selection?.matchedCode ?? "";
+  if (matched === dcpCode.value) return;
+  suppressDcpReload = true;
+  dcpCode.value = matched;
+  void nextTick(() => { suppressDcpReload = false; });
+}
+
+// A rawOnly group is driven entirely by per-shot correction tables from the
+// RAW's maker notes; without them its sliders are inert, so hide the group
+// rather than show controls that do nothing.
+const visibleGroups = computed(() =>
+  isRawSource.value ? groups : groups.filter(g => !g.rawOnly));
+
 // Full-res camera JPEG for the embedded-preview compare. Bound to the overlay
 // <img> whenever a source is active, so the browser has it fetched before the
 // first hold (thumbSrc may serve a 320px cache — too small to compare against).
+// A rendered source's "embedded preview" is just the file itself, so comparing
+// against it would show no difference — the mode only means something for RAW.
 const embeddedSrc = computed(() =>
-  activeSource.value?.embeddedUrl ? resolveUrl(activeSource.value.embeddedUrl) : "");
+  isRawSource.value && activeSource.value?.embeddedUrl ? resolveUrl(activeSource.value.embeddedUrl) : "");
 
 // Denoise params for the render-linear request. amount is normalised to 0..1;
 // disabled (or amount 0) tells the worker to skip inference entirely.
@@ -450,7 +507,7 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
   timing.value = null; // stale timing would mask the live status in the footer
   const t0 = performance.now();
   try {
-    const lin = await fetchLinear({ sourceId: id, halfSize: false, maxSize: 2560, dcpCode: dcpCode.value, denoise: denoisePayload() });
+    const lin = await fetchLinear({ sourceId: id, halfSize: false, maxSize: 2560, dcpCode: dcpCode.value, denoise: denoisePayload(), cameraMatch: cameraMatch.value });
     if (stale()) return false;
     if (!lin) { markInvalid(id); return false; }
     const { meta: linMeta, pixels: linearFloat } = lin;
@@ -458,6 +515,11 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     hasLinearData = true;
     profileCurveLUT = buildProfileLUT(linMeta.colorProfile);
     lensCorr = parseLensCorr(linMeta.colorProfile?.lensCorr);
+    isRawSource.value = linMeta.colorProfile?.kind !== "rendered-image";
+    applyDcpSelection(linMeta.colorProfile?.selection);
+    // Availability is independent of the toggle, so the control stays visible
+    // after the user switches the match off (which drops the applied cameraMatch).
+    hasCameraMatch.value = linMeta.colorProfile?.cameraMatchAvailable === true;
     srcW.value = linMeta.width;
     srcH.value = linMeta.height;
     srcFullW.value = linMeta.fullWidth ?? linMeta.width;
@@ -633,7 +695,7 @@ function onContextLost(e: Event): void {
   e.preventDefault();
   destroyWebGL({ keepContext: true });
   status.value = "error";
-  errorMessage.value = "Graphics context lost — recovering…";
+  errorMessage.value = t("error.contextLost");
 }
 
 function onContextRestored(): void {
@@ -846,6 +908,12 @@ watch(dcpCode, async () => {
   await loadSource(currentSourceId, { resetView: false });
 });
 
+// Camera-match rides the DCP into linear.bin, so toggling it re-decodes too.
+watch(cameraMatch, async () => {
+  if (suppressDcpReload || !currentSourceId) return;
+  await loadSource(currentSourceId, { resetView: false });
+});
+
 // Denoise is baked into linear.bin, so changes re-decode like dcpCode. Debounced
 // because amount is a slider (the first decode runs inference; later ones hit the
 // worker's cache and only re-blend). The amount slider is hidden while disabled,
@@ -916,11 +984,26 @@ async function onFileChange(e: Event): Promise<void> {
   t.value = "";
 }
 
+// A drag only means "import" when it actually carries files. Dragging a
+// filmstrip thumbnail — or any text/link — fires dragover on the shell too, and
+// without this gate the full-screen import overlay flashes on every such drag.
+function onDragOver(e: DragEvent): void {
+  e.preventDefault();
+  if (e.dataTransfer?.types.includes("Files")) isDragging.value = true;
+}
+
+// dragleave bubbles from every child the pointer crosses on its way across the
+// shell; only a null relatedTarget means the drag really left the window.
+function onDragLeave(e: DragEvent): void {
+  if (!e.relatedTarget) isDragging.value = false;
+}
+
 async function onDrop(e: DragEvent): Promise<void> {
   e.preventDefault();
   isDragging.value = false;
-  if (!e.dataTransfer) return;
-  await uploadFiles(Array.from(e.dataTransfer.files));
+  const files = e.dataTransfer?.files;
+  if (!files?.length) return;
+  await uploadFiles(Array.from(files));
 }
 
 function resetRecipe(): void { Object.assign(recipe, defaultRecipe()); resetHslGrading(); }
@@ -947,6 +1030,7 @@ function buildExportPlan(): ExportPlan | null {
     settings,
     stripPrivate: viewSettings.exportStripPrivate === 1,
     dcpCode: settings.dcp,
+    cameraMatch: cameraMatch.value,
     denoise: denoisePayload(settings.denoise),
     params: buildPipelineParams(settings),
     curveLUT: buildToneCurveLUT(settings.curve, currentBasic(settings.recipe)),
@@ -1012,8 +1096,8 @@ const vWheelAdjust = {
 
 <template>
   <div class="app" :class="{ 'is-drag': isDragging, 'no-filmstrip': !sources.length }"
-    @dragover.prevent="isDragging = true"
-    @dragleave.prevent="isDragging = false"
+    @dragover="onDragOver"
+    @dragleave="onDragLeave"
     @drop="onDrop">
     <header class="topbar">
       <div class="brand">
@@ -1021,20 +1105,20 @@ const vWheelAdjust = {
         <span class="brand-name">LLR</span>
       </div>
       <div class="topbar-actions">
-        <button class="icon-btn" :disabled="!canUndo" @click="undo" title="Undo (Ctrl+Z)" aria-label="Undo">
+        <button class="icon-btn" :disabled="!canUndo" @click="undo" :title="t('action.undo')" :aria-label="t('aria.undo')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M3 9h11a5 5 0 0 1 0 10H8" />
             <path d="M7 5L3 9l4 4" />
           </svg>
         </button>
-        <button class="icon-btn" :disabled="!canRedo" @click="redo" title="Redo (Ctrl+Shift+Z)" aria-label="Redo">
+        <button class="icon-btn" :disabled="!canRedo" @click="redo" :title="t('action.redo')" :aria-label="t('aria.redo')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M21 9H10a5 5 0 0 0 0 10h6" />
             <path d="M17 5l4 4-4 4" />
           </svg>
         </button>
         <button class="icon-btn" :class="{ 'is-on': cropMode }" :disabled="!activeSource" @click="toggleCropMode"
-          title="Crop & Straighten (R)" aria-label="Crop">
+          :title="t('action.crop')" :aria-label="t('aria.crop')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M6 2v14a2 2 0 0 0 2 2h14" />
             <path d="M2 6h14a2 2 0 0 1 2 2v14" />
@@ -1043,7 +1127,7 @@ const vWheelAdjust = {
         <button class="icon-btn" :class="{ 'is-on': showOriginal }" :disabled="!activeSource || cropMode"
           @mousedown="startCompare" @mouseup="endCompare" @mouseleave="endCompare"
           @touchstart.prevent="startCompare" @touchend.prevent="endCompare" @touchcancel="endCompare"
-          title="Hold to compare original ( \ )" aria-label="Compare with original">
+          :title="t('action.compareOriginal')" :aria-label="t('aria.compareOriginal')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <rect x="3" y="5" width="18" height="14" rx="2" />
             <path d="M12 5v14" />
@@ -1052,7 +1136,7 @@ const vWheelAdjust = {
         <button class="icon-btn" :class="{ 'is-on': showEmbedded }" :disabled="!activeSource || cropMode || !embeddedSrc"
           @mousedown="startCompareEmbedded" @mouseup="endCompareEmbedded" @mouseleave="endCompareEmbedded"
           @touchstart.prevent="startCompareEmbedded" @touchend.prevent="endCompareEmbedded" @touchcancel="endCompareEmbedded"
-          title="Hold to compare camera JPEG ( | )" aria-label="Compare with camera JPEG">
+          :title="t('action.compareJpeg')" :aria-label="t('aria.compareJpeg')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M20 19H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h3l2-2.5h6L17 7h3a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2z" />
             <circle cx="12" cy="13" r="3.5" />
@@ -1064,7 +1148,7 @@ const vWheelAdjust = {
           <span>{{ activeSource.name }}</span>
           <span class="meta-empty">{{ formatBytes(activeSource.size) }}</span>
         </template>
-        <span v-else class="meta-empty">No image loaded</span>
+        <span v-else class="meta-empty">{{ t('meta.noImage') }}</span>
       </div>
       <button class="export-btn" type="button" :disabled="!activeSource || exporting" @click="exportImage">
         <svg v-if="!exporting" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1073,7 +1157,7 @@ const vWheelAdjust = {
           <path d="M5 21h14" />
         </svg>
         <span class="export-spinner" v-else aria-hidden="true" />
-        <span>{{ exporting ? 'Exporting…' : 'Export' }}</span>
+        <span>{{ exporting ? t('action.exporting') : t('action.export') }}</span>
       </button>
     </header>
 
@@ -1093,18 +1177,18 @@ const vWheelAdjust = {
               <circle cx="17" cy="20" r="3.5" stroke="currentColor" stroke-width="2" />
               <path d="M9 33l9-9 6 6 8-8 7 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
             </svg>
-            <p class="dropzone-title">Drop a RAW file to start</p>
-            <p class="dropzone-sub">or click anywhere to browse</p>
-            <p class="dropzone-hint">ARW · DNG · CR3 · NEF · RAF · RW2 · ORF</p>
+            <p class="dropzone-title">{{ t('dropzone.title') }}</p>
+            <p class="dropzone-sub">{{ t('dropzone.sub') }}</p>
+            <p class="dropzone-hint">{{ IMPORT_FORMAT_HINT }}</p>
           </div>
         </div>
         <div v-show="activeSource && status === 'rendering' && !webglRenderer" class="preview-loading">
           <span class="spinner spinner-lg" aria-hidden="true" />
-          <span>Decoding…</span>
+          <span>{{ t('status.decoding') }}</span>
         </div>
         <div v-show="status === 'uploading' && !activeSource" class="preview-loading">
           <span class="spinner spinner-lg" aria-hidden="true" />
-          <span>Importing…</span>
+          <span>{{ t('status.importing') }}</span>
         </div>
         <canvas v-show="webglRenderer != null && activeSource && !activeSource.invalid" ref="canvasRef" class="preview" :style="{ transform: displayTransform, width: imageW + 'px', height: imageH + 'px' }" />
         <!-- Camera-JPEG compare: opaque overlay in the canvas's exact box. The
@@ -1114,11 +1198,11 @@ const vWheelAdjust = {
         <img v-show="showEmbedded && webglRenderer != null && activeSource && !activeSource.invalid"
           class="preview compare-embedded"
           :style="{ transform: displayTransform, width: imageW + 'px', height: imageH + 'px' }"
-          :src="embeddedSrc || undefined" alt="Camera JPEG preview" />
+          :src="embeddedSrc || undefined" :alt="t('aria.cameraJpeg')" />
         <div v-show="activeSource && webglRenderer && (status === 'rendering' || status === 'uploading')"
           class="viewport-busy" aria-live="polite">
           <span class="spinner" aria-hidden="true" />
-          <span>{{ status === 'uploading' ? 'Importing…' : 'Decoding…' }}</span>
+          <span>{{ status === 'uploading' ? t('status.importing') : t('status.decoding') }}</span>
         </div>
         <svg v-show="cropMode && webglRenderer != null" ref="cropOverlayRef" class="crop-overlay"
           :style="{ transform: displayTransform, width: imageW + 'px', height: imageH + 'px' }"
@@ -1146,23 +1230,23 @@ const vWheelAdjust = {
             :style="{ cursor: h.cursor }"
             @mousedown="onCropHandleDown($event, h.key)" />
         </svg>
-        <img v-show="activeSource && !activeSource.invalid && !webglRenderer && status !== 'rendering'" class="preview" :style="{ transform: displayTransform }" :src="activeSource ? thumbSrc(activeSource) : ''" alt="preview" />
+        <img v-show="activeSource && !activeSource.invalid && !webglRenderer && status !== 'rendering'" class="preview" :style="{ transform: displayTransform }" :src="activeSource ? thumbSrc(activeSource) : ''" :alt="t('aria.preview')" />
         <div v-if="activeSource?.invalid" class="invalid-state">
           <img v-if="activeSource && thumbSrc(activeSource)" :src="thumbSrc(activeSource)" :alt="activeSource.name" />
-          <p class="invalid-title">Source file no longer available</p>
-          <p class="invalid-sub">The server cache may have been cleared — re-import this photo</p>
+          <p class="invalid-title">{{ t('invalid.missingTitle') }}</p>
+          <p class="invalid-sub">{{ t('invalid.missingSub') }}</p>
         </div>
         <div v-if="webglUnsupported" class="invalid-state">
-          <p class="invalid-title">WebGL2 unavailable</p>
-          <p class="invalid-sub">LLR renders entirely on the GPU — enable hardware acceleration or use a browser with WebGL2 support</p>
+          <p class="invalid-title">{{ t('invalid.webglTitle') }}</p>
+          <p class="invalid-sub">{{ t('invalid.webglSub') }}</p>
         </div>
       </div>
 
       <footer class="status" v-show="activeSource">
         <div class="status-left">
           <div class="status-cell">
-            <span class="status-label">Status</span>
-            <span class="status-value" :data-state="status">{{ timing ? `Decoded in ${timing}ms` : status }}</span>
+            <span class="status-label">{{ t('status.label') }}</span>
+            <span class="status-value" :data-state="status">{{ timing ? t('status.decodedIn', { ms: timing }) : status }}</span>
           </div>
         </div>
         <div class="status-right">
@@ -1170,7 +1254,7 @@ const vWheelAdjust = {
             <button class="zoom-btn" @click="zoomOut" :disabled="zoom <= 0.1">−</button>
             <span class="zoom-percent">{{ zoomPercent }}%</span>
             <button class="zoom-btn" @click="zoomIn" :disabled="zoom >= 50">+</button>
-            <button class="zoom-btn" @click="fitView">Fit</button>
+            <button class="zoom-btn" @click="fitView">{{ t('zoom.fit') }}</button>
           </div>
         </div>
       </footer>
@@ -1183,18 +1267,18 @@ const vWheelAdjust = {
 
       <section class="panel crop-panel" v-if="activeSource && cropMode">
         <header class="panel-head">
-          <span>Crop &amp; Straighten</span>
-          <button class="ghost" type="button" @click="resetCrop">Reset</button>
+          <span>{{ t('panel.crop') }}</span>
+          <button class="ghost" type="button" @click="resetCrop">{{ t('common.reset') }}</button>
         </header>
         <div class="control-row">
-          <label class="control-label">Aspect</label>
+          <label class="control-label">{{ t('crop.aspect') }}</label>
           <div class="crop-aspect">
             <select class="control-select" :value="customAspect ? 'custom' : cropAspect"
               @change="selectAspect(($event.target as HTMLSelectElement).value)">
-              <option v-for="a in ASPECT_PRESETS" :key="a.key" :value="a.key">{{ a.label }}</option>
-              <option value="custom">Custom…</option>
+              <option v-for="a in ASPECT_PRESETS" :key="a.key" :value="a.key">{{ aspectLabel(a) }}</option>
+              <option value="custom">{{ t('crop.custom') }}</option>
             </select>
-            <button class="icon-mini" type="button" title="Swap orientation (X)" @click="swapAspect" aria-label="Swap aspect">
+            <button class="icon-mini" type="button" :title="t('crop.swap')" @click="swapAspect" :aria-label="t('aria.swapAspect')">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M16 3l4 4-4 4" /><path d="M20 7H8a4 4 0 0 0-4 4" />
                 <path d="M8 21l-4-4 4-4" /><path d="M4 17h12a4 4 0 0 0 4-4" />
@@ -1203,7 +1287,7 @@ const vWheelAdjust = {
           </div>
         </div>
         <div class="control-row" v-if="customAspect">
-          <label class="control-label">Ratio</label>
+          <label class="control-label">{{ t('crop.ratio') }}</label>
           <div class="crop-custom">
             <input class="slider-number" type="number" min="0.1" step="0.1" :value="customAspect[0]"
               @change="setCustomAspect(($event.target as HTMLInputElement).valueAsNumber, customAspect![1])" />
@@ -1213,108 +1297,113 @@ const vWheelAdjust = {
           </div>
         </div>
         <SliderRow :model-value="Number(crop.angle.toFixed(1))" @update:model-value="setAngle"
-          label="Angle" :min="-45" :max="45" :step="0.1" />
+          :label="t('crop.angle')" :min="-45" :max="45" :step="0.1" />
         <div class="crop-buttons">
-          <button type="button" class="crop-tool" title="Rotate left 90°" @click="rotateCrop(-1)">
+          <button type="button" class="crop-tool" :title="t('crop.rotateLeft')" @click="rotateCrop(-1)">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5" />
             </svg>
           </button>
-          <button type="button" class="crop-tool" title="Rotate right 90°" @click="rotateCrop(1)">
+          <button type="button" class="crop-tool" :title="t('crop.rotateRight')" @click="rotateCrop(1)">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M21 12a9 9 0 1 1-3-6.7L21 8" /><path d="M21 3v5h-5" />
             </svg>
           </button>
-          <button type="button" class="crop-tool" :class="{ 'is-on': crop.flipH }" title="Flip horizontal" @click="flipCropH">
+          <button type="button" class="crop-tool" :class="{ 'is-on': crop.flipH }" :title="t('crop.flipH')" @click="flipCropH">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M12 3v18" /><path d="M8 7l-4 5 4 5" /><path d="M16 7l4 5-4 5" />
             </svg>
           </button>
-          <button type="button" class="crop-tool" :class="{ 'is-on': crop.flipV }" title="Flip vertical" @click="flipCropV">
+          <button type="button" class="crop-tool" :class="{ 'is-on': crop.flipV }" :title="t('crop.flipV')" @click="flipCropV">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M3 12h18" /><path d="M7 8l5-4 5 4" /><path d="M7 16l5 4 5-4" />
             </svg>
           </button>
         </div>
-        <button type="button" class="crop-done" @click="exitCropMode">Done</button>
+        <button type="button" class="crop-done" @click="exitCropMode">{{ t('crop.done') }}</button>
       </section>
 
       <section class="panel" v-show="!cropMode">
         <header class="panel-head">
-          <span>Settings</span>
-          <button class="ghost" type="button" @click="resetRecipe">Reset</button>
+          <span>{{ t('panel.settings') }}</span>
+          <button class="ghost" type="button" @click="resetRecipe">{{ t('common.reset') }}</button>
         </header>
-        <div class="control-row" v-if="activeSource">
-          <label class="control-label">DCP Style</label>
-          <select v-model="dcpCode" class="control-select">
-            <option value="">Auto (camera)</option>
-            <option value="ST">Standard</option>
-            <option value="FL">Film Look</option>
-            <option value="VV">Vivid</option>
-            <option value="VV2">Vivid 2</option>
-            <option value="NT">Neutral</option>
-            <option value="PT">Portrait</option>
-            <option value="SH">Soft High</option>
-            <option value="IN">Intense</option>
-            <option value="BW">Black & White</option>
+        <div class="control-row">
+          <label class="control-label">{{ t('settings.language') }}</label>
+          <select class="control-select" :value="locale"
+            @change="setLocale(($event.target as HTMLSelectElement).value as Locale)">
+            <option v-for="l in LOCALES" :key="l.value" :value="l.value">{{ l.label }}</option>
           </select>
         </div>
+        <div class="control-row" v-if="activeSource && isRawSource && dcpStyles.length">
+          <label class="control-label">{{ t('settings.dcp') }}</label>
+          <select v-model="dcpCode" class="control-select">
+            <option v-for="code in dcpStyles" :key="code" :value="code">{{ dcpStyleLabel(code) }}</option>
+          </select>
+        </div>
+        <div class="control-row" v-if="activeSource && isRawSource && hasCameraMatch">
+          <label class="control-label" for="camera-match" :title="t('settings.cameraMatchHint')">{{ t('settings.cameraMatch') }}</label>
+          <label class="switch">
+            <input id="camera-match" type="checkbox" v-model="cameraMatch" />
+            <span class="switch-track"><span class="switch-thumb" /></span>
+          </label>
+        </div>
         <div class="control-row" v-if="activeSource">
-          <label class="control-label">Look</label>
+          <label class="control-label">{{ t('settings.look') }}</label>
           <select v-model.number="viewSettings.viewTransform" class="control-select">
-            <option :value="0">Lightroom-style</option>
-            <option :value="1">AgX (filmic)</option>
+            <option :value="0">{{ t('look.lightroom') }}</option>
+            <option :value="1">{{ t('look.agx') }}</option>
           </select>
         </div>
         <div class="control-row" v-if="activeSource && p3Supported">
-          <label class="control-label">Display</label>
+          <label class="control-label">{{ t('settings.display') }}</label>
           <select v-model.number="viewSettings.displayGamut" class="control-select">
             <option :value="0">sRGB</option>
-            <option :value="1">Display-P3 (wide)</option>
+            <option :value="1">{{ t('display.p3') }}</option>
           </select>
         </div>
         <div class="control-row" v-if="activeSource">
-          <label class="control-label">Export EXIF</label>
+          <label class="control-label">{{ t('settings.exportExif') }}</label>
           <select v-model.number="viewSettings.exportStripPrivate" class="control-select"
-            title="Full keeps everything from the RAW; Private-safe strips GPS, serial numbers, owner name, and maker notes">
-            <option :value="0">Full metadata</option>
-            <option :value="1">Private-safe (no GPS/serials)</option>
+            :title="t('exif.hint')">
+            <option :value="0">{{ t('exif.full') }}</option>
+            <option :value="1">{{ t('exif.private') }}</option>
           </select>
         </div>
       </section>
-      <section v-for="group in groups" :key="group.title" class="panel" v-show="!cropMode">
+      <section v-for="group in visibleGroups" :key="group.title" class="panel" v-show="!cropMode">
         <header class="panel-head">
           <span class="panel-title">
-            {{ group.title }}
+            {{ t(`panel.${group.title}`) }}
             <span v-if="groupEdited(group)" class="panel-dot" aria-hidden="true" />
           </span>
         </header>
         <SliderRow v-for="spec in group.items" :key="spec.key"
-          v-model="recipe[spec.key]" :label="spec.label" :input-id="`s-${spec.key}`"
+          v-model="recipe[spec.key]" :label="t(`slider.${spec.key}`)" :input-id="`s-${spec.key}`"
           :min="spec.min" :max="spec.max" :step="spec.step"
           :reset-value="SLIDER_DEFAULTS[spec.key]" :track="WB_TRACK[spec.key]" show-modified />
       </section>
 
-      <section class="panel" v-if="activeSource && !cropMode">
+      <section class="panel" v-if="activeSource && !cropMode && isRawSource">
         <header class="panel-head">
-          <span>Detail</span>
-          <span v-if="denoiseBusy" class="panel-hint">Denoising…</span>
+          <span>{{ t('panel.detail') }}</span>
+          <span v-if="denoiseBusy" class="panel-hint">{{ t('detail.denoising') }}</span>
         </header>
         <div class="control-row">
-          <label class="control-label" for="denoise-on">AI Denoise</label>
+          <label class="control-label" for="denoise-on">{{ t('detail.aiDenoise') }}</label>
           <label class="switch">
             <input id="denoise-on" type="checkbox" v-model="denoise.enabled" />
             <span class="switch-track"><span class="switch-thumb" /></span>
           </label>
         </div>
-        <SliderRow v-show="denoise.enabled" v-model="denoise.amount" style="margin-top: 12px;"
-          label="Amount" input-id="denoise-amount" :min="0" :max="100" :reset-value="100" />
+        <SliderRow v-show="denoise.enabled" v-model="denoise.amount" style="margin-top: 6px;"
+          :label="t('detail.amount')" input-id="denoise-amount" :min="0" :max="100" :reset-value="100" />
       </section>
 
       <section class="panel" v-if="activeSource && !cropMode">
         <header class="panel-head">
           <span class="panel-title">
-            HSL / Color
+            {{ t('panel.hsl') }}
             <span v-if="hslEdited" class="panel-dot" aria-hidden="true" />
           </span>
         </header>
@@ -1323,40 +1412,40 @@ const vWheelAdjust = {
           <button :class="{ active: hslTab === 'sat' }" @click="hslTab = 'sat'">S</button>
           <button :class="{ active: hslTab === 'lum' }" @click="hslTab = 'lum'">L</button>
         </div>
-        <SliderRow v-for="(range, i) in HSL_RANGES" :key="range.name"
+        <SliderRow v-for="(range, i) in HSL_RANGES" :key="range.key"
           :model-value="hslValue(i)" @update:model-value="v => setHsl(i, v)"
-          :label="range.name" :dot-color="range.color" row-class="hsl-row" number-class="hsl-number"
+          :label="t(`hsl.${range.key}`)" :dot-color="range.color" row-class="hsl-row" number-class="hsl-number"
           :min="-100" :max="100" show-modified />
       </section>
 
       <section class="panel" v-if="activeSource && !cropMode">
         <header class="panel-head">
           <span class="panel-title">
-            Color Grading
+            {{ t('panel.grading') }}
             <span v-if="gradingEdited" class="panel-dot" aria-hidden="true" />
           </span>
         </header>
         <div v-for="g in GRADING_BANDS" :key="g.band" class="grading-group">
           <div class="grading-header">
             <span class="grading-dot" :style="{ background: gradingColor(g.band) }" />
-            <span>{{ g.label }}</span>
+            <span>{{ t(`grading.${g.band}`) }}</span>
           </div>
-          <SliderRow v-model="grading[g.hueKey]" label="H" row-class="grading-row" :min="-180" :max="180" />
-          <SliderRow v-model="grading[g.satKey]" label="S" row-class="grading-row" :min="0" :max="100" />
+          <SliderRow v-model="grading[g.hueKey]" :label="t('grading.h')" row-class="grading-row" :min="-180" :max="180" />
+          <SliderRow v-model="grading[g.satKey]" :label="t('grading.s')" row-class="grading-row" :min="0" :max="100" />
         </div>
-        <SliderRow v-model="grading.blend" label="Blend" :min="0" :max="100" :reset-value="50" />
-        <SliderRow v-model="grading.balance" label="Balance" :min="-100" :max="100" />
+        <SliderRow v-model="grading.blend" :label="t('grading.blend')" :min="0" :max="100" :reset-value="50" />
+        <SliderRow v-model="grading.balance" :label="t('grading.balance')" :min="-100" :max="100" />
       </section>
 
       <section class="panel" v-if="activeSource && !cropMode">
         <header class="panel-head">
-          <span>Tone Curve</span>
-          <button class="ghost" type="button" @click="resetCurve">Reset</button>
+          <span>{{ t('panel.curve') }}</span>
+          <button class="ghost" type="button" @click="resetCurve">{{ t('common.reset') }}</button>
         </header>
         <div class="curve-tabs">
-          <button v-for="tab in CURVE_TABS" :key="tab.key" type="button"
-            :class="['curve-tab', `curve-tab--${tab.key}`, { active: curveChannel === tab.key }]"
-            @click="setCurveChannel(tab.key)">{{ tab.label }}</button>
+          <button v-for="tab in CURVE_TABS" :key="tab" type="button"
+            :class="['curve-tab', `curve-tab--${tab}`, { active: curveChannel === tab }]"
+            @click="setCurveChannel(tab)">{{ t(`curve.${tab}`) }}</button>
         </div>
         <canvas ref="curveCanvas" class="curve-canvas"
           @mousedown="onCurveMouseDown"
@@ -1366,11 +1455,11 @@ const vWheelAdjust = {
 
         <!-- Parametric region + split sliders -->
         <div v-if="curveChannel === 'parametric'" class="curve-params">
-          <SliderRow v-for="r in PARAM_REGIONS" :key="r.key"
-            :model-value="paramValue(r.key)" @update:model-value="v => setParam(r.key, v)"
-            :label="r.label" :min="-100" :max="100" />
+          <SliderRow v-for="r in PARAM_REGIONS" :key="r"
+            :model-value="paramValue(r)" @update:model-value="v => setParam(r, v)"
+            :label="t(`curveRegion.${r}`)" :min="-100" :max="100" />
           <div class="curve-splits">
-            <span class="curve-splits-label">Range Splits</span>
+            <span class="curve-splits-label">{{ t('curve.splits') }}</span>
             <input type="range" min="4" max="96" step="1"
               :value="paramValue('shadowSplit')"
               :style="{ '--track': trackFill(paramValue('shadowSplit'), 0, 100) }"
@@ -1389,7 +1478,7 @@ const vWheelAdjust = {
         <!-- Point-curve presets (applied to the RGB master channel) -->
         <div v-else class="curve-presets">
           <button v-for="name in presetNames" :key="name" type="button"
-            class="curve-preset" @click="applyCurvePreset(name)">{{ name }}</button>
+            class="curve-preset" @click="applyCurvePreset(name)">{{ t(`curvePreset.${name}`) }}</button>
         </div>
       </section>
     </aside>
@@ -1398,10 +1487,10 @@ const vWheelAdjust = {
       :rendering="status === 'rendering'" :thumb-src="thumbSrc"
       @select="selectSource" @remove="removeSource" @import="pickFiles" />
 
-    <input ref="fileInput" type="file" accept=".arw,.dng,.cr2,.cr3,.nef,.raf,.rw2,.orf,.tif,.tiff,.jpg,.jpeg,.png" hidden multiple @change="onFileChange" />
-    <transition name="fade"><div v-if="isDragging" class="drag-overlay">Drop to import</div></transition>
+    <input ref="fileInput" type="file" :accept="IMPORT_ACCEPT" hidden multiple @change="onFileChange" />
+    <transition name="fade"><div v-if="isDragging" class="drag-overlay">{{ t('drag.overlay') }}</div></transition>
     <transition name="fade">
-      <div v-if="errorMessage && !activeSource?.invalid" class="error-toast" @click="errorMessage = null" title="Click to dismiss">
+      <div v-if="errorMessage && !activeSource?.invalid" class="error-toast" @click="errorMessage = null" :title="t('toast.dismiss')">
         {{ errorMessage }}
       </div>
     </transition>

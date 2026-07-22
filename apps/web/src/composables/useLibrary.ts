@@ -5,6 +5,7 @@ import {
   type PersistedEdit,
 } from "../persistence";
 import { type Source } from "../ui";
+import { t } from "../i18n";
 
 function isAbsoluteUrl(u: string): boolean {
   return u.startsWith("blob:") || u.startsWith("data:") || u.startsWith("http");
@@ -122,7 +123,7 @@ export function useLibrary<S, V>(opts: {
     const s = sources.value.find(x => x.id === id);
     if (s) s.invalid = true;
     status.value = "error";
-    errorMessage.value = "Source file no longer available (the server cache may have been cleared) — re-import this photo.";
+    errorMessage.value = t("error.sourceGone");
   }
 
   // Point the live edit + pixels at `id` (does NOT save the outgoing edit).

@@ -79,8 +79,12 @@ select {
   color: inherit;
 }
 
+/* The UA's 1px 6px on <button> silently eats the content box of any fixed-size
+   icon button — an 18px round button is left 6px of room for a 10px glyph, so
+   the glyph lands off-centre. Every button here sizes itself explicitly. */
 button {
   border: none;
+  padding: 0;
   background: transparent;
   cursor: pointer;
 }
@@ -474,16 +478,20 @@ button {
   grid-area: right;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
   padding: var(--stage-inset) var(--stage-inset) var(--stage-inset) 0;
   background: var(--bg);
   overflow-y: auto;
 }
 
+/* The rail is dense on purpose: an editing session is a long sequence of small
+   adjustments, so every pixel of vertical padding is a pixel of scrolling
+   between the tone sliders and the curve. Density here is trimmed from the gaps
+   *between* controls — knob, number field and select hit areas are untouched. */
 .panel {
   background: var(--card);
   border-radius: var(--radius-card);
-  padding: 12px 14px 14px;
+  padding: 10px 12px 11px;
   box-shadow: var(--shadow-card);
 }
 
@@ -491,12 +499,12 @@ button {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  min-height: 22px;
+  min-height: 20px;
   font-size: 13px;
   font-weight: 600;
   letter-spacing: -0.01em;
   color: var(--text);
-  margin-bottom: 10px;
+  margin-bottom: 7px;
 }
 
 /* A panel that is nothing but its header (Settings before an image loads). */
@@ -556,7 +564,7 @@ button {
   grid-template-columns: 62px 1fr 44px;
   gap: 10px;
   align-items: center;
-  padding: 5px 0;
+  padding: 2px 0;
 }
 
 .slider label {
@@ -576,6 +584,9 @@ button {
 input[type="range"] {
   appearance: none;
   width: 100%;
+  /* UA margin sits outside the 100% width, pushing the track 2px past its grid
+     column on both sides — enough to misalign it against the number box. */
+  margin: 0;
   height: 22px;
   background: transparent;
   cursor: pointer;
@@ -682,10 +693,14 @@ input[type="range"]:active::-webkit-slider-thumb {
 }
 
 .control-select {
+  /* A select is sized by its widest option, and min-width:auto lets that beat
+     the 1fr track — "Full metadata" would push the box past the card's edge. */
+  width: 100%;
+  min-width: 0;
   background: var(--control);
   border: 1px solid transparent;
   border-radius: var(--radius);
-  padding: 7px 28px 7px 10px;
+  padding: 6px 28px 6px 10px;
   color: var(--text);
   font-size: 13px;
   appearance: none;
@@ -796,7 +811,7 @@ input[type="range"]:active::-webkit-slider-thumb {
   grid-template-columns: 12px 44px 1fr 48px;
   gap: 10px;
   align-items: center;
-  padding: 4px 0;
+  padding: 2px 0;
 }
 
 .hsl-dot {
@@ -815,14 +830,14 @@ input[type="range"]:active::-webkit-slider-thumb {
 /* ---------- Color Grading ---------- */
 
 .grading-group {
-  margin-bottom: 12px;
+  margin-bottom: 9px;
 }
 
 .grading-header {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 5px;
+  margin-bottom: 3px;
   font-size: 12px;
   font-weight: 500;
   color: var(--text-dim);
@@ -841,7 +856,7 @@ input[type="range"]:active::-webkit-slider-thumb {
   grid-template-columns: 14px 1fr 40px;
   gap: 8px;
   align-items: center;
-  padding: 3px 0 3px 18px;
+  padding: 1px 0 1px 18px;
 }
 
 .grading-row label {
@@ -909,16 +924,16 @@ input[type="range"]:active::-webkit-slider-thumb {
 
 /* Parametric region sliders + range splits */
 .curve-params {
-  margin-top: 12px;
+  margin-top: 8px;
 }
 
 .curve-splits {
   display: grid;
   grid-template-columns: 66px 1fr;
   align-items: center;
-  gap: 4px 10px;
-  margin-top: 8px;
-  padding-top: 10px;
+  gap: 2px 10px;
+  margin-top: 7px;
+  padding-top: 8px;
   border-top: 1px solid var(--sep);
 }
 
@@ -937,7 +952,7 @@ input[type="range"]:active::-webkit-slider-thumb {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  margin-top: 12px;
+  margin-top: 9px;
 }
 
 .curve-preset {
@@ -1019,12 +1034,19 @@ input[type="range"]:active::-webkit-slider-thumb {
   display: flex;
   align-items: center;
   justify-content: center;
+  gap: 5px;
   color: var(--accent);
   font-size: 12px;
   font-weight: 500;
   border-radius: var(--radius);
   margin: 10px 0 10px 12px;
   transition: background 120ms;
+}
+
+.filmstrip-import svg {
+  width: 14px;
+  height: 14px;
+  flex: none;
 }
 
 .filmstrip-import:hover {

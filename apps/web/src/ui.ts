@@ -23,3 +23,26 @@ export function formatBytes(n: number): string {
   if (n < 1048576) return `${(n / 1024).toFixed(0)} KB`;
   return `${(n / 1048576).toFixed(1)} MB`;
 }
+
+// Importable formats, in the order the dropzone names them. One list drives
+// both the file picker's accept string and the hint under the dropzone, which
+// had drifted apart — .srf/.sr2/.cr2 were accepted but went unmentioned.
+// The aliases grouped under each label are accepted but not worth listing.
+const IMPORT_FORMATS: { label: string; ext: string[] }[] = [
+  { label: "ARW", ext: ["arw", "srf", "sr2"] },
+  { label: "DNG", ext: ["dng"] },
+  { label: "CR3", ext: ["cr2", "cr3"] },
+  { label: "NEF", ext: ["nef"] },
+  { label: "RAF", ext: ["raf"] },
+  { label: "RW2", ext: ["rw2"] },
+  { label: "ORF", ext: ["orf"] },
+  { label: "JPEG", ext: ["jpg", "jpeg"] },
+  { label: "PNG", ext: ["png"] },
+  { label: "TIFF", ext: ["tif", "tiff"] },
+];
+
+/** `accept` for the hidden file input. */
+export const IMPORT_ACCEPT = IMPORT_FORMATS.flatMap(f => f.ext.map(e => `.${e}`)).join(",");
+
+/** The format line under the dropzone. */
+export const IMPORT_FORMAT_HINT = IMPORT_FORMATS.map(f => f.label).join(" · ");

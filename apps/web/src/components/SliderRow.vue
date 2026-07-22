@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick } from "vue";
+import { t } from "../i18n";
 import { trackFill, clamp } from "../ui";
 
 // One labelled range + number pair. Covers every slider row in the settings
@@ -62,7 +63,7 @@ async function onCommit(e: Event): Promise<void> {
     <input :id="inputId" type="range" :min="min" :max="max" :step="step"
       :value="modelValue" :style="{ '--track': trackStyle }"
       @input="onInput" @dblclick="emit('update:modelValue', resetValue)"
-      title="Double-click to reset" />
+      :title="t('slider.dblclickReset')" />
     <input :class="numberClass" type="number" :min="min" :max="max" :step="step"
       :value="modelValue" :aria-label="label"
       @input="onInput" @change="onCommit" @blur="onCommit" />

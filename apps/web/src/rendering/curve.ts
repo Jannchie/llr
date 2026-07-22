@@ -34,6 +34,9 @@ export interface ParametricCurve {
   highlightSplit: number; // 0-100 (Lightroom default 75)
 }
 
+/** The four adjustable regions of the parametric curve, low to high. */
+export type ParamRegion = "shadows" | "darks" | "lights" | "highlights";
+
 /** The full tone curve: parametric + point curves (master + per-channel). */
 export interface ToneCurve {
   rgb: CurvePoint[];
@@ -178,16 +181,21 @@ export function defaultToneCurve(): ToneCurve {
   };
 }
 
-/** Lightroom point-curve presets (applied to the RGB master channel). */
-export const CURVE_PRESETS: Record<string, CurvePoint[]> = {
-  Linear: [{ x: 0, y: 0 }, { x: 1, y: 1 }],
-  "Medium Contrast": [
+/**
+ * Lightroom point-curve presets (applied to the RGB master channel). Keys are
+ * identifiers, not captions — the UI shows `curvePreset.<key>` from i18n.
+ */
+export const CURVE_PRESETS = {
+  linear: [{ x: 0, y: 0 }, { x: 1, y: 1 }],
+  mediumContrast: [
     { x: 0, y: 0 }, { x: 0.25, y: 0.219 }, { x: 0.5, y: 0.5 }, { x: 0.75, y: 0.781 }, { x: 1, y: 1 },
   ],
-  "Strong Contrast": [
+  strongContrast: [
     { x: 0, y: 0 }, { x: 0.25, y: 0.188 }, { x: 0.5, y: 0.5 }, { x: 0.75, y: 0.812 }, { x: 1, y: 1 },
   ],
-};
+} satisfies Record<string, CurvePoint[]>;
+
+export type CurvePresetName = keyof typeof CURVE_PRESETS;
 
 /** Coerce arbitrary/legacy stored data into a valid ToneCurve. */
 export function normalizeToneCurve(raw: unknown): ToneCurve {

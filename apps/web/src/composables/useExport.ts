@@ -1,6 +1,7 @@
 import { ref, type Ref } from "vue";
 import { PipelineRenderer, type EditParams } from "../rendering/pipeline-renderer";
 import { API, fetchLinear, type LinearMeta } from "../api";
+import { t } from "../i18n";
 
 /**
  * Everything the export mechanics need, frozen at click time. The full-res
@@ -16,6 +17,7 @@ export interface ExportPlan {
   /** Exclude GPS/serials/owner/maker notes from the copied EXIF (opt-in). */
   stripPrivate: boolean;
   dcpCode: string | undefined;
+  cameraMatch: boolean;
   denoise: { enabled: boolean; model: string; amount: number };
   params: Partial<EditParams>;
   curveLUT: Float32Array;
@@ -51,9 +53,9 @@ export function useExport(opts: {
       // 1. Decode full-resolution linear data (no half-size / no max-size cap)
       const lin = await fetchLinear({
         sourceId: plan.sourceId, halfSize: false, maxSize: 0,
-        dcpCode: plan.dcpCode, denoise: plan.denoise,
+        dcpCode: plan.dcpCode, cameraMatch: plan.cameraMatch, denoise: plan.denoise,
       });
-      if (!lin) throw new Error("Source is no longer available server-side");
+      if (!lin) throw new Error(t("error.exportSourceGone"));
       const { meta, pixels } = lin;
 
       // 2. Render full-res off-screen with the frozen edit, read back as JPEG

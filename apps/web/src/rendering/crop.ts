@@ -17,6 +17,10 @@
  * affine transform the WebGL pass can bake while sampling.
  */
 
+// Type-only: the aspect presets name their translatable captions, but this
+// module stays free of any runtime i18n dependency.
+import type { MessageKey } from "../i18n";
+
 export type Orientation = 0 | 90 | 180 | 270;
 
 export type CropState = {
@@ -242,15 +246,19 @@ export function constrainCrop(c: CropState, srcW: number, srcH: number): CropSta
 
 // ── Aspect ratios ────────────────────────────────────────────────────────────
 
-export type AspectPreset = { key: string; label: string; ratio: number | null };
+// `label` is a ratio that reads the same in every language. A preset whose
+// caption is a word instead carries `labelKey` and is looked up in the i18n
+// catalog — so the data says which entries need translating, rather than the
+// panel guessing from the key.
+export type AspectPreset = { key: string; label: string; labelKey?: MessageKey; ratio: number | null };
 
 // Lightroom-style orientation-agnostic presets: each ratio is listed once and
 // stored as long/short (≥ 1); the resolved pixel ratio follows the crop box's
 // current landscape/portrait orientation (swap with the X button/key).
 // null = free, 0 = the image's own ratio ("Original").
 export const ASPECT_PRESETS: AspectPreset[] = [
-  { key: "free", label: "Free", ratio: null },
-  { key: "orig", label: "Original", ratio: 0 },
+  { key: "free", label: "Free", labelKey: "aspect.free", ratio: null },
+  { key: "orig", label: "Original", labelKey: "aspect.orig", ratio: 0 },
   { key: "1:1", label: "1 × 1", ratio: 1 },
   { key: "4:5", label: "4 × 5 / 8 × 10", ratio: 5 / 4 },
   { key: "8.5:11", label: "8.5 × 11", ratio: 11 / 8.5 },

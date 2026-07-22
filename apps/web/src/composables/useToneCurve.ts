@@ -1,7 +1,8 @@
 import { onBeforeUnmount, ref, watch } from "vue";
 import {
   defaultToneCurve, renderToneCurve, hitTest, hitTestSplit, regionForX,
-  CURVE_PRESETS, type CurvePoint, type ToneCurve, type ToneChannel, type PointChannel,
+  CURVE_PRESETS, type CurvePoint, type CurvePresetName, type ToneCurve, type ToneChannel,
+  type PointChannel, type ParamRegion,
 } from "../rendering/curve";
 import { clamp } from "../ui";
 
@@ -20,21 +21,13 @@ export function useToneCurve(opts: {
   const curveHover = ref(-1); // hovered parametric region (0=shadows..3=highlights), -1 = none
   const curveCanvas = ref<HTMLCanvasElement | null>(null);
 
-  const CURVE_TABS: { key: ToneChannel; label: string }[] = [
-    { key: "parametric", label: "Param" },
-    { key: "rgb", label: "RGB" },
-    { key: "red", label: "R" },
-    { key: "green", label: "G" },
-    { key: "blue", label: "B" },
-  ];
-  const PARAM_REGIONS: { key: "highlights" | "lights" | "darks" | "shadows"; label: string }[] = [
-    { key: "highlights", label: "Highlights" },
-    { key: "lights", label: "Lights" },
-    { key: "darks", label: "Darks" },
-    { key: "shadows", label: "Shadows" },
-  ];
-  const REGION_BY_INDEX: ("shadows" | "darks" | "lights" | "highlights")[] = ["shadows", "darks", "lights", "highlights"];
-  const presetNames = Object.keys(CURVE_PRESETS);
+  // Captions come from the i18n catalog as `curve.<key>` / `curveRegion.<key>`.
+  const CURVE_TABS: ToneChannel[] = ["parametric", "rgb", "red", "green", "blue"];
+  // Curve-space order (index 0 = shadows). The panel lists the same regions
+  // top-down, i.e. highlights first — one list, one reversal, no drift.
+  const REGION_BY_INDEX: ParamRegion[] = ["shadows", "darks", "lights", "highlights"];
+  const PARAM_REGIONS: ParamRegion[] = [...REGION_BY_INDEX].reverse();
+  const presetNames = Object.keys(CURVE_PRESETS) as CurvePresetName[];
 
   function setCurveChannel(ch: ToneChannel): void {
     curveChannel.value = ch;
@@ -50,9 +43,8 @@ export function useToneCurve(opts: {
     opts.onReset();
   }
 
-  function applyCurvePreset(name: string): void {
+  function applyCurvePreset(name: CurvePresetName): void {
     const preset = CURVE_PRESETS[name];
-    if (!preset) return;
     toneCurve.value = { ...toneCurve.value, rgb: preset.map(p => ({ ...p })) };
     curveChannel.value = "rgb";
     curveActive.value = -1;
