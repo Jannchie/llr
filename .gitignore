@@ -23,8 +23,9 @@ __pycache__/
 # Third-party vendored dependencies (install via system package manager)
 vendor/exiftool
 
-# Proprietary Adobe DNG Camera Profiles (copy from Adobe DNG Converter / Lightroom install)
-vendor/adobe-camera-profiles
+# Vendored data: proprietary Adobe DNG Camera Profiles (copy from Adobe DNG
+# Converter / Lightroom install) and locally-fitted camera-match tables.
+vendor/
 
 # npm lockfile (project uses pnpm)
 apps/web/package-lock.json
