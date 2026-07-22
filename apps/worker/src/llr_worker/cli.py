@@ -21,10 +21,12 @@ from typing import Any
 
 import numpy as np
 import rawpy
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from .dcp import DcpProfile, apply_dcp_profile, load_dcp_profile
 from .denoise import DEFAULT_MODEL, denoise_raw_inplace, get_denoiser
+from .fit_profile import camera_match_path, postprocess_camera_native
+from .imported import decode_image_linear
 
 RAW_EXTENSIONS = {".arw", ".srf", ".sr2", ".dng", ".cr2", ".cr3", ".nef", ".raf", ".rw2", ".orf"}
 LOCAL_CAMERA_PROFILE_ROOT = Path("vendor/adobe-camera-profiles/Camera")
@@ -261,13 +263,14 @@ def _linear_cache_key(
     dcp_code: str | None,
     denoise_model: str | None,
     denoise_amount: float,
+    camera_match: bool,
 ) -> tuple[Any, ...]:
     try:
         st = input_path.stat()
         base = (str(input_path), st.st_size, int(st.st_mtime_ns))
     except OSError:
         base = (str(input_path),)
-    return (*base, profile_id, bool(half_size), int(max_size or 0), dcp_code or "", denoise_model or "", round(float(denoise_amount), 3))
+    return (*base, profile_id, bool(half_size), int(max_size or 0), dcp_code or "", denoise_model or "", round(float(denoise_amount), 3), bool(camera_match))
 
 
 _LINEAR_CACHE: OrderedDict[tuple[Any, ...], tuple[np.ndarray, dict[str, Any]]] = OrderedDict()
@@ -300,17 +303,25 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     if isinstance(max_size, str):
         max_size = int(max_size) if max_size else None
     dcp_code: str | None = request.get("dcpCode")
+    # Fitted camera-match table is layered on top of the DCP. Defaults on — it is
+    # the whole point of the profile — but the frontend can switch it off to
+    # compare against Adobe's uncorrected rendering. Baked into linear.bin (it
+    # rides the DCP), so toggling it re-decodes, hence it keys the linear cache.
+    camera_match = bool(request.get("cameraMatch", True))
 
     # RAW-domain denoise request. amount<=0 (or disabled) is treated as off so
     # the heavy inference and the second decode are skipped entirely.
     denoise_req = request.get("denoise") or {}
     dn_amount = max(0.0, min(1.0, float(denoise_req.get("amount", 1.0))))
     dn_model: str | None = None
-    if bool(denoise_req.get("enabled", False)) and dn_amount > 0.0:
+    # Denoise operates on the Bayer mosaic, which a rendered image does not have.
+    # Forcing it off here (rather than no-op'ing deeper) keeps the two-decode
+    # blend below from decoding an identical image twice.
+    if bool(denoise_req.get("enabled", False)) and dn_amount > 0.0 and is_raw(input_path):
         dn_model = str(denoise_req.get("model") or DEFAULT_MODEL)
 
     # Check processed sRGB cache first
-    cache_key = _linear_cache_key(input_path, profile_id, half_size, max_size, dcp_code, dn_model, dn_amount)
+    cache_key = _linear_cache_key(input_path, profile_id, half_size, max_size, dcp_code, dn_model, dn_amount, camera_match)
     with _CACHE_LOCK:
         cached_linear = _LINEAR_CACHE.get(cache_key)
         if cached_linear is not None:
@@ -330,6 +341,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
         }
 
     recipe = merge_recipe(PROFILES[profile_id], {})
+    recipe["cameraMatch"] = camera_match
     if dcp_code:
         recipe["dcpCode"] = dcp_code
 
@@ -397,6 +409,10 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     prepared.color_profile["fullWidth"] = prepared.metadata.full_width
     prepared.color_profile["fullHeight"] = prepared.metadata.full_height
     prepared.color_profile["lensCorr"] = prepared.metadata.lens_corr
+    # Whether a fitted table exists for this body+style, independent of whether it
+    # was applied this render. The frontend needs this to keep showing the toggle
+    # after the user switches the match off (at which point cameraMatch goes null).
+    prepared.color_profile["cameraMatchAvailable"] = has_camera_match(root, prepared.color_profile.get("selection"))
 
     # Cache processed sRGB so switching back to this DCP code is instant. The
     # decode/DCP/downsample paths already yield C-contiguous float32, so this is a
@@ -867,9 +883,7 @@ def prepare_linear(
     pin gigabytes with no reuse and evict the cheap preview entries.
     """
     if not is_raw(input_path):
-        raise UnsupportedSourceError(
-            f"{input_path.suffix or input_path.name} is not a RAW format LLR can edit"
-        )
+        return prepare_rendered_image(input_path, half_size=half_size, max_size=max_size)
 
     cache_key = _raw_cache_key(input_path, half_size, max_size, denoise_model)
 
@@ -882,7 +896,7 @@ def prepare_linear(
         camera_rgb, metadata = cached_camera
         dcp_profile, dcp_selection = resolve_dcp_profile(root, dcp_arg, disable_dcp, recipe, metadata)
         if dcp_profile is not None:
-            linear, dcp_info = apply_dcp_profile(camera_rgb, dcp_profile)
+            linear, dcp_info = apply_dcp_profile(camera_rgb, dcp_profile, find_camera_match(root, dcp_selection) if recipe.get("cameraMatch", True) else None)
             color_profile = dcp_info.to_json()
             color_profile["selection"] = dcp_selection
             return PreparedLinear(linear=linear, metadata=metadata, color_profile=color_profile)
@@ -939,18 +953,7 @@ def prepare_linear(
             if store_cache:
                 _remember(_FALLBACK_CACHE, cache_key, (linear, metadata, color_profile), _FALLBACK_CACHE_MAX)
         else:
-            camera_rgb = np.divide(
-                raw.postprocess(
-                    use_camera_wb=True,
-                    no_auto_bright=True,
-                    output_color=rawpy.ColorSpace.raw,
-                    gamma=(1, 1),
-                    output_bps=16,
-                    half_size=half_size,
-                ),
-                65535.0,
-                dtype=np.float32,
-            )
+            camera_rgb = postprocess_camera_native(raw, half_size=half_size)
             camera_rgb = apply_camera_crop(camera_rgb, metadata.camera_crop)
             if camera_rgb.shape[-1] != 3:
                 raise ValueError("DCP rendering currently supports only three-channel camera RGB data")
@@ -959,10 +962,63 @@ def prepare_linear(
             # Cache camera RGB so DCP code changes skip RAW re-decode
             if store_cache:
                 _remember(RAW_CAMERA_CACHE, cache_key, (camera_rgb, metadata), RAW_CAMERA_CACHE_MAX)
-            linear, dcp_info = apply_dcp_profile(camera_rgb, dcp_profile)
+            linear, dcp_info = apply_dcp_profile(camera_rgb, dcp_profile, find_camera_match(root, dcp_selection) if recipe.get("cameraMatch", True) else None)
             color_profile = dcp_info.to_json()
             color_profile["selection"] = dcp_selection
 
+    return PreparedLinear(linear=linear, metadata=metadata, color_profile=color_profile)
+
+
+def prepare_rendered_image(
+    input_path: Path,
+    half_size: bool = False,
+    max_size: int | None = None,
+) -> PreparedLinear:
+    """Decode an already-rendered image (JPEG/PNG/TIFF) into the RAW path's contract.
+
+    No decode-level cache: Pillow decode is milliseconds against LibRaw's
+    seconds, and the two caches the RAW path needs exist to make *DCP switching*
+    and *denoise amount* cheap — neither applies here. daemon_linear's
+    _LINEAR_CACHE still covers repeat requests for the same variant.
+    """
+    try:
+        linear, color_profile = decode_image_linear(input_path)
+    except (UnidentifiedImageError, OSError) as error:
+        raise UnsupportedSourceError(
+            f"{input_path.name} could not be decoded as an image"
+        ) from error
+    full_height, full_width = linear.shape[:2]
+
+    # half_size is LibRaw's Bayer binning; the closest honest equivalent for a
+    # demosaiced image is a plain half-resolution downsample, and it keeps the
+    # preview/export cost ratio the frontend assumes. Fold both constraints into
+    # one target so a full->half->max_size chain doesn't resize twice.
+    targets = []
+    if half_size:
+        targets.append(max(1, max(full_width, full_height) // 2))
+    if max_size:
+        targets.append(max_size)
+    if targets:
+        linear = downsample_linear(linear, min(targets))
+
+    exif = read_exiftool_metadata(input_path)
+    metadata = RawMetadata(
+        make=exif.get("Make"),
+        model=exif.get("Model"),
+        lens_model=exif.get("LensModel"),
+        creative_style=None,
+        white_balance=exif.get("WhiteBalance"),
+        # A rendered image has no mosaic and no per-shot correction data, so every
+        # RAW-only field stays None and the frontend hides the controls that need it.
+        camera_white_balance=None,
+        black_level=None,
+        white_level=None,
+        rgb_xyz_matrix=None,
+        full_width=full_width,
+        full_height=full_height,
+        camera_crop=None,
+        lens_corr=None,
+    )
     return PreparedLinear(linear=linear, metadata=metadata, color_profile=color_profile)
 
 
@@ -1201,6 +1257,51 @@ def exiftool_env() -> dict[str, str]:
     return env
 
 
+@functools.lru_cache(maxsize=32)
+def _load_camera_match(path_str: str, size: int, mtime_ns: int) -> tuple[Any, int] | None:
+    """Load a fitted camera-match table, memoised on the file's identity.
+
+    Keyed by size+mtime like the other profile caches, so re-fitting a table is
+    picked up on the next decode without restarting the daemon.
+    """
+    from .dcp import DcpHueSatMap
+    from .fit_profile import load as load_table
+
+    loaded = load_table(Path(path_str))
+    if loaded is None:
+        return None
+    table, dims, encoding = loaded
+    return DcpHueSatMap(dimensions=dims, data=table), encoding
+
+
+def _camera_match_path_for(root: Path, selection: dict[str, Any] | None) -> Path | None:
+    if not selection:
+        return None
+    camera = selection.get("camera")
+    code = selection.get("matchedCode")
+    if not camera or not code:
+        return None
+    return camera_match_path(root, str(camera), str(code))
+
+
+def has_camera_match(root: Path, selection: dict[str, Any] | None) -> bool:
+    """Whether a fitted table exists for this body+style, regardless of the toggle."""
+    path = _camera_match_path_for(root, selection)
+    return path is not None and path.exists()
+
+
+def find_camera_match(root: Path, selection: dict[str, Any] | None) -> tuple[Any, int] | None:
+    """A camera-match table for the camera+style the DCP lookup settled on."""
+    path = _camera_match_path_for(root, selection)
+    if path is None:
+        return None
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return _load_camera_match(str(path), st.st_size, int(st.st_mtime_ns))
+
+
 def resolve_dcp_profile(
     root: Path, dcp_arg: str | None, disable_dcp: bool, recipe: dict[str, Any], metadata: RawMetadata
 ) -> tuple[DcpProfile | None, dict[str, Any] | None]:
@@ -1240,20 +1341,25 @@ def find_local_camera_dcp(root: Path, metadata: RawMetadata, override_code: str 
     if profile_dir is None:
         return None
 
-    # If user specified a code, use it directly
+    def selection(**extra: Any) -> dict[str, Any]:
+        return {
+            "mode": "auto",
+            "root": str(profile_root),
+            "camera": profile_dir.name,
+            "availableCodes": available_profile_codes(profile_dir),
+            **extra,
+        }
+
+    # A user-picked style wins, but only if this body ships it. Switching to a
+    # camera without that style falls through to the automatic match rather than
+    # dropping the profile entirely — the picker has no "auto" entry to fall back
+    # to, so an unresolvable code must not leave the image unprofiled.
     if override_code:
         code = normalize_profile_code(override_code)
         if code:
             profile_path = find_dcp_by_code(profile_dir, code)
             if profile_path is not None:
-                return profile_path, {
-                    "mode": "auto",
-                    "root": str(profile_root),
-                    "camera": profile_dir.name,
-                    "matchedCode": code,
-                    "reason": "user-selected",
-                }
-        return None
+                return profile_path, selection(matchedCode=code, reason="user-selected")
 
     creative_style = normalize_profile_code(metadata.creative_style)
     for code, reason in [(creative_style, "creativeStyle"), ("ST", "fallback-standard")]:
@@ -1261,27 +1367,29 @@ def find_local_camera_dcp(root: Path, metadata: RawMetadata, override_code: str 
             continue
         profile_path = find_dcp_by_code(profile_dir, code)
         if profile_path is not None:
-            return profile_path, {
-                "mode": "auto",
-                "root": str(profile_root),
-                "camera": profile_dir.name,
-                "creativeStyle": metadata.creative_style,
-                "matchedCode": code,
-                "reason": reason,
-            }
+            return profile_path, selection(
+                creativeStyle=metadata.creative_style, matchedCode=code, reason=reason
+            )
 
-    profiles = sorted(profile_dir.glob("*.dcp"))
-    if not profiles:
-        return None
+    # The camera's style is one we have no profile for; fall back to whatever the
+    # body does ship and report the code so the picker reflects what is applied.
+    # Code and path come from one list, so the reported code always names the
+    # file actually loaded. A profile whose filename breaks the convention still
+    # gets applied, just unlabelled — better unprofiled-but-rendered than neither.
+    shipped = profile_codes_with_paths(profile_dir)
+    if shipped:
+        fallback_code, fallback_path = shipped[0]
+    else:
+        uncoded = sorted(profile_dir.glob("*.dcp"))
+        if not uncoded:
+            return None
+        fallback_code, fallback_path = None, uncoded[0]
 
-    return profiles[0], {
-        "mode": "auto",
-        "root": str(profile_root),
-        "camera": profile_dir.name,
-        "creativeStyle": metadata.creative_style,
-        "matchedCode": None,
-        "reason": "first-available",
-    }
+    return fallback_path, selection(
+        creativeStyle=metadata.creative_style,
+        matchedCode=fallback_code,
+        reason="first-available",
+    )
 
 
 def find_camera_profile_dir(profile_root: Path, metadata: RawMetadata) -> Path | None:
@@ -1312,11 +1420,43 @@ def _find_camera_profile_dir_cached(profile_root: Path, make: str | None, model:
 
 
 @functools.lru_cache(maxsize=256)
-def find_dcp_by_code(profile_dir: Path, code: str) -> Path | None:
-    suffix = f" camera {code.lower()}.dcp"
+def profile_codes_with_paths(profile_dir: Path) -> list[tuple[str, Path]]:
+    """The camera's own style codes paired with the .dcp file each came from.
+
+    The "<name> camera <code>.dcp" convention is parsed here and nowhere else,
+    so a vendor that names files differently breaks in one place rather than
+    desynchronising the code the picker offers from the file that gets loaded.
+    """
+    found: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    marker = " camera "
     for candidate in sorted(profile_dir.glob("*.dcp")):
-        if candidate.name.lower().endswith(suffix):
-            return candidate
+        stem = candidate.stem
+        index = stem.lower().rfind(marker)
+        if index == -1:
+            continue
+        code = stem[index + len(marker):].strip().upper()
+        if code and code not in seen:
+            seen.add(code)
+            found.append((code, candidate))
+    return found
+
+
+def available_profile_codes(profile_dir: Path) -> list[str]:
+    """The style codes this body ships.
+
+    The frontend builds its style picker from this rather than a hardcoded list,
+    so a body that ships no VV2 (or ships a code we have never seen) cannot be
+    offered a style that resolves to nothing.
+    """
+    return [code for code, _ in profile_codes_with_paths(profile_dir)]
+
+
+def find_dcp_by_code(profile_dir: Path, code: str) -> Path | None:
+    wanted = code.upper()
+    for candidate_code, path in profile_codes_with_paths(profile_dir):
+        if candidate_code == wanted:
+            return path
     return None
 
 

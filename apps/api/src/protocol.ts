@@ -23,6 +23,7 @@ export interface RenderLinearBody {
   halfSize?: boolean;
   maxSize?: number;
   dcpCode?: string;
+  cameraMatch?: boolean;
   denoise?: { enabled?: boolean; model?: string; amount?: number };
 }
 
@@ -31,6 +32,7 @@ export interface RenderParams {
   halfSize: boolean;
   maxSize: number;
   dcpCode: string | undefined;
+  cameraMatch: boolean;
   denoise: { enabled: boolean; model: string | undefined; amount: number };
 }
 
@@ -44,6 +46,9 @@ export function clampRenderParams(body: RenderLinearBody): RenderParams {
     halfSize: typeof body.halfSize === "boolean" ? body.halfSize : true,
     maxSize: Number.isFinite(maxSizeRaw) ? Math.min(16384, Math.max(0, Math.trunc(maxSizeRaw))) : 1600,
     dcpCode: typeof body.dcpCode === "string" ? body.dcpCode : undefined,
+    // Defaults on when omitted — a client that never sets it still gets the
+    // fitted match, matching the worker's own default.
+    cameraMatch: body.cameraMatch !== false,
     denoise: {
       enabled: body.denoise?.enabled === true,
       model: typeof body.denoise?.model === "string" ? body.denoise.model : undefined,

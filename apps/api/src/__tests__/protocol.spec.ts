@@ -30,8 +30,15 @@ describe("clampRenderParams", () => {
       halfSize: true,
       maxSize: 1600,
       dcpCode: undefined,
+      cameraMatch: true,
       denoise: { enabled: false, model: undefined, amount: 1 },
     });
+  });
+
+  it("defaults cameraMatch on, off only when explicitly false", () => {
+    expect(clampRenderParams({}).cameraMatch).toBe(true);
+    expect(clampRenderParams({ cameraMatch: false }).cameraMatch).toBe(false);
+    expect(clampRenderParams({ cameraMatch: true }).cameraMatch).toBe(true);
   });
 
   it("clamps out-of-range and malformed numbers instead of forwarding them", () => {

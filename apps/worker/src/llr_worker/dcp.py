@@ -123,6 +123,8 @@ class DcpRenderInfo:
     limitations: list[str]
     working_space: str = "linear-prophoto-d50"
     profile_tone_curve: list[list[float]] | None = None
+    # Present when a fitted camera-match table was layered on top of Adobe's chain.
+    camera_match: dict[str, Any] | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -136,6 +138,7 @@ class DcpRenderInfo:
             "limitations": self.limitations,
             "workingSpace": self.working_space,
             "profileToneCurve": self.profile_tone_curve,
+            "cameraMatch": self.camera_match,
         }
 
 
@@ -194,7 +197,18 @@ def _parse_dcp_file(path: Path) -> DcpProfile:
     )
 
 
-def apply_dcp_profile(camera_rgb: np.ndarray, profile: DcpProfile) -> tuple[np.ndarray, DcpRenderInfo]:
+def apply_dcp_profile(
+    camera_rgb: np.ndarray,
+    profile: DcpProfile,
+    correction: tuple[DcpHueSatMap, int] | None = None,
+) -> tuple[np.ndarray, DcpRenderInfo]:
+    """Render camera RGB to scene-linear ProPhoto through a DCP.
+
+    `correction` is an optional camera-match table fitted against this body's own
+    JPEG rendering (see fit_profile.py). It rides on top of Adobe's chain rather
+    than replacing any of it, so the calibration underneath stays intact and the
+    match can be turned off for comparison.
+    """
     matrix_name, camera_to_xyz = camera_to_xyz_matrix(profile)
     xyz_d50 = camera_rgb @ camera_to_xyz.T
     linear_prophoto = np.clip(xyz_d50 @ XYZ_D50_TO_PROPHOTO.T, 0, None)
@@ -213,6 +227,12 @@ def apply_dcp_profile(camera_rgb: np.ndarray, profile: DcpProfile) -> tuple[np.n
     if profile.look_table is not None:
         linear_prophoto = apply_hsv_table(linear_prophoto, profile.look_table, profile.look_table_encoding)
         look_table_info = table_info(profile.look_table, profile.look_table_encoding)
+
+    camera_match_info: dict[str, Any] | None = None
+    if correction is not None:
+        match_table, match_encoding = correction
+        linear_prophoto = apply_hsv_table(linear_prophoto, match_table, match_encoding)
+        camera_match_info = table_info(match_table, match_encoding)
 
     # Scene-referred pipeline: do NOT bake the profile tone curve here and do NOT
     # convert to display sRGB. Deliver linear ProPhoto (D50) so the browser edits
@@ -234,6 +254,7 @@ def apply_dcp_profile(camera_rgb: np.ndarray, profile: DcpProfile) -> tuple[np.n
         look_table=look_table_info,
         limitations=limitations,
         profile_tone_curve=tone_curve_pts,
+        camera_match=camera_match_info,
     )
 
 
