@@ -11,7 +11,7 @@
  * approximate ACR PV2012's response; the exported XMP carries the raw slider
  * values so Lightroom applies its own exact interpretation.
  */
-import { glslFloat, srgbDecode, srgbEncode } from "./color-spaces";
+import { glslFloat, smoothstep, srgbDecode, srgbEncode } from "./color-spaces";
 
 export const LOG2_MID = Math.log2(0.18); // middle gray in log2 luminance
 
@@ -75,11 +75,6 @@ export function expoShoulder(x: number): number {
   return x <= EXPO_KNEE
     ? x
     : EXPO_KNEE + EXPO_P * (1 - Math.exp(-(x - EXPO_KNEE) / EXPO_P));
-}
-
-function smoothstep(e0: number, e1: number, x: number): number {
-  const t = Math.min(1, Math.max(0, (x - e0) / (e1 - e0)));
-  return t * t * (3 - 2 * t);
 }
 
 /**

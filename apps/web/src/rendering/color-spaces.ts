@@ -96,6 +96,12 @@ export const XYZ_D50_TO_PROPHOTO: Mat3 = [
   [0.00000000, 0.00000000, 1.21181275],
 ];
 
+/** TS mirror of the GLSL builtin — shared by every module with a shader twin. */
+export function smoothstep(e0: number, e1: number, x: number): number {
+  const t = Math.min(1, Math.max(0, (x - e0) / (e1 - e0)));
+  return t * t * (3 - 2 * t);
+}
+
 /** Row-major M · v. */
 export function mulMat3(m: Mat3, v: readonly [number, number, number]): [number, number, number] {
   return [
