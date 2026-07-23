@@ -16,7 +16,7 @@ export const HSL_CENTERS: readonly number[] = [0.5101, 0.9210, 1.9160, 2.4873, -
 const TWO_PI = Math.PI * 2;
 
 /** Wrap an angle difference to [-π, π]. */
-const wrapAngle = (a: number): number => Math.atan2(Math.sin(a), Math.cos(a));
+const wrapAngle = (a: number): number => a - TWO_PI * Math.floor(a / TWO_PI + 0.5);
 
 /** Gap from band k's centre to the next centre, counter-clockwise (always > 0). */
 export const HSL_RIGHT_GAP: readonly number[] = HSL_CENTERS.map((c, k) => {
@@ -65,16 +65,19 @@ const float SKIN_C1 = ${glslFloat(SKIN_C1)};
 const float SKIN_C2 = ${glslFloat(SKIN_C2)};
 const float SKIN_C3 = ${glslFloat(SKIN_C3)};
 const float SKIN_DAMP = ${glslFloat(SKIN_DAMP)};
+const float HSL_TWO_PI = ${glslFloat(TWO_PI)};
+// Wrap an angle difference to [-π, π] (mirrors wrapAngle in hsl-bands.ts).
+// Exact, and three ops against the ~25 of an atan(sin, cos) round-trip — this
+// runs eight times per pixel inside the band loop.
+float wrapAngle(float a) { return a - HSL_TWO_PI * floor(a / HSL_TWO_PI + 0.5); }
 // Triangular partition-of-unity band weight (see hsl-bands.ts).
 float hslBandWeight(int k, float h) {
-  float d = h - HSL_CENTERS[k];
-  d = atan(sin(d), cos(d));
+  float d = wrapAngle(h - HSL_CENTERS[k]);
   float gap = d >= 0.0 ? HSL_RGAP[k] : HSL_RGAP[(k + 7) % 8];
   return max(0.0, 1.0 - abs(d) / gap);
 }
 // Triangular window around a hue centre (mirrors hueWindow in hsl-bands.ts).
 float hueWindow(float h, float center, float halfWidth) {
-  float d = h - center;
-  return max(0.0, 1.0 - abs(atan(sin(d), cos(d))) / halfWidth);
+  return max(0.0, 1.0 - abs(wrapAngle(h - center)) / halfWidth);
 }
 `;
