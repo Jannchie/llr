@@ -302,24 +302,63 @@ void main() {
   // pixel every frame. Branch is on a uniform, so it is coherent across the draw.
   if (u_hslActive == 1) {
     vec3 lab = proPhotoToOklab(c);
-    float C = length(lab.yz);
-    if (C > 1e-4) {
-      float h = atan(lab.z, lab.y);                    // Oklab hue, radians
+    // Which band a pixel belongs to is a property of its *neighbourhood*, not
+    // of the pixel: chroma noise swings a single pixel's hue by more than the
+    // Red-Orange centres are apart (0.41 rad, the tightest pair), so per-pixel
+    // band weights speckle — adjacent pixels land in different bands and only
+    // some of them take the Luminance move. Take the selection colour from
+    // four bilinear taps around the pixel instead. The adjustment still applies
+    // to this pixel's own colour, so detail and edges survive.
+    //
+    // Sampling after white balance is enough: everything between it and here
+    // (exposure, tonal regions, vibrance) scales luminance or chroma without
+    // rotating hue, and the gate reads the ratio C/L, which those scalings
+    // leave near enough alone.
+    // Radius: half an output pixel, floored at 0.75 source texels. The preview
+    // renders at previewScale, so in a fit-to-window view one output pixel
+    // spans several texels; fwidth follows that and halves the worst-case
+    // residue there (90th-percentile grain 0.21 -> 0.10), while at 1:1 and on
+    // export it drops to the floor and the two agree. The floor is 0.75 rather
+    // than 0.5 because the source texture falls back to NEAREST when RGB32F is
+    // not filterable: at 0.5 the taps can all round back to the centre texel
+    // and average nothing.
+    vec2 ts = max(0.75 / vec2(textureSize(u_input, 0)), 0.5 * fwidth(lensUV));
+    vec3 nb = texture(u_input, lensUV + vec2( ts.x,  ts.y)).rgb
+            + texture(u_input, lensUV + vec2(-ts.x,  ts.y)).rgb
+            + texture(u_input, lensUV + vec2( ts.x, -ts.y)).rgb
+            + texture(u_input, lensUV + vec2(-ts.x, -ts.y)).rgb;
+    // Same fetch -> gain -> WB chain as the main sample above, on the average.
+    vec3 labSel = proPhotoToOklab(max(u_wbMatrix * (max(nb * 0.25, 0.0) * lensGain), 0.0));
+    // Chroma gate: hue is meaningless where chroma is, so near-neutral pixels
+    // must fall out of every band rather than land in a random one
+    // (hsl-bands.ts). Hue/Saturation and Luminance smoothstep the same ratio
+    // over different windows; Luminance is gated harder because it is the axis
+    // that shows the noise.
+    float rel = hslChromaRatio(length(labSel.yz), labSel.x);
+    float sel = smoothstep(HSL_SEL_S0, HSL_SEL_S1, rel);
+    if (sel > 1e-3) {
+      float hSel = atan(labSel.z, labSel.y);           // Oklab hue, radians
       // Triangular partition-of-unity band weights (HSL_GLSL, hsl-bands.ts):
       // adjacent band values interpolate exactly, with no dead zones between
       // widely spaced centres and no overshoot where bands used to overlap.
       float hAdj = 0.0, sAdj = 0.0, lAdj = 0.0;
       for (int k = 0; k < 8; k++) {
-        float m = hslBandWeight(k, h);
+        float m = hslBandWeight(k, hSel);
         hAdj += m * u_hsl_h[k];
         sAdj += m * u_hsl_s[k];
         lAdj += m * u_hsl_l[k];
       }
-      float newH = h + hAdj * 0.5;                     // hue rotation (radians)
-      float newC = C * (1.0 + sAdj);                   // per-band saturation
+      // Hue and saturation move this pixel's own (a,b) — the neighbourhood only
+      // chose the band. Rotating the vector directly is exact and avoids a
+      // second atan2 just to re-encode an angle nothing else reads.
+      float dH = hAdj * sel * 0.5;
+      float cd = cos(dH), sd = sin(dH);
+      lab.yz = (1.0 + sAdj * sel) * vec2(lab.y * cd - lab.z * sd, lab.y * sd + lab.z * cd);
+      // Luminance also fades into the deepest stop: its Oklab-L offset is
+      // additive, so a fixed step is a far larger relative move down in the
+      // shadows — re-amplifying exactly what the gate just damped.
+      lAdj *= smoothstep(HSL_SEL_L_S0, HSL_SEL_L_S1, rel) * hslLumFade(lab.x);
       lab.x = max(lab.x + lAdj * 0.15, 0.0);           // per-band luminance
-      lab.y = newC * cos(newH);
-      lab.z = newC * sin(newH);
       c = max(oklabToProPhoto(lab), 0.0);
     }
   }

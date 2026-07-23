@@ -8,7 +8,7 @@
  * where fixed-width bands used to overlap.
  */
 
-import { glslFloat } from "./color-spaces";
+import { glslFloat, smoothstep } from "./color-spaces";
 
 /** Band hue centres (Oklab radians): Red, Orange, Yellow, Green, Aqua, Blue, Purple, Magenta. */
 export const HSL_CENTERS: readonly number[] = [0.5101, 0.9210, 1.9160, 2.4873, -2.8833, -1.6745, -1.1558, -0.5523];
@@ -24,11 +24,61 @@ export const HSL_RIGHT_GAP: readonly number[] = HSL_CENTERS.map((c, k) => {
   return d <= 0 ? d + TWO_PI : d;
 });
 
-/** Triangular band weight for band k at Oklab hue h (radians). */
+/**
+ * Triangular band weight for band k at Oklab hue h (radians), smoothstepped.
+ *
+ * The raw triangle is C¹-discontinuous at every centre, so a hue ramp crossing
+ * a centre shows a crease. Smoothstep is symmetric about 0.5 — s(w) + s(1-w)
+ * = 1 — and at most two bands are ever non-zero, so the partition of unity
+ * survives the shaping while the response flattens at each centre.
+ */
 export function hslBandWeight(k: number, h: number): number {
   const d = wrapAngle(h - HSL_CENTERS[k]);
   const gap = d >= 0 ? HSL_RIGHT_GAP[k] : HSL_RIGHT_GAP[(k + HSL_CENTERS.length - 1) % HSL_CENTERS.length];
-  return Math.max(0, 1 - Math.abs(d) / gap);
+  return smoothstep(0, 1, 1 - Math.abs(d) / gap);
+}
+
+// Selection gate. A pixel's hue is `atan(b, a)` — as chroma falls to zero that
+// angle becomes pure sensor noise, so neighbouring near-neutral pixels scatter
+// across different bands and a Luminance adjustment prints them as grain. Both
+// windows read chroma *relative* to lightness, so shadows need proportionally
+// more chroma to count as coloured — which is exactly where the noise lives.
+// The windows sit low on purpose. Desaturated-but-real colour is the common
+// case a mixer exists for — foliage on this repo's sample reads C/L ≈ 0.04 —
+// and it has to keep full strength; only chroma down at sensor-noise level may
+// fall away. A window wide enough to look "safe" (0.02→0.10) also halves the
+// slider on ordinary greens.
+export const HSL_SEL_S0 = 0.012;     // below: near-neutral, mixer inert
+export const HSL_SEL_S1 = 0.030;     // above: full strength
+export const HSL_SEL_L_FLOOR = 0.35; // L divisor floor, so deep shadows don't divide to infinity
+// Luminance gets its own, tighter window rather than a squared `sel`: it is the
+// axis that shows noise, since it moves brightness directly where a hue or
+// chroma wobble of the same size stays subtle. Squaring would work at the low
+// end but also costs ~40% on genuinely coloured pixels; shifting the window
+// right instead leaves those at full strength.
+export const HSL_SEL_L_S0 = 0.018;
+export const HSL_SEL_L_S1 = 0.038;
+// L is also an *additive* Oklab-L offset, so a fixed amount is a far larger
+// relative move in shadows than in midtones — the same noise, amplified. Fade
+// it in over the deepest stop.
+export const HSL_LUM_L1 = 0.25;
+
+/** The ratio both selection windows read. GLSL mirror. */
+const chromaRatio = (C: number, L: number): number => C / Math.max(L, HSL_SEL_L_FLOOR);
+
+/** Hue/Saturation selection strength at Oklab chroma C, lightness L. */
+export function hslSelection(C: number, L: number): number {
+  return smoothstep(HSL_SEL_S0, HSL_SEL_S1, chromaRatio(C, L));
+}
+
+/** Luminance selection strength — the tighter window. */
+export function hslSelectionL(C: number, L: number): number {
+  return smoothstep(HSL_SEL_L_S0, HSL_SEL_L_S1, chromaRatio(C, L));
+}
+
+/** Extra Luminance fade over the deepest stop, at Oklab lightness L. */
+export function hslLumFade(L: number): number {
+  return smoothstep(0, HSL_LUM_L1, L);
 }
 
 /** Triangular window around a hue centre — TS mirror of the GLSL hueWindow. */
@@ -66,16 +116,27 @@ const float SKIN_C2 = ${glslFloat(SKIN_C2)};
 const float SKIN_C3 = ${glslFloat(SKIN_C3)};
 const float SKIN_DAMP = ${glslFloat(SKIN_DAMP)};
 const float HSL_TWO_PI = ${glslFloat(TWO_PI)};
+const float HSL_SEL_S0 = ${glslFloat(HSL_SEL_S0)};
+const float HSL_SEL_S1 = ${glslFloat(HSL_SEL_S1)};
+const float HSL_SEL_L_S0 = ${glslFloat(HSL_SEL_L_S0)};
+const float HSL_SEL_L_S1 = ${glslFloat(HSL_SEL_L_S1)};
+const float HSL_SEL_L_FLOOR = ${glslFloat(HSL_SEL_L_FLOOR)};
+const float HSL_LUM_L1 = ${glslFloat(HSL_LUM_L1)};
 // Wrap an angle difference to [-π, π] (mirrors wrapAngle in hsl-bands.ts).
 // Exact, and three ops against the ~25 of an atan(sin, cos) round-trip — this
 // runs eight times per pixel inside the band loop.
 float wrapAngle(float a) { return a - HSL_TWO_PI * floor(a / HSL_TWO_PI + 0.5); }
-// Triangular partition-of-unity band weight (see hsl-bands.ts).
+// Smoothstepped triangular partition-of-unity band weight (see hsl-bands.ts).
 float hslBandWeight(int k, float h) {
   float d = wrapAngle(h - HSL_CENTERS[k]);
   float gap = d >= 0.0 ? HSL_RGAP[k] : HSL_RGAP[(k + 7) % 8];
-  return max(0.0, 1.0 - abs(d) / gap);
+  return smoothstep(0.0, 1.0, 1.0 - abs(d) / gap);
 }
+// The ratio both selection windows read; call sites smoothstep it with their
+// own edges, so the divide is paid once per pixel (see hsl-bands.ts).
+float hslChromaRatio(float C, float L) { return C / max(L, HSL_SEL_L_FLOOR); }
+// Extra Luminance fade over the deepest stop.
+float hslLumFade(float L) { return smoothstep(0.0, HSL_LUM_L1, L); }
 // Triangular window around a hue centre (mirrors hueWindow in hsl-bands.ts).
 float hueWindow(float h, float center, float halfWidth) {
   return max(0.0, 1.0 - abs(wrapAngle(h - center)) / halfWidth);
