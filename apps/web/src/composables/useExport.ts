@@ -1,5 +1,5 @@
 import { ref, type Ref } from "vue";
-import { PipelineRenderer, type EditParams } from "../rendering/pipeline-renderer";
+import { PipelineRenderer, type EditParams, type ProfileCurve } from "../rendering/pipeline-renderer";
 import { API, fetchLinear, type LinearMeta } from "../api";
 import { t } from "../i18n";
 
@@ -17,11 +17,13 @@ export interface ExportPlan {
   /** Exclude GPS/serials/owner/maker notes from the copied EXIF (opt-in). */
   stripPrivate: boolean;
   dcpCode: string | undefined;
+  /** Which colour engine renders camera RGB — must match the preview's. */
+  profileId: string;
   cameraMatch: boolean;
   denoise: { enabled: boolean; model: string; amount: number };
   params: Partial<EditParams>;
   curveLUT: Float32Array;
-  profileLUT: (meta: LinearMeta) => Float32Array | null;
+  profileLUT: (meta: LinearMeta) => ProfileCurve;
   /** Crop-aware output dims + source transform for the full-res frame. */
   output: (meta: LinearMeta) => { width: number; height: number; texXform: Float32Array };
   background: [number, number, number];
@@ -53,7 +55,7 @@ export function useExport(opts: {
       // 1. Decode full-resolution linear data (no half-size / no max-size cap)
       const lin = await fetchLinear({
         sourceId: plan.sourceId, halfSize: false, maxSize: 0,
-        dcpCode: plan.dcpCode, cameraMatch: plan.cameraMatch, denoise: plan.denoise,
+        profileId: plan.profileId, dcpCode: plan.dcpCode, cameraMatch: plan.cameraMatch, denoise: plan.denoise,
       });
       if (!lin) throw new Error(t("error.exportSourceGone"));
       const { meta, pixels } = lin;

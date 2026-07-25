@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
-import { PipelineRenderer, type EditParams } from "./rendering/pipeline-renderer";
+import { PipelineRenderer, type EditParams, type ProfileCurve } from "./rendering/pipeline-renderer";
 import {
   curveToLUT, buildToneCurveLUT, defaultToneCurve, normalizeToneCurve,
   DEFAULT_BASIC, sameBasic,
@@ -93,6 +93,18 @@ const fileInput = ref<HTMLInputElement | null>(null);
 const canvasRef = ref<HTMLCanvasElement | null>(null);
 const timing = ref<number | null>(null);
 const dcpCode = ref("");  // empty = auto-detect
+// Which colour engine renders camera RGB into the working space. "standard" is
+// Adobe's chain through a DCP; "sony" reproduces Imaging Edge from calibration
+// the body wrote into the RAW (worker sony/profile.py) and needs no profile
+// files — but only Sony RAWs carry it, so the worker falls back on its own.
+// Baked into linear.bin, so switching re-decodes like dcpCode.
+type ProfileId = "standard" | "sony";
+const profileId = ref<ProfileId>("standard");
+// The engine the last decode actually used (see loadSource) and, on the Sony
+// path, which Creative Look's tone curve it applied.
+const activeProfileKind = ref<string | null>(null);
+const sonyLook = ref("");
+const usingDcp = computed(() => activeProfileKind.value === "dcp");
 // False for already-rendered sources (JPEG/PNG/TIFF), which the worker decodes
 // into the same linear ProPhoto working space but which carry no mosaic, no
 // camera profile and no embedded preview. Gates the controls that need those.
@@ -298,6 +310,7 @@ type Snapshot = {
   crop: CropState;
   aspect?: string;  // crop aspect-lock key; optional: absent in older persisted sessions
   dcp: string;
+  profile?: ProfileId;  // colour engine; optional: absent in pre-Sony persisted sessions
   denoise?: typeof denoise;  // optional: absent in pre-denoise persisted sessions
 };
 
@@ -317,6 +330,7 @@ function defaultSnapshot(): Snapshot {
     crop: defaultCrop(),
     aspect: DEFAULT_ASPECT,
     dcp: "",
+    profile: "standard",
     denoise: defaultDenoise(),
   };
 }
@@ -341,6 +355,7 @@ function captureSnapshot(): Snapshot {
     crop: cloneCrop(crop),
     aspect: cropAspect.value,
     dcp: dcpCode.value,
+    profile: profileId.value,
     denoise: { ...denoise },
   };
 }
@@ -361,6 +376,7 @@ function setEditState(s: Snapshot): void {
   cropAspect.value = s.aspect ?? "free";
   Object.assign(denoise, s.denoise ?? defaultDenoise());
   dcpCode.value = s.dcp;
+  profileId.value = s.profile ?? "standard";
   // Rebake with the snapshot's Basic values (bakeCurveLUT also syncs bakedBasic).
   // Uploading a curve-only LUT here would leave a stale bakedBasic: if the
   // snapshot's Contrast/Blacks happen to equal it, drawWebGL's sameBasic check
@@ -507,7 +523,7 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
   timing.value = null; // stale timing would mask the live status in the footer
   const t0 = performance.now();
   try {
-    const lin = await fetchLinear({ sourceId: id, halfSize: false, maxSize: 2560, dcpCode: dcpCode.value, denoise: denoisePayload(), cameraMatch: cameraMatch.value });
+    const lin = await fetchLinear({ sourceId: id, halfSize: false, maxSize: 2560, profileId: profileId.value, dcpCode: dcpCode.value, denoise: denoisePayload(), cameraMatch: cameraMatch.value });
     if (stale()) return false;
     if (!lin) { markInvalid(id); return false; }
     const { meta: linMeta, pixels: linearFloat } = lin;
@@ -516,6 +532,11 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     profileCurveLUT = buildProfileLUT(linMeta.colorProfile);
     lensCorr = parseLensCorr(linMeta.colorProfile?.lensCorr);
     isRawSource.value = linMeta.colorProfile?.kind !== "rendered-image";
+    // What the worker *actually* rendered with, which is not always what was
+    // asked for: "sony" falls back to the DCP path on a RAW without Sony's
+    // calibration. The DCP-only controls follow this, not profileId.
+    activeProfileKind.value = linMeta.colorProfile?.kind ?? null;
+    sonyLook.value = linMeta.colorProfile?.creativeLook ?? "";
     applyDcpSelection(linMeta.colorProfile?.selection);
     // Availability is independent of the toggle, so the control stays visible
     // after the user switches the match off (which drops the applied cameraMatch).
@@ -596,17 +617,21 @@ function buildPipelineParams(s?: Snapshot): Partial<EditParams> {
   };
 }
 
-// ── DCP profile tone curve (camera display rendering, applied in the view transform) ──
+// ── Camera profile tone curve (the camera's display rendering, applied in the view transform) ──
 
-let profileCurveLUT: Float32Array | null = null;
+let profileCurveLUT: ProfileCurve = null;
 
 // Per-image lens correction tables (canonical 16-knot grid), parsed from the
 // decode response in loadSource. null = the RAW carries no correction data.
 let lensCorr: LensCorr | null = null;
 
-function buildProfileLUT(cp: ColorProfileMeta | null | undefined): Float32Array | null {
+function buildProfileLUT(cp: ColorProfileMeta | null | undefined): ProfileCurve {
   const pts = cp?.profileToneCurve;
-  return (pts && pts.length >= 2) ? curveToLUT(pts.map(([x, y]) => ({ x, y }))) : null;
+  if (!pts || pts.length < 2) return null;
+  // A per-channel curve is basis-dependent, and the basis belongs to the profile:
+  // Sony's MainGamma runs on the body's own near-Rec.709 primaries, a DCP's curve
+  // in the ProPhoto working space. The shader rotates accordingly.
+  return { lut: curveToLUT(pts.map(([x, y]) => ({ x, y }))), srgbBasis: cp?.kind === "sony" };
 }
 
 // ── Histogram ──
@@ -898,12 +923,12 @@ watch(crop, () => {
 // History/persist for the edit state not covered above (redraws handled by
 // their own paths: curve LUT bake, dcp/denoise re-decode; aspect is snapshot
 // state but changes no pixels by itself).
-watch([toneCurve, dcpCode, denoise, cropAspect],
+watch([toneCurve, dcpCode, profileId, denoise, cropAspect],
   () => { scheduleHistoryCommit(); schedulePersist(); }, { deep: true });
 
-// Re-decode when the user changes the DCP style (keeps the current view).
-// Suppressed while a source load is already handling the decode.
-watch(dcpCode, async () => {
+// Re-decode when the user changes the DCP style or the colour engine (keeps the
+// current view). Suppressed while a source load is already handling the decode.
+watch([dcpCode, profileId], async () => {
   if (suppressDcpReload || !currentSourceId) return;
   await loadSource(currentSourceId, { resetView: false });
 });
@@ -1030,6 +1055,7 @@ function buildExportPlan(): ExportPlan | null {
     settings,
     stripPrivate: viewSettings.exportStripPrivate === 1,
     dcpCode: settings.dcp,
+    profileId: settings.profile ?? "standard",
     cameraMatch: cameraMatch.value,
     denoise: denoisePayload(settings.denoise),
     params: buildPipelineParams(settings),
@@ -1335,13 +1361,27 @@ const vWheelAdjust = {
             <option v-for="l in LOCALES" :key="l.value" :value="l.value">{{ l.label }}</option>
           </select>
         </div>
-        <div class="control-row" v-if="activeSource && isRawSource && dcpStyles.length">
+        <div class="control-row" v-if="activeSource && isRawSource">
+          <label class="control-label" :title="t('settings.engineHint')">{{ t('settings.engine') }}</label>
+          <select v-model="profileId" class="control-select">
+            <option value="standard">{{ t('engine.adobe') }}</option>
+            <option value="sony">{{ t('engine.sony') }}</option>
+          </select>
+        </div>
+        <div class="control-row" v-if="activeSource && isRawSource && sonyLook">
+          <label class="control-label">{{ t('settings.creativeLook') }}</label>
+          <span class="control-value">{{ sonyLook }}</span>
+        </div>
+        <p class="control-note" v-if="activeSource && isRawSource && profileId === 'sony' && usingDcp">
+          {{ t('engine.sonyUnavailable') }}
+        </p>
+        <div class="control-row" v-if="activeSource && isRawSource && usingDcp && dcpStyles.length">
           <label class="control-label">{{ t('settings.dcp') }}</label>
           <select v-model="dcpCode" class="control-select">
             <option v-for="code in dcpStyles" :key="code" :value="code">{{ dcpStyleLabel(code) }}</option>
           </select>
         </div>
-        <div class="control-row" v-if="activeSource && isRawSource && hasCameraMatch">
+        <div class="control-row" v-if="activeSource && isRawSource && usingDcp && hasCameraMatch">
           <label class="control-label" for="camera-match" :title="t('settings.cameraMatchHint')">{{ t('settings.cameraMatch') }}</label>
           <label class="switch">
             <input id="camera-match" type="checkbox" v-model="cameraMatch" />

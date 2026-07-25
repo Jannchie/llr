@@ -44,6 +44,14 @@ const HSL_ZERO = [0, 0, 0, 0, 0, 0, 0, 0];
 export type LinearPixels = Float32Array | Uint16Array;
 
 /**
+ * A camera profile's tone curve, baked onto the shader's LUT grid. `srgbBasis`
+ * says which primaries the per-channel curve is defined on — sRGB/Rec.709 for
+ * Sony's MainGamma, the ProPhoto working space for a DCP's own curve. null when
+ * the profile carries no curve.
+ */
+export type ProfileCurve = { lut: Float32Array; srgbBasis: boolean } | null;
+
+/**
  * Override for the histogram's render window: logical output dims plus the
  * output→source-texcoord transform (see setOutput). Lets the crop editor bin
  * the tight crop box while the canvas shows the padded straighten bbox.
@@ -92,6 +100,9 @@ export class PipelineRenderer {
   private curveLutTex: WebGLTexture | null = null;
   private profileLutTex: WebGLTexture | null = null;
   private hasProfileCurve = false;
+  // Whether that curve is defined on sRGB/Rec.709 primaries (Sony's MainGamma)
+  // rather than the ProPhoto working space (a DCP's own curve).
+  private profileCurveSrgb = false;
   private texWidth = 0;
   private texHeight = 0;
   // Output (canvas / render) dimensions — equal to the texture dims for an
@@ -395,13 +406,13 @@ export class PipelineRenderer {
   }
 
   /**
-   * Upload the DCP profile tone curve as a per-channel LUT applied in the
+   * Upload the camera profile tone curve as a per-channel LUT applied in the
    * Lightroom-style view transform (the camera's display rendering). Pass null
-   * to disable it (e.g. no DCP / monochrome profile) and fall back to identity.
+   * to disable it (e.g. no profile / monochrome profile) and fall back to identity.
    */
-  uploadProfileCurveLUT(lut: Float32Array | null): void {
+  uploadProfileCurveLUT(curve: ProfileCurve): void {
     const gl = this.gl;
-    let data = lut;
+    let data = curve?.lut;
     if (!data) {
       data = new Float32Array(LUT_SIZE);
       for (let i = 0; i < LUT_SIZE; i++) data[i] = i / (LUT_SIZE - 1);
@@ -413,7 +424,8 @@ export class PipelineRenderer {
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
       gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, LUT_SIZE, 1, gl.RED, gl.FLOAT, data);
     }
-    this.hasProfileCurve = lut != null;
+    this.hasProfileCurve = curve != null;
+    this.profileCurveSrgb = curve?.srgbBasis ?? false;
   }
 
   draw(params: Partial<EditParams> = {}): void {
@@ -803,6 +815,7 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     i("u_viewTransform", p.viewTransform);
     i("u_displayGamut", p.displayGamut);
     i("u_hasProfileCurve", this.hasProfileCurve ? 1 : 0);
+    i("u_profileCurveSrgb", this.profileCurveSrgb ? 1 : 0);
     i("u_curveActive", this.curveActive ? 1 : 0);
     s("u_exposure", p.exposure); s("u_highlights", p.highlights);
     s("u_shadows", p.shadows);

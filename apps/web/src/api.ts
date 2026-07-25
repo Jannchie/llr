@@ -8,10 +8,13 @@ import type { LinearPixels } from "./rendering/pipeline-renderer";
 export const API = (import.meta.env.VITE_API_URL as string | undefined) ?? "/api";
 
 export type ColorProfileMeta = {
-  // How the worker produced the linear data: a DCP profile, LibRaw's matrix
-  // fallback, or "rendered-image" for a decoded JPEG/PNG/TIFF, which carries no
-  // mosaic, camera profile or lens correction data.
-  kind?: "dcp" | "libraw-matrix" | "rendered-image";
+  // How the worker produced the linear data: a DCP profile, Sony's own rendering
+  // reproduced from calibration inside the RAW, LibRaw's matrix fallback, or
+  // "rendered-image" for a decoded JPEG/PNG/TIFF, which carries no mosaic,
+  // camera profile or lens correction data.
+  kind?: "dcp" | "sony" | "libraw-matrix" | "rendered-image";
+  // Sony path only: the Creative Look whose tone curve was applied.
+  creativeLook?: string;
   // How the DCP was picked, and which styles this camera body actually ships.
   // The style picker is built from these, so it can only offer profiles that
   // resolve — there is no "auto" entry, the matched code is simply selected.

@@ -692,6 +692,23 @@ input[type="range"]:active::-webkit-slider-thumb {
   font-size: 12px;
 }
 
+/* Read-only counterpart to .control-select: a value the decode reports rather
+   than one the user picks. Sits on the same 1fr track, no control chrome. */
+.control-value {
+  color: var(--text);
+  font-size: 13px;
+  padding: 6px 0;
+}
+
+/* Full-width note under a control row, for when the decode did something other
+   than what the control asked for. */
+.control-note {
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.4;
+  margin: -2px 0 2px;
+}
+
 .control-select {
   /* A select is sized by its widest option, and min-width:auto lets that beat
      the 1fr track — "Full metadata" would push the box past the card's edge. */

@@ -84,8 +84,9 @@ uniform float u_grad_balance;
 // curves, applied display-referred. .r/.g/.b hold the baked R/G/B channel curves.
 uniform sampler2D u_curve_lut;
 uniform int u_curveActive;      // 0 when the baked LUT is the identity -> skip its 5 fetches
-uniform sampler2D u_profile_lut; // DCP profile tone curve (per-channel), display rendering
-uniform int u_hasProfileCurve;   // 1 if a DCP profile tone curve is available
+uniform sampler2D u_profile_lut; // camera profile tone curve (per-channel), display rendering
+uniform int u_hasProfileCurve;   // 1 if a profile tone curve is available
+uniform int u_profileCurveSrgb;  // 1 if that curve is defined on sRGB/Rec.709 primaries, not ProPhoto
 uniform int u_viewTransform;    // 0 = Lightroom-style, 1 = AgX
 uniform int u_displayGamut;     // 0 = sRGB, 1 = Display-P3
 uniform vec3 u_bgColor;         // display-encoded fill for areas outside the image (crop editor)
@@ -112,13 +113,21 @@ ${LUT_GLSL}
 vec3 viewTransformLR(vec3 c) {
   c = max(c, 0.0);
   if (u_hasProfileCurve == 1) {
-    // The DCP profile tone curve IS the camera's display rendering — apply it per
+    // The profile tone curve IS the camera's display rendering — apply it per
     // channel (as Adobe/ACR do). This matches the camera/"official" look closely.
-    return vec3(
-      texture(u_profile_lut, vec2(lutCoord(clamp(c.r, 0.0, 1.0)), 0.5)).r,
-      texture(u_profile_lut, vec2(lutCoord(clamp(c.g, 0.0, 1.0)), 0.5)).r,
-      texture(u_profile_lut, vec2(lutCoord(clamp(c.b, 0.0, 1.0)), 0.5)).r
+    //
+    // Which primaries it runs on is part of the profile, not a preference: a
+    // DCP's curve is defined in the working space, while Sony's MainGamma runs
+    // on the body's own near-Rec.709 primaries (worker sony/profile.py). A
+    // per-channel curve is basis-dependent — applying it in the wrong one skews
+    // hue — so rotate into the curve's basis and back out.
+    vec3 s = (u_profileCurveSrgb == 1) ? PROPHOTO_TO_SRGB * c : c;
+    s = vec3(
+      texture(u_profile_lut, vec2(lutCoord(clamp(s.r, 0.0, 1.0)), 0.5)).r,
+      texture(u_profile_lut, vec2(lutCoord(clamp(s.g, 0.0, 1.0)), 0.5)).r,
+      texture(u_profile_lut, vec2(lutCoord(clamp(s.b, 0.0, 1.0)), 0.5)).r
     );
+    return (u_profileCurveSrgb == 1) ? SRGB_TO_PROPHOTO * s : s;
   }
   // Fallback (no profile curve): identity here; the display sRGB encode supplies the
   // gamma so mid gray (0.18) lands at ~0.46 and white reaches white.
@@ -495,7 +504,7 @@ export const PASSES: PassDef[] = [
     "u_hsl_l[0]","u_hsl_l[1]","u_hsl_l[2]","u_hsl_l[3]","u_hsl_l[4]","u_hsl_l[5]","u_hsl_l[6]","u_hsl_l[7]",
     "u_grad_sh_tint","u_grad_md_tint","u_grad_hl_tint",
     "u_grad_blend","u_grad_balance",
-    "u_curve_lut", "u_curveActive", "u_hasProfileCurve",
+    "u_curve_lut", "u_curveActive", "u_hasProfileCurve", "u_profileCurveSrgb",
     "u_lensActive", "u_lensScale", "u_lensNorm",
     ...Array.from({ length: 16 }, (_, k) => `u_lensDist[${k}]`),
     ...Array.from({ length: 16 }, (_, k) => `u_lensVig[${k}]`),
