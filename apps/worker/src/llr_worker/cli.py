@@ -23,10 +23,14 @@ import numpy as np
 import rawpy
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+from .creative_style import normalize_style
 from .dcp import DcpProfile, apply_dcp_profile, load_dcp_profile
 from .denoise import DEFAULT_MODEL, denoise_raw_inplace, get_denoiser
 from .fit_profile import camera_match_path, postprocess_camera_native
 from .imported import decode_image_linear
+from .sony import apply_sony_profile, calibration_for
+from .sony import can_render as sony_can_render
+from .sony.sr2 import LookCalibration
 
 RAW_EXTENSIONS = {".arw", ".srf", ".sr2", ".dng", ".cr2", ".cr3", ".nef", ".raf", ".rw2", ".orf"}
 LOCAL_CAMERA_PROFILE_ROOT = Path("vendor/adobe-camera-profiles/Camera")
@@ -54,6 +58,13 @@ class RawMetadata:
     # Per-shot lens correction splines from the RAW's maker notes, mapped to
     # vendor-neutral factor tables (see sony_lens_corrections), or None.
     lens_corr: dict[str, Any] | None = None
+    # In-camera tweaks to the Creative Look, each -9..+9. Sony applies these on
+    # top of the look's factory tone curve, so reproducing its rendering needs
+    # them (see sony/tone.py). Fade is here for completeness; it acts on a later
+    # stage and leaves the tone curve untouched.
+    look_highlights: int = 0
+    look_shadows: int = 0
+    look_fade: int = 0
 
 
 @dataclass
@@ -78,12 +89,21 @@ _FALLBACK_CACHE_MAX = 6
 
 
 # The worker only decodes; the browser owns every pixel operation, so a profile
-# carries no tone/sharpen values here. `profileId` gates the DCP lookup ("neutral"
-# means the libraw-matrix fallback) and daemon_linear layers `dcpCode` on top.
+# carries no tone/sharpen values here. `profileId` picks the colour pipeline
+# (see resolve_color_renderer): "standard" looks up a DCP and daemon_linear
+# layers `dcpCode` on top, "sony" reproduces Imaging Edge from calibration in the
+# RAW itself, "neutral" means the libraw-matrix fallback.
 PROFILES: dict[str, dict[str, Any]] = {
     "neutral": {"profileId": "neutral"},
     "standard": {"profileId": "standard"},
+    "sony": {"profileId": "sony"},
 }
+
+# The profileIds that want a camera profile at all; anything else ("neutral")
+# is asking for the raw matrix fallback. "sony" is in here because it falls back
+# to a DCP whenever the shot has no Sony rendering available — dropping all the
+# way to the matrix fallback would be a visible downgrade, not a fallback.
+PROFILED_IDS = frozenset({"standard", "sony"})
 
 
 class UnsupportedSourceError(ValueError):
@@ -858,6 +878,73 @@ def _raw_cache_key(
     return (*base, denoise_model or "")
 
 
+@dataclass(frozen=True)
+class ColorRenderer:
+    """Which colour pipeline a recipe selects, decided before the RAW is decoded.
+
+    Both branches consume camera-native RGB and deliver scene-linear ProPhoto,
+    so the choice only changes what happens after postprocess. `active` False
+    means neither is available and the decode falls back to LibRaw's ProPhoto.
+    """
+
+    sony_look: LookCalibration | None = None
+    sony_style: str | None = None
+    dcp_profile: DcpProfile | None = None
+    dcp_selection: dict[str, Any] | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.sony_look is not None or self.dcp_profile is not None
+
+
+def resolve_color_renderer(
+    root: Path,
+    dcp_arg: str | None,
+    disable_dcp: bool,
+    recipe: dict[str, Any],
+    metadata: RawMetadata,
+    input_path: Path,
+) -> ColorRenderer:
+    """Pick the colour pipeline: Sony's own rendering, a DCP, or neither.
+
+    profileId "sony" reproduces Imaging Edge from calibration inside the RAW
+    itself (see sony/profile.py), so it needs no profile files. It takes two
+    things the shot may not have: that calibration (Sony RAWs only) and a
+    Creative Look these two stages can express — Black & White and Sepia
+    desaturate in stages this pipeline does not reproduce. Missing either, and
+    an explicit --dcp, falls through to the DCP lookup.
+    """
+    if not disable_dcp and dcp_arg is None and recipe.get("profileId") == "sony":
+        style = normalize_style(metadata.creative_style)
+        look = calibration_for(input_path, style) if sony_can_render(style) else None
+        if look is not None:
+            return ColorRenderer(sony_look=look, sony_style=style)
+    profile, selection = resolve_dcp_profile(root, dcp_arg, disable_dcp, recipe, metadata)
+    return ColorRenderer(dcp_profile=profile, dcp_selection=selection)
+
+
+def render_color(
+    renderer: ColorRenderer,
+    camera_rgb: np.ndarray,
+    metadata: RawMetadata,
+    root: Path,
+    recipe: dict[str, Any],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Camera RGB -> scene-linear ProPhoto plus its colour-profile report."""
+    if renderer.sony_look is not None:
+        linear, info = apply_sony_profile(
+            camera_rgb, renderer.sony_look, renderer.sony_style,
+            highlights=metadata.look_highlights, shadows=metadata.look_shadows,
+        )
+        return linear, info.to_json()
+
+    correction = find_camera_match(root, renderer.dcp_selection) if recipe.get("cameraMatch", True) else None
+    linear, dcp_info = apply_dcp_profile(camera_rgb, renderer.dcp_profile, correction)
+    color_profile = dcp_info.to_json()
+    color_profile["selection"] = renderer.dcp_selection
+    return linear, color_profile
+
+
 def prepare_linear(
     input_path: Path,
     recipe: dict[str, Any],
@@ -894,25 +981,23 @@ def prepare_linear(
             RAW_CAMERA_CACHE.move_to_end(cache_key)
     if cached_camera is not None:
         camera_rgb, metadata = cached_camera
-        dcp_profile, dcp_selection = resolve_dcp_profile(root, dcp_arg, disable_dcp, recipe, metadata)
-        if dcp_profile is not None:
-            linear, dcp_info = apply_dcp_profile(camera_rgb, dcp_profile, find_camera_match(root, dcp_selection) if recipe.get("cameraMatch", True) else None)
-            color_profile = dcp_info.to_json()
-            color_profile["selection"] = dcp_selection
+        renderer = resolve_color_renderer(root, dcp_arg, disable_dcp, recipe, metadata, input_path)
+        if renderer.active:
+            linear, color_profile = render_color(renderer, camera_rgb, metadata, root, recipe)
             return PreparedLinear(linear=linear, metadata=metadata, color_profile=color_profile)
-        # DCP no longer available; fall through to re-decode
+        # No colour pipeline available any more; fall through to re-decode
         with _CACHE_LOCK:
             RAW_CAMERA_CACHE.pop(cache_key, None)
 
-    # Cache hit for the no-DCP fallback: linear is final unless DCP reappeared.
+    # Cache hit for the no-profile fallback: linear is final unless a colour
+    # pipeline became available again.
     with _CACHE_LOCK:
         cached_fallback = _FALLBACK_CACHE.get(cache_key)
         if cached_fallback is not None:
             _FALLBACK_CACHE.move_to_end(cache_key)
     if cached_fallback is not None:
         linear, metadata, color_profile = cached_fallback
-        dcp_profile, _ = resolve_dcp_profile(root, dcp_arg, disable_dcp, recipe, metadata)
-        if dcp_profile is None:
+        if not resolve_color_renderer(root, dcp_arg, disable_dcp, recipe, metadata, input_path).active:
             return PreparedLinear(linear=linear, metadata=metadata, color_profile=color_profile)
         with _CACHE_LOCK:
             _FALLBACK_CACHE.pop(cache_key, None)
@@ -925,8 +1010,8 @@ def prepare_linear(
         # Returns None (mosaic untouched) on non-2x2 CFAs such as Fuji X-Trans.
         if denoise_model:
             denoise_raw_inplace(raw, get_denoiser(denoise_model))
-        dcp_profile, dcp_selection = resolve_dcp_profile(root, dcp_arg, disable_dcp, recipe, metadata)
-        if dcp_profile is None:
+        renderer = resolve_color_renderer(root, dcp_arg, disable_dcp, recipe, metadata, input_path)
+        if not renderer.active:
             # Scene-referred fallback: deliver linear ProPhoto (D50) so the browser
             # edits in the same wide-gamut working space as the DCP path. LibRaw
             # still normalises the white level, so this path does not carry true
@@ -956,15 +1041,13 @@ def prepare_linear(
             camera_rgb = postprocess_camera_native(raw, half_size=half_size)
             camera_rgb = apply_camera_crop(camera_rgb, metadata.camera_crop)
             if camera_rgb.shape[-1] != 3:
-                raise ValueError("DCP rendering currently supports only three-channel camera RGB data")
+                raise ValueError("Profiled rendering currently supports only three-channel camera RGB data")
             if max_size:
                 camera_rgb = downsample_linear(camera_rgb, max_size)
-            # Cache camera RGB so DCP code changes skip RAW re-decode
+            # Cache camera RGB so colour-pipeline changes skip RAW re-decode
             if store_cache:
                 _remember(RAW_CAMERA_CACHE, cache_key, (camera_rgb, metadata), RAW_CAMERA_CACHE_MAX)
-            linear, dcp_info = apply_dcp_profile(camera_rgb, dcp_profile, find_camera_match(root, dcp_selection) if recipe.get("cameraMatch", True) else None)
-            color_profile = dcp_info.to_json()
-            color_profile["selection"] = dcp_selection
+            linear, color_profile = render_color(renderer, camera_rgb, metadata, root, recipe)
 
     return PreparedLinear(linear=linear, metadata=metadata, color_profile=color_profile)
 
@@ -1134,7 +1217,23 @@ def read_raw_metadata(input_path: Path, raw: rawpy.RawPy) -> RawMetadata:
         full_height=full_height,
         camera_crop=camera_crop,
         lens_corr=sony_lens_corrections(exif),
+        look_highlights=_exif_int(exif.get("Highlights")),
+        look_shadows=_exif_int(exif.get("Shadows")),
+        look_fade=_exif_int(exif.get("Fade")),
     )
+
+
+def _exif_int(value: Any) -> int:
+    """One signed exif integer, 0 when absent or unparseable.
+
+    exiftool renders these as "+1" / "-6" strings, which int() handles, but a
+    body that doesn't write the tag at all is the common case and simply means
+    no tweak was applied.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _exif_int_list(value: Any) -> list[int] | None:
@@ -1312,7 +1411,7 @@ def resolve_dcp_profile(
         path = resolve_path(root, dcp_arg)
         return load_dcp_profile(path), {"mode": "explicit", "path": str(path)}
 
-    if recipe.get("profileId") != "standard":
+    if recipe.get("profileId") not in PROFILED_IDS:
         return None, None
 
     # Check for explicit DCP code override
