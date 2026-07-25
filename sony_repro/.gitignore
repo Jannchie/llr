@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+# Memory dumps and fitted arrays — regenerate them with tools/, don't commit them.
+*.npz
+*.bin
