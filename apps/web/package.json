@@ -6,6 +6,7 @@
   "scripts": {
     "build": "vite build",
     "check": "vue-tsc -p tsconfig.json --noEmit",
+    "check:shaders": "tsx scripts/shader-check.ts",
     "dev": "vite --host 0.0.0.0",
     "test": "vitest run"
   },

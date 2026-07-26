@@ -329,4 +329,5 @@ float srgbDecode(float c) {
   c = clamp(c, 0.0, 1.0);
   return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
 }
+vec3 srgbDecode(vec3 c) { return vec3(srgbDecode(c.r), srgbDecode(c.g), srgbDecode(c.b)); }
 `;
