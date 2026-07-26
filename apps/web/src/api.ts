@@ -20,6 +20,10 @@ export type ColorProfileMeta = {
   // resolve — there is no "auto" entry, the matched code is simply selected.
   selection?: { matchedCode?: string | null; availableCodes?: string[] } | null;
   profileToneCurve?: [number, number][] | null;
+  // Sony's RGB2YCC, applied right after that curve: four cross terms and four
+  // gains, each pair indexed by the sign of a chroma difference. Sony only.
+  profileChromaCross?: number[] | null;
+  profileChromaGain?: number[] | null;
   // A fitted camera-match table layered on the DCP (present only when applied);
   // cameraMatchAvailable reports whether one exists regardless of the toggle.
   cameraMatch?: unknown;

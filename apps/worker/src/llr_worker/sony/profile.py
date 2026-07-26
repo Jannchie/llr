@@ -1,14 +1,17 @@
 """Render camera RGB the way Sony Imaging Edge does.
 
-The Sony chain that matters for colour is two steps, and both are now reproduced
-bit-exactly (see ../../../../sony_repro/PIPELINE.md):
+The Sony chain that matters for colour is three steps, all reproduced against
+the running engine's own pixels (see ../../../../sony_repro/PIPELINE.md):
 
     SIMDLinearMatrix16   hue-segmented 3x3, calibration read from the ARW
     MainGamma            one per-channel 1D LUT, one curve per Creative Look
+    RGB2YCC              the look's saturation and hue (chroma.py)
 
-They map cleanly onto this pipeline's two halves. The matrix replaces the DCP
-colour step and runs here; the curve replaces the view transform and runs in the
-browser, shipped as `profileToneCurve` exactly like a DCP's own curve.
+They map onto this pipeline's two halves. The matrix replaces the DCP colour
+step and runs here; the curve replaces the view transform and runs in the
+browser, shipped as `profileToneCurve` exactly like a DCP's own curve. RGB2YCC
+travels with the curve because the engine runs it immediately afterwards, on the
+curve's own output and in the curve's own basis.
 
 Both are read out of the shot itself: the body writes calibration for all ten
 Creative Looks into every frame, so switching looks needs no extra data and no
@@ -24,11 +27,12 @@ Two facts make the swap safe (both measured against the running engine):
   separate camera-to-standard-space matrix at all, which is the whole reason
   this path beats routing through XYZ.
 
-Against a correctly-matched DCP profile the two trade places depending on the
-frame — this path wins on RMSE and on shadow rendering, the DCP sometimes wins
-on hue angle. What it does not yet reproduce is the saturation the engine adds
-in its later YCC stages, which reads as an overall flatness next to the
-in-camera JPEG.
+Measured against the engine's own frame, one stage at a time: the tone curve is
+within 1/16383, RGB2YCC's luma is bit-identical and its chroma within 1, and the
+matrix now lands at 0.9891 / 1.0031 on the two chroma differences with the hue
+angle within a quarter of a degree. What is left of the engine — ITP,
+sharpening, Spica, and the parts of Marble that are not a round trip — comes to
+about 5% of chroma, plus DRO on shots that asked for it.
 """
 
 from __future__ import annotations
@@ -42,6 +46,7 @@ from typing import Any
 import numpy as np
 
 from ..dcp import D50_TO_D65, XYZ_D50_TO_PROPHOTO, XYZ_D65_TO_SRGB
+from .chroma import ILLUMINANT_UNIT, blend_params, unpack_params
 from .linear_matrix import SegmentedMatrix
 from .sr2 import LookCalibration, look_calibrations, unpack_param_block
 from .tone import LOOK_ORDER, look_index, tone_curve
@@ -62,6 +67,8 @@ class SonyRenderInfo:
     style: str
     tone_curve: list[list[float]]
     limitations: list[str]
+    chroma_cross: list[float]
+    chroma_gain: list[float]
     working_space: str = "linear-prophoto-d50"
 
     def to_json(self) -> dict[str, Any]:
@@ -74,6 +81,10 @@ class SonyRenderInfo:
             "limitations": self.limitations,
             "workingSpace": self.working_space,
             "profileToneCurve": self.tone_curve,
+            # RGB2YCC, applied by the shader right after the curve — that is
+            # where the engine runs it, and it needs the curve's own encoding.
+            "profileChromaCross": self.chroma_cross,
+            "profileChromaGain": self.chroma_gain,
         }
 
 
@@ -84,10 +95,11 @@ REC709_TO_PROPHOTO_D50 = (
 ).astype(np.float32)
 
 
-# Black & White and Sepia carry an *identity* colour matrix — their desaturation
-# happens entirely in the YCC stages this pipeline does not reproduce, so
-# rendering them here would produce a colour image with the wrong curve.
-MONOCHROME_LOOKS = frozenset({"BW", "SE"})
+# Sepia's chroma terms are identical to Standard's, so its toning happens in
+# some stage still unaccounted for; rendering it here would give a plain colour
+# image under a Sepia label. Black & White needs no special case at all — its
+# eight chroma values are zero, which zeroes both gains and leaves R = G = B.
+MONOCHROME_LOOKS = frozenset({"SE"})
 
 
 def available_styles() -> list[str]:
@@ -169,12 +181,36 @@ def apply_sony_profile(
     matrix = SegmentedMatrix(unpack_param_block(cal.param_block))
     rec709 = matrix.apply(camera_rgb)
     linear_prophoto = np.clip(rec709 @ REC709_TO_PROPHOTO_D50.T, 0, None)
+    cross, gain = chroma_terms(cal)
 
     return linear_prophoto, SonyRenderInfo(
         style=style,
         tone_curve=tone_curve_points(cal, style, highlights, shadows),
-        # The remaining gap to the engine is ZcTask3DLut (which the default
-        # preview path never executes) plus the SSCS saturation and AreaComp
-        # stages, and DRO, which lifts shadows on shots that requested it.
-        limitations=["Sony's YCC stages (SSCS saturation, AreaComp, sharpening) and DRO are not reproduced."],
+        chroma_cross=[float(x) for x in cross],
+        chroma_gain=[float(x) for x in gain],
+        # What is left of the engine is ChromaSuppres (identity in midtones),
+        # SSCS (measured to touch no pixel on a whole frame), AreaComp (0.9999),
+        # ITP, sharpening, Spica and Marble — together about 5% of chroma — plus
+        # DRO, which lifts shadows on shots that requested it.
+        limitations=["Sony's ITP, sharpening and DRO stages are not reproduced."],
     )
+
+
+def chroma_terms(cal: LookCalibration) -> tuple[np.ndarray, np.ndarray]:
+    """This look's RGB2YCC cross terms and gains, using the base alone.
+
+    The engine blends four illuminant deltas into the base with weights it keeps
+    at calibration block +0xe44..0xe4a, and those weights are *not* constant:
+    two frames measured came out (1024, 0, 0, 0), a third came out roughly
+    (340, 684, 0, 0), i.e. two thirds of the way to the second illuminant. What
+    picks them has not been worked out — it looks like an interpolation by
+    colour temperature — so this uses the base and accepts the error.
+
+    Measured cost on the frame where the weights differ, against the engine's
+    own output: hue lands 4.5 degrees off, and feeding the engine's actual
+    values instead brings it to 0.03. Chroma is barely affected (1.06 vs 1.04),
+    so the far larger error this stage removes — a 40% chroma deficit — is worth
+    having meanwhile.
+    """
+    weights = np.array([ILLUMINANT_UNIT, 0, 0, 0], dtype=np.int64)
+    return unpack_params(blend_params(cal.chroma_base, cal.chroma_deltas, weights))

@@ -34,6 +34,11 @@ CURVE_X_TAG = 0x7805     # tone curve control points, x (not evenly spaced)
 CURVE_Y_TAG = 0x7806     # ...and y
 LOOK_NAME_TAG = 0x7770   # the look's own name, e.g. "Standard" / "FL" / "VV2"
 
+# RGB2YCC's eight signed shorts: a base plus four illuminant deltas (chroma.py).
+CHROMA_BASE_TAG = 0x7842
+CHROMA_ILLUMINANT_TAGS = (0x7843, 0x7844, 0x7845, 0x7846)
+_CHROMA_TAGS = (CHROMA_BASE_TAG, *CHROMA_ILLUMINANT_TAGS)
+
 # TIFF field type -> bytes per unit
 _TYPE_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8}
 
@@ -50,9 +55,11 @@ class LookCalibration:
     """
 
     name: str
-    param_block: bytes      # 276 bytes -> LinearMatrix16 knot coefficients
-    curve_x: np.ndarray     # 128 control points, in units of LUT index * 128
-    curve_y: np.ndarray     # ...and their outputs, in units of full scale / 16384
+    param_block: bytes        # 276 bytes -> LinearMatrix16 knot coefficients
+    curve_x: np.ndarray       # 128 control points, in units of LUT index * 128
+    curve_y: np.ndarray       # ...and their outputs, in units of full scale / 16384
+    chroma_base: np.ndarray   # int16[8] -> RGB2YCC cross terms and gains
+    chroma_deltas: np.ndarray  # int16[4, 8], the per-illuminant deltas
 
 
 def decrypt(data: bytes, start: int, length: int, key: int) -> bytes:
@@ -187,16 +194,21 @@ def look_calibrations(path: str | Path) -> list[LookCalibration]:
         for tag, _typ, cnt, tag_pos, size in _ifd_entries(dec, pos, endian):
             if tag in (CURVE_X_TAG, CURVE_Y_TAG):
                 got[tag] = np.array(struct.unpack_from(f"{endian}{cnt}i", dec, tag_pos), dtype=np.int64)
+            elif tag in _CHROMA_TAGS:
+                got[tag] = np.array(struct.unpack_from(f"{endian}{cnt}h", dec, tag_pos), dtype=np.int64)
             elif tag == LOOK_NAME_TAG:
                 got[tag] = dec[tag_pos:tag_pos + size]
-        missing = {CURVE_X_TAG, CURVE_Y_TAG} - set(got)
+        missing = {CURVE_X_TAG, CURVE_Y_TAG, CHROMA_BASE_TAG} - set(got)
         if missing:
             raise KeyError(f"SR2DataIFD at 0x{pos:x} is missing {sorted(hex(t) for t in missing)}")
+        zero = np.zeros(8, dtype=np.int64)
         out.append(LookCalibration(
             name=bytes(got.get(LOOK_NAME_TAG, b"")).split(b"\x00")[0].decode("ascii", "replace"),
             param_block=param_block,
             curve_x=got[CURVE_X_TAG],
             curve_y=got[CURVE_Y_TAG],
+            chroma_base=got[CHROMA_BASE_TAG],
+            chroma_deltas=np.stack([got.get(t, zero) for t in CHROMA_ILLUMINANT_TAGS]),
         ))
     return out
 

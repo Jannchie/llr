@@ -87,6 +87,11 @@ uniform int u_curveActive;      // 0 when the baked LUT is the identity -> skip 
 uniform sampler2D u_profile_lut; // camera profile tone curve (per-channel), display rendering
 uniform int u_hasProfileCurve;   // 1 if a profile tone curve is available
 uniform int u_profileCurveSrgb;  // 1 if that curve is defined on sRGB/Rec.709 primaries, not ProPhoto
+// Sony RGB2YCC (sonyChroma below): four cross terms and four gains, both
+// indexed by sign. Zero gains are how Black & White desaturates.
+uniform int u_sonyChromaActive;
+uniform vec4 u_sonyCross;
+uniform vec4 u_sonyGain;
 uniform int u_viewTransform;    // 0 = Lightroom-style, 1 = AgX
 uniform int u_displayGamut;     // 0 = sRGB, 1 = Display-P3
 uniform vec3 u_bgColor;         // display-encoded fill for areas outside the image (crop editor)
@@ -109,6 +114,27 @@ ${LUT_GLSL}
 
 // ===== View transforms: scene-linear ProPhoto -> display-linear ProPhoto [0,1] =====
 
+// Sony's RGB2YCC — the stage that carries a Creative Look's saturation and hue.
+// Runs on display-*encoded* values in the curve's own basis, which is exactly
+// where the engine runs it (worker sony/chroma.py). The chroma differences are
+// green differences, not luma ones; both the cross terms and the gains branch on
+// sign, which is what makes the gain hue-dependent and adds the rotation.
+// The return trip is plain BT.601 — all of the styling is in the forward half.
+vec3 sonyChroma(vec3 s) {
+  vec3 e = srgbEncode(clamp(s, 0.0, 1.0));
+  float y = dot(e, vec3(2432.0, 4864.0, 896.0) / 8192.0);
+  float u = e.r - e.g;
+  float v = e.b - e.g;
+  // Both cross terms read the *unmodified* u and v, and each looks at the
+  // other's sign.
+  float v2 = (u >= 0.0 ? u_sonyCross.y : u_sonyCross.w) * u + v;
+  float u2 = (v >= 0.0 ? u_sonyCross.x : u_sonyCross.z) * v + u;
+  float cr = clamp((u2 >= 0.0 ? u_sonyGain.y : u_sonyGain.w) * u2, -0.5, 0.5);
+  float cb = clamp((v2 >= 0.0 ? u_sonyGain.x : u_sonyGain.z) * v2, -0.5, 0.5);
+  vec3 o = vec3(y + 1.4020 * cr, y - 0.7141 * cr - 0.3441 * cb, y + 1.7720 * cb);
+  return srgbDecode(clamp(o, 0.0, 1.0));
+}
+
 // (a) Lightroom-style: hue-stable luminance shoulder + highlight desaturation.
 vec3 viewTransformLR(vec3 c) {
   c = max(c, 0.0);
@@ -127,6 +153,7 @@ vec3 viewTransformLR(vec3 c) {
       texture(u_profile_lut, vec2(lutCoord(clamp(s.g, 0.0, 1.0)), 0.5)).r,
       texture(u_profile_lut, vec2(lutCoord(clamp(s.b, 0.0, 1.0)), 0.5)).r
     );
+    if (u_sonyChromaActive == 1) s = sonyChroma(s);
     return (u_profileCurveSrgb == 1) ? SRGB_TO_PROPHOTO * s : s;
   }
   // Fallback (no profile curve): identity here; the display sRGB encode supplies the
@@ -505,6 +532,7 @@ export const PASSES: PassDef[] = [
     "u_grad_sh_tint","u_grad_md_tint","u_grad_hl_tint",
     "u_grad_blend","u_grad_balance",
     "u_curve_lut", "u_curveActive", "u_hasProfileCurve", "u_profileCurveSrgb",
+    "u_sonyChromaActive", "u_sonyCross", "u_sonyGain",
     "u_lensActive", "u_lensScale", "u_lensNorm",
     ...Array.from({ length: 16 }, (_, k) => `u_lensDist[${k}]`),
     ...Array.from({ length: 16 }, (_, k) => `u_lensVig[${k}]`),

@@ -13,6 +13,7 @@ import pytest
 
 from llr_worker.cli import prepare_linear
 from llr_worker.sony import apply_sony_profile, available_styles, calibration_for, can_render
+from llr_worker.sony.chroma import apply_chroma, blend_params, unpack_params
 from llr_worker.sony.linear_matrix import (
     KNOT_STEP,
     N_INDEX,
@@ -21,7 +22,12 @@ from llr_worker.sony.linear_matrix import (
     expand,
     matrices_from_coeff,
 )
-from llr_worker.sony.profile import REC709_TO_PROPHOTO_D50, TONE_CURVE_POINTS, tone_curve_points
+from llr_worker.sony.profile import (
+    REC709_TO_PROPHOTO_D50,
+    TONE_CURVE_POINTS,
+    chroma_terms,
+    tone_curve_points,
+)
 from llr_worker.sony.sr2 import (
     PARAM_BLOCK_SIZE,
     decrypt,
@@ -179,15 +185,85 @@ def test_every_look_shares_one_colour_matrix() -> None:
 
 
 @requires_sample
-def test_black_and_white_is_still_refused() -> None:
-    """BW and SE desaturate in the YCC stage, which this path does not reproduce.
+def test_black_and_white_desaturates_itself() -> None:
+    """BW needs no special case: all eight of its chroma values are zero.
 
-    Their chroma gains (0x7842) are all zero, which zeroes Cb and Cr and leaves
-    R=G=B. Rendering them here would give a colour image with a monochrome
-    look's curve, which is worse than falling back to a DCP.
+    Zero gains zero Cb and Cr, and the BT.601 return leaves R = G = B = Y. That
+    is the whole of Sony's monochrome rendering, and it is why BW no longer has
+    to fall back to a DCP.
     """
-    assert not can_render("BW")
+    looks = look_calibrations(SAMPLE_FL)
+    cross, gain = chroma_terms(looks[LOOK_ORDER.index("BW")])
+    assert not cross.any()
+    assert not gain.any()
+
+    rng = np.random.default_rng(0)
+    out = apply_chroma(rng.random((16, 16, 3), dtype=np.float32), cross, gain)
+    assert np.allclose(out[..., 0], out[..., 1], atol=1e-6)
+    assert np.allclose(out[..., 1], out[..., 2], atol=1e-6)
+
+
+# ── RGB2YCC ────────────────────────────────────────────────────────────────
+
+# What the engine's own interpolation produced for DSC03015 (VV2), read out of
+# its buffer with Frida. Also what the RAW's 0x7842 holds, bit for bit.
+VV2_CHROMA = np.array([-267, -226, -235, -172, 1110, 654, 952, 1126])
+
+
+def test_the_chroma_unpacking_is_not_plain_fixed_point() -> None:
+    """9-bit signed at bit 2 for the cross terms, 8-bit unsigned at bit 3 /128.
+
+    Reading these as /1024 gives gains below 1.0, which cannot produce the
+    saturation the engine visibly adds — that mismatch is what found the layout.
+    """
+    cross, gain = unpack_params(VV2_CHROMA)
+    assert cross == pytest.approx([-0.2617, -0.2227, -0.2305, -0.1680], abs=1e-4)
+    assert gain == pytest.approx([1.0781, 0.6328, 0.9297, 1.0938], abs=1e-4)
+    assert gain.max() > 1.0
+
+
+def test_a_neutral_pixel_comes_back_untouched() -> None:
+    """Both differences are zero on grey, so the whole stage must be identity."""
+    cross, gain = unpack_params(VV2_CHROMA)
+    grey = np.linspace(0.0, 1.0, 32, dtype=np.float32)[:, None].repeat(3, 1)
+    assert apply_chroma(grey, cross, gain) == pytest.approx(grey, abs=1e-6)
+
+
+def test_the_pair_is_deliberately_not_an_identity() -> None:
+    """If it were, the stage would do nothing and the look would have no colour.
+
+    The forward transform carries all of it; the return trip is plain BT.601.
+    """
+    cross, gain = unpack_params(VV2_CHROMA)
+    rng = np.random.default_rng(3)
+    img = rng.random((64, 64, 3), dtype=np.float32)
+    assert np.abs(apply_chroma(img, cross, gain) - img).max() > 0.05
+
+
+def test_illuminant_deltas_ride_on_the_base() -> None:
+    """p = base + (sum delta[k] * w[k]) >> 10, with 1024 meaning 1.0."""
+    base = np.zeros(8, dtype=np.int64)
+    deltas = np.zeros((4, 8), dtype=np.int64)
+    deltas[0] = 512
+    assert np.array_equal(blend_params(base, deltas, [1024, 0, 0, 0]), np.full(8, 512))
+    assert np.array_equal(blend_params(base, deltas, [512, 0, 0, 0]), np.full(8, 256))
+    assert np.array_equal(blend_params(base, deltas, [0, 0, 0, 0]), base)
+
+
+@requires_sample
+def test_sepia_is_refused_because_its_chroma_matches_standard() -> None:
+    """SE's eight values are Standard's, so its toning is in some other stage.
+
+    Rendering it here would give a plain colour image under a Sepia label, which
+    is worse than falling back to a DCP.
+    """
+    looks = look_calibrations(SAMPLE_FL)
+    se = chroma_terms(looks[LOOK_ORDER.index("SE")])
+    st = chroma_terms(looks[LOOK_ORDER.index("ST")])
+    assert np.array_equal(se[0], st[0])
+    assert np.array_equal(se[1], st[1])
     assert not can_render("SE")
+    assert can_render("BW")
     assert can_render("VV2")
 
 
@@ -331,11 +407,11 @@ def test_render_delivers_prophoto_and_the_shot_s_own_look() -> None:
     assert len(payload["profileToneCurve"]) == TONE_CURVE_POINTS
 
 
-def test_monochrome_looks_are_refused_rather_than_rendered_in_colour() -> None:
-    """BW and SE desaturate in stages this pipeline does not reproduce."""
+def test_sepia_is_refused_rather_than_rendered_in_colour() -> None:
+    """Only SE is left out: its toning is in a stage this pipeline has not found."""
     assert can_render("FL")
     assert can_render("IN")
-    assert not can_render("BW")
+    assert can_render("BW")
     assert not can_render("SE")
     assert not can_render(None)
 

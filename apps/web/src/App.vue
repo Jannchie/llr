@@ -631,7 +631,14 @@ function buildProfileLUT(cp: ColorProfileMeta | null | undefined): ProfileCurve 
   // A per-channel curve is basis-dependent, and the basis belongs to the profile:
   // Sony's MainGamma runs on the body's own near-Rec.709 primaries, a DCP's curve
   // in the ProPhoto working space. The shader rotates accordingly.
-  return { lut: curveToLUT(pts.map(([x, y]) => ({ x, y }))), srgbBasis: cp?.kind === "sony" };
+  // Sony's RGB2YCC follows the curve immediately and in the same basis, so it
+  // travels with it — that keeps preview and export on one path.
+  const cross = cp?.profileChromaCross, gain = cp?.profileChromaGain;
+  return {
+    lut: curveToLUT(pts.map(([x, y]) => ({ x, y }))),
+    srgbBasis: cp?.kind === "sony",
+    chroma: cross?.length === 4 && gain?.length === 4 ? { cross, gain } : null,
+  };
 }
 
 // ── Histogram ──

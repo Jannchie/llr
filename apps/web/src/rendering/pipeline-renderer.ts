@@ -48,8 +48,16 @@ export type LinearPixels = Float32Array | Uint16Array;
  * says which primaries the per-channel curve is defined on — sRGB/Rec.709 for
  * Sony's MainGamma, the ProPhoto working space for a DCP's own curve. null when
  * the profile carries no curve.
+ *
+ * `chroma` rides along because Sony's RGB2YCC runs immediately after the curve,
+ * on the curve's own output and in the curve's own basis — four cross terms and
+ * four gains (worker sony/chroma.py). Absent for profiles with no such stage,
+ * which is every DCP.
  */
-export type ProfileCurve = { lut: Float32Array; srgbBasis: boolean } | null;
+export type ProfileChroma = { cross: number[]; gain: number[] };
+export type ProfileCurve =
+  | { lut: Float32Array; srgbBasis: boolean; chroma?: ProfileChroma | null }
+  | null;
 
 /**
  * Override for the histogram's render window: logical output dims plus the
@@ -103,6 +111,8 @@ export class PipelineRenderer {
   // Whether that curve is defined on sRGB/Rec.709 primaries (Sony's MainGamma)
   // rather than the ProPhoto working space (a DCP's own curve).
   private profileCurveSrgb = false;
+  // Sony's RGB2YCC terms, applied right after the curve. null = no such stage.
+  private profileChroma: ProfileChroma | null = null;
   private texWidth = 0;
   private texHeight = 0;
   // Output (canvas / render) dimensions — equal to the texture dims for an
@@ -426,6 +436,7 @@ export class PipelineRenderer {
     }
     this.hasProfileCurve = curve != null;
     this.profileCurveSrgb = curve?.srgbBasis ?? false;
+    this.profileChroma = curve?.chroma ?? null;
   }
 
   draw(params: Partial<EditParams> = {}): void {
@@ -816,6 +827,13 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     i("u_displayGamut", p.displayGamut);
     i("u_hasProfileCurve", this.hasProfileCurve ? 1 : 0);
     i("u_profileCurveSrgb", this.profileCurveSrgb ? 1 : 0);
+    const chroma = this.profileChroma;
+    i("u_sonyChromaActive", chroma ? 1 : 0);
+    if (chroma) {
+      const c = chroma.cross, g = chroma.gain;
+      gl.uniform4f(this.uniforms["u_sonyCross"]!, c[0], c[1], c[2], c[3]);
+      gl.uniform4f(this.uniforms["u_sonyGain"]!, g[0], g[1], g[2], g[3]);
+    }
     i("u_curveActive", this.curveActive ? 1 : 0);
     s("u_exposure", p.exposure); s("u_highlights", p.highlights);
     s("u_shadows", p.shadows);
