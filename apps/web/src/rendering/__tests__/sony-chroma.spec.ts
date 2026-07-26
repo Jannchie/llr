@@ -22,6 +22,9 @@ import { PROCESS_SHADER } from "../passes";
 const CROSS = [-0.261719, -0.222656, -0.230469, -0.167969];
 const GAIN = [1.078125, 0.632812, 0.929688, 1.09375];
 
+// YGamma's contrast term (calibration block +0x91964). See worker sony/chroma.py.
+const LUMA_GAIN = 1.0546875;
+
 const clamp = (x: number, lo: number, hi: number) => Math.min(Math.max(x, lo), hi);
 
 /** Line-for-line port of the GLSL. Display-linear in, display-linear out. */
@@ -34,27 +37,31 @@ function sonyChroma(s: number[], cross: number[], gain: number[]): number[] {
   const u2 = (v >= 0 ? cross[0] : cross[2]) * v + u;
   const cr = clamp((u2 >= 0 ? gain[1] : gain[3]) * u2, -0.5, 0.5);
   const cb = clamp((v2 >= 0 ? gain[0] : gain[2]) * v2, -0.5, 0.5);
-  const o = [y + 1.402 * cr, y - 0.7141 * cr - 0.3441 * cb, y + 1.772 * cb];
+  const yg = Math.min(y * LUMA_GAIN, 1); // YGamma — Y only, chroma untouched
+  const o = [yg + 1.402 * cr, yg - 0.7141 * cr - 0.3441 * cb, yg + 1.772 * cb];
   return o.map(x => srgbDecode(clamp(x, 0, 1)));
 }
 
 describe("Sony RGB2YCC", () => {
-  it("leaves neutrals exactly alone", () => {
-    // Both chroma differences are zero on grey, so every branch collapses.
+  it("keeps neutrals neutral, but brightens them by YGamma's gain", () => {
+    // Both chroma differences are zero on grey, so every chroma branch
+    // collapses — the channels stay equal. Y does not stay put: YGamma lifts it
+    // by 1.0546875 in the encoded domain, which is the engine's own behaviour.
     for (const g of [0, 0.05, 0.25, 0.5, 0.75, 1]) {
-      expect(sonyChroma([g, g, g], CROSS, GAIN)).toEqual([
-        expect.closeTo(g, 6), expect.closeTo(g, 6), expect.closeTo(g, 6),
-      ]);
+      const [r, gg, b] = sonyChroma([g, g, g], CROSS, GAIN);
+      expect(gg).toBeCloseTo(r, 6);
+      expect(b).toBeCloseTo(r, 6);
+      expect(srgbEncode(r)).toBeCloseTo(Math.min(srgbEncode(g) * LUMA_GAIN, 1), 5);
     }
   });
 
   it("matches the worker, which matches the engine", () => {
     const cases: [number[], number[]][] = [
-      [[0.5, 0.5, 0.5], [0.500000, 0.500000, 0.500000]],
-      [[0.6, 0.2, 0.05], [0.744396, 0.199059, 0.003650]],
-      [[0.05, 0.2, 0.6], [0.000000, 0.280816, 1.000000]],
-      [[0.9, 0.8, 0.4], [0.969610, 0.843826, 0.195387]],
-      [[0.02, 0.05, 0.03], [0.007997, 0.068831, 0.018231]],
+      [[0.5, 0.5, 0.5], [0.563248, 0.563248, 0.563248]],
+      [[0.6, 0.2, 0.05], [0.803479, 0.226881, 0.006806]],
+      [[0.05, 0.2, 0.6], [0.000000, 0.308154, 1.000000]],
+      [[0.9, 0.8, 0.4], [1.000000, 0.948125, 0.241093]],
+      [[0.02, 0.05, 0.03], [0.009673, 0.074523, 0.020898]],
     ];
     for (const [input, want] of cases) {
       const got = sonyChroma(input, CROSS, GAIN);
@@ -83,6 +90,10 @@ describe("Sony RGB2YCC", () => {
     const body = src.slice(0, src.indexOf("\n}"));
     expect(body).toContain("vec3(2432.0, 4864.0, 896.0) / 8192.0");
     expect(body).toContain("y + 1.4020 * cr, y - 0.7141 * cr - 0.3441 * cb, y + 1.7720 * cb");
+    // YGamma must land after the chroma is computed and clamped: applying it to
+    // Y first would scale Cb and Cr with it, which the engine does not do.
+    expect(body).toContain(`y = min(y * ${LUMA_GAIN}, 1.0);`);
+    expect(body.indexOf("y = min(y *")).toBeGreaterThan(body.indexOf("float cb = clamp"));
     // Each cross term reads the *other* difference's sign, and both read the
     // unmodified u and v — swapping either is a silent hue error.
     expect(body).toContain("(u >= 0.0 ? u_sonyCross.y : u_sonyCross.w) * u + v");

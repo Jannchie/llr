@@ -41,6 +41,25 @@ CHROMA_LIMIT = 0.5                 # the engine clamps Cb/Cr to +-8192 of 16383
 # BT.601, in the engine's own fixed point (/10000).
 _R_CR, _G_CR, _G_CB, _B_CB = 1.4020, 0.7141, 0.3441, 1.7720
 
+# YGamma (RVA 0x36f030) sits between the two halves and touches Y alone — its
+# two chroma planes come out bit-identical. Its full form is
+#
+#     black = -((bl + (bl>>31 & 3)) >> 2) * (1/512) * 32767
+#     scale = 512 / ((0x200 - wl) - black_int)
+#     Y' = trunc(clamp(((max(0, lut[Y]) - black) * scale - pivot) * contrast
+#                      + pivot, 0, 16383))
+#
+# but bl, wl and pivot all read 0 on every frame measured, collapsing it to
+# `trunc(lut[Y] * contrast)`. That form reproduces the engine's own output
+# 100.0000% bit-exactly over 2M pixels (sony_repro/tools/ygamma_verify.py).
+#
+# The LUT is identity above Y ~ 1024 and departs from it by at most 16 in 16383
+# below that, so it is dropped here: the approximation is bounded at 0.1% and
+# confined to deep shadow. Removing it left a consistent luma bias — measured
+# against the engine's own frames on eight shots, median 0.0139 too dark before,
+# 0.0009 after.
+LUMA_GAIN = 1.0546875              # calibration block +0x91964, 135/128
+
 
 def blend_params(base: np.ndarray, deltas: np.ndarray, weights: np.ndarray) -> np.ndarray:
     """Base plus illuminant deltas: p = base + (sum_k delta[k] * w[k]) >> 10."""
@@ -76,6 +95,11 @@ def rgb_to_ycc(rgb: np.ndarray, cross: np.ndarray, gain: np.ndarray,
     return y, cb, cr
 
 
+def luma_gamma(y: np.ndarray) -> np.ndarray:
+    """YGamma: lift Y and clip, leaving chroma alone. See LUMA_GAIN."""
+    return np.minimum(y * LUMA_GAIN, 1.0)
+
+
 def ycc_to_rgb(y: np.ndarray, cb: np.ndarray, cr: np.ndarray) -> np.ndarray:
     """Plain BT.601. All of the styling is in the forward direction."""
     return np.clip(np.stack([
@@ -86,5 +110,11 @@ def ycc_to_rgb(y: np.ndarray, cb: np.ndarray, cr: np.ndarray) -> np.ndarray:
 
 
 def apply_chroma(rgb: np.ndarray, cross: np.ndarray, gain: np.ndarray) -> np.ndarray:
-    """The whole stage: display-encoded RGB in, display-encoded RGB out."""
-    return ycc_to_rgb(*rgb_to_ycc(rgb, cross, gain))
+    """The whole YCC section: display-encoded RGB in, the same out.
+
+    Grey does not survive this unchanged — YGamma brightens it by LUMA_GAIN.
+    That is the engine's behaviour, not a bug in the chroma maths: the two
+    chroma planes really are untouched, and only Y moves.
+    """
+    y, cb, cr = rgb_to_ycc(rgb, cross, gain)
+    return ycc_to_rgb(luma_gamma(y), cb, cr)

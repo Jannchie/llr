@@ -13,7 +13,15 @@ import pytest
 
 from llr_worker.cli import prepare_linear
 from llr_worker.sony import apply_sony_profile, available_styles, calibration_for, can_render
-from llr_worker.sony.chroma import apply_chroma, blend_params, unpack_params
+from llr_worker.sony.chroma import (
+    LUMA_GAIN,
+    apply_chroma,
+    blend_params,
+    luma_gamma,
+    rgb_to_ycc,
+    unpack_params,
+    ycc_to_rgb,
+)
 from llr_worker.sony.linear_matrix import (
     KNOT_STEP,
     N_INDEX,
@@ -222,11 +230,46 @@ def test_the_chroma_unpacking_is_not_plain_fixed_point() -> None:
     assert gain.max() > 1.0
 
 
-def test_a_neutral_pixel_comes_back_untouched() -> None:
-    """Both differences are zero on grey, so the whole stage must be identity."""
+def test_a_neutral_pixel_stays_neutral_but_gets_brighter() -> None:
+    """Grey zeroes both differences, so every chroma branch collapses.
+
+    It does not come back untouched, though: YGamma sits inside this stage and
+    lifts Y. Chroma really is left alone — the engine's own two chroma planes
+    come out bit-identical across it — so the channels stay equal.
+    """
     cross, gain = unpack_params(VV2_CHROMA)
     grey = np.linspace(0.0, 1.0, 32, dtype=np.float32)[:, None].repeat(3, 1)
-    assert apply_chroma(grey, cross, gain) == pytest.approx(grey, abs=1e-6)
+    out = apply_chroma(grey, cross, gain)
+    assert out[..., 0] == pytest.approx(out[..., 1], abs=1e-6)
+    assert out[..., 1] == pytest.approx(out[..., 2], abs=1e-6)
+    assert out[..., 0] == pytest.approx(np.minimum(grey[..., 0] * LUMA_GAIN, 1.0), abs=1e-6)
+
+
+def test_ygamma_moves_luma_and_nothing_else() -> None:
+    """It is a gain on Y with a clip, and the chroma planes never move.
+
+    Verified against the engine 100.0000% bit-exactly over 2M pixels; what is
+    approximated here is only its near-identity LUT, dropped because it departs
+    from identity by at most 16 in 16383 and only below Y ~ 1024.
+    """
+    assert luma_gamma(np.float32(0.5)) == pytest.approx(0.5 * LUMA_GAIN)
+    assert luma_gamma(np.float32(0.99)) == pytest.approx(1.0), "the top clips"
+
+    # Because it moves Y and only Y, it must shift all three channels by the
+    # *same* amount. Applying the gain before the chroma maths instead would
+    # scale Cb and Cr with it and pull the channels apart.
+    cross, gain = unpack_params(VV2_CHROMA)
+    rng = np.random.default_rng(7)
+    img = rng.random((32, 32, 3), dtype=np.float32) * 0.4 + 0.1
+    y, cb, cr = rgb_to_ycc(img, cross, gain)
+    lo, hi = ycc_to_rgb(y, cb, cr), ycc_to_rgb(luma_gamma(y), cb, cr)
+    # ycc_to_rgb clips, and these gains push saturated pixels past the ends, so
+    # only unclipped ones can show the shift.
+    free = ((lo > 0) & (lo < 1) & (hi > 0) & (hi < 1)).all(-1)
+    assert free.sum() > 100
+    shift = (hi - lo)[free]
+    assert shift.min() > 0, "it is a lift, not a cut"
+    assert np.ptp(shift, axis=-1).max() < 1e-6, "the same shift on R, G and B"
 
 
 def test_the_pair_is_deliberately_not_an_identity() -> None:

@@ -131,6 +131,9 @@ vec3 sonyChroma(vec3 s) {
   float u2 = (v >= 0.0 ? u_sonyCross.x : u_sonyCross.z) * v + u;
   float cr = clamp((u2 >= 0.0 ? u_sonyGain.y : u_sonyGain.w) * u2, -0.5, 0.5);
   float cb = clamp((v2 >= 0.0 ? u_sonyGain.x : u_sonyGain.z) * v2, -0.5, 0.5);
+  // YGamma, which the engine runs here, between the two halves: it lifts Y and
+  // clips, and leaves both chroma planes bit-identical (worker sony/chroma.py).
+  y = min(y * 1.0546875, 1.0);
   vec3 o = vec3(y + 1.4020 * cr, y - 0.7141 * cr - 0.3441 * cb, y + 1.7720 * cb);
   return srgbDecode(clamp(o, 0.0, 1.0));
 }
