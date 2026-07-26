@@ -44,7 +44,9 @@ def main():
     rows = []
     for stem in stems:
         f = TMP / f"final_{stem}.npz"
-        if not f.exists():
+        # tmp 里还躺着别的实验抓的整幅(改过滑块的副本之类),它们没有对应的
+        # 原始 ARW —— 跳过,而不是让 rawpy 在半路上炸掉整轮统计。
+        if not f.exists() or not (SRC / f"{stem}.ARW").exists():
             continue
         eng = np.load(f)["ZcTaskSIMDMarble_out"]
         ok = eng.max(-1) > 0
