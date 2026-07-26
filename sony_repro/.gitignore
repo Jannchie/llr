@@ -6,3 +6,4 @@ __pycache__/
 *.bin
 tools/sliderprobe_work.ARW
 tools/sliderprobe/*.npy
+looksweep/

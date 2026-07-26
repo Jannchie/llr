@@ -123,7 +123,7 @@ def _srgb_decode(y: np.ndarray) -> np.ndarray:
 
 def tone_curve_points(
     cal: LookCalibration, style: str, highlights: int = 0, shadows: int = 0,
-    n: int = TONE_CURVE_POINTS,
+    contrast: int = 0, n: int = TONE_CURVE_POINTS,
 ) -> list[list[float]]:
     """Sony's MainGamma LUT as (x, y) points in the frontend's contract.
 
@@ -137,7 +137,7 @@ def tone_curve_points(
     The curve saturates just under x = 1.0, so [0, 1] is its whole domain and no
     highlight rolloff is lost by clamping there.
     """
-    lut = tone_curve(cal, style, highlights, shadows)
+    lut = tone_curve(cal, style, highlights, shadows, contrast)
     x = np.linspace(0.0, 1.0, n)
     y = np.interp(x, np.linspace(0.0, 1.0, lut.size), lut)
     y = _srgb_decode(np.clip(y, 0.0, 1.0))
@@ -175,7 +175,8 @@ def calibration_for(raw_path: Path, style: str) -> LookCalibration | None:
 
 def apply_sony_profile(
     camera_rgb: np.ndarray, cal: LookCalibration, style: str,
-    highlights: int = 0, shadows: int = 0, fade: int = 0, dro: bool = False,
+    highlights: int = 0, shadows: int = 0, contrast: int = 0, fade: int = 0,
+    dro: bool = False,
 ) -> tuple[np.ndarray, SonyRenderInfo]:
     """Camera RGB -> scene-linear ProPhoto (D50), plus the matching tone curve.
 
@@ -188,15 +189,18 @@ def apply_sony_profile(
     rec709 = matrix.apply(camera_rgb)
     linear_prophoto = np.clip(rec709 @ REC709_TO_PROPHOTO_D50.T, 0, None)
     cross, gain = chroma_terms(cal)
-    pivot, contrast = luma_terms(cal, fade)
+    # Named apart from `contrast` on purpose: that one is the tone-curve tweak,
+    # this one is YGamma's, and the two are unrelated numbers on unrelated
+    # scales. Reusing the name silently fed YGamma's 1.05 to the tone curve.
+    luma_pivot, luma_contrast = luma_terms(cal, fade)
 
     return linear_prophoto, SonyRenderInfo(
         style=style,
-        tone_curve=tone_curve_points(cal, style, highlights, shadows),
+        tone_curve=tone_curve_points(cal, style, highlights, shadows, contrast),
         chroma_cross=[float(x) for x in cross],
         chroma_gain=[float(x) for x in gain],
-        luma_pivot=pivot,
-        luma_contrast=contrast,
+        luma_pivot=luma_pivot,
+        luma_contrast=luma_contrast,
         # What is left of the engine is ChromaSuppres (measured identity in
         # every luma band), SSCS (touches no pixel on a whole frame), AreaComp
         # (0.9999), ITP, sharpening, Spica and Marble. On shots without DRO,

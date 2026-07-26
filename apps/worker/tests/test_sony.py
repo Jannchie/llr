@@ -501,6 +501,64 @@ def test_a_tweak_is_linear_in_its_setting() -> None:
 
 
 @requires_sample
+def test_every_in_camera_tweak_reaches_the_shipped_curve() -> None:
+    """The tweaks are only worth measuring if they survive the trip out.
+
+    Each one has to change the curve that actually ships, and the two YGamma
+    terms have to arrive as themselves. This is the layer where a wrong argument
+    is invisible: the render still looks plausible, just not like the engine's.
+    """
+    cal = calibration_for(SAMPLE_FL, "FL")
+    assert cal is not None
+    rgb = np.full((2, 2, 3), 0.3, dtype=np.float32)
+
+    def curve(**kw: int) -> list[float]:
+        return [y for _, y in apply_sony_profile(rgb, cal, "FL", **kw)[1].tone_curve]
+
+    plain = curve()
+    for field in ("highlights", "shadows", "contrast"):
+        assert curve(**{field: 5}) != plain, f"{field} never reached the curve"
+    # Fade drives YGamma, not the curve — so the curve must NOT move, and the
+    # two luma terms must.
+    faded = apply_sony_profile(rgb, cal, "FL", fade=5)[1]
+    assert [y for _, y in faded.tone_curve] == plain
+    assert faded.luma_pivot > 0.5
+    assert faded.luma_contrast < 1.0
+    assert faded.to_json()["profileLumaPivot"] == faded.luma_pivot
+
+
+@requires_sample
+def test_contrast_is_linear_going_down_and_measured_going_up() -> None:
+    """The one tweak whose two directions are not the same kind of thing.
+
+    Negative Contrast behaves like Highlights and Shadows — one shape, scaled.
+    Positive Contrast changes shape as well as size: rescaling the +9 shape down
+    to +3 leaves 44/16384 against a total amplitude of 110, so every step is
+    measured. Interpolation between them still has to be monotone and to land
+    exactly on the measured steps at whole settings.
+    """
+    cal = calibration_for(SAMPLE_FL, "FL")
+    assert cal is not None
+    base = base_curve(cal)
+    assert apply_tuning(base, "FL", contrast=+6)[1024] > base[1024]
+    assert apply_tuning(base, "FL", contrast=-6)[1024] < base[1024]
+
+    down_full = apply_tuning(base, "FL", contrast=-9) - base
+    down_third = apply_tuning(base, "FL", contrast=-3) - base
+    assert np.allclose(down_third * 3, down_full, atol=1e-6), "the negative side is linear"
+
+    up_full = apply_tuning(base, "FL", contrast=+9) - base
+    up_third = apply_tuning(base, "FL", contrast=+3) - base
+    assert np.abs(up_third * 3 - up_full).max() > 1e-3, "the positive side is not"
+
+    # Between measured steps, and monotone across the whole range.
+    mids = [apply_tuning(base, "FL", contrast=c)[1024] for c in range(10)]
+    assert mids == sorted(mids)
+    half = apply_tuning(base, "FL", contrast=4)[1024]
+    assert mids[3] <= half <= mids[5]
+
+
+@requires_sample
 def test_a_setting_past_the_camera_s_range_keeps_going() -> None:
     """Edit.exe refuses out-of-range values; this pipeline extrapolates them.
 

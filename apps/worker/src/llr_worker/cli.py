@@ -58,12 +58,13 @@ class RawMetadata:
     # Per-shot lens correction splines from the RAW's maker notes, mapped to
     # vendor-neutral factor tables (see sony_lens_corrections), or None.
     lens_corr: dict[str, Any] | None = None
-    # In-camera tweaks to the Creative Look. Highlights and Shadows (-9..+9) ride
-    # on the look's factory tone curve (sony/tone.py); Fade (0..9) is a separate
-    # stage that pulls luma toward a pivot (sony/chroma.py). Reproducing Sony's
-    # rendering needs all three.
+    # In-camera tweaks to the Creative Look. Highlights, Shadows and Contrast
+    # (-9..+9) ride on the look's factory tone curve (sony/tone.py); Fade (0..9)
+    # is a separate stage that pulls luma toward a pivot (sony/chroma.py).
+    # Reproducing Sony's rendering needs all four.
     look_highlights: int = 0
     look_shadows: int = 0
+    look_contrast: int = 0
     look_fade: int = 0
     # Whether the shot asked for DRO. Sony runs a whole extra stage for it
     # (ZcTaskVatr) that this pipeline does not reproduce, so the render is
@@ -939,7 +940,8 @@ def render_color(
         linear, info = apply_sony_profile(
             camera_rgb, renderer.sony_look, renderer.sony_style,
             highlights=metadata.look_highlights, shadows=metadata.look_shadows,
-            fade=metadata.look_fade, dro=metadata.dro_active,
+            contrast=metadata.look_contrast, fade=metadata.look_fade,
+            dro=metadata.dro_active,
         )
         return linear, info.to_json()
 
@@ -1225,6 +1227,8 @@ def read_raw_metadata(input_path: Path, raw: rawpy.RawPy) -> RawMetadata:
         look_highlights=_exif_int(exif.get("Highlights")),
         look_shadows=_exif_int(exif.get("Shadows")),
         look_fade=_exif_int(exif.get("Fade")),
+        # exiftool prints Sony's zero for these as "Normal", not "0".
+        look_contrast=_exif_int(exif.get("Contrast")),
         dro_active=str(exif.get("DynamicRangeOptimizer") or "Off").strip().lower() != "off",
     )
 
@@ -1329,6 +1333,7 @@ def _read_exiftool_metadata_cached(path: str, size: int, mtime_ns: int) -> dict[
                 "-Sony:Highlights",
                 "-Sony:Shadows",
                 "-Sony:Fade",
+                "-Sony:Contrast",
                 # DRO is a whole stage (ZcTaskVatr) that this pipeline does not
                 # reproduce, and it runs only when the shot asked for it — 2 of
                 # 65 in the reference set. Knowing which shots those are is the
@@ -1353,6 +1358,7 @@ def _read_exiftool_metadata_cached(path: str, size: int, mtime_ns: int) -> dict[
         "Highlights",
         "Shadows",
         "Fade",
+        "Contrast",
         "DynamicRangeOptimizer",
     ]:
         out[key] = record.get(key)
