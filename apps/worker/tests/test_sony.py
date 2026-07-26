@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from llr_worker.cli import prepare_linear
+from llr_worker.cli import _exif_int, detect_exiftool, prepare_linear, read_exiftool_metadata
 from llr_worker.sony import apply_sony_profile, available_styles, calibration_for, can_render
 from llr_worker.sony.chroma import (
     LUMA_GAIN,
@@ -43,7 +43,14 @@ from llr_worker.sony.sr2 import (
     read_sr2_tag,
     unpack_param_block,
 )
-from llr_worker.sony.tone import LOOK_ORDER, TUNE_LIMIT, apply_tuning, base_curve, tone_curve
+from llr_worker.sony.tone import (
+    LOOK_ORDER,
+    TUNE_EXTRAPOLATION_LIMIT,
+    TUNE_LIMIT,
+    apply_tuning,
+    base_curve,
+    tone_curve,
+)
 
 SAMPLES = Path(__file__).resolve().parents[3] / "samples"
 # Both shot on an ILCE-7CM2, Creative Look FL and IN respectively.
@@ -51,6 +58,26 @@ SAMPLE_FL = SAMPLES / "DSC01157.ARW"
 SAMPLE_IN = SAMPLES / "DSC04568.ARW"
 
 requires_sample = pytest.mark.skipif(not SAMPLE_FL.exists(), reason="sample ARW not checked out")
+requires_exiftool = pytest.mark.skipif(detect_exiftool() is None, reason="exiftool not installed")
+
+
+@requires_sample
+@requires_exiftool
+def test_the_in_camera_look_tweaks_are_actually_read() -> None:
+    """The tweaks reach the curve only if exiftool is *asked* for them.
+
+    They were plumbed all the way through — parsed, carried on RawMetadata,
+    passed to the profile — but the tag was missing from the exiftool argument
+    list, so every shot rendered as if untweaked. Nothing caught it because the
+    absent key parsed to a clean 0. 56 of 65 frames in the reference set carry
+    a tweak, and both checked-in samples do, so this can assert rather than
+    merely describe.
+    """
+    for sample, want in ((SAMPLE_FL, {"Highlights": -6, "Shadows": 1, "Fade": 0}),
+                         (SAMPLE_IN, {"Highlights": -2, "Shadows": 0, "Fade": 3})):
+        exif = read_exiftool_metadata(sample)
+        got = {k: _exif_int(exif.get(k)) for k in want}
+        assert got == want, f"{sample.name}: {got}"
 
 
 # ── SR2 decryption and unpacking ───────────────────────────────────────────
@@ -423,12 +450,26 @@ def test_a_tweak_is_linear_in_its_setting() -> None:
 
 
 @requires_sample
-def test_a_setting_past_the_limit_is_ignored_not_clamped() -> None:
-    """+-10 renders identically to 0 on the engine, so it must here too."""
+def test_a_setting_past_the_camera_s_range_keeps_going() -> None:
+    """Edit.exe refuses out-of-range values; this pipeline extrapolates them.
+
+    The engine renders +-10 identically to 0, which is validation on a number
+    the body cannot write rather than the curve running out. The response is
+    linear, so the same unit shape carries on — and it is capped, so a wild
+    setting cannot run away.
+    """
     cal = calibration_for(SAMPLE_FL, "FL")
     assert cal is not None
     base = base_curve(cal)
-    assert np.array_equal(apply_tuning(base, "FL", highlights=TUNE_LIMIT + 1), np.clip(base, 0, 1))
+    unit = apply_tuning(base, "FL", highlights=-1) - base
+
+    beyond = apply_tuning(base, "FL", highlights=-(TUNE_LIMIT + 1)) - base
+    assert not np.array_equal(beyond, np.zeros_like(beyond)), "no longer ignored"
+    assert np.allclose(beyond, unit * (TUNE_LIMIT + 1), atol=1e-6)
+
+    capped = apply_tuning(base, "FL", highlights=-(TUNE_EXTRAPOLATION_LIMIT + 50))
+    assert np.array_equal(capped, apply_tuning(base, "FL", highlights=-TUNE_EXTRAPOLATION_LIMIT))
+    assert capped.min() >= 0.0 and capped.max() <= 1.0
 
 
 @requires_sample

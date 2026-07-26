@@ -1317,6 +1317,12 @@ def _read_exiftool_metadata_cached(path: str, size: int, mtime_ns: int) -> dict[
                 "-DistortionCorrParams",
                 "-VignettingCorrParams",
                 "-ChromaticAberrationCorrParams",
+                # The in-camera Creative Look tweaks. Group-qualified on
+                # purpose: Sony writes these alongside ExifIFD tags of the same
+                # bare name, and an unqualified request can pick the wrong one.
+                "-Sony:Highlights",
+                "-Sony:Shadows",
+                "-Sony:Fade",
                 str(input_path),
             ],
             env=exiftool_env(),
@@ -1333,6 +1339,9 @@ def _read_exiftool_metadata_cached(path: str, size: int, mtime_ns: int) -> dict[
         "DistortionCorrParams",
         "VignettingCorrParams",
         "ChromaticAberrationCorrParams",
+        "Highlights",
+        "Shadows",
+        "Fade",
     ]:
         out[key] = record.get(key)
     return out

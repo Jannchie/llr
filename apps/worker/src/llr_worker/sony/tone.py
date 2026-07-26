@@ -44,7 +44,12 @@ TONE_INDEX_WHITE = 8192       # LUT index of Sony's white
 CURVE_X_SCALE = 128.0         # tag 0x7805 units per LUT index
 CURVE_Y_FULL = 16.0 * 16384.0  # tag 0x7806 units at full scale
 
-TUNE_LIMIT = 9  # the engine treats anything beyond this as no tweak at all
+# The camera's own range. Edit.exe treats anything past it as no tweak at all —
+# +-10 renders identically to 0 — but that is input validation on a value the
+# body can never write, not a statement about the curve, so this pipeline
+# extrapolates instead (see apply_tuning).
+TUNE_LIMIT = 9
+TUNE_EXTRAPOLATION_LIMIT = 30
 
 
 def look_index(style: str) -> int | None:
@@ -73,24 +78,35 @@ def base_curve(cal: LookCalibration, n: int = TONE_INDEX_WHITE + 1) -> np.ndarra
 
 
 def apply_tuning(curve: np.ndarray, style: str, highlights: int = 0, shadows: int = 0) -> np.ndarray:
-    """Add the in-camera Highlights/Shadows tweaks to a factory curve.
+    """Add the Highlights/Shadows tweaks to a factory curve.
 
-    Settings outside +-9 are ignored rather than clamped, which is what the
-    engine itself does: +-10 renders identically to 0. A look with no measured
-    shapes on file keeps its baseline, since the tweak is a refinement of an
-    already-correct curve rather than a prerequisite for one.
+    Inside the camera's own -9..+9 this is the engine's behaviour: the effect is
+    strictly linear in the setting, so a unit shape times the value reproduces
+    every intermediate step to within 3/16384.
+
+    Past that the two diverge deliberately. Edit.exe ignores out-of-range values
+    outright — +-10 renders identically to 0 — which is validation on a number
+    the body can never write, not a claim that the curve stops there. Since the
+    response is linear, the same unit shape keeps extrapolating, so this carries
+    on out to TUNE_EXTRAPOLATION_LIMIT and clamps beyond it. The curve is
+    clipped to [0, 1] at the end either way, which is what bounds a large
+    setting rather than the setting itself being refused.
+
+    A look with no measured shapes on file keeps its baseline: the tweak refines
+    an already-correct curve rather than being a prerequisite for one.
     """
     out = curve
     shapes = _tuning()
     for field, value in (("highlights", highlights), ("shadows", shadows)):
-        if not value or abs(value) > TUNE_LIMIT:
+        if not value:
             continue
+        amount = float(np.clip(value, -TUNE_EXTRAPOLATION_LIMIT, TUNE_EXTRAPOLATION_LIMIT))
         shape = shapes.get(f"{style}_{field}_{'neg' if value < 0 else 'pos'}")
         if shape is None:
             continue
         if shape.size != out.size:
             shape = np.interp(np.linspace(0, 1, out.size), np.linspace(0, 1, shape.size), shape)
-        out = out + value * shape
+        out = out + amount * shape
     return np.clip(out, 0.0, 1.0)
 
 
