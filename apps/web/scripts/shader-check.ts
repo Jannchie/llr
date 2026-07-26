@@ -1,5 +1,5 @@
 /**
- * Compile every shader the renderer builds, in a real WebGL2 context.
+ * Build every program the renderer builds, in a real WebGL2 context.
  *
  * The vitest suite cannot do this: there is no GL context under Node, so a
  * shader can be numerically correct, fully unit-tested, type-checked and still
@@ -7,18 +7,23 @@
  * `srgbDecode` on a vec3 when only the float overload was declared, and nothing
  * in the suite noticed until the browser refused the program.
  *
- * This writes a page that compiles each shader and reports the driver's own log.
- * Run it and open the page:
+ * This checks whole programs rather than lone shaders, because linking is where
+ * a second class of error surfaces: a varying that one side declares and the
+ * other does not compiles fine twice over and fails only at link. The pairs
+ * mirror pipeline-renderer's own (compileProgram / ensureMaskPrograms).
  *
  *     pnpm --filter @llr/web check:shaders
  *
- * Headless works too, though Chrome on Windows writes nothing to stdout, so the
- * screenshot is the only way to read the result there:
+ * NOTE: that command only writes the page — nothing is compiled until a browser
+ * opens it, so it exits 0 even when a shader is broken. Do not chain it into
+ * the root `check` script expecting it to gate anything. To get a real verdict,
+ * open the page, or drive it headless:
  *
  *     chrome --headless=new --enable-unsafe-swiftshader --use-angle=swiftshader \
- *            --virtual-time-budget=10000 --screenshot=shot.png <the file URL>
+ *            --virtual-time-budget=10000 --dump-dom <file URL> | grep failures=
  *
- * On Linux `--dump-dom | grep failures=` works and is greppable in CI.
+ * On Windows Chrome writes nothing to stdout, so there `--screenshot=shot.png`
+ * and reading the image is the only way to see the result.
  */
 import { writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -28,42 +33,61 @@ import {
   PROCESS_SHADER, VERTEX_SHADER,
 } from "../src/rendering/passes";
 
-// "vs"/"fs" rather than the GL enums, which do not exist outside a context.
-const SHADERS: Record<string, [string, string]> = {
-  VERTEX_SHADER: ["vs", VERTEX_SHADER],
-  PROCESS_SHADER: ["fs", PROCESS_SHADER],
-  MASK_VERTEX_SHADER: ["vs", MASK_VERTEX_SHADER],
-  MASK_DOWNSAMPLE_SHADER: ["fs", MASK_DOWNSAMPLE_SHADER],
-  MASK_BLUR_SHADER: ["fs", MASK_BLUR_SHADER],
-};
+const PROGRAMS: [name: string, vs: string, fs: string][] = [
+  ["process", VERTEX_SHADER, PROCESS_SHADER],
+  ["mask downsample", MASK_VERTEX_SHADER, MASK_DOWNSAMPLE_SHADER],
+  ["mask blur", MASK_VERTEX_SHADER, MASK_BLUR_SHADER],
+];
 
 const page = `<meta charset="utf-8"><title>shader compile check</title>
 <pre id="out" style="font:13px ui-monospace,monospace;white-space:pre-wrap"></pre>
 <script>
-const SHADERS = ${JSON.stringify(SHADERS)};
+const PROGRAMS = ${JSON.stringify(PROGRAMS)};
 const gl = document.createElement("canvas").getContext("webgl2");
 const out = document.getElementById("out");
 let bad = 0;
+
+// Compile one shader, or return the driver's log. Indented so it reads as a
+// block under the program's own line; the line numbers are into the assembled
+// source, which is why the whole shader is passed through untouched.
+function build(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  return gl.getShaderParameter(sh, gl.COMPILE_STATUS)
+    ? sh : gl.getShaderInfoLog(sh).trim().replace(/^/gm, "  ");
+}
+
+function report(line) {
+  out.textContent += line + "\\n";
+  console.log("SHADERCHECK " + line);
+}
+
 if (!gl) {
   out.textContent = "NO WEBGL2 — cannot compile anything here";
 } else {
-  for (const [name, [kind, src]] of Object.entries(SHADERS)) {
-    const sh = gl.createShader(kind === "vs" ? gl.VERTEX_SHADER : gl.FRAGMENT_SHADER);
-    gl.shaderSource(sh, src);
-    gl.compileShader(sh);
-    const ok = gl.getShaderParameter(sh, gl.COMPILE_STATUS);
-    if (!ok) bad++;
-    // The log carries line numbers into the *assembled* source, so print the
-    // shader with them to make those numbers usable.
-    const log = ok ? "" : "\\n" + gl.getShaderInfoLog(sh).trim().replace(/^/gm, "  ");
-    out.textContent += (ok ? "OK   " : "FAIL ") + name + log + "\\n";
-    console.log((ok ? "SHADERCHECK OK " : "SHADERCHECK FAIL ") + name + log);
+  for (const [name, vsSrc, fsSrc] of PROGRAMS) {
+    const vs = build(gl.VERTEX_SHADER, vsSrc);
+    const fs = build(gl.FRAGMENT_SHADER, fsSrc);
+    if (typeof vs === "string" || typeof fs === "string") {
+      bad++;
+      report("FAIL " + name + "\\n" + [vs, fs].filter(s => typeof s === "string").join("\\n"));
+      continue;
+    }
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs); gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      report("OK   " + name);
+    } else {
+      bad++;
+      report("LINK " + name + "\\n  " + gl.getProgramInfoLog(prog).trim());
+    }
   }
 }
-out.textContent += "\\nDONE failures=" + bad + "\\n";
-console.log("SHADERCHECK DONE failures=" + bad);
+report("DONE failures=" + bad);
 </script>`;
 
 const target = fileURLToPath(new URL("../shader-check.html", import.meta.url));
 writeFileSync(target, page);
-console.log(`wrote ${target}\nopen it in a browser; it prints one line per shader`);
+console.log(`wrote ${target}\nnothing is compiled yet — open it in a browser to get the verdict`);

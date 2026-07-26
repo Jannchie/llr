@@ -11,9 +11,9 @@ import { PROCESS_SHADER } from "../passes";
  * which *was* checked pixel by pixel against Imaging Edge's own buffers (Y
  * bit-identical, chroma within 1 of 16383). So this pins the maths and the
  * numbers; the source-text assertions at the end guard the port against drift.
- * A typo that only breaks compilation would still get through — that is what
- * `scripts/shader-check.ts` (pnpm check:shaders) is for, and it is worth running
- * after touching any GLSL here.
+ * A typo that only breaks compilation would still get through — for that, run
+ * `scripts/shader-check.ts` and open the page it writes, which builds every
+ * program for real. Worth doing after touching any GLSL here.
  */
 
 // The engine's own interpolated values for DSC03015 (VV2), which are also what
