@@ -92,16 +92,45 @@ def unpack_params(params: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return cross.astype(np.float32), gain.astype(np.float32)
 
 
+# The in-camera Saturation slider, -9..+9, as the engine sees it: the settings
+# object holds 10 per step up to 2 and 5 per step after that, and both stages
+# that use it read `1 + value/100`. Measured by dumping the settings struct at
+# every setting (sony_repro/tools/settings_probe.py).
+SATURATION_STEPS = (0, 10, 20, 25, 30, 35, 40, 45, 50, 55)
+
+
+def saturation_factor(setting: int) -> float:
+    """One Saturation setting -> the factor both halves of the stage use.
+
+    Sony applies this twice in opposite directions: RGB2YCC divides its gains by
+    it, and ZcTaskSIMDHueSaturation multiplies both chroma planes back by it
+    afterwards. The two nearly cancel, so the slider's whole visible effect is
+    what the clamp in between does — about 1% at +9, and about 5% at -9, where
+    the intermediate chroma is 2.3x larger and clips.
+    """
+    i = min(abs(int(setting)), len(SATURATION_STEPS) - 1)
+    v = SATURATION_STEPS[i] * (1 if setting >= 0 else -1)
+    return 1.0 + v / 100.0
+
+
 def rgb_to_ycc(rgb: np.ndarray, cross: np.ndarray, gain: np.ndarray,
+               saturation: float = 1.0,
                ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Display-encoded RGB in [0, 1] -> Y, Cb, Cr (chroma centred on zero)."""
+    """Display-encoded RGB in [0, 1] -> Y, Cb, Cr (chroma centred on zero).
+
+    `saturation` is applied the way the engine applies it: the gains are divided
+    by it before the clamp and the result multiplied back after, which is why
+    the setting is nearly a no-op except where the clamp bites.
+    """
     r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
     y = (r * LUMA_WEIGHTS[0] + g * LUMA_WEIGHTS[1] + b * LUMA_WEIGHTS[2]) / LUMA_SHIFT
     u, v = r - g, b - g
     v2 = np.where(u >= 0, cross[1], cross[3]) * u + v
     u2 = np.where(v >= 0, cross[0], cross[2]) * v + u
-    cr = np.clip(np.where(u2 >= 0, gain[1], gain[3]) * u2, -CHROMA_LIMIT, CHROMA_LIMIT)
-    cb = np.clip(np.where(v2 >= 0, gain[0], gain[2]) * v2, -CHROMA_LIMIT, CHROMA_LIMIT)
+    cr = np.clip(np.where(u2 >= 0, gain[1], gain[3]) / saturation * u2,
+                 -CHROMA_LIMIT, CHROMA_LIMIT) * saturation
+    cb = np.clip(np.where(v2 >= 0, gain[0], gain[2]) / saturation * v2,
+                 -CHROMA_LIMIT, CHROMA_LIMIT) * saturation
     return y, cb, cr
 
 
@@ -139,12 +168,13 @@ def ycc_to_rgb(y: np.ndarray, cb: np.ndarray, cr: np.ndarray) -> np.ndarray:
 
 
 def apply_chroma(rgb: np.ndarray, cross: np.ndarray, gain: np.ndarray,
-                 pivot: float = 0.0, contrast: float = 1.0) -> np.ndarray:
+                 pivot: float = 0.0, contrast: float = 1.0,
+                 saturation: float = 1.0) -> np.ndarray:
     """The whole YCC section: display-encoded RGB in, the same out.
 
     Grey does not survive this unchanged — YGamma moves it. That is the engine's
     behaviour, not a bug in the chroma maths: the two chroma planes really are
     untouched, and only Y moves.
     """
-    y, cb, cr = rgb_to_ycc(rgb, cross, gain)
+    y, cb, cr = rgb_to_ycc(rgb, cross, gain, saturation)
     return ycc_to_rgb(luma_gamma(y, pivot, contrast), cb, cr)

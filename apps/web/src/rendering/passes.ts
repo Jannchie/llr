@@ -95,6 +95,11 @@ uniform vec4 u_sonyGain;
 // YGamma, which runs between the two chroma halves: the shot's Fade setting,
 // as a pivot and a contrast. Fade 0 is pivot 0, so it degenerates to a gain.
 uniform vec2 u_sonyLuma;        // (pivot, contrast)
+// The Saturation slider. u_sonyGain arrives already divided by it; this
+// multiplies the chroma back after the clamp, exactly as the engine's separate
+// ZcTaskSIMDHueSaturation stage does. The two nearly cancel — the clamp in
+// between is the whole visible effect.
+uniform float u_sonySat;
 uniform int u_viewTransform;    // 0 = Lightroom-style, 1 = AgX
 uniform int u_displayGamut;     // 0 = sRGB, 1 = Display-P3
 uniform vec3 u_bgColor;         // display-encoded fill for areas outside the image (crop editor)
@@ -132,8 +137,8 @@ vec3 sonyChroma(vec3 s) {
   // other's sign.
   float v2 = (u >= 0.0 ? u_sonyCross.y : u_sonyCross.w) * u + v;
   float u2 = (v >= 0.0 ? u_sonyCross.x : u_sonyCross.z) * v + u;
-  float cr = clamp((u2 >= 0.0 ? u_sonyGain.y : u_sonyGain.w) * u2, -0.5, 0.5);
-  float cb = clamp((v2 >= 0.0 ? u_sonyGain.x : u_sonyGain.z) * v2, -0.5, 0.5);
+  float cr = clamp((u2 >= 0.0 ? u_sonyGain.y : u_sonyGain.w) * u2, -0.5, 0.5) * u_sonySat;
+  float cb = clamp((v2 >= 0.0 ? u_sonyGain.x : u_sonyGain.z) * v2, -0.5, 0.5) * u_sonySat;
   // YGamma, which the engine runs here, between the two halves: it pulls Y
   // toward a pivot and clips, and leaves both chroma planes bit-identical
   // (worker sony/chroma.py). This is where the in-camera Fade setting lives.
@@ -539,7 +544,7 @@ export const PASSES: PassDef[] = [
     "u_grad_sh_tint","u_grad_md_tint","u_grad_hl_tint",
     "u_grad_blend","u_grad_balance",
     "u_curve_lut", "u_curveActive", "u_hasProfileCurve", "u_profileCurveSrgb",
-    "u_sonyChromaActive", "u_sonyCross", "u_sonyGain", "u_sonyLuma",
+    "u_sonyChromaActive", "u_sonyCross", "u_sonyGain", "u_sonyLuma", "u_sonySat",
     "u_lensActive", "u_lensScale", "u_lensNorm",
     ...Array.from({ length: 16 }, (_, k) => `u_lensDist[${k}]`),
     ...Array.from({ length: 16 }, (_, k) => `u_lensVig[${k}]`),

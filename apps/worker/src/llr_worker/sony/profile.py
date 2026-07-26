@@ -46,7 +46,7 @@ from typing import Any
 import numpy as np
 
 from ..dcp import D50_TO_D65, XYZ_D50_TO_PROPHOTO, XYZ_D65_TO_SRGB
-from .chroma import blend_params, luma_terms, unpack_params
+from .chroma import blend_params, luma_terms, saturation_factor, unpack_params
 from .linear_matrix import SegmentedMatrix
 from .sr2 import LookCalibration, look_calibrations, unpack_param_block
 from .tone import LOOK_ORDER, look_index, tone_curve
@@ -71,6 +71,7 @@ class SonyRenderInfo:
     chroma_gain: list[float]
     luma_pivot: float = 0.0
     luma_contrast: float = 1.0
+    chroma_saturation: float = 1.0
     working_space: str = "linear-prophoto-d50"
 
     def to_json(self) -> dict[str, Any]:
@@ -91,6 +92,10 @@ class SonyRenderInfo:
             # the shot's Fade setting: a contrast pull on luma toward a pivot.
             "profileLumaPivot": self.luma_pivot,
             "profileLumaContrast": self.luma_contrast,
+            # The Saturation slider. The gains above are already divided by it;
+            # this is the factor the shader multiplies back after the clamp,
+            # which is where the setting's whole visible effect comes from.
+            "profileChromaSaturation": self.chroma_saturation,
         }
 
 
@@ -176,7 +181,7 @@ def calibration_for(raw_path: Path, style: str) -> LookCalibration | None:
 def apply_sony_profile(
     camera_rgb: np.ndarray, cal: LookCalibration, style: str,
     highlights: int = 0, shadows: int = 0, contrast: int = 0, fade: int = 0,
-    dro: bool = False,
+    saturation: int = 0, dro: bool = False,
 ) -> tuple[np.ndarray, SonyRenderInfo]:
     """Camera RGB -> scene-linear ProPhoto (D50), plus the matching tone curve.
 
@@ -193,12 +198,19 @@ def apply_sony_profile(
     # this one is YGamma's, and the two are unrelated numbers on unrelated
     # scales. Reusing the name silently fed YGamma's 1.05 to the tone curve.
     luma_pivot, luma_contrast = luma_terms(cal, fade)
+    # The engine divides the gains before the clamp and multiplies the chroma
+    # back after it. The shader can only do the multiply, so the division
+    # happens here and it gets the divided gains. chroma.rgb_to_ycc, which is
+    # not passing anything to a shader, does both halves itself and so takes the
+    # look's own gains — do not feed it these.
+    sat = saturation_factor(saturation)
 
     return linear_prophoto, SonyRenderInfo(
         style=style,
         tone_curve=tone_curve_points(cal, style, highlights, shadows, contrast),
         chroma_cross=[float(x) for x in cross],
-        chroma_gain=[float(x) for x in gain],
+        chroma_gain=[float(x) / sat for x in gain],
+        chroma_saturation=sat,
         luma_pivot=luma_pivot,
         luma_contrast=luma_contrast,
         # What is left of the engine is ChromaSuppres (measured identity in

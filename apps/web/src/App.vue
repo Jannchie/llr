@@ -644,6 +644,7 @@ function buildProfileLUT(cp: ColorProfileMeta | null | undefined): ProfileCurve 
           // contrast 1, which is also the right fallback for an older response.
           lumaPivot: cp?.profileLumaPivot ?? 0,
           lumaContrast: cp?.profileLumaContrast ?? 1,
+          saturation: cp?.profileChromaSaturation ?? 1,
         }
       : null,
   };

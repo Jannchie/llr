@@ -36,7 +36,7 @@ const clamp = (x: number, lo: number, hi: number) => Math.min(Math.max(x, lo), h
 /** Line-for-line port of the GLSL. Display-linear in, display-linear out. */
 function sonyChroma(
   s: number[], cross: number[], gain: number[],
-  pivot = LUMA_PIVOT, contrast = LUMA_CONTRAST,
+  pivot = LUMA_PIVOT, contrast = LUMA_CONTRAST, sat = 1,
 ): number[] {
   const e = s.map(v => srgbEncode(clamp(v, 0, 1)));
   const y = (e[0] * 2432 + e[1] * 4864 + e[2] * 896) / 8192;
@@ -44,8 +44,8 @@ function sonyChroma(
   const v = e[2] - e[1];
   const v2 = (u >= 0 ? cross[1] : cross[3]) * u + v;
   const u2 = (v >= 0 ? cross[0] : cross[2]) * v + u;
-  const cr = clamp((u2 >= 0 ? gain[1] : gain[3]) * u2, -0.5, 0.5);
-  const cb = clamp((v2 >= 0 ? gain[0] : gain[2]) * v2, -0.5, 0.5);
+  const cr = clamp((u2 >= 0 ? gain[1] : gain[3]) * u2, -0.5, 0.5) * sat;
+  const cb = clamp((v2 >= 0 ? gain[0] : gain[2]) * v2, -0.5, 0.5) * sat;
   const yg = clamp((y - pivot) * contrast + pivot, 0, 1); // YGamma — Y only
   const o = [yg + 1.402 * cr, yg - 0.7141 * cr - 0.3441 * cb, yg + 1.772 * cb];
   return o.map(x => srgbDecode(clamp(x, 0, 1)));
@@ -123,7 +123,25 @@ describe("Sony RGB2YCC", () => {
     // unmodified u and v — swapping either is a silent hue error.
     expect(body).toContain("(u >= 0.0 ? u_sonyCross.y : u_sonyCross.w) * u + v");
     expect(body).toContain("(v >= 0.0 ? u_sonyCross.x : u_sonyCross.z) * v + u");
-    expect(body).toContain("(u2 >= 0.0 ? u_sonyGain.y : u_sonyGain.w) * u2, -0.5, 0.5");
-    expect(body).toContain("(v2 >= 0.0 ? u_sonyGain.x : u_sonyGain.z) * v2, -0.5, 0.5");
+    expect(body).toContain("(u2 >= 0.0 ? u_sonyGain.y : u_sonyGain.w) * u2, -0.5, 0.5) * u_sonySat");
+    expect(body).toContain("(v2 >= 0.0 ? u_sonyGain.x : u_sonyGain.z) * v2, -0.5, 0.5) * u_sonySat");
+  });
+
+  it("puts Saturation on both sides of the clamp, where the engine puts it", () => {
+    // The gains arrive already divided by the factor and the chroma is
+    // multiplied back after the clamp, so away from the clamp the setting does
+    // nothing at all — that near-cancellation is the engine's actual behaviour,
+    // not an approximation of it.
+    const f = 1.55;
+    const divided = GAIN.map(g => g / f);
+    for (const input of [[0.5, 0.5, 0.5], [0.45, 0.4, 0.35], [0.3, 0.35, 0.4]]) {
+      const plain = sonyChroma(input, CROSS, GAIN);
+      const sat = sonyChroma(input, CROSS, divided, LUMA_PIVOT, LUMA_CONTRAST, f);
+      for (let i = 0; i < 3; i++) expect(sat[i]).toBeCloseTo(plain[i], 5);
+    }
+    // Where it does clamp, the two no longer cancel — that is the whole slider.
+    const wide = [0.95, 0.2, 0.05];
+    const under = sonyChroma(wide, CROSS, GAIN.map(g => g * 2.3), LUMA_PIVOT, LUMA_CONTRAST, 1 / 2.3);
+    expect(Math.abs(under[0] - sonyChroma(wide, CROSS, GAIN)[0])).toBeGreaterThan(1e-3);
   });
 });

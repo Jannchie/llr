@@ -60,6 +60,9 @@ export type ProfileChroma = {
   gain: number[];
   lumaPivot: number;
   lumaContrast: number;
+  // `gain` arrives already divided by this; the shader multiplies it back after
+  // the clamp, which is the shot's Saturation setting.
+  saturation: number;
 };
 export type ProfileCurve =
   | { lut: Float32Array; srgbBasis: boolean; chroma?: ProfileChroma | null }
@@ -840,6 +843,7 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
       gl.uniform4f(this.uniforms["u_sonyCross"]!, c[0], c[1], c[2], c[3]);
       gl.uniform4f(this.uniforms["u_sonyGain"]!, g[0], g[1], g[2], g[3]);
       gl.uniform2f(this.uniforms["u_sonyLuma"]!, chroma.lumaPivot, chroma.lumaContrast);
+      gl.uniform1f(this.uniforms["u_sonySat"]!, chroma.saturation);
     }
     i("u_curveActive", this.curveActive ? 1 : 0);
     s("u_exposure", p.exposure); s("u_highlights", p.highlights);

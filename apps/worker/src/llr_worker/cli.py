@@ -60,11 +60,12 @@ class RawMetadata:
     lens_corr: dict[str, Any] | None = None
     # In-camera tweaks to the Creative Look. Highlights, Shadows and Contrast
     # (-9..+9) ride on the look's factory tone curve (sony/tone.py); Fade (0..9)
-    # is a separate stage that pulls luma toward a pivot (sony/chroma.py).
-    # Reproducing Sony's rendering needs all four.
+    # pulls luma toward a pivot and Saturation (-9..+9) scales the chroma either
+    # side of a clamp (sony/chroma.py). Reproducing Sony's rendering needs all.
     look_highlights: int = 0
     look_shadows: int = 0
     look_contrast: int = 0
+    look_saturation: int = 0
     look_fade: int = 0
     # Whether the shot asked for DRO. Sony runs a whole extra stage for it
     # (ZcTaskVatr) that this pipeline does not reproduce, so the render is
@@ -941,7 +942,7 @@ def render_color(
             camera_rgb, renderer.sony_look, renderer.sony_style,
             highlights=metadata.look_highlights, shadows=metadata.look_shadows,
             contrast=metadata.look_contrast, fade=metadata.look_fade,
-            dro=metadata.dro_active,
+            saturation=metadata.look_saturation, dro=metadata.dro_active,
         )
         return linear, info.to_json()
 
@@ -1229,6 +1230,7 @@ def read_raw_metadata(input_path: Path, raw: rawpy.RawPy) -> RawMetadata:
         look_fade=_exif_int(exif.get("Fade")),
         # exiftool prints Sony's zero for these as "Normal", not "0".
         look_contrast=_exif_int(exif.get("Contrast")),
+        look_saturation=_exif_int(exif.get("Saturation")),
         dro_active=str(exif.get("DynamicRangeOptimizer") or "Off").strip().lower() != "off",
     )
 
@@ -1334,6 +1336,7 @@ def _read_exiftool_metadata_cached(path: str, size: int, mtime_ns: int) -> dict[
                 "-Sony:Shadows",
                 "-Sony:Fade",
                 "-Sony:Contrast",
+                "-Sony:Saturation",
                 # DRO is a whole stage (ZcTaskVatr) that this pipeline does not
                 # reproduce, and it runs only when the shot asked for it — 2 of
                 # 65 in the reference set. Knowing which shots those are is the
@@ -1359,6 +1362,7 @@ def _read_exiftool_metadata_cached(path: str, size: int, mtime_ns: int) -> dict[
         "Shadows",
         "Fade",
         "Contrast",
+        "Saturation",
         "DynamicRangeOptimizer",
     ]:
         out[key] = record.get(key)

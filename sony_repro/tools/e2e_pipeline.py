@@ -38,7 +38,7 @@ def srgb_decode(c):
     return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
 
 
-def sony_chroma(s, cross, gain, pivot=0.0, contrast=1.0):
+def sony_chroma(s, cross, gain, pivot=0.0, contrast=1.0, sat=1.0):
     """passes.ts 的 sonyChroma:display-linear 进,display-linear 出。
 
     **这份要和 worker 的 `sony/chroma.py` 保持一致。** 曾经不一致过一次:
@@ -51,8 +51,8 @@ def sony_chroma(s, cross, gain, pivot=0.0, contrast=1.0):
     u, v = r - g, b - g
     v2 = np.where(u >= 0, cross[1], cross[3]) * u + v
     u2 = np.where(v >= 0, cross[0], cross[2]) * v + u
-    cr = np.clip(np.where(u2 >= 0, gain[1], gain[3]) * u2, -0.5, 0.5)
-    cb = np.clip(np.where(v2 >= 0, gain[0], gain[2]) * v2, -0.5, 0.5)
+    cr = np.clip(np.where(u2 >= 0, gain[1], gain[3]) * u2, -0.5, 0.5) * sat
+    cb = np.clip(np.where(v2 >= 0, gain[0], gain[2]) * v2, -0.5, 0.5) * sat
     y = np.clip((y - pivot) * contrast + pivot, 0.0, 1.0)   # YGamma:只动 Y
     return srgb_decode(np.stack([
         y + 1.4020 * cr, y - 0.7141 * cr - 0.3441 * cb, y + 1.7720 * cb], -1))
@@ -73,7 +73,8 @@ def render(path, profile_id, with_chroma=True):
         if with_chroma and cross and gain:
             s = sony_chroma(s, np.asarray(cross), np.asarray(gain),
                             cp.get("profileLumaPivot", 0.0),
-                            cp.get("profileLumaContrast", 1.0)).astype(np.float32)
+                            cp.get("profileLumaContrast", 1.0),
+                            cp.get("profileChromaSaturation", 1.0)).astype(np.float32)
         c = s @ SRGB_TO_PROPHOTO.T if srgb_basis else s
     return srgb_encode(np.clip(c, 0, 1) @ PROPHOTO_TO_SRGB.T).astype(np.float32), cp
 

@@ -19,6 +19,7 @@ from llr_worker.sony.chroma import (
     luma_gamma,
     luma_terms,
     rgb_to_ycc,
+    saturation_factor,
     unpack_params,
     ycc_to_rgb,
 )
@@ -322,6 +323,37 @@ def test_ygamma_moves_luma_and_nothing_else() -> None:
     assert np.ptp(shift, axis=-1).max() < 1e-6, "the same shift on R, G and B"
 
 
+def test_saturation_is_applied_twice_and_nearly_cancels() -> None:
+    """Sony's Saturation slider divides at RGB2YCC and multiplies back later.
+
+    The two halves are the same factor, so the setting is close to a no-op — the
+    clamp between them is its whole visible effect. Measured on the engine's own
+    finished frames: x0.99 at +9, and x1.05 at -9, where the intermediate chroma
+    is 2.3x larger and clips. Anything that applied only one half would be out
+    by 55%, which is why both belong in one place.
+    """
+    assert saturation_factor(0) == 1.0
+    assert saturation_factor(9) == pytest.approx(1.55)
+    assert saturation_factor(-9) == pytest.approx(0.45)
+    assert saturation_factor(2) == pytest.approx(1.20), "10 per step below 2"
+    assert saturation_factor(3) == pytest.approx(1.25), "5 per step above it"
+    assert saturation_factor(99) == saturation_factor(9), "clamped, not extrapolated"
+
+    cross, gain = unpack_params(VV2_CHROMA)
+    rng = np.random.default_rng(11)
+    img = rng.random((64, 64, 3), dtype=np.float32) * 0.5 + 0.2
+    plain = apply_chroma(img, cross, gain, *FADE0)
+    # rgb_to_ycc does both halves itself, so it takes the look's own gains — the
+    # divided ones are only for the shader, which can only do the multiply.
+    for s in (3, 9, -3):
+        got = apply_chroma(img, cross, gain, *FADE0, saturation=saturation_factor(s))
+        moved = np.abs(got - plain)
+        # Identical wherever the intermediate chroma stayed inside the clamp,
+        # and different only where it did not.
+        assert np.median(moved) < 1e-6
+        assert moved.max() > 1e-3
+
+
 def test_the_pair_is_deliberately_not_an_identity() -> None:
     """If it were, the stage would do nothing and the look would have no colour.
 
@@ -518,6 +550,12 @@ def test_every_in_camera_tweak_reaches_the_shipped_curve() -> None:
     plain = curve()
     for field in ("highlights", "shadows", "contrast"):
         assert curve(**{field: 5}) != plain, f"{field} never reached the curve"
+    for field in ("fade", "saturation"):
+        assert curve(**{field: 5}) == plain, f"{field} does not belong on the curve"
+    sat = apply_sony_profile(rgb, cal, "FL", saturation=9)[1]
+    assert sat.chroma_saturation == pytest.approx(1.55)
+    assert sat.chroma_gain == pytest.approx([g / 1.55 for g in apply_sony_profile(
+        rgb, cal, "FL")[1].chroma_gain])
     # Fade drives YGamma, not the curve — so the curve must NOT move, and the
     # two luma terms must.
     faded = apply_sony_profile(rgb, cal, "FL", fade=5)[1]

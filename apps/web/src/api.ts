@@ -28,6 +28,9 @@ export type ColorProfileMeta = {
   // pivot on the luma scale and a contrast about it. Sony only.
   profileLumaPivot?: number | null;
   profileLumaContrast?: number | null;
+  // The Saturation slider: profileChromaGain is already divided by it, and the
+  // shader multiplies the chroma back after the clamp. Sony only.
+  profileChromaSaturation?: number | null;
   // A fitted camera-match table layered on the DCP (present only when applied);
   // cameraMatchAvailable reports whether one exists regardless of the toggle.
   cameraMatch?: unknown;
