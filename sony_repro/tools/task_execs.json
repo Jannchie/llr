@@ -1,0 +1,230 @@
+{
+ "ZcTask": {
+  "rva": 875744,
+  "vftable_rva": 5098944
+ },
+ "ZcTask3DLut": {
+  "rva": 3601216,
+  "vftable_rva": 4618000
+ },
+ "ZcTaskAreaComp": {
+  "rva": 3776720,
+  "vftable_rva": 4625400
+ },
+ "ZcTaskAreaCompSIMD": {
+  "rva": 3770976,
+  "vftable_rva": 4625304
+ },
+ "ZcTaskArgoITP": {
+  "rva": 3938880,
+  "vftable_rva": 4628344
+ },
+ "ZcTaskBSNR_Y": {
+  "rva": 3788880,
+  "vftable_rva": 4625800
+ },
+ "ZcTaskChromaSuppres": {
+  "rva": 3598624,
+  "vftable_rva": 4617744
+ },
+ "ZcTaskDCV": {
+  "rva": 3833696,
+  "vftable_rva": 4626640
+ },
+ "ZcTaskDemosaic": {
+  "rva": 3884448,
+  "vftable_rva": 4627704
+ },
+ "ZcTaskDemosaicCompRaw": {
+  "rva": 3563808,
+  "vftable_rva": 4614840
+ },
+ "ZcTaskDemosaicHalf": {
+  "rva": 3693792,
+  "vftable_rva": 4623048
+ },
+ "ZcTaskDemosaicPackedRGB": {
+  "rva": 3618112,
+  "vftable_rva": 4619432
+ },
+ "ZcTaskDemosaicRough": {
+  "rva": 3615680,
+  "vftable_rva": 4619336
+ },
+ "ZcTaskDemosaicTrinity": {
+  "rva": 3614128,
+  "vftable_rva": 4619240
+ },
+ "ZcTaskDither": {
+  "rva": 3797008,
+  "vftable_rva": 4626232
+ },
+ "ZcTaskEffect": {
+  "rva": 3610432,
+  "vftable_rva": 4618912
+ },
+ "ZcTaskGeometricTransformCorrection": {
+  "rva": 3573392,
+  "vftable_rva": 4615208
+ },
+ "ZcTaskHueSaturation": {
+  "rva": 3607648,
+  "vftable_rva": 4618664
+ },
+ "ZcTaskITP": {
+  "rva": 3518208,
+  "vftable_rva": 4614072
+ },
+ "ZcTaskLinearMatrix": {
+  "rva": 3681184,
+  "vftable_rva": 4622728
+ },
+ "ZcTaskLinearMatrix16": {
+  "rva": 3583200,
+  "vftable_rva": 4615312
+ },
+ "ZcTaskMainGamma": {
+  "rva": 3592736,
+  "vftable_rva": 4617544
+ },
+ "ZcTaskMainGammaNonRAW": {
+  "rva": 3943424,
+  "vftable_rva": 4628536
+ },
+ "ZcTaskMarble": {
+  "rva": 3747232,
+  "vftable_rva": 4625096
+ },
+ "ZcTaskOpenCLITP": {
+  "rva": 3518208,
+  "vftable_rva": 4626792
+ },
+ "ZcTaskOpenCLSpica": {
+  "rva": 3509216,
+  "vftable_rva": 4625992
+ },
+ "ZcTaskPreprocess": {
+  "rva": 3559776,
+  "vftable_rva": 4614648
+ },
+ "ZcTaskRGB2YCC": {
+  "rva": 3593872,
+  "vftable_rva": 4617640
+ },
+ "ZcTaskRGBConversion": {
+  "rva": 3708528,
+  "vftable_rva": 4623664
+ },
+ "ZcTaskRawNRHalf": {
+  "rva": 3689648,
+  "vftable_rva": 4622920
+ },
+ "ZcTaskRawNRSIMD": {
+  "rva": 3799728,
+  "vftable_rva": 4626328
+ },
+ "ZcTaskRawNrPBX": {
+  "rva": 3886000,
+  "vftable_rva": 4627800
+ },
+ "ZcTaskSIMDBSNR_Y": {
+  "rva": 3784512,
+  "vftable_rva": 4625600
+ },
+ "ZcTaskSIMDGeometricTransformCorrection": {
+  "rva": 3629056,
+  "vftable_rva": 4619760
+ },
+ "ZcTaskSIMDHueSaturation": {
+  "rva": 3602944,
+  "vftable_rva": 4618104
+ },
+ "ZcTaskSIMDITP": {
+  "rva": 3860768,
+  "vftable_rva": 4627216
+ },
+ "ZcTaskSIMDLinearMatrix": {
+  "rva": 3676320,
+  "vftable_rva": 4622568
+ },
+ "ZcTaskSIMDLinearMatrix16": {
+  "rva": 3663152,
+  "vftable_rva": 4619912
+ },
+ "ZcTaskSIMDMarble": {
+  "rva": 3709280,
+  "vftable_rva": 4623760
+ },
+ "ZcTaskSIMDSharpness": {
+  "rva": 3698080,
+  "vftable_rva": 4623248
+ },
+ "ZcTaskSIMDSpica": {
+  "rva": 3791456,
+  "vftable_rva": 4626112
+ },
+ "ZcTaskSSCS": {
+  "rva": 3694832,
+  "vftable_rva": 4623144
+ },
+ "ZcTaskShadeCorrection": {
+  "rva": 3612992,
+  "vftable_rva": 4619144
+ },
+ "ZcTaskSharpness": {
+  "rva": 3705856,
+  "vftable_rva": 4623560
+ },
+ "ZcTaskSpica": {
+  "rva": 3509216,
+  "vftable_rva": 4613920
+ },
+ "ZcTaskTileDiv": {
+  "rva": 3765248,
+  "vftable_rva": 4625208
+ },
+ "ZcTaskTileDivHalf": {
+  "rva": 3684432,
+  "vftable_rva": 4622824
+ },
+ "ZcTaskTileDivNonRAW": {
+  "rva": 3942576,
+  "vftable_rva": 4628440
+ },
+ "ZcTaskTileDivNonRAWRough": {
+  "rva": 3943808,
+  "vftable_rva": 4628632
+ },
+ "ZcTaskTileDivRough": {
+  "rva": 3561328,
+  "vftable_rva": 4614744
+ },
+ "ZcTaskToneCurve": {
+  "rva": 3611968,
+  "vftable_rva": 4619048
+ },
+ "ZcTaskTrinityLPF": {
+  "rva": 3618992,
+  "vftable_rva": 4619528
+ },
+ "ZcTaskVatr": {
+  "rva": 3565856,
+  "vftable_rva": 4614936
+ },
+ "ZcTaskVatrFloat": {
+  "rva": 3570704,
+  "vftable_rva": 4615032
+ },
+ "ZcTaskYCC2RGB": {
+  "rva": 3609568,
+  "vftable_rva": 4618816
+ },
+ "ZcTaskYGamma": {
+  "rva": 3600432,
+  "vftable_rva": 4617904
+ },
+ "ZcTaskYNR": {
+  "rva": 3789360,
+  "vftable_rva": 4625896
+ }
+}

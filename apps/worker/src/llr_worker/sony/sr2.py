@@ -39,6 +39,17 @@ CHROMA_BASE_TAG = 0x7842
 CHROMA_ILLUMINANT_TAGS = (0x7843, 0x7844, 0x7845, 0x7846)
 _CHROMA_TAGS = (CHROMA_BASE_TAG, *CHROMA_ILLUMINANT_TAGS)
 
+# How much of each illuminant to mix in — int16[4] summing to 1024, a property
+# of the shot's white balance rather than of any look, so it lives at the top
+# level and applies to all ten. The engine reads it at calibration block +0xe44,
+# which is where this tag lands; 0x7847 (+0xe3c) has held the same four values
+# in every frame measured, but +0xe44 is what the code indexes.
+CHROMA_WEIGHT_TAG = 0x7848
+# The camera's own already-blended eight shorts, for the look that was selected
+# when the shutter fired. Edit.exe takes this as a shortcut instead of blending
+# (0x14036dce0, the `calib+0x1c != 0` branch, reading +0xddc).
+CHROMA_FINAL_TAG = 0x7841
+
 # TIFF field type -> bytes per unit
 _TYPE_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8}
 
@@ -60,6 +71,11 @@ class LookCalibration:
     curve_y: np.ndarray       # ...and their outputs, in units of full scale / 16384
     chroma_base: np.ndarray   # int16[8] -> RGB2YCC cross terms and gains
     chroma_deltas: np.ndarray  # int16[4, 8], the per-illuminant deltas
+    chroma_weights: np.ndarray  # int16[4], shared by all ten looks, sums to 1024
+    # The camera's own blend, present only for the look the shot was taken on
+    # (the top-level block is that look's — its 0x7842 matches, and 0x7770 names
+    # it). None for the other nine, which have to be blended.
+    chroma_final: np.ndarray | None
 
 
 def decrypt(data: bytes, start: int, length: int, key: int) -> bytes:
@@ -188,6 +204,21 @@ def look_calibrations(path: str | Path) -> list[LookCalibration]:
     _, _, mpos, msize = shared
     param_block = dec[mpos:mpos + msize]
 
+    def _top_shorts(tag: int) -> np.ndarray | None:
+        e = _find_tag(dec, sub_pos, endian, tag)
+        if e is None:
+            return None
+        _, cnt, tpos, _ = e
+        return np.array(struct.unpack_from(f"{endian}{cnt}h", dec, tpos), dtype=np.int64)
+
+    # The illuminant weights and the as-shot look's finished parameters are both
+    # top-level: they describe the frame, not a look.
+    weights = _top_shorts(CHROMA_WEIGHT_TAG)
+    if weights is None or weights.size != 4:
+        weights = np.array([1024, 0, 0, 0], dtype=np.int64)
+    final = _top_shorts(CHROMA_FINAL_TAG)
+    shot_base = _top_shorts(CHROMA_BASE_TAG)
+
     out = []
     for pos in offsets:
         got = {}
@@ -209,6 +240,13 @@ def look_calibrations(path: str | Path) -> list[LookCalibration]:
             curve_y=got[CURVE_Y_TAG],
             chroma_base=got[CHROMA_BASE_TAG],
             chroma_deltas=np.stack([got.get(t, zero) for t in CHROMA_ILLUMINANT_TAGS]),
+            chroma_weights=weights,
+            # Matching on the base rather than the name: the name is what the
+            # top-level block claims, the base is what it *is*.
+            chroma_final=final if (
+                final is not None and final.size == 8 and shot_base is not None
+                and np.array_equal(shot_base, got[CHROMA_BASE_TAG])
+            ) else None,
         ))
     return out
 

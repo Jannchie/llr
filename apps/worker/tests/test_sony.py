@@ -251,6 +251,47 @@ def test_illuminant_deltas_ride_on_the_base() -> None:
 
 
 @requires_sample
+def test_the_illuminant_weights_come_out_of_the_frame_not_a_constant() -> None:
+    """They are a property of the shot's light, so all ten looks share them.
+
+    Assuming (1024, 0, 0, 0) — using the base alone — is right for most frames
+    but not all: of 65 measured, 19 blend two illuminants, and on those the
+    rendered hue lands up to 11 degrees off. Both checked-in samples happen to
+    be blends, which is why this can be asserted rather than merely described.
+    """
+    for sample in (SAMPLE_FL, SAMPLE_IN):
+        looks = look_calibrations(sample)
+        weights = looks[0].chroma_weights
+        assert weights.shape == (4,)
+        assert weights.sum() == 1024, "the four weights partition 1.0"
+        assert weights.max() < 1024, f"{sample.name} was meant to be a blend"
+        assert all(np.array_equal(cal.chroma_weights, weights) for cal in looks)
+
+
+@requires_sample
+def test_recomputing_the_blend_agrees_with_the_camera() -> None:
+    """The as-shot look carries the camera's own answer; ours must match it.
+
+    Only that one look has it (tag 0x7841 sits at the top of the SR2SubIFD,
+    which holds the calibration for the look the shutter fired on), so the other
+    nine are blended from base and deltas. This pins the two against each other
+    on the one look where both exist — the engine itself prefers the camera's,
+    taking the `calib+0x1c != 0` shortcut at 0x14036dce0.
+    """
+    for sample in (SAMPLE_FL, SAMPLE_IN):
+        shot = [cal for cal in look_calibrations(sample) if cal.chroma_final is not None]
+        assert len(shot) == 1, "exactly one look was the as-shot one"
+        cal = shot[0]
+        ours = blend_params(cal.chroma_base, cal.chroma_deltas, cal.chroma_weights)
+        # Within one unit: the camera rounds the four gains slightly differently,
+        # and one unit is usually invisible after the gain's `>> 3`.
+        assert np.abs(ours - cal.chroma_final).max() <= 1
+        # chroma_terms must hand back the camera's value, not the recomputed one.
+        for got, want in zip(chroma_terms(cal), unpack_params(cal.chroma_final), strict=True):
+            assert got == pytest.approx(want)
+
+
+@requires_sample
 def test_sepia_is_refused_because_its_chroma_matches_standard() -> None:
     """SE's eight values are Standard's, so its toning is in some other stage.
 

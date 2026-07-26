@@ -46,7 +46,7 @@ from typing import Any
 import numpy as np
 
 from ..dcp import D50_TO_D65, XYZ_D50_TO_PROPHOTO, XYZ_D65_TO_SRGB
-from .chroma import ILLUMINANT_UNIT, blend_params, unpack_params
+from .chroma import blend_params, unpack_params
 from .linear_matrix import SegmentedMatrix
 from .sr2 import LookCalibration, look_calibrations, unpack_param_block
 from .tone import LOOK_ORDER, look_index, tone_curve
@@ -197,20 +197,20 @@ def apply_sony_profile(
 
 
 def chroma_terms(cal: LookCalibration) -> tuple[np.ndarray, np.ndarray]:
-    """This look's RGB2YCC cross terms and gains, using the base alone.
+    """This look's RGB2YCC cross terms and gains, blended for the shot's light.
 
-    The engine blends four illuminant deltas into the base with weights it keeps
-    at calibration block +0xe44..0xe4a, and those weights are *not* constant:
-    two frames measured came out (1024, 0, 0, 0), a third came out roughly
-    (340, 684, 0, 0), i.e. two thirds of the way to the second illuminant. What
-    picks them has not been worked out — it looks like an interpolation by
-    colour temperature — so this uses the base and accepts the error.
+    The eight parameters are a base plus four illuminant deltas, mixed by four
+    weights that sum to 1024. The weights belong to the frame, not the look —
+    they follow the white balance — so they sit at the top of the SR2SubIFD
+    while the base and deltas are per look. Across 65 frames, 46 came out
+    (1024, 0, 0, 0), which is why using the base alone looked right most of the
+    time; the other 19 blend two illuminants and move a parameter by up to 352.
 
-    Measured cost on the frame where the weights differ, against the engine's
-    own output: hue lands 4.5 degrees off, and feeding the engine's actual
-    values instead brings it to 0.03. Chroma is barely affected (1.06 vs 1.04),
-    so the far larger error this stage removes — a 40% chroma deficit — is worth
-    having meanwhile.
+    Where the camera has already done the blend — the look the shot was taken
+    on — its own answer is used, which is also the shortcut Edit.exe takes. That
+    matters in 2 frames of 65: recomputing agrees to within one unit everywhere
+    else, and one unit usually vanishes in the gain's `>> 3`.
     """
-    weights = np.array([ILLUMINANT_UNIT, 0, 0, 0], dtype=np.int64)
-    return unpack_params(blend_params(cal.chroma_base, cal.chroma_deltas, weights))
+    if cal.chroma_final is not None:
+        return unpack_params(cal.chroma_final)
+    return unpack_params(blend_params(cal.chroma_base, cal.chroma_deltas, cal.chroma_weights))
