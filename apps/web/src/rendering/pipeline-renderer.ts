@@ -51,10 +51,16 @@ export type LinearPixels = Float32Array | Uint16Array;
  *
  * `chroma` rides along because Sony's RGB2YCC runs immediately after the curve,
  * on the curve's own output and in the curve's own basis — four cross terms and
- * four gains (worker sony/chroma.py). Absent for profiles with no such stage,
- * which is every DCP.
+ * four gains, plus YGamma's pivot and contrast, which the engine runs between
+ * the two chroma halves and which carry the shot's Fade setting (worker
+ * sony/chroma.py). Absent for profiles with no such stage, which is every DCP.
  */
-export type ProfileChroma = { cross: number[]; gain: number[] };
+export type ProfileChroma = {
+  cross: number[];
+  gain: number[];
+  lumaPivot: number;
+  lumaContrast: number;
+};
 export type ProfileCurve =
   | { lut: Float32Array; srgbBasis: boolean; chroma?: ProfileChroma | null }
   | null;
@@ -833,6 +839,7 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
       const c = chroma.cross, g = chroma.gain;
       gl.uniform4f(this.uniforms["u_sonyCross"]!, c[0], c[1], c[2], c[3]);
       gl.uniform4f(this.uniforms["u_sonyGain"]!, g[0], g[1], g[2], g[3]);
+      gl.uniform2f(this.uniforms["u_sonyLuma"]!, chroma.lumaPivot, chroma.lumaContrast);
     }
     i("u_curveActive", this.curveActive ? 1 : 0);
     s("u_exposure", p.exposure); s("u_highlights", p.highlights);

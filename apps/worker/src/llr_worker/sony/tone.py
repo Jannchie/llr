@@ -20,8 +20,9 @@ a unit shape measured at +-9 reproduces every intermediate step to within
 own pair. Those 40 shapes are measured, not derived, and live in
 data/look_tuning.npz; how they were captured is in ../../../../sony_repro.
 
-Fade is deliberately absent: it measures as exactly zero on this curve, so it
-must act on one of the later YCC stages instead.
+Fade is deliberately absent, and that was the clue that found it: it measures as
+exactly zero on this curve because it acts on YGamma instead, as a contrast pull
+toward a pivot on luma alone (chroma.luma_gamma).
 """
 
 from __future__ import annotations

@@ -50,6 +50,15 @@ CHROMA_WEIGHT_TAG = 0x7848
 # (0x14036dce0, the `calib+0x1c != 0` branch, reading +0xddc).
 CHROMA_FINAL_TAG = 0x7841
 
+# YGamma's two terms, ten entries each, indexed by the in-camera Fade setting.
+# Fade is a contrast pull toward a fixed pivot applied to luma alone, and these
+# are the tables it reads (Edit.exe 0x14017b480 / 0x14017b5e0, which index them
+# at Fade*10 and interpolate in tenths). Top-level, like the illuminant weights.
+LUMA_PIVOT_TAG = 0x780B     # uint16[10], on the engine's 0..16383 luma scale
+LUMA_CONTRAST_TAG = 0x780E  # uint16[10], 16384 = x1.0
+FADE_STEPS = 10             # Fade 0..9, one table entry each
+LUMA_CONTRAST_UNIT = 16384
+
 # TIFF field type -> bytes per unit
 _TYPE_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8}
 
@@ -72,6 +81,8 @@ class LookCalibration:
     chroma_base: np.ndarray   # int16[8] -> RGB2YCC cross terms and gains
     chroma_deltas: np.ndarray  # int16[4, 8], the per-illuminant deltas
     chroma_weights: np.ndarray  # int16[4], shared by all ten looks, sums to 1024
+    luma_pivot: np.ndarray      # uint16[10], YGamma's pivot per Fade setting
+    luma_contrast: np.ndarray   # uint16[10], YGamma's contrast per Fade setting
     # The camera's own blend, present only for the look the shot was taken on
     # (the top-level block is that look's — its 0x7842 matches, and 0x7770 names
     # it). None for the other nine, which have to be blended.
@@ -219,6 +230,15 @@ def look_calibrations(path: str | Path) -> list[LookCalibration]:
     final = _top_shorts(CHROMA_FINAL_TAG)
     shot_base = _top_shorts(CHROMA_BASE_TAG)
 
+    # A file with no Fade tables renders as if Fade were 0, which is a pivot of
+    # zero and a contrast of one — not "no YGamma", since YGamma still runs.
+    pivots = _top_shorts(LUMA_PIVOT_TAG)
+    if pivots is None or pivots.size != FADE_STEPS:
+        pivots = np.zeros(FADE_STEPS, dtype=np.int64)
+    contrasts = _top_shorts(LUMA_CONTRAST_TAG)
+    if contrasts is None or contrasts.size != FADE_STEPS:
+        contrasts = np.full(FADE_STEPS, LUMA_CONTRAST_UNIT, dtype=np.int64)
+
     out = []
     for pos in offsets:
         got = {}
@@ -241,6 +261,8 @@ def look_calibrations(path: str | Path) -> list[LookCalibration]:
             chroma_base=got[CHROMA_BASE_TAG],
             chroma_deltas=np.stack([got.get(t, zero) for t in CHROMA_ILLUMINANT_TAGS]),
             chroma_weights=weights,
+            luma_pivot=pivots,
+            luma_contrast=contrasts,
             # Matching on the base rather than the name: the name is what the
             # top-level block claims, the base is what it *is*.
             chroma_final=final if (

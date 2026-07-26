@@ -56,11 +56,12 @@ Interceptor.attach(base.add(0x36d220), { onEnter(a) {
 _SPEC = {0x0037: (r"1 bytes, int8u\[1\]", "<b"),
          0xB029: (r"4 bytes, int32u\[1\]", "<i"),
          0xB020: (r"16 bytes, string\[16\]", None),
+         0x2004: (r"4 bytes, int32s\[1\]", "<i"),
          0x2032: (r"4 bytes, int32s\[1\]", "<i"),
          0x2033: (r"4 bytes, int32s\[1\]", "<i"),
          0x2034: (r"4 bytes, int32s\[1\]", "<i")}
 NAME = {0x0037: "style", 0xB029: "colormode", 0xB020: "stylestr",
-        0x2032: "shadows", 0x2033: "highlights", 0x2034: "fade"}
+        0x2004: "contrast", 0x2032: "shadows", 0x2033: "highlights", 0x2034: "fade"}
 FMT = {NAME[t]: s[1] for t, s in _SPEC.items() if s[1]}
 
 
@@ -139,10 +140,17 @@ def main():
     print("偏移:", {k: hex(v) for k, v in offs.items()})
     print("外观名:", names, flush=True)
 
+    # Contrast 和 Highlights/Shadows 走的是同一条路(都改 MainGamma 的 LUT)。
+    # 但 Highlights/Shadows 对档位严格线性(±9 定形状即可),Contrast 只有负方向
+    # 线性 —— 正方向连**形状**都随档位变(按 +9 缩放去推 +3,残差 44/16384,
+    # 而单位幅度才 110),所以正方向要逐档实测。--values 就是为此。
+    fields = next((a.split("=")[1].split(",") for a in sys.argv if a.startswith("--fields=")),
+                  ["highlights", "shadows"])
+    values = next(([int(v) for v in a.split("=")[1].split(",")]
+                   for a in sys.argv if a.startswith("--values=")), [-LIMIT, LIMIT])
     jobs = [("base", None)]
     if not only_base:
-        jobs += [(f"{f}{s:+d}", {f: s})
-                 for f in ("highlights", "shadows") for s in (-LIMIT, LIMIT)]
+        jobs += [(f"{f}{s:+d}", {f: s}) for f in fields for s in values]
 
     for look in LOOK_ORDER:
         for tag, tune in jobs:

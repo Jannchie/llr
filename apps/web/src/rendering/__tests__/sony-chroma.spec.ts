@@ -22,13 +22,22 @@ import { PROCESS_SHADER } from "../passes";
 const CROSS = [-0.261719, -0.222656, -0.230469, -0.167969];
 const GAIN = [1.078125, 0.632812, 0.929688, 1.09375];
 
-// YGamma's contrast term (calibration block +0x91964). See worker sony/chroma.py.
-const LUMA_GAIN = 1.0546875;
+// YGamma's two terms, which carry the shot's Fade setting: at Fade 0 the pivot
+// is zero and the stage is a plain gain. Both come out of the RAW (worker
+// sony/sr2.py, tags 0x780b and 0x780e); these are DSC03015's Fade 0 entries.
+const LUMA_PIVOT = 0;
+const LUMA_CONTRAST = 1.0546875;
+// The same file's Fade 5 entries, where the pivot does show up.
+const FADE5_PIVOT = 10624 / 16383;
+const FADE5_CONTRAST = 12928 / 16384;
 
 const clamp = (x: number, lo: number, hi: number) => Math.min(Math.max(x, lo), hi);
 
 /** Line-for-line port of the GLSL. Display-linear in, display-linear out. */
-function sonyChroma(s: number[], cross: number[], gain: number[]): number[] {
+function sonyChroma(
+  s: number[], cross: number[], gain: number[],
+  pivot = LUMA_PIVOT, contrast = LUMA_CONTRAST,
+): number[] {
   const e = s.map(v => srgbEncode(clamp(v, 0, 1)));
   const y = (e[0] * 2432 + e[1] * 4864 + e[2] * 896) / 8192;
   const u = e[0] - e[1];
@@ -37,7 +46,7 @@ function sonyChroma(s: number[], cross: number[], gain: number[]): number[] {
   const u2 = (v >= 0 ? cross[0] : cross[2]) * v + u;
   const cr = clamp((u2 >= 0 ? gain[1] : gain[3]) * u2, -0.5, 0.5);
   const cb = clamp((v2 >= 0 ? gain[0] : gain[2]) * v2, -0.5, 0.5);
-  const yg = Math.min(y * LUMA_GAIN, 1); // YGamma — Y only, chroma untouched
+  const yg = clamp((y - pivot) * contrast + pivot, 0, 1); // YGamma — Y only
   const o = [yg + 1.402 * cr, yg - 0.7141 * cr - 0.3441 * cb, yg + 1.772 * cb];
   return o.map(x => srgbDecode(clamp(x, 0, 1)));
 }
@@ -51,7 +60,23 @@ describe("Sony RGB2YCC", () => {
       const [r, gg, b] = sonyChroma([g, g, g], CROSS, GAIN);
       expect(gg).toBeCloseTo(r, 6);
       expect(b).toBeCloseTo(r, 6);
-      expect(srgbEncode(r)).toBeCloseTo(Math.min(srgbEncode(g) * LUMA_GAIN, 1), 5);
+      expect(srgbEncode(r)).toBeCloseTo(Math.min(srgbEncode(g) * LUMA_CONTRAST, 1), 5);
+    }
+  });
+
+  it("fades toward the pivot, which is the whole of the Fade slider", () => {
+    // On grey the luma weights sum to one and both chroma branches collapse, so
+    // the encoded output *is* YGamma's own output — the stage can be read off
+    // directly. What makes this a fade rather than a brightness change is that
+    // it moves everything toward the pivot: lifting below it, cutting above it.
+    for (const g of [0.02, 0.1, 0.3, 0.6, 0.9]) {
+      const [r, gg, b] = sonyChroma([g, g, g], CROSS, GAIN, FADE5_PIVOT, FADE5_CONTRAST);
+      expect(gg).toBeCloseTo(r, 6);
+      expect(b).toBeCloseTo(r, 6);
+      const before = srgbEncode(g), after = srgbEncode(r);
+      expect(Math.abs(after - FADE5_PIVOT)).toBeLessThan(Math.abs(before - FADE5_PIVOT));
+      if (before < FADE5_PIVOT) expect(after).toBeGreaterThan(before);
+      else expect(after).toBeLessThan(before);
     }
   });
 
@@ -92,8 +117,8 @@ describe("Sony RGB2YCC", () => {
     expect(body).toContain("y + 1.4020 * cr, y - 0.7141 * cr - 0.3441 * cb, y + 1.7720 * cb");
     // YGamma must land after the chroma is computed and clamped: applying it to
     // Y first would scale Cb and Cr with it, which the engine does not do.
-    expect(body).toContain(`y = min(y * ${LUMA_GAIN}, 1.0);`);
-    expect(body.indexOf("y = min(y *")).toBeGreaterThan(body.indexOf("float cb = clamp"));
+    expect(body).toContain("y = clamp((y - u_sonyLuma.x) * u_sonyLuma.y + u_sonyLuma.x, 0.0, 1.0);");
+    expect(body.indexOf("y = clamp((y -")).toBeGreaterThan(body.indexOf("float cb = clamp"));
     // Each cross term reads the *other* difference's sign, and both read the
     // unmodified u and v — swapping either is a silent hue error.
     expect(body).toContain("(u >= 0.0 ? u_sonyCross.y : u_sonyCross.w) * u + v");

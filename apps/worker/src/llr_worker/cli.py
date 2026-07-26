@@ -58,10 +58,10 @@ class RawMetadata:
     # Per-shot lens correction splines from the RAW's maker notes, mapped to
     # vendor-neutral factor tables (see sony_lens_corrections), or None.
     lens_corr: dict[str, Any] | None = None
-    # In-camera tweaks to the Creative Look, each -9..+9. Sony applies these on
-    # top of the look's factory tone curve, so reproducing its rendering needs
-    # them (see sony/tone.py). Fade is here for completeness; it acts on a later
-    # stage and leaves the tone curve untouched.
+    # In-camera tweaks to the Creative Look. Highlights and Shadows (-9..+9) ride
+    # on the look's factory tone curve (sony/tone.py); Fade (0..9) is a separate
+    # stage that pulls luma toward a pivot (sony/chroma.py). Reproducing Sony's
+    # rendering needs all three.
     look_highlights: int = 0
     look_shadows: int = 0
     look_fade: int = 0
@@ -939,7 +939,7 @@ def render_color(
         linear, info = apply_sony_profile(
             camera_rgb, renderer.sony_look, renderer.sony_style,
             highlights=metadata.look_highlights, shadows=metadata.look_shadows,
-            dro=metadata.dro_active,
+            fade=metadata.look_fade, dro=metadata.dro_active,
         )
         return linear, info.to_json()
 

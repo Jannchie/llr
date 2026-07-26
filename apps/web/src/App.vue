@@ -637,7 +637,15 @@ function buildProfileLUT(cp: ColorProfileMeta | null | undefined): ProfileCurve 
   return {
     lut: curveToLUT(pts.map(([x, y]) => ({ x, y }))),
     srgbBasis: cp?.kind === "sony",
-    chroma: cross?.length === 4 && gain?.length === 4 ? { cross, gain } : null,
+    chroma: cross?.length === 4 && gain?.length === 4
+      ? {
+          cross, gain,
+          // Fade 0 — every shot that never touched the slider — is pivot 0 and
+          // contrast 1, which is also the right fallback for an older response.
+          lumaPivot: cp?.profileLumaPivot ?? 0,
+          lumaContrast: cp?.profileLumaContrast ?? 1,
+        }
+      : null,
   };
 }
 

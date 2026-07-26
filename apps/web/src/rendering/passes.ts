@@ -92,6 +92,9 @@ uniform int u_profileCurveSrgb;  // 1 if that curve is defined on sRGB/Rec.709 p
 uniform int u_sonyChromaActive;
 uniform vec4 u_sonyCross;
 uniform vec4 u_sonyGain;
+// YGamma, which runs between the two chroma halves: the shot's Fade setting,
+// as a pivot and a contrast. Fade 0 is pivot 0, so it degenerates to a gain.
+uniform vec2 u_sonyLuma;        // (pivot, contrast)
 uniform int u_viewTransform;    // 0 = Lightroom-style, 1 = AgX
 uniform int u_displayGamut;     // 0 = sRGB, 1 = Display-P3
 uniform vec3 u_bgColor;         // display-encoded fill for areas outside the image (crop editor)
@@ -131,9 +134,10 @@ vec3 sonyChroma(vec3 s) {
   float u2 = (v >= 0.0 ? u_sonyCross.x : u_sonyCross.z) * v + u;
   float cr = clamp((u2 >= 0.0 ? u_sonyGain.y : u_sonyGain.w) * u2, -0.5, 0.5);
   float cb = clamp((v2 >= 0.0 ? u_sonyGain.x : u_sonyGain.z) * v2, -0.5, 0.5);
-  // YGamma, which the engine runs here, between the two halves: it lifts Y and
-  // clips, and leaves both chroma planes bit-identical (worker sony/chroma.py).
-  y = min(y * 1.0546875, 1.0);
+  // YGamma, which the engine runs here, between the two halves: it pulls Y
+  // toward a pivot and clips, and leaves both chroma planes bit-identical
+  // (worker sony/chroma.py). This is where the in-camera Fade setting lives.
+  y = clamp((y - u_sonyLuma.x) * u_sonyLuma.y + u_sonyLuma.x, 0.0, 1.0);
   vec3 o = vec3(y + 1.4020 * cr, y - 0.7141 * cr - 0.3441 * cb, y + 1.7720 * cb);
   return srgbDecode(clamp(o, 0.0, 1.0));
 }
@@ -535,7 +539,7 @@ export const PASSES: PassDef[] = [
     "u_grad_sh_tint","u_grad_md_tint","u_grad_hl_tint",
     "u_grad_blend","u_grad_balance",
     "u_curve_lut", "u_curveActive", "u_hasProfileCurve", "u_profileCurveSrgb",
-    "u_sonyChromaActive", "u_sonyCross", "u_sonyGain",
+    "u_sonyChromaActive", "u_sonyCross", "u_sonyGain", "u_sonyLuma",
     "u_lensActive", "u_lensScale", "u_lensNorm",
     ...Array.from({ length: 16 }, (_, k) => `u_lensDist[${k}]`),
     ...Array.from({ length: 16 }, (_, k) => `u_lensVig[${k}]`),

@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from .sr2 import LookCalibration
+
 CHROMA_BASE_TAG = 0x7842
 CHROMA_ILLUMINANT_TAGS = (0x7843, 0x7844, 0x7845, 0x7846)
 
@@ -49,16 +51,24 @@ _R_CR, _G_CR, _G_CB, _B_CB = 1.4020, 0.7141, 0.3441, 1.7720
 #     Y' = trunc(clamp(((max(0, lut[Y]) - black) * scale - pivot) * contrast
 #                      + pivot, 0, 16383))
 #
-# but bl, wl and pivot all read 0 on every frame measured, collapsing it to
-# `trunc(lut[Y] * contrast)`. That form reproduces the engine's own output
-# 100.0000% bit-exactly over 2M pixels (sony_repro/tools/ygamma_verify.py).
+# bl and wl read 0 on every frame measured, which drops black and scale. Pivot
+# and contrast do not: they are the *Fade* setting, read out of the RAW's two
+# ten-entry tables (sr2.LUMA_PIVOT_TAG / LUMA_CONTRAST_TAG). At Fade 0 the pivot
+# is 0 and the whole thing is a plain gain, which is why Fade looked absent for
+# so long — every frame in the sample corpus was shot at Fade 0.
+#
+# Checked against the engine's own in/out on whole frames: 100.0000% bit-exact
+# over 2M pixels at Fade 0 *and* at Fade 5, where the pivot is 10624 and the
+# contrast 0.789 (sony_repro/tools/ygamma_verify.py). Rounding must be
+# truncation; round-to-nearest matches only half the pixels.
 #
 # The LUT is identity above Y ~ 1024 and departs from it by at most 16 in 16383
 # below that, so it is dropped here: the approximation is bounded at 0.1% and
 # confined to deep shadow. Removing it left a consistent luma bias — measured
 # against the engine's own frames on eight shots, median 0.0139 too dark before,
 # 0.0009 after.
-LUMA_GAIN = 1.0546875              # calibration block +0x91964, 135/128
+LUMA_FULL_SCALE = 16383.0          # the engine's luma range, and the pivot's units
+LUMA_CONTRAST_UNIT = 16384.0       # tag 0x780e's units: 16384 means x1.0
 
 
 def blend_params(base: np.ndarray, deltas: np.ndarray, weights: np.ndarray) -> np.ndarray:
@@ -95,9 +105,28 @@ def rgb_to_ycc(rgb: np.ndarray, cross: np.ndarray, gain: np.ndarray,
     return y, cb, cr
 
 
-def luma_gamma(y: np.ndarray) -> np.ndarray:
-    """YGamma: lift Y and clip, leaving chroma alone. See LUMA_GAIN."""
-    return np.minimum(y * LUMA_GAIN, 1.0)
+def luma_terms(cal: LookCalibration, fade: int = 0) -> tuple[float, float]:
+    """This shot's YGamma pivot and contrast, for its Fade setting.
+
+    The engine indexes both tables at Fade*10 and interpolates in tenths, so a
+    whole-number Fade — all the camera can write — lands exactly on an entry.
+    Out-of-range values clamp rather than extrapolate, matching the engine: past
+    90 it holds the last entry, and Fade has no negative side to begin with.
+    """
+    i = int(np.clip(fade, 0, cal.luma_pivot.size - 1))
+    return (float(cal.luma_pivot[i]) / LUMA_FULL_SCALE,
+            float(cal.luma_contrast[i]) / LUMA_CONTRAST_UNIT)
+
+
+def luma_gamma(y: np.ndarray, pivot: float, contrast: float) -> np.ndarray:
+    """YGamma: pull luma toward `pivot` by `contrast`, and clip. Chroma is untouched.
+
+    At Fade 0 the pivot is zero and this is the plain gain it was first measured
+    as; with Fade on, the pivot rises to about 0.65 and the contrast drops below
+    one, which lifts the shadows while pulling the highlights down — the faded
+    look, done in one stage on luma alone.
+    """
+    return np.clip((y - pivot) * contrast + pivot, 0.0, 1.0)
 
 
 def ycc_to_rgb(y: np.ndarray, cb: np.ndarray, cr: np.ndarray) -> np.ndarray:
@@ -109,12 +138,13 @@ def ycc_to_rgb(y: np.ndarray, cb: np.ndarray, cr: np.ndarray) -> np.ndarray:
     ], -1), 0.0, 1.0)
 
 
-def apply_chroma(rgb: np.ndarray, cross: np.ndarray, gain: np.ndarray) -> np.ndarray:
+def apply_chroma(rgb: np.ndarray, cross: np.ndarray, gain: np.ndarray,
+                 pivot: float = 0.0, contrast: float = 1.0) -> np.ndarray:
     """The whole YCC section: display-encoded RGB in, the same out.
 
-    Grey does not survive this unchanged — YGamma brightens it by LUMA_GAIN.
-    That is the engine's behaviour, not a bug in the chroma maths: the two
-    chroma planes really are untouched, and only Y moves.
+    Grey does not survive this unchanged — YGamma moves it. That is the engine's
+    behaviour, not a bug in the chroma maths: the two chroma planes really are
+    untouched, and only Y moves.
     """
     y, cb, cr = rgb_to_ycc(rgb, cross, gain)
-    return ycc_to_rgb(luma_gamma(y), cb, cr)
+    return ycc_to_rgb(luma_gamma(y, pivot, contrast), cb, cr)

@@ -14,10 +14,10 @@ import pytest
 from llr_worker.cli import _exif_int, detect_exiftool, prepare_linear, read_exiftool_metadata
 from llr_worker.sony import apply_sony_profile, available_styles, calibration_for, can_render
 from llr_worker.sony.chroma import (
-    LUMA_GAIN,
     apply_chroma,
     blend_params,
     luma_gamma,
+    luma_terms,
     rgb_to_ycc,
     unpack_params,
     ycc_to_rgb,
@@ -251,7 +251,7 @@ def test_black_and_white_desaturates_itself() -> None:
     assert not gain.any()
 
     rng = np.random.default_rng(0)
-    out = apply_chroma(rng.random((16, 16, 3), dtype=np.float32), cross, gain)
+    out = apply_chroma(rng.random((16, 16, 3), dtype=np.float32), cross, gain, *FADE0)
     assert np.allclose(out[..., 0], out[..., 1], atol=1e-6)
     assert np.allclose(out[..., 1], out[..., 2], atol=1e-6)
 
@@ -261,6 +261,10 @@ def test_black_and_white_desaturates_itself() -> None:
 # What the engine's own interpolation produced for DSC03015 (VV2), read out of
 # its buffer with Frida. Also what the RAW's 0x7842 holds, bit for bit.
 VV2_CHROMA = np.array([-267, -226, -235, -172, 1110, 654, 952, 1126])
+# YGamma's (pivot, contrast) for the same file at Fade 0 — the setting every
+# frame in the sample corpus was shot at, where the pivot is zero and the stage
+# degenerates to a gain. luma_terms reads both out of the RAW.
+FADE0 = (0.0, 1.0546875)
 
 
 def test_the_chroma_unpacking_is_not_plain_fixed_point() -> None:
@@ -284,21 +288,22 @@ def test_a_neutral_pixel_stays_neutral_but_gets_brighter() -> None:
     """
     cross, gain = unpack_params(VV2_CHROMA)
     grey = np.linspace(0.0, 1.0, 32, dtype=np.float32)[:, None].repeat(3, 1)
-    out = apply_chroma(grey, cross, gain)
+    out = apply_chroma(grey, cross, gain, *FADE0)
     assert out[..., 0] == pytest.approx(out[..., 1], abs=1e-6)
     assert out[..., 1] == pytest.approx(out[..., 2], abs=1e-6)
-    assert out[..., 0] == pytest.approx(np.minimum(grey[..., 0] * LUMA_GAIN, 1.0), abs=1e-6)
+    assert out[..., 0] == pytest.approx(np.minimum(grey[..., 0] * FADE0[1], 1.0), abs=1e-6)
 
 
 def test_ygamma_moves_luma_and_nothing_else() -> None:
-    """It is a gain on Y with a clip, and the chroma planes never move.
+    """It is a contrast about a pivot on Y, and the chroma planes never move.
 
-    Verified against the engine 100.0000% bit-exactly over 2M pixels; what is
-    approximated here is only its near-identity LUT, dropped because it departs
-    from identity by at most 16 in 16383 and only below Y ~ 1024.
+    Verified against the engine 100.0000% bit-exactly over 2M pixels, at Fade 0
+    and at Fade 5; what is approximated here is only its near-identity LUT,
+    dropped because it departs from identity by at most 16 in 16383 and only
+    below Y ~ 1024.
     """
-    assert luma_gamma(np.float32(0.5)) == pytest.approx(0.5 * LUMA_GAIN)
-    assert luma_gamma(np.float32(0.99)) == pytest.approx(1.0), "the top clips"
+    assert luma_gamma(np.float32(0.5), *FADE0) == pytest.approx(0.5 * FADE0[1])
+    assert luma_gamma(np.float32(0.99), *FADE0) == pytest.approx(1.0), "the top clips"
 
     # Because it moves Y and only Y, it must shift all three channels by the
     # *same* amount. Applying the gain before the chroma maths instead would
@@ -307,7 +312,7 @@ def test_ygamma_moves_luma_and_nothing_else() -> None:
     rng = np.random.default_rng(7)
     img = rng.random((32, 32, 3), dtype=np.float32) * 0.4 + 0.1
     y, cb, cr = rgb_to_ycc(img, cross, gain)
-    lo, hi = ycc_to_rgb(y, cb, cr), ycc_to_rgb(luma_gamma(y), cb, cr)
+    lo, hi = ycc_to_rgb(y, cb, cr), ycc_to_rgb(luma_gamma(y, *FADE0), cb, cr)
     # ycc_to_rgb clips, and these gains push saturated pixels past the ends, so
     # only unclipped ones can show the shift.
     free = ((lo > 0) & (lo < 1) & (hi > 0) & (hi < 1)).all(-1)
@@ -325,7 +330,35 @@ def test_the_pair_is_deliberately_not_an_identity() -> None:
     cross, gain = unpack_params(VV2_CHROMA)
     rng = np.random.default_rng(3)
     img = rng.random((64, 64, 3), dtype=np.float32)
-    assert np.abs(apply_chroma(img, cross, gain) - img).max() > 0.05
+    assert np.abs(apply_chroma(img, cross, gain, *FADE0) - img).max() > 0.05
+
+
+@requires_sample
+def test_fade_is_a_contrast_pull_toward_a_pivot() -> None:
+    """Fade reads two ten-entry tables out of the RAW, one pivot and one contrast.
+
+    Fade 0 is the degenerate case — pivot zero, so a plain gain — which is why
+    the stage read as a constant for as long as every sample was shot at 0. From
+    Fade 1 on the pivot jumps to a fixed value and the contrast falls, and the
+    two together lift the shadows while pulling the highlights down.
+    """
+    cal = look_calibrations(SAMPLE_FL)[LOOK_ORDER.index("FL")]
+    pivot0, contrast0 = luma_terms(cal, 0)
+    assert pivot0 == 0.0
+    assert contrast0 > 1.0, "Fade 0 still applies a gain, it is not an identity"
+
+    pivot5, contrast5 = luma_terms(cal, 5)
+    assert pivot5 > 0.5
+    assert contrast5 < 1.0
+    # Monotone in the setting, and clamped rather than extrapolated past the end.
+    contrasts = [luma_terms(cal, f)[1] for f in range(10)]
+    assert contrasts == sorted(contrasts, reverse=True)
+    assert luma_terms(cal, 99) == luma_terms(cal, 9)
+
+    # Below the pivot it lifts, above it it cuts. That crossover is what makes it
+    # a fade rather than a brightness change.
+    assert luma_gamma(np.float32(0.2), pivot5, contrast5) > luma_gamma(np.float32(0.2), pivot0, contrast0)
+    assert luma_gamma(np.float32(0.95), pivot5, contrast5) < luma_gamma(np.float32(0.95), pivot0, contrast0)
 
 
 def test_illuminant_deltas_ride_on_the_base() -> None:

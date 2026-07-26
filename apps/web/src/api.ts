@@ -24,6 +24,10 @@ export type ColorProfileMeta = {
   // gains, each pair indexed by the sign of a chroma difference. Sony only.
   profileChromaCross?: number[] | null;
   profileChromaGain?: number[] | null;
+  // YGamma, run between the two chroma halves: the shot's Fade setting, as a
+  // pivot on the luma scale and a contrast about it. Sony only.
+  profileLumaPivot?: number | null;
+  profileLumaContrast?: number | null;
   // A fitted camera-match table layered on the DCP (present only when applied);
   // cameraMatchAvailable reports whether one exists regardless of the toggle.
   cameraMatch?: unknown;

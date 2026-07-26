@@ -46,7 +46,7 @@ from typing import Any
 import numpy as np
 
 from ..dcp import D50_TO_D65, XYZ_D50_TO_PROPHOTO, XYZ_D65_TO_SRGB
-from .chroma import blend_params, unpack_params
+from .chroma import blend_params, luma_terms, unpack_params
 from .linear_matrix import SegmentedMatrix
 from .sr2 import LookCalibration, look_calibrations, unpack_param_block
 from .tone import LOOK_ORDER, look_index, tone_curve
@@ -69,6 +69,8 @@ class SonyRenderInfo:
     limitations: list[str]
     chroma_cross: list[float]
     chroma_gain: list[float]
+    luma_pivot: float = 0.0
+    luma_contrast: float = 1.0
     working_space: str = "linear-prophoto-d50"
 
     def to_json(self) -> dict[str, Any]:
@@ -85,6 +87,10 @@ class SonyRenderInfo:
             # where the engine runs it, and it needs the curve's own encoding.
             "profileChromaCross": self.chroma_cross,
             "profileChromaGain": self.chroma_gain,
+            # YGamma, which the engine runs between the two chroma halves. It is
+            # the shot's Fade setting: a contrast pull on luma toward a pivot.
+            "profileLumaPivot": self.luma_pivot,
+            "profileLumaContrast": self.luma_contrast,
         }
 
 
@@ -169,7 +175,7 @@ def calibration_for(raw_path: Path, style: str) -> LookCalibration | None:
 
 def apply_sony_profile(
     camera_rgb: np.ndarray, cal: LookCalibration, style: str,
-    highlights: int = 0, shadows: int = 0, dro: bool = False,
+    highlights: int = 0, shadows: int = 0, fade: int = 0, dro: bool = False,
 ) -> tuple[np.ndarray, SonyRenderInfo]:
     """Camera RGB -> scene-linear ProPhoto (D50), plus the matching tone curve.
 
@@ -182,12 +188,15 @@ def apply_sony_profile(
     rec709 = matrix.apply(camera_rgb)
     linear_prophoto = np.clip(rec709 @ REC709_TO_PROPHOTO_D50.T, 0, None)
     cross, gain = chroma_terms(cal)
+    pivot, contrast = luma_terms(cal, fade)
 
     return linear_prophoto, SonyRenderInfo(
         style=style,
         tone_curve=tone_curve_points(cal, style, highlights, shadows),
         chroma_cross=[float(x) for x in cross],
         chroma_gain=[float(x) for x in gain],
+        luma_pivot=pivot,
+        luma_contrast=contrast,
         # What is left of the engine is ChromaSuppres (measured identity in
         # every luma band), SSCS (touches no pixel on a whole frame), AreaComp
         # (0.9999), ITP, sharpening, Spica and Marble. On shots without DRO,

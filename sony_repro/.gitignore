@@ -4,3 +4,5 @@ __pycache__/
 # Memory dumps and fitted arrays — regenerate them with tools/, don't commit them.
 *.npz
 *.bin
+tools/sliderprobe_work.ARW
+tools/sliderprobe/*.npy
