@@ -40,7 +40,14 @@ _TYPE_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4
 
 @dataclass(frozen=True)
 class LookCalibration:
-    """One Creative Look's factory calibration, straight out of the RAW."""
+    """One Creative Look's factory calibration, straight out of the RAW.
+
+    `param_block` holds the *same* 276 bytes for all ten looks: the colour
+    matrix belongs to the body, not to the look. Each SR2DataIFD does carry its
+    own 0x780f, but the engine never reads it — it memcpys the SR2SubIFD's
+    top-level one into the calibration block and unpacks that. Confirmed
+    against the buffer the engine actually unpacks, byte for byte.
+    """
 
     name: str
     param_block: bytes      # 276 bytes -> LinearMatrix16 knot coefficients
@@ -166,20 +173,28 @@ def look_calibrations(path: str | Path) -> list[LookCalibration]:
     _, count, vpos, _ = e
     offsets = struct.unpack_from(f"{endian}{count}I", dec, vpos)
 
+    # The matrix comes from the SR2SubIFD itself, shared by every look — see
+    # LookCalibration. The per-look 0x780f is deliberately ignored.
+    shared = _find_tag(dec, sub_pos, endian, SR2_PARAM_TAG)
+    if shared is None:
+        raise KeyError(f"SR2SubIFD has no tag 0x{SR2_PARAM_TAG:04x} (colour matrix)")
+    _, _, mpos, msize = shared
+    param_block = dec[mpos:mpos + msize]
+
     out = []
     for pos in offsets:
         got = {}
         for tag, _typ, cnt, tag_pos, size in _ifd_entries(dec, pos, endian):
             if tag in (CURVE_X_TAG, CURVE_Y_TAG):
                 got[tag] = np.array(struct.unpack_from(f"{endian}{cnt}i", dec, tag_pos), dtype=np.int64)
-            elif tag in (SR2_PARAM_TAG, LOOK_NAME_TAG):
+            elif tag == LOOK_NAME_TAG:
                 got[tag] = dec[tag_pos:tag_pos + size]
-        missing = {SR2_PARAM_TAG, CURVE_X_TAG, CURVE_Y_TAG} - set(got)
+        missing = {CURVE_X_TAG, CURVE_Y_TAG} - set(got)
         if missing:
             raise KeyError(f"SR2DataIFD at 0x{pos:x} is missing {sorted(hex(t) for t in missing)}")
         out.append(LookCalibration(
             name=bytes(got.get(LOOK_NAME_TAG, b"")).split(b"\x00")[0].decode("ascii", "replace"),
-            param_block=got[SR2_PARAM_TAG],
+            param_block=param_block,
             curve_x=got[CURVE_X_TAG],
             curve_y=got[CURVE_Y_TAG],
         ))

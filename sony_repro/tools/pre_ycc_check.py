@@ -31,13 +31,33 @@ def main():
     ours = render(arw, style, half=False).astype(np.float32)
     print("我们 %s   引擎(1/4) %s" % (ours.shape, eng.shape))
 
-    # 把我们的降到引擎帧的网格上,两边都是全分辨率出来的,直接按比例取点
-    sy, sx = ours.shape[0] / eng.shape[0], ours.shape[1] / eng.shape[1]
-    yi = np.clip((np.arange(eng.shape[0]) * sy).astype(int), 0, ours.shape[0] - 1)
-    xi = np.clip((np.arange(eng.shape[1]) * sx).astype(int), 0, ours.shape[1] - 1)
-    ours8 = ours[np.ix_(yi, xi)]
+    def to_grid(a, shape):
+        """按比例取点降到引擎帧的网格上(两边都是全分辨率出来的)。"""
+        sy, sx = a.shape[0] / shape[0], a.shape[1] / shape[1]
+        yi = np.clip((np.arange(shape[0]) * sy).astype(int), 0, a.shape[0] - 1)
+        xi = np.clip((np.arange(shape[1]) * sx).astype(int), 0, a.shape[1] - 1)
+        return a[np.ix_(yi, xi)]
 
-    jpg = load_jpeg(arw.with_suffix(".JPG"), eng.shape).astype(np.float32)
+    # 竖幅的图 rawpy 会按 EXIF 方向出片,而 stage_frame.py 的画布写死是横的。
+    # 转错方向比不转还糟(错位对比会把色相差算成 30 度),所以按相关性挑,别猜。
+    ref = eng8[..., 1].astype(np.float64)
+    ref = ref - ref.mean()
+    best = None
+    for k in range(4):
+        cand = np.rot90(ours, k)
+        if (cand.shape[0] > cand.shape[1]) != (eng.shape[0] > eng.shape[1]):
+            continue
+        g = to_grid(cand, eng.shape[:2])[..., 1].astype(np.float64)
+        score = float((ref * (g - g.mean())).mean())
+        if best is None or score > best[0]:
+            best = (score, k, cand)
+    ours = best[2]
+    print("  取 rot90 k=%d(相关性 %.1f)-> %s" % (best[1], best[0], ours.shape))
+
+    ours8 = to_grid(ours, eng.shape[:2])
+    # 机内 JPEG 先按我们的方向缩放,再走同一个网格 —— 直接缩到引擎帧会把竖幅压扁
+    jpg = to_grid(load_jpeg(arw.with_suffix(".JPG"), ours.shape[:2]).astype(np.float32),
+                  eng.shape[:2])
 
     print("\n以引擎的 MainGamma 出口为基准(1.0 = 完全对上):")
     chroma_stats("我们矩阵+曲线", ours8[ok], eng8[ok])

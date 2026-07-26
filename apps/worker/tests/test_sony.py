@@ -167,15 +167,28 @@ def test_apply_is_scale_invariant() -> None:
 
 
 @requires_sample
-def test_black_and_white_carries_an_identity_matrix() -> None:
-    """Why BW and SE are refused: their desaturation is not in this stage at all.
+def test_every_look_shares_one_colour_matrix() -> None:
+    """The matrix belongs to the body, not to the look.
 
-    Rendering them here would give a colour image with a monochrome look's
-    curve, which is worse than falling back to a DCP.
+    Each SR2DataIFD carries its own 0x780f, but the engine memcpys the
+    SR2SubIFD's top-level one instead — reading the per-look copy gave a table
+    that matched the engine's expanded 1024 matrices for no look at all.
     """
-    looks = look_calibrations(SAMPLE_FL)
-    bw = matrices_from_coeff(unpack_param_block(looks[LOOK_ORDER.index("BW")].param_block))
-    assert np.allclose(bw, np.eye(3), atol=1e-6)
+    blocks = {cal.param_block for cal in look_calibrations(SAMPLE_FL)}
+    assert len(blocks) == 1
+
+
+@requires_sample
+def test_black_and_white_is_still_refused() -> None:
+    """BW and SE desaturate in the YCC stage, which this path does not reproduce.
+
+    Their chroma gains (0x7842) are all zero, which zeroes Cb and Cr and leaves
+    R=G=B. Rendering them here would give a colour image with a monochrome
+    look's curve, which is worse than falling back to a DCP.
+    """
+    assert not can_render("BW")
+    assert not can_render("SE")
+    assert can_render("VV2")
 
 
 # ── Working-space conversion and the tone curve ────────────────────────────
