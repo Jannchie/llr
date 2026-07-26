@@ -38,8 +38,16 @@ def srgb_decode(c):
     return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
 
 
+LUMA_GAIN = 1.0546875   # YGamma 的 contrast 项,见 worker sony/chroma.py
+
+
 def sony_chroma(s, cross, gain):
-    """passes.ts 的 sonyChroma:display-linear 进,display-linear 出。"""
+    """passes.ts 的 sonyChroma:display-linear 进,display-linear 出。
+
+    **这份要和 worker 的 `sony/chroma.py` 保持一致。** 曾经不一致过一次:
+    给主管线加上 YGamma 时忘了同步这里,于是这套研究工具量出来的亮度整体偏
+    +0.021,看着像"复刻偏暗",其实只是工具没跟上。
+    """
     e = srgb_encode(s)
     r, g, b = e[..., 0], e[..., 1], e[..., 2]
     y = (r * 2432 + g * 4864 + b * 896) / 8192
@@ -48,6 +56,7 @@ def sony_chroma(s, cross, gain):
     u2 = np.where(v >= 0, cross[0], cross[2]) * v + u
     cr = np.clip(np.where(u2 >= 0, gain[1], gain[3]) * u2, -0.5, 0.5)
     cb = np.clip(np.where(v2 >= 0, gain[0], gain[2]) * v2, -0.5, 0.5)
+    y = np.minimum(y * LUMA_GAIN, 1.0)          # YGamma:只动 Y
     return srgb_decode(np.stack([
         y + 1.4020 * cr, y - 0.7141 * cr - 0.3441 * cb, y + 1.7720 * cb], -1))
 
