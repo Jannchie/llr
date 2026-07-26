@@ -65,6 +65,10 @@ class RawMetadata:
     look_highlights: int = 0
     look_shadows: int = 0
     look_fade: int = 0
+    # Whether the shot asked for DRO. Sony runs a whole extra stage for it
+    # (ZcTaskVatr) that this pipeline does not reproduce, so the render is
+    # honest about it only on the shots where it actually applies.
+    dro_active: bool = False
 
 
 @dataclass
@@ -935,6 +939,7 @@ def render_color(
         linear, info = apply_sony_profile(
             camera_rgb, renderer.sony_look, renderer.sony_style,
             highlights=metadata.look_highlights, shadows=metadata.look_shadows,
+            dro=metadata.dro_active,
         )
         return linear, info.to_json()
 
@@ -1220,6 +1225,7 @@ def read_raw_metadata(input_path: Path, raw: rawpy.RawPy) -> RawMetadata:
         look_highlights=_exif_int(exif.get("Highlights")),
         look_shadows=_exif_int(exif.get("Shadows")),
         look_fade=_exif_int(exif.get("Fade")),
+        dro_active=str(exif.get("DynamicRangeOptimizer") or "Off").strip().lower() != "off",
     )
 
 
@@ -1323,6 +1329,11 @@ def _read_exiftool_metadata_cached(path: str, size: int, mtime_ns: int) -> dict[
                 "-Sony:Highlights",
                 "-Sony:Shadows",
                 "-Sony:Fade",
+                # DRO is a whole stage (ZcTaskVatr) that this pipeline does not
+                # reproduce, and it runs only when the shot asked for it — 2 of
+                # 65 in the reference set. Knowing which shots those are is the
+                # difference between a limitation and a lie.
+                "-DynamicRangeOptimizer",
                 str(input_path),
             ],
             env=exiftool_env(),
@@ -1342,6 +1353,7 @@ def _read_exiftool_metadata_cached(path: str, size: int, mtime_ns: int) -> dict[
         "Highlights",
         "Shadows",
         "Fade",
+        "DynamicRangeOptimizer",
     ]:
         out[key] = record.get(key)
     return out

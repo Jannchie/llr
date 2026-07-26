@@ -169,7 +169,7 @@ def calibration_for(raw_path: Path, style: str) -> LookCalibration | None:
 
 def apply_sony_profile(
     camera_rgb: np.ndarray, cal: LookCalibration, style: str,
-    highlights: int = 0, shadows: int = 0,
+    highlights: int = 0, shadows: int = 0, dro: bool = False,
 ) -> tuple[np.ndarray, SonyRenderInfo]:
     """Camera RGB -> scene-linear ProPhoto (D50), plus the matching tone curve.
 
@@ -188,12 +188,29 @@ def apply_sony_profile(
         tone_curve=tone_curve_points(cal, style, highlights, shadows),
         chroma_cross=[float(x) for x in cross],
         chroma_gain=[float(x) for x in gain],
-        # What is left of the engine is ChromaSuppres (identity in midtones),
-        # SSCS (measured to touch no pixel on a whole frame), AreaComp (0.9999),
-        # ITP, sharpening, Spica and Marble — together about 5% of chroma — plus
-        # DRO, which lifts shadows on shots that requested it.
-        limitations=["Sony's ITP, sharpening and DRO stages are not reproduced."],
+        # What is left of the engine is ChromaSuppres (measured identity in
+        # every luma band), SSCS (touches no pixel on a whole frame), AreaComp
+        # (0.9999), ITP, sharpening, Spica and Marble. On shots without DRO,
+        # those come to a chroma ratio of 0.983..1.008 and under half a degree
+        # of hue against the engine's own output.
+        limitations=_limitations(dro),
     )
+
+
+def _limitations(dro: bool) -> list[str]:
+    """What this render cannot claim to match, for *this* shot.
+
+    DRO is the one that changes per shot: Sony runs an extra stage for it
+    (ZcTaskVatr, identified by running the stage census on a DRO shot and a
+    non-DRO one — it is the only difference between them), and it lifts shadows
+    by up to 5%. Listing it unconditionally would be wrong on the 63 frames in
+    64 that never asked for it.
+    """
+    out = ["Sony's ITP, sharpening and Spica stages are not reproduced."]
+    if dro:
+        out.append("This shot used DRO, which Sony applies as a separate stage "
+                   "(ZcTaskVatr) that is not reproduced.")
+    return out
 
 
 def chroma_terms(cal: LookCalibration) -> tuple[np.ndarray, np.ndarray]:

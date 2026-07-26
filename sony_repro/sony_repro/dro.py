@@ -5,22 +5,35 @@
 这是对 Sony 相机内 **Dynamic Range Optimizer (DRO)** 的**结构性近似重建**,
 **并非 bit-exact 复刻**。
 
-逆向分析表明 DRO 在引擎中对应 ``ZcTaskAreaComp``(area compensation,
-"area" = 区域 / 局部)。它是一个**经典的空间局部色调映射算法**(classic
-spatial local tone mapping),**不是神经网络**。其核心处理结构为:
+⚠️ **归属已更正:DRO 是 ``ZcTaskVatr``,不是本文档原先写的 ``ZcTaskAreaComp``。**
+
+决定性证据是执行普查(``tools/stage_census.py``)对照两张图:65 张素材里只有
+2 张 ``DynamicRangeOptimizer=Auto``,**恰好只有这两张跑 ``ZcTaskVatr``(36 次),
+其余 63 张一次不跑**,而两份普查再无任何其它差异。``ZcTaskAreaComp`` 本身从未
+执行(跑的是 ``ZcTaskAreaCompSIMD``),且它实测只在 Cb-Cr 平面上做楔形**加性**
+修正,整幅色度只改 ×0.9999 —— 那是记忆色修正,不是动态范围优化。
+(PIPELINE.md 里"Vatr 不在链上"那句同样是错的:那是只在 DRO=Off 的图上测的。)
+
+实测 ``ZcTaskVatr``(``tools/vatr_probe.py`` / ``vatr_scale.py``):
+排在 DemosaicRough 之后、GeometricTransformCorrection 之前,吃**线性 RGB**;
+三通道增益几乎相同(1.030 / 1.029 / 1.028),是保色的;暗部抬得多
+(in=128 → ×1.048,in=1024 → ×1.020)。
+
+**主体是逐像素的一条曲线,不是空间算法。** 按输入值分箱的中位增益解释掉
+76% 的增益方差;残差与邻域均值的相关随核尺度单调上升(132px 处 −0.0001,
+2052px 处 −0.34),只解释残差方差的 12%,即总方差约 3%。
+下面这份结构性重建把空间部分当成了核心,这一点与实测不符。
+
+本模块保留的是一个**结构性近似**,处理结构为:
 
     局部亮度估计 (local luminance estimate)
       → 自适应增益 (adaptive per-pixel gain)
       → 保色应用 (color-preserving application)
 
-本模块忠实复现上述**处理结构**,并暴露与 Sony 一致的参数
-(High / Low / ShadowDetail / Mode)。但**我们尚未完成对
-``ZcTaskAreaComp`` 反汇编代码的逐指令重建**,因此各系数、曲线形状、
-模糊核尺度等均为结构上合理的近似,而非从二进制精确恢复的数值。
-
-⚠️ 请勿声称本实现为 bit-exact。要达到 bit-exact,需要后续将
-``ZcTaskAreaComp`` 的反编译代码逐步重建为等价数值流程
-(pending 完整反汇编重建)。
+各系数、曲线形状、模糊核尺度均为结构上合理的近似,而非从二进制恢复的数值。
+⚠️ 请勿声称本实现为 bit-exact。要做对,应当照 ``ZcTaskVatr``(RVA 0x366920)
+重建,并且还要解决「DRO=Auto 时档位由引擎按画面自行决定」这一步 ——
+相机只写下 ``Auto``,没有写下它选了哪一档。
 
 实现说明
 ========

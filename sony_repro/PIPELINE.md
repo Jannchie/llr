@@ -56,7 +56,12 @@ Preprocess(2) → TileDivRough(1) → DemosaicRough(1)
 **一次都没跑的(38 个)**,其中和颜色有关的:`ZcTask3DLut`、`ZcTaskLinearMatrix`、
 `ZcTaskLinearMatrix16`(非 SIMD)、`ZcTaskToneCurve`、`ZcTaskEffect`、`ZcTaskDither`、
 **`ZcTaskSIMDHueSaturation`**、`ZcTaskITP`、`ZcTaskAreaComp`、`ZcTaskMarble`、
-`ZcTaskSpica`、`ZcTaskVatr`(早前写的 Vatr 在链上是错的)。
+`ZcTaskSpica`。
+
+> ⚠️ **`ZcTaskVatr` 曾被列在这里,是错的 —— 它就是 DRO。** 上面这份普查跑的是
+> `DynamicRangeOptimizer=Off` 的图。65 张素材里只有 2 张是 `Auto`,
+> **恰好只有那两张跑 `ZcTaskVatr`(36 次,排在 DemosaicRough 之后)**,
+> 两份普查再无其它差异。详见 §7.10。
 
 > 不跑的那些**照样值得反编译** —— 每个 SIMD 任务都有一个不带 SIMD 后缀的标量孪生版,
 > 结构逐行对应但没有 AVX intrinsic 的噪声,读起来省一个数量级。SSCS、ITP、AreaComp、
@@ -524,6 +529,37 @@ B 路:                   解码 x^2.2            [0.8605  0.1501 -0.0106]
 > |B-G| x0.786),曾据此以为找到了 §7.6 的缺口 —— 但整幅一比,Marble **入口 0.9637、
 > 出口 0.9738**(对机内 JPEG),整段只改了 1%。它是 Marble 自己的工作空间,末尾会转回去。
 > 把它接在我们管线后面反而更糟:色度 0.8162 -> 1.1628,色相 -7.7 度 -> -13.3 度。
+
+## 7.10 DRO = `ZcTaskVatr`(定位确凿,尚未复刻)
+
+**怎么定位的:拿两张图做执行普查对照。** 65 张素材里只有 2 张
+`DynamicRangeOptimizer=Auto`(DSC02961 / DSC02962),其余 63 张 `Off`。
+**恰好只有那两张跑 `ZcTaskVatr`,各 36 次,排在 DemosaicRough 之后、
+GeometricTransformCorrection 之前;两份普查再无任何其它差异。**
+这一条同时推翻两个旧结论:「Vatr 不在链上」(只在 DRO=Off 的图上测的)、
+以及 `dro.py`/README 里「DRO 对应 `ZcTaskAreaComp`」(那个从未执行,
+跑的是 `AreaCompSIMD`,而且只在 Cb-Cr 平面做楔形加性修正,整幅色度 ×0.9999)。
+
+**症状对得上。** 修好机内微调之后,63 张 DRO=Off 的图对引擎成品的色度比落在
+0.983~1.008、色相 0.5 度以内;**剩下两张离群的正是这两张 DRO 图**
+(色度 1.066 / 1.084,DSC02962 亮度还偏 +0.083)。
+
+**实测行为**(`tools/vatr_probe.py`、`tools/vatr_scale.py`):吃线性 RGB,
+三通道增益几乎相同(1.030 / 1.029 / 1.028)所以是保色的,暗部抬得多 ——
+
+| 输入 | 128 | 256 | 512 | 1024 |
+|---|---|---|---|---|
+| 增益 | ×1.048 | ×1.039 | ×1.033 | ×1.020 |
+
+**主体是逐像素的,不是空间的。** 按输入值分箱的中位增益解释掉 **76%** 的增益方差。
+残差与邻域均值的相关**随核尺度单调上升**(132px 处 −0.0001、516px 处 −0.19、
+2052px 处 −0.34,仍在升),但只解释残差方差的 12%,即总方差约 3%。
+⚠️ 别在小尺度上测就下「逐像素」的结论 —— 我第一版用 33×33(dump 是 STEP=4,
+只覆盖 132 个原始像素)得到相关 −0.0001,差点据此判定它没有空间成分。
+
+**还差什么:** 逐指令重建 `ZcTaskVatr`(RVA 0x366920,函数很大),
+以及一道更麻烦的坎 —— **`Auto` 档位由引擎按画面自行决定,相机只写下 `Auto`**,
+没有记下它选了哪一级,所以离线复刻还得把那套自动判级逻辑也挖出来。
 
 ## 8. 3D-LUT:已定位、已抓到数据,但**默认路径不执行**
 

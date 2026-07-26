@@ -62,6 +62,24 @@ requires_exiftool = pytest.mark.skipif(detect_exiftool() is None, reason="exifto
 
 
 @requires_sample
+def test_dro_is_only_disclaimed_on_shots_that_used_it() -> None:
+    """It is a per-shot stage, so an unconditional caveat would be wrong.
+
+    Sony runs ZcTaskVatr only when the shot asked for DRO — 2 frames in 65 of
+    the reference set. That was how the stage was identified: the census of a
+    DRO frame and a non-DRO one differ in exactly this one entry.
+    """
+    cal = calibration_for(SAMPLE_FL, "FL")
+    assert cal is not None
+    rgb = np.zeros((2, 2, 3), dtype=np.float32)
+    off = apply_sony_profile(rgb, cal, "FL")[1].limitations
+    on = apply_sony_profile(rgb, cal, "FL", dro=True)[1].limitations
+    assert not any("DRO" in line for line in off)
+    assert any("DRO" in line for line in on)
+    assert len(on) == len(off) + 1
+
+
+@requires_sample
 @requires_exiftool
 def test_the_in_camera_look_tweaks_are_actually_read() -> None:
     """The tweaks reach the curve only if exiftool is *asked* for them.
