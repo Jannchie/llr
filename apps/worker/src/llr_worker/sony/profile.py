@@ -46,10 +46,10 @@ from typing import Any
 import numpy as np
 
 from ..dcp import D50_TO_D65, XYZ_D50_TO_PROPHOTO, XYZ_D65_TO_SRGB
-from .chroma import blend_params, luma_terms, saturation_factor, unpack_params
+from .chroma import SATURATION_STEPS, blend_params, luma_terms, saturation_factor, unpack_params
 from .linear_matrix import SegmentedMatrix
-from .sr2 import LookCalibration, look_calibrations, unpack_param_block
-from .tone import LOOK_ORDER, look_index, tone_curve
+from .sr2 import FADE_STEPS, LookCalibration, look_calibrations, unpack_param_block
+from .tone import LOOK_ORDER, TUNE_LIMIT, look_index, tone_curve
 
 _DATA = Path(__file__).resolve().parent / "data"
 
@@ -61,6 +61,73 @@ TONE_OUT_SCALE = 16384.0
 # Points shipped to the frontend. The browser resamples them onto its 2048-entry
 # LUT with a monotone spline; at 1024 the round trip costs under 0.05/255.
 TONE_CURVE_POINTS = 1024
+
+# The camera's own range for each tweak, which is also the range the frontend
+# offers. tone.apply_tuning will happily extrapolate past its limit, but a value
+# the body cannot write is no longer a Creative Look setting — and Edit.exe
+# refuses those outright. Fade has no negative side; the other four are centred.
+TWEAK_RANGES: dict[str, tuple[int, int]] = {
+    "highlights": (-TUNE_LIMIT, TUNE_LIMIT),
+    "shadows": (-TUNE_LIMIT, TUNE_LIMIT),
+    "contrast": (-TUNE_LIMIT, TUNE_LIMIT),
+    "fade": (0, FADE_STEPS - 1),
+    "saturation": (-(len(SATURATION_STEPS) - 1), len(SATURATION_STEPS) - 1),
+}
+
+
+def _clamp_tweak(field: str, value: Any) -> int:
+    lo, hi = TWEAK_RANGES[field]
+    try:
+        return max(lo, min(hi, int(value)))
+    except (TypeError, ValueError):
+        return 0
+
+
+@dataclass(frozen=True)
+class LookTweaks:
+    """The five in-camera tweaks that ride on a Creative Look.
+
+    Not one of them touches a pixel on the way through the matrix: Highlights,
+    Shadows and Contrast reshape the tone curve (tone.apply_tuning), Fade sets
+    YGamma's pivot and contrast, and Saturation scales the chroma either side of
+    the clamp. All five leave with the profile and are applied in the browser,
+    which is what lets the frontend re-request a profile for a moved slider
+    instead of re-decoding the frame.
+    """
+
+    highlights: int = 0
+    shadows: int = 0
+    contrast: int = 0
+    fade: int = 0
+    saturation: int = 0
+
+    def to_json(self) -> dict[str, int]:
+        return {field: getattr(self, field) for field in TWEAK_RANGES}
+
+    @classmethod
+    def from_json(cls, data: Any) -> LookTweaks:
+        """Parse a client's (or our own) JSON: missing fields mean no tweak."""
+        return cls().merged(data)
+
+    def merged(self, overrides: Any) -> LookTweaks:
+        """These settings with a client's overrides on top, field by field.
+
+        An override that is absent (or null) leaves the camera's own value
+        alone, so a client can move one slider without echoing the other four.
+        """
+        if not isinstance(overrides, dict):
+            return self
+        return LookTweaks(**{
+            field: getattr(self, field) if overrides.get(field) is None
+            else _clamp_tweak(field, overrides[field])
+            for field in TWEAK_RANGES
+        })
+
+
+# A shot with no tweak at all, and the default everywhere one is optional. One
+# shared instance is safe because LookTweaks is frozen.
+NO_TWEAKS = LookTweaks()
+
 
 @dataclass
 class SonyRenderInfo:
@@ -75,6 +142,11 @@ class SonyRenderInfo:
     luma_contrast: float = 1.0
     chroma_saturation: float = 1.0
     sepia: dict[str, Any] | None = None
+    # What was applied, and what the body itself recorded. They differ only when
+    # the client overrode a slider; shipping both lets the panel show the
+    # camera's own numbers as its starting point and its reset target.
+    tweaks: LookTweaks = NO_TWEAKS
+    as_shot: LookTweaks = NO_TWEAKS
     working_space: str = "linear-prophoto-d50"
 
     def to_json(self) -> dict[str, Any]:
@@ -101,6 +173,10 @@ class SonyRenderInfo:
             "profileChromaSaturation": self.chroma_saturation,
             # Sepia's toning (ZcTaskEffect), null for the nine looks without it.
             "profileSepia": self.sepia,
+            # The Creative Look tweaks this profile was built with, and the ones
+            # the body recorded. Everything above already has them baked in.
+            "lookTweaks": self.tweaks.to_json(),
+            "lookAsShot": self.as_shot.to_json(),
         }
 
 
@@ -207,10 +283,54 @@ def calibration_for(raw_path: Path, style: str) -> LookCalibration | None:
     return looks[index] if index < len(looks) else None
 
 
+def look_render_info(
+    cal: LookCalibration, style: str, tweaks: LookTweaks = NO_TWEAKS,
+    as_shot: LookTweaks | None = None, dro: bool = False,
+) -> SonyRenderInfo:
+    """Everything about a shot's rendering that runs in the browser.
+
+    Split out from apply_sony_profile because none of the five tweaks reaches
+    the matrix: moving one changes this report and nothing else, so the frontend
+    can ask for a new one over a few hundred bytes rather than re-decoding tens
+    of megabytes of pixels it already has.
+    """
+    cross, gain = chroma_terms(cal)
+    # Named apart from `contrast` on purpose: that one is the tone-curve tweak,
+    # this one is YGamma's, and the two are unrelated numbers on unrelated
+    # scales. Reusing the name silently fed YGamma's 1.05 to the tone curve.
+    luma_pivot, luma_contrast = luma_terms(cal, tweaks.fade)
+    # The engine divides the gains before the clamp and multiplies the chroma
+    # back after it. The shader can only do the multiply, so the division
+    # happens here and it gets the divided gains. chroma.rgb_to_ycc, which is
+    # not passing anything to a shader, does both halves itself and so takes the
+    # look's own gains — do not feed it these.
+    sat = saturation_factor(tweaks.saturation)
+
+    return SonyRenderInfo(
+        style=style,
+        tone_curve=tone_curve_points(cal, style, tweaks.highlights, tweaks.shadows,
+                                     tweaks.contrast),
+        chroma_cross=[float(x) for x in cross],
+        chroma_gain=[float(x) / sat for x in gain],
+        chroma_saturation=sat,
+        sepia=sepia_toning(style),
+        luma_pivot=luma_pivot,
+        luma_contrast=luma_contrast,
+        tweaks=tweaks,
+        as_shot=tweaks if as_shot is None else as_shot,
+        # What is left of the engine is ChromaSuppres (measured identity in
+        # every luma band), SSCS (touches no pixel on a whole frame), AreaComp
+        # (0.9999), ITP, sharpening, Spica and Marble. On shots without DRO,
+        # those come to a chroma ratio of 0.983..1.008 and under half a degree
+        # of hue against the engine's own output.
+        limitations=_limitations(dro),
+    )
+
+
 def apply_sony_profile(
     camera_rgb: np.ndarray, cal: LookCalibration, style: str,
-    highlights: int = 0, shadows: int = 0, contrast: int = 0, fade: int = 0,
-    saturation: int = 0, dro: bool = False,
+    tweaks: LookTweaks = NO_TWEAKS, as_shot: LookTweaks | None = None,
+    dro: bool = False,
 ) -> tuple[np.ndarray, SonyRenderInfo]:
     """Camera RGB -> scene-linear ProPhoto (D50), plus the matching tone curve.
 
@@ -222,34 +342,37 @@ def apply_sony_profile(
     matrix = SegmentedMatrix(unpack_param_block(cal.param_block))
     rec709 = matrix.apply(camera_rgb)
     linear_prophoto = np.clip(rec709 @ REC709_TO_PROPHOTO_D50.T, 0, None)
-    cross, gain = chroma_terms(cal)
-    # Named apart from `contrast` on purpose: that one is the tone-curve tweak,
-    # this one is YGamma's, and the two are unrelated numbers on unrelated
-    # scales. Reusing the name silently fed YGamma's 1.05 to the tone curve.
-    luma_pivot, luma_contrast = luma_terms(cal, fade)
-    # The engine divides the gains before the clamp and multiplies the chroma
-    # back after it. The shader can only do the multiply, so the division
-    # happens here and it gets the divided gains. chroma.rgb_to_ycc, which is
-    # not passing anything to a shader, does both halves itself and so takes the
-    # look's own gains — do not feed it these.
-    sat = saturation_factor(saturation)
+    return linear_prophoto, look_render_info(cal, style, tweaks, as_shot, dro)
 
-    return linear_prophoto, SonyRenderInfo(
-        style=style,
-        tone_curve=tone_curve_points(cal, style, highlights, shadows, contrast),
-        chroma_cross=[float(x) for x in cross],
-        chroma_gain=[float(x) / sat for x in gain],
-        chroma_saturation=sat,
-        sepia=sepia_toning(style),
-        luma_pivot=luma_pivot,
-        luma_contrast=luma_contrast,
-        # What is left of the engine is ChromaSuppres (measured identity in
-        # every luma band), SSCS (touches no pixel on a whole frame), AreaComp
-        # (0.9999), ITP, sharpening, Spica and Marble. On shots without DRO,
-        # those come to a chroma ratio of 0.983..1.008 and under half a degree
-        # of hue against the engine's own output.
-        limitations=_limitations(dro),
-    )
+
+def apply_look_overrides(
+    profile: dict[str, Any], raw_path: Path, overrides: Any,
+) -> dict[str, Any]:
+    """Re-derive a finished sony profile for different Creative Look tweaks.
+
+    The point of this existing at all is the linear cache: the tweaks change no
+    pixel, so they stay out of its key and a cached decode serves any setting.
+    That only works if the profile that travels with those cached pixels can be
+    rebuilt for the request at hand, which is what this does.
+
+    Anything that is not a sony profile — a DCP render, a JPEG — comes back
+    untouched, as does a RAW whose calibration can no longer be read.
+    """
+    if profile.get("kind") != "sony" or not isinstance(overrides, dict):
+        return profile
+    style = str(profile.get("creativeLook") or "")
+    as_shot = LookTweaks.from_json(profile.get("lookAsShot"))
+    tweaks = as_shot.merged(overrides)
+    if tweaks == LookTweaks.from_json(profile.get("lookTweaks")):
+        return profile
+    cal = calibration_for(raw_path, style)
+    if cal is None:
+        return profile
+    rebuilt = {**profile, **look_render_info(cal, style, tweaks, as_shot).to_json()}
+    # DRO is a property of the shot, not of any tweak, and _limitations cannot
+    # know it from here — keep the ones the decode itself reported.
+    rebuilt["limitations"] = profile.get("limitations", [])
+    return rebuilt
 
 
 def _limitations(dro: bool) -> list[str]:

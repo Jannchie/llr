@@ -7,6 +7,12 @@ import type { LinearPixels } from "./rendering/pipeline-renderer";
 
 export const API = (import.meta.env.VITE_API_URL as string | undefined) ?? "/api";
 
+// The in-camera Creative Look tweaks, on Sony's own scales: Highlights,
+// Shadows, Contrast and Saturation run -9..+9, Fade 0..9. Sony only.
+export type LookTweaks = {
+  highlights: number; shadows: number; contrast: number; fade: number; saturation: number;
+};
+
 export type ColorProfileMeta = {
   // How the worker produced the linear data: a DCP profile, Sony's own rendering
   // reproduced from calibration inside the RAW, LibRaw's matrix fallback, or
@@ -34,6 +40,11 @@ export type ColorProfileMeta = {
   // Sepia's toning stage: a weighted sum of the encoded RGB through one curve
   // per channel. Null for every look but Sepia.
   profileSepia?: { weights: number[]; lut: number[][] } | null;
+  // What the tone curve and chroma terms above were built with, and what the
+  // body itself recorded. The Creative Look panel starts at lookAsShot, which
+  // is also what a double-click resets a slider to.
+  lookTweaks?: LookTweaks | null;
+  lookAsShot?: LookTweaks | null;
   // A fitted camera-match table layered on the DCP (present only when applied);
   // cameraMatchAvailable reports whether one exists regardless of the toggle.
   cameraMatch?: unknown;
@@ -67,4 +78,18 @@ export async function fetchLinear(body: Record<string, unknown>): Promise<{ meta
     ? new Uint16Array(buf, 4 + headerLen)
     : new Float32Array(buf, 4 + headerLen);
   return { meta, pixels };
+}
+
+// Re-derive the colour profile for a different set of Creative Look tweaks.
+// None of the five reaches a pixel — they reshape the tone curve and the chroma
+// terms the shader applies — so a moved slider costs this instead of pulling
+// the whole frame back through /render-linear. Null means the shot has no Sony
+// rendering to re-derive, and the caller keeps the profile it already has.
+export async function fetchLookProfile(sourceId: string, look: Partial<LookTweaks>): Promise<ColorProfileMeta | null> {
+  const res = await fetch(`${API}/look-profile`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ sourceId, look }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return ((await res.json()) as { colorProfile: ColorProfileMeta | null }).colorProfile;
 }

@@ -28,8 +28,9 @@ from .dcp import DcpProfile, apply_dcp_profile, load_dcp_profile
 from .denoise import DEFAULT_MODEL, denoise_raw_inplace, get_denoiser
 from .fit_profile import camera_match_path, postprocess_camera_native
 from .imported import decode_image_linear
-from .sony import apply_sony_profile, calibration_for
+from .sony import NO_TWEAKS, LookTweaks, apply_look_overrides, apply_sony_profile, calibration_for
 from .sony import can_render as sony_can_render
+from .sony.profile import look_render_info
 from .sony.sr2 import LookCalibration
 
 RAW_EXTENSIONS = {".arw", ".srf", ".sr2", ".dng", ".cr2", ".cr3", ".nef", ".raf", ".rw2", ".orf"}
@@ -62,11 +63,7 @@ class RawMetadata:
     # (-9..+9) ride on the look's factory tone curve (sony/tone.py); Fade (0..9)
     # pulls luma toward a pivot and Saturation (-9..+9) scales the chroma either
     # side of a clamp (sony/chroma.py). Reproducing Sony's rendering needs all.
-    look_highlights: int = 0
-    look_shadows: int = 0
-    look_contrast: int = 0
-    look_saturation: int = 0
-    look_fade: int = 0
+    look: LookTweaks = NO_TWEAKS
     # Whether the shot asked for DRO. Sony runs a whole extra stage for it
     # (ZcTaskVatr) that this pipeline does not reproduce, so the render is
     # honest about it only on the shots where it actually applies.
@@ -272,6 +269,8 @@ def handle_daemon_request(request: dict[str, Any], root: Path) -> dict[str, Any]
     command = request.get("command")
     if command == "render-linear":
         return daemon_linear(request, root)
+    if command == "look-profile":
+        return daemon_look_profile(request, root)
     if command == "extract-preview":
         return daemon_extract_preview(request, root)
     if command == "export":
@@ -346,6 +345,11 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     if bool(denoise_req.get("enabled", False)) and dn_amount > 0.0 and is_raw(input_path):
         dn_model = str(denoise_req.get("model") or DEFAULT_MODEL)
 
+    # Overrides for the shot's Creative Look tweaks. Deliberately absent from the
+    # cache key: not one of the five reaches the pixels, so a cached decode
+    # serves every setting and only the profile that rides along is re-derived.
+    look_overrides = request.get("look")
+
     # Check processed sRGB cache first
     cache_key = _linear_cache_key(input_path, profile_id, half_size, max_size, dcp_code, dn_model, dn_amount, camera_match)
     with _CACHE_LOCK:
@@ -354,6 +358,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
             _LINEAR_CACHE.move_to_end(cache_key)
     if cached_linear is not None:
         linear_arr, color_profile = cached_linear
+        color_profile = apply_look_overrides(color_profile, input_path, look_overrides)
         bytes_written = _write_linear_f16(linear_arr, output_path)
         return {
             "width": linear_arr.shape[1],
@@ -458,10 +463,37 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
         "fullWidth": prepared.metadata.full_width,
         "fullHeight": prepared.metadata.full_height,
         "output": str(output_path),
-        "colorProfile": prepared.color_profile,
+        # After the cache insert, so what is cached stays the camera's own
+        # rendering and this request's overrides do not outlive it.
+        "colorProfile": apply_look_overrides(prepared.color_profile, input_path, look_overrides),
         "dtype": "float16",
         "bytesWritten": bytes_written,
     }
+
+
+def daemon_look_profile(request: dict[str, Any], root: Path) -> dict[str, Any]:
+    """The Sony profile for a set of Creative Look tweaks, with no pixels at all.
+
+    Not one of the five reaches the matrix (sony.profile.look_render_info), so a
+    moved slider needs nothing more than this: a few hundred bytes of curve and
+    chroma terms, against the tens of megabytes a re-decode would send back for
+    a frame the browser is already holding. Reading the calibration means
+    reading and decrypting the RAW's SR2 block, which is cached, and the exif
+    read alongside it is memoised — no decode happens on this path.
+
+    A null profile is the honest answer for a shot this path cannot render (a
+    non-Sony body, a look with no calibration): the caller keeps what it has.
+    """
+    input_path = resolve_path(root, request["input"])
+    exif = read_exiftool_metadata(input_path)
+    style = normalize_style(exif.get("CreativeStyle"))
+    cal = calibration_for(input_path, style) if sony_can_render(style) else None
+    if style is None or cal is None:
+        return {"colorProfile": None}
+    as_shot = look_from_exif(exif)
+    info = look_render_info(cal, style, as_shot.merged(request.get("look")), as_shot,
+                            dro=dro_from_exif(exif))
+    return {"colorProfile": info.to_json()}
 
 
 def daemon_extract_preview(request: dict[str, Any], root: Path) -> dict[str, Any]:
@@ -940,9 +972,11 @@ def render_color(
     if renderer.sony_look is not None:
         linear, info = apply_sony_profile(
             camera_rgb, renderer.sony_look, renderer.sony_style,
-            highlights=metadata.look_highlights, shadows=metadata.look_shadows,
-            contrast=metadata.look_contrast, fade=metadata.look_fade,
-            saturation=metadata.look_saturation, dro=metadata.dro_active,
+            # Always the camera's own settings, never a client override: the
+            # linear cache holds this profile, and a request that overrode a
+            # slider must not leave its answer behind for the next one. Overrides
+            # are re-derived per request instead (sony.apply_look_overrides).
+            tweaks=metadata.look, dro=metadata.dro_active,
         )
         return linear, info.to_json()
 
@@ -1225,14 +1259,25 @@ def read_raw_metadata(input_path: Path, raw: rawpy.RawPy) -> RawMetadata:
         full_height=full_height,
         camera_crop=camera_crop,
         lens_corr=sony_lens_corrections(exif),
-        look_highlights=_exif_int(exif.get("Highlights")),
-        look_shadows=_exif_int(exif.get("Shadows")),
-        look_fade=_exif_int(exif.get("Fade")),
-        # exiftool prints Sony's zero for these as "Normal", not "0".
-        look_contrast=_exif_int(exif.get("Contrast")),
-        look_saturation=_exif_int(exif.get("Saturation")),
-        dro_active=str(exif.get("DynamicRangeOptimizer") or "Off").strip().lower() != "off",
+        look=look_from_exif(exif),
+        dro_active=dro_from_exif(exif),
     )
+
+
+def look_from_exif(exif: dict[str, Any]) -> LookTweaks:
+    """The five Creative Look tweaks the body recorded for this shot."""
+    return LookTweaks(
+        highlights=_exif_int(exif.get("Highlights")),
+        shadows=_exif_int(exif.get("Shadows")),
+        fade=_exif_int(exif.get("Fade")),
+        # exiftool prints Sony's zero for these as "Normal", not "0".
+        contrast=_exif_int(exif.get("Contrast")),
+        saturation=_exif_int(exif.get("Saturation")),
+    )
+
+
+def dro_from_exif(exif: dict[str, Any]) -> bool:
+    return str(exif.get("DynamicRangeOptimizer") or "Off").strip().lower() != "off"
 
 
 def _exif_int(value: Any) -> int:

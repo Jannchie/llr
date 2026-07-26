@@ -32,7 +32,19 @@ describe("clampRenderParams", () => {
       dcpCode: undefined,
       cameraMatch: true,
       denoise: { enabled: false, model: undefined, amount: 1 },
+      look: {},
     });
+  });
+
+  it("keeps only the Creative Look keys, as whole numbers", () => {
+    expect(clampRenderParams({ look: { highlights: -6, fade: 2.7 } }).look)
+      .toEqual({ highlights: -6, fade: 2 });
+    // An absent field means "leave the camera's own value alone", so a null or
+    // a NaN has to drop out rather than reach the worker as a zero.
+    expect(clampRenderParams({
+      look: { shadows: null, contrast: Number.NaN, nonsense: 3 } as never,
+    }).look).toEqual({});
+    expect(clampRenderParams({ look: "all of them" as never }).look).toEqual({});
   });
 
   it("defaults cameraMatch on, off only when explicitly false", () => {

@@ -17,6 +17,13 @@ export function isValidSourceId(sourceId: string): boolean {
   return SOURCE_ID_RE.test(sourceId);
 }
 
+// The in-camera Creative Look tweaks, on Sony's own scales. Sent only for the
+// fields the client is actually overriding: the worker fills the rest in from
+// what the body recorded, so a moved slider does not have to echo the others.
+// Ranges are the camera's and are enforced worker-side (sony/profile.py).
+export const LOOK_TWEAK_KEYS = ["highlights", "shadows", "contrast", "fade", "saturation"] as const;
+export type LookTweaks = Partial<Record<(typeof LOOK_TWEAK_KEYS)[number], number>>;
+
 export interface RenderLinearBody {
   sourceId?: string;
   profileId?: string;
@@ -25,6 +32,7 @@ export interface RenderLinearBody {
   dcpCode?: string;
   cameraMatch?: boolean;
   denoise?: { enabled?: boolean; model?: string; amount?: number };
+  look?: LookTweaks;
 }
 
 export interface RenderParams {
@@ -34,6 +42,21 @@ export interface RenderParams {
   dcpCode: string | undefined;
   cameraMatch: boolean;
   denoise: { enabled: boolean; model: string | undefined; amount: number };
+  look: LookTweaks;
+}
+
+// Keep only the known keys carrying a real number. An absent field means "leave
+// the shot's own setting alone", so anything unusable — null, NaN, a string —
+// has to drop out rather than reach the worker as a zero, which would read as a
+// deliberate override. The camera's own range is enforced worker-side.
+export function clampLookTweaks(look: unknown): LookTweaks {
+  if (!look || typeof look !== "object") return {};
+  const out: LookTweaks = {};
+  for (const key of LOOK_TWEAK_KEYS) {
+    const v = (look as Record<string, unknown>)[key];
+    if (typeof v === "number" && Number.isFinite(v)) out[key] = Math.trunc(v);
+  }
+  return out;
 }
 
 // Clamp/coerce what gets forwarded to the Python daemon: a malformed field
@@ -54,6 +77,7 @@ export function clampRenderParams(body: RenderLinearBody): RenderParams {
       model: typeof body.denoise?.model === "string" ? body.denoise.model : undefined,
       amount: Number.isFinite(denoiseAmount) ? Math.min(1, Math.max(0, denoiseAmount)) : 1,
     },
+    look: clampLookTweaks(body.look),
   };
 }
 

@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import {
   SOURCE_ID,
   buildLinearFrameHeader,
+  clampLookTweaks,
   clampRenderParams,
   isAllowedHost,
   isJsonContentType,
@@ -141,6 +142,11 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
     return;
   }
 
+  if (method === "POST" && pathname === "/look-profile") {
+    await handleLookProfile(request, response);
+    return;
+  }
+
   if (method === "POST" && pathname === "/export") {
     await handleExport(request, response);
     return;
@@ -233,6 +239,7 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
       dcpCode: params.dcpCode,
       cameraMatch: params.cameraMatch,
       denoise: params.denoise,
+      look: params.look,
     });
   } catch (error) {
     await rm(outputPath, { force: true });
@@ -254,6 +261,29 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
   } finally {
     await rm(outputPath, { force: true });
   }
+}
+
+// The Creative Look sliders. They reshape the tone curve and the chroma terms
+// the browser applies but reach no pixel, so this returns the profile alone —
+// the client re-bakes its LUT and redraws the frame it already has, instead of
+// pulling tens of megabytes back through /render-linear for a slider drag.
+async function handleLookProfile(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const body = await readJson<RenderLinearBody>(request);
+  if (!body.sourceId) {
+    sendJson(response, { error: "Missing sourceId" }, 400);
+    return;
+  }
+  const sourcePath = await findSource(sessionDirFor(body.sourceId));
+  if (!sourcePath) {
+    sendJson(response, { error: "Unknown sourceId" }, 404);
+    return;
+  }
+  const meta = await daemon.send({
+    command: "look-profile",
+    input: sourcePath,
+    look: clampLookTweaks(body.look),
+  });
+  sendJson(response, { colorProfile: meta.colorProfile ?? null });
 }
 
 async function handleExport(request: IncomingMessage, response: ServerResponse): Promise<void> {

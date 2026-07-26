@@ -13,7 +13,7 @@ import {
   ASPECT_PRESETS,
   type AspectPreset, type CropState,
 } from "./rendering/crop";
-import { API, fetchLinear, type ColorProfileMeta } from "./api";
+import { API, fetchLinear, fetchLookProfile, type ColorProfileMeta, type LookTweaks } from "./api";
 import { type PersistedEdit } from "./persistence";
 import { gradingTint, gradingHueDeg } from "./rendering/grading";
 import { parseLensCorr, mixLensTable, lensFillScale, LENS_IDENTITY, type LensCorr } from "./rendering/lens";
@@ -75,6 +75,19 @@ const groups: SliderGroup[] = [
   ]},
 ];
 
+// The in-camera Creative Look tweaks, in the order the camera's own menu lists
+// them. Ranges are Sony's: four run -9..+9 and Fade has no negative side. These
+// are not the Tone panel's sliders under another name — they drive Sony's own
+// stages (the look's tone curve, YGamma, RGB2YCC), which is why they live with
+// the look instead of with our edits.
+const LOOK_SLIDERS: { key: keyof LookTweaks; min: number; max: number }[] = [
+  { key: "contrast", min: -9, max: 9 },
+  { key: "highlights", min: -9, max: 9 },
+  { key: "shadows", min: -9, max: 9 },
+  { key: "fade", min: 0, max: 9 },
+  { key: "saturation", min: -9, max: 9 },
+];
+
 function aspectLabel(a: AspectPreset): string {
   return a.labelKey ? t(a.labelKey) : a.label;
 }
@@ -104,6 +117,21 @@ const profileId = ref<ProfileId>("standard");
 // path, which Creative Look's tone curve it applied.
 const activeProfileKind = ref<string | null>(null);
 const sonyLook = ref("");
+// The Creative Look tweaks the body recorded for this shot, and the ones in
+// force. `null` means "as shot" — the panel shows the camera's own numbers and
+// keeps following them, which is also where a double-click resets a slider to.
+// Both are null until a decode reports a Sony rendering.
+const lookAsShot = ref<LookTweaks | null>(null);
+const look = ref<LookTweaks | null>(null);
+const ZERO_LOOK: LookTweaks = { highlights: 0, shadows: 0, contrast: 0, fade: 0, saturation: 0 };
+const effectiveLook = computed<LookTweaks>(() => look.value ?? lookAsShot.value ?? ZERO_LOOK);
+const lookEdited = computed(() =>
+  !!look.value && !!lookAsShot.value
+  && LOOK_SLIDERS.some(s => look.value![s.key] !== lookAsShot.value![s.key]));
+
+function setLookTweak(key: keyof LookTweaks, value: number): void {
+  look.value = { ...effectiveLook.value, [key]: value };
+}
 const usingDcp = computed(() => activeProfileKind.value === "dcp");
 // False for already-rendered sources (JPEG/PNG/TIFF), which the worker decodes
 // into the same linear ProPhoto working space but which carry no mosaic, no
@@ -312,6 +340,8 @@ type Snapshot = {
   dcp: string;
   profile?: ProfileId;  // colour engine; optional: absent in pre-Sony persisted sessions
   denoise?: typeof denoise;  // optional: absent in pre-denoise persisted sessions
+  // Creative Look tweaks; null (or absent, in older sessions) means as shot.
+  look?: LookTweaks | null;
 };
 
 let isRestoring = false;
@@ -332,6 +362,7 @@ function defaultSnapshot(): Snapshot {
     dcp: "",
     profile: "standard",
     denoise: defaultDenoise(),
+    look: null,
   };
 }
 
@@ -357,6 +388,7 @@ function captureSnapshot(): Snapshot {
     dcp: dcpCode.value,
     profile: profileId.value,
     denoise: { ...denoise },
+    look: look.value ? { ...look.value } : null,
   };
 }
 
@@ -375,6 +407,7 @@ function setEditState(s: Snapshot): void {
   // that doesn't match the new default lock isn't reshaped by the next drag.
   cropAspect.value = s.aspect ?? "free";
   Object.assign(denoise, s.denoise ?? defaultDenoise());
+  look.value = s.look ? { ...s.look } : null;
   dcpCode.value = s.dcp;
   profileId.value = s.profile ?? "standard";
   // Rebake with the snapshot's Basic values (bakeCurveLUT also syncs bakedBasic).
@@ -523,7 +556,10 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
   timing.value = null; // stale timing would mask the live status in the footer
   const t0 = performance.now();
   try {
-    const lin = await fetchLinear({ sourceId: id, halfSize: false, maxSize: 2560, profileId: profileId.value, dcpCode: dcpCode.value, denoise: denoisePayload(), cameraMatch: cameraMatch.value });
+    // look is sent only when it overrides the shot's own settings; without it
+    // the worker renders what the body recorded, which is what a fresh import
+    // wants and what the panel is then populated from.
+    const lin = await fetchLinear({ sourceId: id, halfSize: false, maxSize: 2560, profileId: profileId.value, dcpCode: dcpCode.value, denoise: denoisePayload(), cameraMatch: cameraMatch.value, look: look.value ?? undefined });
     if (stale()) return false;
     if (!lin) { markInvalid(id); return false; }
     const { meta: linMeta, pixels: linearFloat } = lin;
@@ -537,6 +573,10 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     // calibration. The DCP-only controls follow this, not profileId.
     activeProfileKind.value = linMeta.colorProfile?.kind ?? null;
     sonyLook.value = linMeta.colorProfile?.creativeLook ?? "";
+    // Reported by every Sony decode, so the panel shows the shot's own tweaks
+    // the moment it appears rather than a row of zeros. Null on the DCP path,
+    // which hides the panel — those stages are Sony's, not ours.
+    lookAsShot.value = linMeta.colorProfile?.lookAsShot ?? null;
     applyDcpSelection(linMeta.colorProfile?.selection);
     // Availability is independent of the toggle, so the control stays visible
     // after the user switches the match off (which drops the applied cameraMatch).
@@ -579,6 +619,29 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
 }
 
 let denoiseReloadTimer = 0; // debounce for the denoise watcher below
+
+// A moved Creative Look slider needs no pixels: the five tweaks reshape the
+// tone curve and the chroma terms the shader applies, and the decoded frame is
+// already on the GPU. So this re-fetches the profile alone (a few hundred
+// bytes) and re-uploads the LUT, instead of re-decoding like dcp/denoise do.
+// Sequenced, not debounced: the request is cheap and a drag should track.
+let lookProfileSeq = 0;
+async function reloadLookProfile(): Promise<void> {
+  if (!currentSourceId || !lookAsShot.value) return;
+  const seq = ++lookProfileSeq;
+  try {
+    const profile = await fetchLookProfile(currentSourceId, effectiveLook.value);
+    // A newer slider position (or a different image) owns the renderer now.
+    if (seq !== lookProfileSeq || !profile || !webglRenderer) return;
+    profileCurveLUT = buildProfileLUT(profile);
+    webglRenderer.uploadProfileCurveLUT(profileCurveLUT);
+    scheduleWebGLDraw();
+  } catch (err) {
+    if (seq !== lookProfileSeq) return;
+    status.value = "error";
+    errorMessage.value = err instanceof Error ? err.message : String(err);
+  }
+}
 
 // ── WebGL ──
 
@@ -940,8 +1003,17 @@ watch(crop, () => {
 // History/persist for the edit state not covered above (redraws handled by
 // their own paths: curve LUT bake, dcp/denoise re-decode; aspect is snapshot
 // state but changes no pixels by itself).
-watch([toneCurve, dcpCode, profileId, denoise, cropAspect],
+watch([toneCurve, dcpCode, profileId, denoise, cropAspect, look],
   () => { scheduleHistoryCommit(); schedulePersist(); }, { deep: true });
+
+// The Creative Look sliders. Not a re-decode: reloadLookProfile swaps the
+// profile LUT under the pixels already on the GPU. Suppressed only while a
+// source load is in flight (that request carries the same tweaks itself) —
+// undo/redo must go through here, exactly as it does for dcpCode.
+watch(look, () => {
+  if (suppressDcpReload) return;
+  void reloadLookProfile();
+}, { deep: true });
 
 // Re-decode when the user changes the DCP style or the colour engine (keeps the
 // current view). Suppressed while a source load is already handling the decode.
@@ -1075,6 +1147,9 @@ function buildExportPlan(): ExportPlan | null {
     profileId: settings.profile ?? "standard",
     cameraMatch: cameraMatch.value,
     denoise: denoisePayload(settings.denoise),
+    // Absent means as shot, same as everywhere else — the full-res decode then
+    // rebuilds the profile the preview was showing (plan.profileLUT).
+    look: settings.look ?? undefined,
     params: buildPipelineParams(settings),
     curveLUT: buildToneCurveLUT(settings.curve, currentBasic(settings.recipe)),
     profileLUT: (meta) => buildProfileLUT(meta.colorProfile),
@@ -1427,6 +1502,25 @@ const vWheelAdjust = {
             <option :value="1">{{ t('exif.private') }}</option>
           </select>
         </div>
+      </section>
+      <!-- The shot's in-camera Creative Look tweaks. Its own panel because these
+           are Sony's stages, not ours: they start at what the body recorded and
+           reset back to it, which is why they cannot share the Tone panel. -->
+      <section class="panel" v-if="lookAsShot && !cropMode">
+        <header class="panel-head">
+          <span class="panel-title">
+            {{ t('panel.creativeLook') }}
+            <span v-if="lookEdited" class="panel-dot" aria-hidden="true" />
+          </span>
+          <button class="ghost" type="button" :disabled="!lookEdited" @click="look = null">
+            {{ t('common.reset') }}
+          </button>
+        </header>
+        <SliderRow v-for="spec in LOOK_SLIDERS" :key="spec.key"
+          :model-value="effectiveLook[spec.key]" @update:model-value="setLookTweak(spec.key, $event)"
+          :label="t(`lookSlider.${spec.key}`)" :input-id="`look-${spec.key}`"
+          :min="spec.min" :max="spec.max" :step="1"
+          :reset-value="lookAsShot[spec.key]" show-modified />
       </section>
       <section v-for="group in visibleGroups" :key="group.title" class="panel" v-show="!cropMode">
         <header class="panel-head">

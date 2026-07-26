@@ -1,6 +1,6 @@
 import { ref, type Ref } from "vue";
 import { PipelineRenderer, type EditParams, type ProfileCurve } from "../rendering/pipeline-renderer";
-import { API, fetchLinear, type LinearMeta } from "../api";
+import { API, fetchLinear, type LinearMeta, type LookTweaks } from "../api";
 import { t } from "../i18n";
 
 /**
@@ -21,6 +21,8 @@ export interface ExportPlan {
   profileId: string;
   cameraMatch: boolean;
   denoise: { enabled: boolean; model: string; amount: number };
+  /** Creative Look tweaks; undefined renders the shot's own (Sony path only). */
+  look: LookTweaks | undefined;
   params: Partial<EditParams>;
   curveLUT: Float32Array;
   profileLUT: (meta: LinearMeta) => ProfileCurve;
@@ -56,6 +58,7 @@ export function useExport(opts: {
       const lin = await fetchLinear({
         sourceId: plan.sourceId, halfSize: false, maxSize: 0,
         profileId: plan.profileId, dcpCode: plan.dcpCode, cameraMatch: plan.cameraMatch, denoise: plan.denoise,
+        look: plan.look,
       });
       if (!lin) throw new Error(t("error.exportSourceGone"));
       const { meta, pixels } = lin;

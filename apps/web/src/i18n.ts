@@ -104,6 +104,16 @@ const en = {
   "slider.lensVignetting": "Vignetting",
   "slider.dblclickReset": "Double-click to reset",
 
+  // The shot's in-camera Creative Look tweaks (Sony engine only). Named apart
+  // from the Tone sliders on purpose: these drive the camera's own stages and
+  // start at what the body recorded, not at zero.
+  "panel.creativeLook": "Creative Look",
+  "lookSlider.contrast": "Contrast",
+  "lookSlider.highlights": "Highlights",
+  "lookSlider.shadows": "Shadows",
+  "lookSlider.fade": "Fade",
+  "lookSlider.saturation": "Saturation",
+
   // Detail panel
   "panel.detail": "Detail",
   "detail.denoising": "Denoising…",
@@ -253,6 +263,13 @@ const zh: Record<MessageKey, string> = {
   "slider.lensDistortion": "扭曲度",
   "slider.lensVignetting": "晕影",
   "slider.dblclickReset": "双击复位",
+
+  "panel.creativeLook": "创意外观",
+  "lookSlider.contrast": "对比度",
+  "lookSlider.highlights": "高光",
+  "lookSlider.shadows": "阴影",
+  "lookSlider.fade": "褪色",
+  "lookSlider.saturation": "饱和度",
 
   "panel.detail": "细节",
   "detail.denoising": "降噪中…",

@@ -11,8 +11,21 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from llr_worker.cli import _exif_int, detect_exiftool, prepare_linear, read_exiftool_metadata
-from llr_worker.sony import apply_sony_profile, available_styles, calibration_for, can_render
+from llr_worker.cli import (
+    _exif_int,
+    daemon_look_profile,
+    detect_exiftool,
+    prepare_linear,
+    read_exiftool_metadata,
+)
+from llr_worker.sony import (
+    LookTweaks,
+    apply_look_overrides,
+    apply_sony_profile,
+    available_styles,
+    calibration_for,
+    can_render,
+)
 from llr_worker.sony.chroma import (
     apply_chroma,
     blend_params,
@@ -35,6 +48,7 @@ from llr_worker.sony.profile import (
     REC709_TO_PROPHOTO_D50,
     TONE_CURVE_POINTS,
     chroma_terms,
+    look_render_info,
     sepia_toning,
     tone_curve_points,
 )
@@ -561,24 +575,104 @@ def test_every_in_camera_tweak_reaches_the_shipped_curve() -> None:
     rgb = np.full((2, 2, 3), 0.3, dtype=np.float32)
 
     def curve(**kw: int) -> list[float]:
-        return [y for _, y in apply_sony_profile(rgb, cal, "FL", **kw)[1].tone_curve]
+        info = apply_sony_profile(rgb, cal, "FL", LookTweaks(**kw))[1]
+        return [y for _, y in info.tone_curve]
 
     plain = curve()
     for field in ("highlights", "shadows", "contrast"):
         assert curve(**{field: 5}) != plain, f"{field} never reached the curve"
     for field in ("fade", "saturation"):
         assert curve(**{field: 5}) == plain, f"{field} does not belong on the curve"
-    sat = apply_sony_profile(rgb, cal, "FL", saturation=9)[1]
+    sat = apply_sony_profile(rgb, cal, "FL", LookTweaks(saturation=9))[1]
     assert sat.chroma_saturation == pytest.approx(1.55)
     assert sat.chroma_gain == pytest.approx([g / 1.55 for g in apply_sony_profile(
         rgb, cal, "FL")[1].chroma_gain])
     # Fade drives YGamma, not the curve — so the curve must NOT move, and the
     # two luma terms must.
-    faded = apply_sony_profile(rgb, cal, "FL", fade=5)[1]
+    faded = apply_sony_profile(rgb, cal, "FL", LookTweaks(fade=5))[1]
     assert [y for _, y in faded.tone_curve] == plain
     assert faded.luma_pivot > 0.5
     assert faded.luma_contrast < 1.0
     assert faded.to_json()["profileLumaPivot"] == faded.luma_pivot
+
+
+def test_an_override_only_replaces_the_fields_it_names() -> None:
+    """One moved slider must not silently zero the other four.
+
+    The frontend sends the whole set today, but the contract is per-field: a
+    request that names Highlights alone leaves the shot's own Fade and
+    Saturation in place. Values outside the camera's own range are clamped
+    rather than extrapolated — a number the body cannot write is not a setting.
+    """
+    as_shot = LookTweaks(highlights=-6, shadows=1, fade=3, saturation=2)
+    assert as_shot.merged({"highlights": 4}) == LookTweaks(
+        highlights=4, shadows=1, fade=3, saturation=2)
+    assert as_shot.merged({"shadows": None}) == as_shot
+    assert as_shot.merged(None) == as_shot
+    assert as_shot.merged({"fade": -5, "contrast": 99}).fade == 0
+    assert as_shot.merged({"contrast": 99}).contrast == 9
+    assert LookTweaks.from_json({"highlights": "-6"}) == LookTweaks(highlights=-6)
+    assert LookTweaks.from_json("nonsense") == LookTweaks()
+
+
+@requires_sample
+def test_a_look_override_rebuilds_the_profile_without_touching_the_pixels() -> None:
+    """The whole reason the tweaks stay out of the linear cache key.
+
+    Not one of the five reaches the matrix, so a cached decode has to be able to
+    serve any setting: apply_look_overrides rebuilds the profile that rides with
+    those pixels. It must rebase on what the body recorded rather than on
+    whatever the last request asked for, or one client's slider would leak into
+    the next one's render.
+    """
+    cal = calibration_for(SAMPLE_FL, "FL")
+    assert cal is not None
+    rgb = np.full((2, 2, 3), 0.3, dtype=np.float32)
+    as_shot = LookTweaks(highlights=-6, shadows=1)
+    linear, info = apply_sony_profile(rgb, cal, "FL", as_shot, dro=True)
+    base = info.to_json()
+
+    lifted = apply_look_overrides(base, SAMPLE_FL, {"highlights": 6})
+    assert lifted["lookTweaks"] == {**as_shot.to_json(), "highlights": 6}
+    assert lifted["lookAsShot"] == as_shot.to_json()
+    assert lifted["profileToneCurve"] != base["profileToneCurve"]
+    # DRO belongs to the shot, not to any tweak, and the rebuild cannot see it.
+    assert lifted["limitations"] == base["limitations"]
+
+    # Rebased on lookAsShot, so overriding an override still lands on the same
+    # answer as overriding the original — and dropping it returns to as shot.
+    assert apply_look_overrides(lifted, SAMPLE_FL, {"highlights": 6}) == lifted
+    assert apply_look_overrides(lifted, SAMPLE_FL, as_shot.to_json()) == base
+    # A profile this path did not produce is none of its business.
+    dcp = {"kind": "dcp", "profileToneCurve": [[0.0, 0.0]]}
+    assert apply_look_overrides(dcp, SAMPLE_FL, {"highlights": 6}) is dcp
+    assert linear.shape == rgb.shape
+
+
+@requires_sample
+@requires_exiftool
+def test_the_look_profile_command_answers_without_decoding_anything() -> None:
+    """What a moved slider costs: a curve and eight chroma terms, no pixels.
+
+    The frontend already holds the decoded frame, so re-running /render-linear
+    for a slider drag would send tens of megabytes back to redraw pixels that
+    never changed. This command is the whole reason the split in
+    look_render_info exists, so it has to agree with the render path exactly.
+    """
+    request = {"input": str(SAMPLE_FL), "look": {"highlights": 4}}
+    profile = daemon_look_profile(request, SAMPLES)["colorProfile"]
+    assert profile is not None
+    assert profile["creativeLook"] == "FL"
+    # DSC01157 was shot at Highlights -6 / Shadows +1, and the panel is built
+    # from this: as-shot is what it starts at and resets to.
+    assert profile["lookAsShot"]["highlights"] == -6
+    assert profile["lookTweaks"] == {**profile["lookAsShot"], "highlights": 4}
+
+    cal = calibration_for(SAMPLE_FL, "FL")
+    assert cal is not None
+    direct = look_render_info(cal, "FL", LookTweaks(highlights=4, shadows=1)).to_json()
+    assert profile["profileToneCurve"] == direct["profileToneCurve"]
+    assert profile["profileChromaGain"] == direct["profileChromaGain"]
 
 
 @requires_sample
