@@ -51,6 +51,8 @@ from .linear_matrix import SegmentedMatrix
 from .sr2 import LookCalibration, look_calibrations, unpack_param_block
 from .tone import LOOK_ORDER, look_index, tone_curve
 
+_DATA = Path(__file__).resolve().parent / "data"
+
 # Sony's tone LUT is indexed in units of camera RGB x 8192 and its output is
 # 1/16384 of full scale. The white point was pinned four independent ways.
 TONE_INDEX_WHITE = 8192
@@ -72,6 +74,7 @@ class SonyRenderInfo:
     luma_pivot: float = 0.0
     luma_contrast: float = 1.0
     chroma_saturation: float = 1.0
+    sepia: dict[str, Any] | None = None
     working_space: str = "linear-prophoto-d50"
 
     def to_json(self) -> dict[str, Any]:
@@ -96,6 +99,8 @@ class SonyRenderInfo:
             # this is the factor the shader multiplies back after the clamp,
             # which is where the setting's whole visible effect comes from.
             "profileChromaSaturation": self.chroma_saturation,
+            # Sepia's toning (ZcTaskEffect), null for the nine looks without it.
+            "profileSepia": self.sepia,
         }
 
 
@@ -106,11 +111,12 @@ REC709_TO_PROPHOTO_D50 = (
 ).astype(np.float32)
 
 
-# Sepia's chroma terms are identical to Standard's, so its toning happens in
-# some stage still unaccounted for; rendering it here would give a plain colour
-# image under a Sepia label. Black & White needs no special case at all — its
-# eight chroma values are zero, which zeroes both gains and leaves R = G = B.
-MONOCHROME_LOOKS = frozenset({"SE"})
+# Black & White needs no special case at all — its eight chroma values are zero,
+# which zeroes both gains and leaves R = G = B. Sepia's are identical to
+# Standard's, so its toning is a separate stage: ZcTaskEffect, which the engine
+# runs right after YCC2RGB and only for this look (found by running the stage
+# census on a Sepia frame and a Film one). See sepia_toning.
+UNRENDERABLE_LOOKS: frozenset[str] = frozenset()
 
 
 def available_styles() -> list[str]:
@@ -119,11 +125,34 @@ def available_styles() -> list[str]:
     Every ARW carries the calibration for all ten, so this is about what the two
     reproduced stages can express, not about what data is on hand.
     """
-    return [s for s in LOOK_ORDER if s not in MONOCHROME_LOOKS]
+    return [s for s in LOOK_ORDER if s not in UNRENDERABLE_LOOKS]
 
 
 def _srgb_decode(y: np.ndarray) -> np.ndarray:
     return np.where(y <= 0.04045, y / 12.92, ((y + 0.055) / 1.055) ** 2.4)
+
+
+# Sepia's toning, measured off ZcTaskEffect's own in/out over three frames and
+# six million pixels. The stage throws the chroma away and maps a weighted sum
+# of the display-encoded RGB through one curve per channel — which is what a
+# toned monochrome is. The weights are fitted rather than the engine's luma
+# ones: they halve the residual, and they hold up on a frame left out of the
+# fit (median 0.18% against 0.32% for the luma weights).
+SEPIA_LOOK = "SE"
+
+
+@lru_cache(maxsize=1)
+def _sepia() -> tuple[list[float], list[list[float]]]:
+    with np.load(_DATA / "sepia.npz") as z:
+        return [float(w) for w in z["weights"]], [[float(v) for v in row] for row in z["lut"].T]
+
+
+def sepia_toning(style: str) -> dict[str, Any] | None:
+    """The toning table for a look, or None for the nine that need none."""
+    if style != SEPIA_LOOK:
+        return None
+    weights, lut = _sepia()
+    return {"weights": weights, "lut": lut}
 
 
 def tone_curve_points(
@@ -156,7 +185,7 @@ def _cached_calibrations(path: str, size: int, mtime: int) -> tuple[LookCalibrat
 
 def can_render(style: str | None) -> bool:
     """Whether this path can reproduce a given Creative Look."""
-    return style in LOOK_ORDER and style not in MONOCHROME_LOOKS
+    return style in LOOK_ORDER and style not in UNRENDERABLE_LOOKS
 
 
 def calibration_for(raw_path: Path, style: str) -> LookCalibration | None:
@@ -211,6 +240,7 @@ def apply_sony_profile(
         chroma_cross=[float(x) for x in cross],
         chroma_gain=[float(x) / sat for x in gain],
         chroma_saturation=sat,
+        sepia=sepia_toning(style),
         luma_pivot=luma_pivot,
         luma_contrast=luma_contrast,
         # What is left of the engine is ChromaSuppres (measured identity in

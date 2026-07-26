@@ -35,6 +35,7 @@ from llr_worker.sony.profile import (
     REC709_TO_PROPHOTO_D50,
     TONE_CURVE_POINTS,
     chroma_terms,
+    sepia_toning,
     tone_curve_points,
 )
 from llr_worker.sony.sr2 import (
@@ -445,20 +446,35 @@ def test_recomputing_the_blend_agrees_with_the_camera() -> None:
 
 
 @requires_sample
-def test_sepia_is_refused_because_its_chroma_matches_standard() -> None:
-    """SE's eight values are Standard's, so its toning is in some other stage.
+def test_sepias_colour_is_a_separate_stage_not_its_chroma() -> None:
+    """SE's eight chroma values are Standard's, which is the whole clue.
 
-    Rendering it here would give a plain colour image under a Sepia label, which
-    is worse than falling back to a DCP.
+    A look whose chroma matches Standard's cannot be what makes it sepia, so the
+    toning has to live somewhere else — it is ZcTaskEffect, which the engine
+    runs right after YCC2RGB and only for this look. sepia_toning carries the
+    table measured off that stage; every other look gets None.
     """
     looks = look_calibrations(SAMPLE_FL)
     se = chroma_terms(looks[LOOK_ORDER.index("SE")])
     st = chroma_terms(looks[LOOK_ORDER.index("ST")])
     assert np.array_equal(se[0], st[0])
     assert np.array_equal(se[1], st[1])
-    assert not can_render("SE")
-    assert can_render("BW")
-    assert can_render("VV2")
+
+    assert sepia_toning("ST") is None
+    assert sepia_toning("BW") is None
+    tone = sepia_toning("SE")
+    assert tone is not None
+    assert len(tone["weights"]) == 3
+    assert sum(tone["weights"]) == pytest.approx(1.0, abs=1e-3)
+    lut = tone["lut"]
+    assert len(lut) >= 129
+    # Warm: red above the input, blue below, and monotone all the way up.
+    mid = lut[len(lut) // 2]
+    assert mid[0] > mid[1] > mid[2]
+    for k in range(3):
+        column = [row[k] for row in lut]
+        assert column == sorted(column)
+    assert lut[0][0] < 0.02 and lut[-1][2] > 0.98
 
 
 # ── Working-space conversion and the tone curve ────────────────────────────
@@ -679,13 +695,12 @@ def test_render_delivers_prophoto_and_the_shot_s_own_look() -> None:
     assert len(payload["profileToneCurve"]) == TONE_CURVE_POINTS
 
 
-def test_sepia_is_refused_rather_than_rendered_in_colour() -> None:
-    """Only SE is left out: its toning is in a stage this pipeline has not found."""
-    assert can_render("FL")
-    assert can_render("IN")
-    assert can_render("BW")
-    assert not can_render("SE")
+def test_all_ten_looks_render_now_that_sepia_tones() -> None:
+    """Sepia was the last hold-out, and it was a missing stage rather than data."""
+    for style in ("FL", "IN", "BW", "SE"):
+        assert can_render(style)
     assert not can_render(None)
+    assert not can_render("nonsense")
 
 
 @requires_sample

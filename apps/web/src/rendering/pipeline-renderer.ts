@@ -63,7 +63,11 @@ export type ProfileChroma = {
   // `gain` arrives already divided by this; the shader multiplies it back after
   // the clamp, which is the shot's Saturation setting.
   saturation: number;
+  // Sepia's toning stage, absent for the nine looks that do not tone.
+  sepia?: SepiaToning | null;
 };
+/** Weighted sum of the encoded RGB, then one curve per channel. */
+export type SepiaToning = { weights: number[]; lut: number[][] };
 export type ProfileCurve =
   | { lut: Float32Array; srgbBasis: boolean; chroma?: ProfileChroma | null }
   | null;
@@ -122,6 +126,8 @@ export class PipelineRenderer {
   private profileCurveSrgb = false;
   // Sony's RGB2YCC terms, applied right after the curve. null = no such stage.
   private profileChroma: ProfileChroma | null = null;
+  private sepiaLutTex: WebGLTexture | null = null;
+  private sepiaActive = false;
   private texWidth = 0;
   private texHeight = 0;
   // Output (canvas / render) dimensions — equal to the texture dims for an
@@ -446,6 +452,35 @@ export class PipelineRenderer {
     this.hasProfileCurve = curve != null;
     this.profileCurveSrgb = curve?.srgbBasis ?? false;
     this.profileChroma = curve?.chroma ?? null;
+    this.uploadSepiaLUT(curve?.chroma?.sepia ?? null);
+  }
+
+  /**
+   * Sepia's toning table: one curve per channel, indexed by a weighted sum of
+   * the encoded RGB. Resampled from the worker's knots onto the shared LUT grid
+   * and uploaded as RGBA so one texture fetch reads all three channels.
+   */
+  private uploadSepiaLUT(sepia: SepiaToning | null): void {
+    const gl = this.gl;
+    this.sepiaActive = sepia != null;
+    if (!sepia) return;
+    const knots = sepia.lut;
+    const data = new Float32Array(LUT_SIZE * 4);
+    for (let i = 0; i < LUT_SIZE; i++) {
+      const t = (i / (LUT_SIZE - 1)) * (knots.length - 1);
+      const lo = Math.min(Math.floor(t), knots.length - 2), f = t - lo;
+      for (let k = 0; k < 3; k++) {
+        data[i * 4 + k] = knots[lo]![k]! * (1 - f) + knots[lo + 1]![k]! * f;
+      }
+      data[i * 4 + 3] = 1;
+    }
+    if (!this.sepiaLutTex) {
+      this.sepiaLutTex = this.makeLutTexture(data, 4);
+    } else {
+      gl.bindTexture(gl.TEXTURE_2D, this.sepiaLutTex);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, LUT_SIZE, 1, gl.RGBA, gl.FLOAT, data);
+    }
   }
 
   draw(params: Partial<EditParams> = {}): void {
@@ -498,6 +533,11 @@ export class PipelineRenderer {
       gl.activeTexture(gl.TEXTURE3);
       gl.bindTexture(gl.TEXTURE_2D, this.maskTex);
       gl.uniform1i(this.uniforms["u_mask_lum"], 3);
+    }
+    if (this.sepiaLutTex) {
+      gl.activeTexture(gl.TEXTURE4);
+      gl.bindTexture(gl.TEXTURE_2D, this.sepiaLutTex);
+      gl.uniform1i(this.uniforms["u_sepia_lut"], 4);
     }
     gl.activeTexture(gl.TEXTURE0);
     this.setUniforms(p);
@@ -797,6 +837,7 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     if (this.sourceTex) gl.deleteTexture(this.sourceTex);
     if (this.curveLutTex) gl.deleteTexture(this.curveLutTex);
     if (this.profileLutTex) gl.deleteTexture(this.profileLutTex);
+    if (this.sepiaLutTex) gl.deleteTexture(this.sepiaLutTex);
     if (this.histoTex) gl.deleteTexture(this.histoTex);
     if (this.histoFbo) gl.deleteFramebuffer(this.histoFbo);
     if (this.histoBinTex) gl.deleteTexture(this.histoBinTex);
@@ -838,12 +879,15 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     i("u_profileCurveSrgb", this.profileCurveSrgb ? 1 : 0);
     const chroma = this.profileChroma;
     i("u_sonyChromaActive", chroma ? 1 : 0);
+    i("u_sepiaActive", this.sepiaActive && this.sepiaLutTex ? 1 : 0);
     if (chroma) {
       const c = chroma.cross, g = chroma.gain;
       gl.uniform4f(this.uniforms["u_sonyCross"]!, c[0], c[1], c[2], c[3]);
       gl.uniform4f(this.uniforms["u_sonyGain"]!, g[0], g[1], g[2], g[3]);
       gl.uniform2f(this.uniforms["u_sonyLuma"]!, chroma.lumaPivot, chroma.lumaContrast);
       gl.uniform1f(this.uniforms["u_sonySat"]!, chroma.saturation);
+      const w = chroma.sepia?.weights;
+      if (w) gl.uniform3f(this.uniforms["u_sepiaWeights"]!, w[0]!, w[1]!, w[2]!);
     }
     i("u_curveActive", this.curveActive ? 1 : 0);
     s("u_exposure", p.exposure); s("u_highlights", p.highlights);

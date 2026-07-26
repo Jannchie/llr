@@ -100,6 +100,11 @@ uniform vec2 u_sonyLuma;        // (pivot, contrast)
 // ZcTaskSIMDHueSaturation stage does. The two nearly cancel — the clamp in
 // between is the whole visible effect.
 uniform float u_sonySat;
+// Sepia's toning (the engine's ZcTaskEffect, which runs only for that look):
+// throw the chroma away and map one weighted sum through a curve per channel.
+uniform int u_sepiaActive;
+uniform vec3 u_sepiaWeights;
+uniform sampler2D u_sepia_lut;
 uniform int u_viewTransform;    // 0 = Lightroom-style, 1 = AgX
 uniform int u_displayGamut;     // 0 = sRGB, 1 = Display-P3
 uniform vec3 u_bgColor;         // display-encoded fill for areas outside the image (crop editor)
@@ -143,8 +148,13 @@ vec3 sonyChroma(vec3 s) {
   // toward a pivot and clips, and leaves both chroma planes bit-identical
   // (worker sony/chroma.py). This is where the in-camera Fade setting lives.
   y = clamp((y - u_sonyLuma.x) * u_sonyLuma.y + u_sonyLuma.x, 0.0, 1.0);
-  vec3 o = vec3(y + 1.4020 * cr, y - 0.7141 * cr - 0.3441 * cb, y + 1.7720 * cb);
-  return srgbDecode(clamp(o, 0.0, 1.0));
+  vec3 o = clamp(vec3(y + 1.4020 * cr, y - 0.7141 * cr - 0.3441 * cb, y + 1.7720 * cb), 0.0, 1.0);
+  // Sepia's toning goes here, on the encoded values the engine's own stage sees.
+  if (u_sepiaActive == 1) {
+    float t = lutCoord(clamp(dot(o, u_sepiaWeights), 0.0, 1.0));
+    o = texture(u_sepia_lut, vec2(t, 0.5)).rgb;
+  }
+  return srgbDecode(o);
 }
 
 // (a) Lightroom-style: hue-stable luminance shoulder + highlight desaturation.
@@ -545,6 +555,7 @@ export const PASSES: PassDef[] = [
     "u_grad_blend","u_grad_balance",
     "u_curve_lut", "u_curveActive", "u_hasProfileCurve", "u_profileCurveSrgb",
     "u_sonyChromaActive", "u_sonyCross", "u_sonyGain", "u_sonyLuma", "u_sonySat",
+    "u_sepiaActive", "u_sepiaWeights", "u_sepia_lut",
     "u_lensActive", "u_lensScale", "u_lensNorm",
     ...Array.from({ length: 16 }, (_, k) => `u_lensDist[${k}]`),
     ...Array.from({ length: 16 }, (_, k) => `u_lensVig[${k}]`),

@@ -31,6 +31,9 @@ export type ColorProfileMeta = {
   // The Saturation slider: profileChromaGain is already divided by it, and the
   // shader multiplies the chroma back after the clamp. Sony only.
   profileChromaSaturation?: number | null;
+  // Sepia's toning stage: a weighted sum of the encoded RGB through one curve
+  // per channel. Null for every look but Sepia.
+  profileSepia?: { weights: number[]; lut: number[][] } | null;
   // A fitted camera-match table layered on the DCP (present only when applied);
   // cameraMatchAvailable reports whether one exists regardless of the toggle.
   cameraMatch?: unknown;

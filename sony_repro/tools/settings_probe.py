@@ -4,8 +4,11 @@ r"""把引擎那份"渲染参数"结构体整段 dump 出来,靠对照两次配�
 Contrast / Saturation / Sharpness —— 与其逐个猜偏移,不如整段抓下来对照:改哪一个
 滑块,就只有那一格会动。定位到偏移之后,`scan_disp.py` 就能顺藤摸到用它的代码。
 
+流水线构造函数 `0x17f072` 处的 `rsi` 是另一个(更大的)设置结构,守卫都在那上面
+(见 chain_map.py)。给个 `--at`/`--reg` 就能改抓哪一个。
+
 必须用 Windows 的 Python 跑(要 frida):
-    python settings_probe.py <ARW> <输出名>
+    python settings_probe.py <ARW> <输出名> [--at 0x17f072] [--reg rsi] [--n 0x200]
 """
 import json
 import os
@@ -27,20 +30,27 @@ let done = false;
 Interceptor.attach(base.add(HOOKV), { onEnter() {
   if (done) return;
   done = true;
-  try { send({ok: 1}, this.context.rbx.readByteArray(NV)); }
+  try { send({ok: 1}, this.context.REGV.readByteArray(NV)); }
   catch (e) { send({err: '' + e}); }
 }});
 send({info: 'armed'});
-""".replace("HOOKV", str(HOOK)).replace("NV", str(N))
+"""
+
+
+def _opt(flag, default):
+    return sys.argv[sys.argv.index(flag) + 1] if flag in sys.argv else default
 
 
 def main():
     arw, name = sys.argv[1], sys.argv[2]
+    js = (JS.replace("HOOKV", str(int(_opt("--at", hex(HOOK)), 0)))
+            .replace("REGV", _opt("--reg", "rbx"))
+            .replace("NV", str(int(_opt("--n", hex(N)), 0))))
     subprocess.run(["taskkill", "/F", "/IM", "Edit.exe"], capture_output=True, check=False)
     time.sleep(1.0)
     pid = frida.spawn([EXE, arw])
     session = frida.attach(pid)
-    script = session.create_script(JS)
+    script = session.create_script(js)
     got = {}
 
     def on_msg(m, d):

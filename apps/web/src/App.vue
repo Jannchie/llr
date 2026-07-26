@@ -645,6 +645,7 @@ function buildProfileLUT(cp: ColorProfileMeta | null | undefined): ProfileCurve 
           lumaPivot: cp?.profileLumaPivot ?? 0,
           lumaContrast: cp?.profileLumaContrast ?? 1,
           saturation: cp?.profileChromaSaturation ?? 1,
+          sepia: cp?.profileSepia ?? null,
         }
       : null,
   };
