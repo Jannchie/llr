@@ -12,6 +12,10 @@ export function useViewport(opts: {
   srcFullW: Ref<number>; // full-resolution dims (for 100% = original 1:1)
   srcFullH: Ref<number>;
   cropMode: Ref<boolean>; // pan/zoom is disabled inside the crop editor
+  // Origin of the sub-rectangle the canvas actually renders, in output-frame
+  // px (see visibleWindow). The canvas is positioned there rather than at the
+  // frame's corner. Null/absent means it covers the whole frame.
+  renderOrigin?: Ref<{ x: number; y: number } | null>;
 }) {
   const { imageW, imageH, srcW, srcH, srcFullW, srcFullH, cropMode } = opts;
 
@@ -25,17 +29,64 @@ export function useViewport(opts: {
   let panStartPanX = 0;
   let panStartPanY = 0;
 
-  const displayTransform = computed(() => {
-    if (!imageW.value || !imageH.value) return '';
+  // Where the frame's top-left lands on screen, and the scale it is drawn at.
+  // Everything positional below is derived from this so the canvas placement and
+  // the visible-window maths cannot drift apart.
+  function framePlacement(): { scale: number; tx: number; ty: number; vw: number; vh: number } | null {
     const vp = viewportRef.value;
-    if (!vp) return '';
+    if (!vp || !imageW.value || !imageH.value) return null;
     const vw = vp.clientWidth;
     const vh = vp.clientHeight;
     const scale = fitScale.value * zoom.value;
-    const tx = (vw - imageW.value * scale) / 2 + pan.x;
-    const ty = (vh - imageH.value * scale) / 2 + pan.y;
-    return `translate(${tx}px, ${ty}px) scale(${scale})`;
+    return {
+      scale, vw, vh,
+      tx: (vw - imageW.value * scale) / 2 + pan.x,
+      ty: (vh - imageH.value * scale) / 2 + pan.y,
+    };
+  }
+
+  // Places a box covering the whole output frame: the compare overlays, which
+  // are always full-frame images.
+  const displayTransform = computed(() => {
+    const fp = framePlacement();
+    return fp ? `translate(${fp.tx}px, ${fp.ty}px) scale(${fp.scale})` : '';
   });
+
+  // Places the canvas, which covers only the render window and so is offset to
+  // that window's origin. Identical to displayTransform when there is no window.
+  const canvasTransform = computed(() => {
+    const fp = framePlacement();
+    if (!fp) return '';
+    const o = opts.renderOrigin?.value;
+    if (!o) return `translate(${fp.tx}px, ${fp.ty}px) scale(${fp.scale})`;
+    return `translate(${fp.tx + o.x * fp.scale}px, ${fp.ty + o.y * fp.scale}px) scale(${fp.scale})`;
+  });
+
+  /**
+   * The part of the output frame the viewport can currently see, in output-frame
+   * pixels, grown by `slack` of the visible size on each side so small pans stay
+   * inside it. Null when the whole frame is visible — the fit view, where a
+   * window would only add arithmetic.
+   */
+  function visibleWindow(slack = 0): { x: number; y: number; w: number; h: number } | null {
+    const fp = framePlacement();
+    if (!fp || !(fp.scale > 0)) return null;
+    const { scale, tx, ty, vw, vh } = fp;
+    const iw = imageW.value, ih = imageH.value;
+    let x0 = Math.max(0, -tx / scale);
+    let y0 = Math.max(0, -ty / scale);
+    let x1 = Math.min(iw, (vw - tx) / scale);
+    let y1 = Math.min(ih, (vh - ty) / scale);
+    if (!(x1 > x0) || !(y1 > y0)) return null;   // scrolled entirely off-screen
+    const mx = (x1 - x0) * slack;
+    const my = (y1 - y0) * slack;
+    x0 = Math.max(0, Math.floor(x0 - mx));
+    y0 = Math.max(0, Math.floor(y0 - my));
+    x1 = Math.min(iw, Math.ceil(x1 + mx));
+    y1 = Math.min(ih, Math.ceil(y1 + my));
+    if (x0 <= 0 && y0 <= 0 && x1 >= iw && y1 >= ih) return null;  // whole frame
+    return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+  }
 
   // Ratio that rescales preview px → original full-res px (≤1; 1 when the preview
   // is already full resolution). Lets us report/zoom relative to the original.
@@ -153,7 +204,7 @@ export function useViewport(opts: {
 
   return {
     zoom, pan, fitScale, viewportRef, isPanning,
-    displayTransform, previewToFull, zoomPercent, fullResZoom,
+    displayTransform, canvasTransform, previewToFull, zoomPercent, fullResZoom, visibleWindow,
     recomputeFit, startPan, doPan, stopPan, applyZoom,
     onWheel, zoomIn, zoomOut, fitView, zoomToFull, onDoubleClick,
   };

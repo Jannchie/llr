@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
-import { PipelineRenderer, parseDcpTables, type EditParams, type ProfileCurve } from "./rendering/pipeline-renderer";
+import { PipelineRenderer, parseDcpTables, type EditParams, type ProfileCurve, type ViewWindow } from "./rendering/pipeline-renderer";
 import {
   curveToLUT, buildToneCurveLUT, defaultToneCurve, normalizeToneCurve,
   DEFAULT_BASIC, sameBasic,
@@ -228,12 +228,19 @@ const viewSettings = reactive({ displayGamut: 0, exportStripPrivate: 0 });
 const crop = reactive<CropState>(defaultCrop());
 const cropMode = ref(false);
 
+// The sub-rectangle of the frame the canvas currently covers (output-frame px);
+// null = the whole frame. See updateRenderWindow for why it exists.
+const renderWindow = ref<ViewWindow | null>(null);
+
 const {
   zoom, pan, fitScale, viewportRef, isPanning,
-  displayTransform, zoomPercent,
+  displayTransform, canvasTransform, zoomPercent, visibleWindow,
   recomputeFit, startPan, doPan, stopPan,
   onWheel, zoomIn, zoomOut, fitView, zoomToFull, onDoubleClick,
-} = useViewport({ imageW, imageH, srcW, srcH, srcFullW, srcFullH, cropMode });
+} = useViewport({
+  imageW, imageH, srcW, srcH, srcFullW, srcFullH, cropMode,
+  renderOrigin: renderWindow,
+});
 const {
   cropAspect, cropBBox, cropRenderScale, cropOverlayRef,
   currentImageDims, resetCrop,
@@ -794,6 +801,62 @@ function computePreviewScale(): number {
   return Math.min(1, displayScale * dpr);
 }
 
+// The canvas's CSS box: the render window when there is one, the whole frame
+// otherwise. Its transform carries the matching origin offset.
+const canvasBoxStyle = computed(() => {
+  const w = renderWindow.value;
+  return {
+    transform: canvasTransform.value,
+    width: `${w ? w.w : imageW.value}px`,
+    height: `${w ? w.h : imageH.value}px`,
+  };
+});
+
+// How far beyond the viewport the render window reaches, as a fraction of the
+// visible size on each side. Pans within it are pure CSS transform, exactly as
+// they were before the window existed; the cost is shading that much extra.
+const WINDOW_SLACK = 0.25;
+// Rebuild once the window is this many times wider/taller than it needs to be.
+// Without it the window would only ever grow: zooming in shrinks the visible
+// region monotonically, every smaller region is still contained by the old
+// window, and it would sit at whatever size the first zoom step produced. Must
+// exceed 1 + 2*WINDOW_SLACK or a freshly built window would re-trigger at once.
+const WINDOW_SHRINK = 2;
+
+/**
+ * Keep the render window covering what the viewport can see, and report whether
+ * it moved (i.e. whether a redraw is owed).
+ *
+ * Zoomed in, the canvas covers only the visible part of the frame instead of all
+ * of it. previewScale cannot do this on its own: it is capped at 1 so as never
+ * to supersample the source, which at 1:1 means a drawing buffer the size of the
+ * whole frame — 33 MP of fragments for the ~1 MP a viewport can show. Frame cost
+ * is very nearly linear in fragment count, so this is that ratio, saved.
+ *
+ * Returns false for a pan that stays inside the current window: those pixels are
+ * already on the canvas and CSS moves it, which is what keeps panning smooth.
+ */
+function updateRenderWindow(): boolean {
+  const cur = renderWindow.value;
+  // The crop editor already renders a size-capped bbox, and its overlay geometry
+  // assumes a canvas covering that whole box.
+  const visible = cropMode.value ? null : visibleWindow(0);
+  if (!visible) {
+    if (!cur) return false;
+    renderWindow.value = null;
+    return true;
+  }
+  const covered = cur
+    && cur.x <= visible.x && cur.y <= visible.y
+    && cur.x + cur.w >= visible.x + visible.w
+    && cur.y + cur.h >= visible.y + visible.h;
+  const oversized = cur
+    && (cur.w > visible.w * WINDOW_SHRINK || cur.h > visible.h * WINDOW_SHRINK);
+  if (covered && !oversized) return false;
+  renderWindow.value = visibleWindow(WINDOW_SLACK);
+  return true;
+}
+
 function drawWebGL(): void {
   if (!webglRenderer) return;
   // Contrast/Blacks/Whites all live in the curve LUT bake, not shader uniforms.
@@ -802,6 +865,8 @@ function drawWebGL(): void {
   if (!showOriginal.value && (bakedBasic === null || !sameBasic(bakedBasic, currentBasic()))) {
     bakeCurveLUT();
   }
+  updateRenderWindow();
+  webglRenderer.setViewWindow(renderWindow.value);
   webglRenderer.setPreviewScale(computePreviewScale());
   webglRenderer.draw(showOriginal.value ? baselineParams() : buildPipelineParams());
 }
@@ -863,6 +928,9 @@ function renderNormal(): void {
   imageW.value = ow;
   imageH.value = oh;
   recomputeFit();
+  // The frame just changed size, so any window from the previous one is stated
+  // in coordinates that no longer mean the same thing. drawWebGL rebuilds it.
+  renderWindow.value = null;
   drawWebGL();
   scheduleHistogram();
 }
@@ -881,6 +949,9 @@ function renderCropEditor(): void {
   imageW.value = cw;
   imageH.value = ch;
   recomputeFit();
+  // The frame just changed size, so any window from the previous one is stated
+  // in coordinates that no longer mean the same thing. drawWebGL rebuilds it.
+  renderWindow.value = null;
   drawWebGL();
   scheduleHistogram();
 }
@@ -1008,6 +1079,15 @@ watch(viewSettings, () => { scheduleWebGLDraw(); schedulePersist(); }, { deep: t
 // scale, so re-rasterise when it changes to stay crisp (zoom in) or shed fragments
 // (zoom out / resize). rAF-batched, so wheel and resize bursts collapse to one draw.
 watch([zoom, fitScale], () => { if (webglRenderer) scheduleWebGLDraw(); });
+
+// Panning is a CSS transform and normally costs no redraw at all. Zoomed in the
+// canvas only covers the visible part of the frame (updateRenderWindow), so a
+// pan that reaches the edge of that window has to re-render — but only then,
+// which is what the window's slack is for.
+watch([() => pan.x, () => pan.y], () => {
+  if (!webglRenderer || cropMode.value) return;
+  if (updateRenderWindow()) scheduleWebGLDraw();
+});
 
 // Crop changes resize the output, so they re-render (not just redraw) the editor
 // or the committed view. rAF-coalesced like scheduleWebGLDraw: crop drags emit
@@ -1361,7 +1441,10 @@ const vWheelAdjust = {
           <span class="spinner spinner-lg" aria-hidden="true" />
           <span>{{ t('status.importing') }}</span>
         </div>
-        <canvas v-show="webglRenderer != null && activeSource && !activeSource.invalid" ref="canvasRef" class="preview" :style="{ transform: displayTransform, width: imageW + 'px', height: imageH + 'px' }" />
+        <!-- Sized and placed by the render window, which zoomed in covers only
+             the visible part of the frame; the compare overlays below stay
+             full-frame and so keep displayTransform. -->
+        <canvas v-show="webglRenderer != null && activeSource && !activeSource.invalid" ref="canvasRef" class="preview" :style="canvasBoxStyle" />
         <!-- Camera-JPEG compare: opaque overlay in the canvas's exact box. The
              src stays bound while a source is active so the JPEG is already
              fetched when the hold starts; contain-fit letterboxes it when the

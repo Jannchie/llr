@@ -164,6 +164,9 @@ export type ProfileCurve =
  * output→source-texcoord transform (see setOutput). Lets the crop editor bin
  * the tight crop box while the canvas shows the padded straighten bbox.
  */
+/** A sub-rectangle of the logical output frame, in output-frame pixels. */
+export interface ViewWindow { x: number; y: number; w: number; h: number }
+
 export interface HistogramView {
   width: number;
   height: number;
@@ -226,6 +229,9 @@ export class PipelineRenderer {
   // fraction of the logical output size and CSS-upscaled to fit. 1 = full res;
   // off-screen / export renderers never shrink it.
   private previewScale = 1;
+  // Sub-rectangle of the output frame the canvas covers; null = the whole frame.
+  // Only the canvas honours it — histogram and export always see everything.
+  private viewWindow: ViewWindow | null = null;
   // The DCP HueSatMaps, as 3D LUTs. Each sampler always has a texture bound —
   // an unbound sampler3D is undefined behaviour on some drivers even when the
   // fetch is branched around — so a missing table gets the 1×1×1 identity and
@@ -467,6 +473,43 @@ export class PipelineRenderer {
   }
 
   /**
+   * Restrict the canvas to a sub-rectangle of the logical output frame, in
+   * output-frame pixels; null renders the whole frame.
+   *
+   * previewScale alone cannot keep a zoomed-in view cheap: it is capped at 1
+   * (never supersample the source), so at 1:1 the canvas grows to the entire
+   * frame — 33 MP of fragments for the ~1 MP the viewport can actually show.
+   * This is the other half of that budget. The caller positions the canvas to
+   * match, and gives the window some slack beyond the viewport so panning does
+   * not re-render on every mouse move.
+   *
+   * Deliberately *not* folded into this.texXform: the histogram renders through
+   * the same transform and must keep seeing the whole frame, so the window is
+   * composed in draw() and nowhere else.
+   */
+  setViewWindow(win: ViewWindow | null): void {
+    this.viewWindow = win;
+  }
+
+  /**
+   * this.texXform ∘ (window -> full output frame). Both are affine, so this is
+   * one multiply of the 2x3 parts.
+   */
+  private windowXform(win: ViewWindow): Float32Array {
+    const t = this.texXform;
+    const [a00, a10, , a01, a11, , tx, ty] = t;
+    const sx = win.w / this.outWidth;
+    const sy = win.h / this.outHeight;
+    const ox = win.x / this.outWidth;
+    const oy = win.y / this.outHeight;
+    return new Float32Array([
+      a00! * sx, a10! * sx, 0,
+      a01! * sy, a11! * sy, 0,
+      a00! * ox + a01! * oy + tx!, a10! * ox + a11! * oy + ty!, 1,
+    ]);
+  }
+
+  /**
    * Upload a DCP's HueSatMaps as 3D LUTs. Pass null for a render that has none
    * (Sony's engine, a plain JPEG), which binds identities and switches all three
    * off. Costs one small upload per decoded image and nothing per frame — which
@@ -636,11 +679,14 @@ export class PipelineRenderer {
     // slider moves wastes fragments that are never seen. Histogram/export stay
     // full-res (they don't read the canvas / run at scale 1). Only assign
     // canvas.width when it changes — the assignment reallocates and clears it.
-    const cw = Math.max(1, Math.round(this.outWidth * this.previewScale));
-    const ch = Math.max(1, Math.round(this.outHeight * this.previewScale));
+    // When a view window is set the canvas covers only that part of the frame,
+    // so both the buffer size and the transform come off the window.
+    const win = this.viewWindow;
+    const cw = Math.max(1, Math.round((win ? win.w : this.outWidth) * this.previewScale));
+    const ch = Math.max(1, Math.round((win ? win.h : this.outHeight) * this.previewScale));
     if (this.canvas.width !== cw) this.canvas.width = cw;
     if (this.canvas.height !== ch) this.canvas.height = ch;
-    this.renderPass(null, cw, ch, p);
+    this.renderPass(null, cw, ch, p, win ? this.windowXform(win) : undefined);
   }
 
   /** Render the current source + params into `fbo` (null = canvas) at w×h. */
