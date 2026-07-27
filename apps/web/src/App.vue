@@ -16,7 +16,7 @@ import {
 import { API, fetchLinear, fetchLookProfile, type ColorProfileMeta, type LookTweaks } from "./api";
 import { type PersistedEdit } from "./persistence";
 import { gradingTint, gradingHueDeg } from "./rendering/grading";
-import { parseLensCorr, mixLensTable, lensFillScale, LENS_IDENTITY, type LensCorr } from "./rendering/lens";
+import { parseLensCorr, mixLensTable, LENS_IDENTITY, type LensCorr } from "./rendering/lens";
 import { trackFill, formatBytes, clamp, IMPORT_ACCEPT, IMPORT_FORMAT_HINT } from "./ui";
 import { t, locale, setLocale, LOCALES, type Locale } from "./i18n";
 import SliderRow from "./components/SliderRow.vue";
@@ -652,12 +652,12 @@ function buildPipelineParams(s?: Snapshot): Partial<EditParams> {
   const r = s?.recipe ?? recipe;
   const [hue, sat, lum] = s ? [s.hslHue, s.hslSat, s.hslLum] : [hslHue, hslSat, hslLum];
   const g = s?.grading ?? grading;
-  // Per-shot lens tables with the slider amounts mixed in. The fill scale
-  // tracks the mixed distortion so easing the slider eases the crop-in too.
+  // Per-shot lens tables with the slider amounts mixed in. The renderer derives
+  // the fill scale from these, so easing the slider eases the scale with it.
   const lensDist = lensCorr ? mixLensTable(lensCorr.distortion, (r.lensDistortion ?? 100) / 100) : [...LENS_IDENTITY];
   const lensVig = lensCorr ? mixLensTable(lensCorr.vignetting, (r.lensVignetting ?? 100) / 100) : [...LENS_IDENTITY];
   return {
-    lensDist, lensVig, lensScale: lensFillScale(lensDist),
+    lensDist, lensVig,
     exposure: r.exposure,
     saturation: 1 + r.saturation / 100,
     highlights: r.highlights / 100,

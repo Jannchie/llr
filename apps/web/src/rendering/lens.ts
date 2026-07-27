@@ -4,7 +4,7 @@
  *
  * The worker delivers factor tables sampled on knots in radius normalised to
  * the frame's half-diagonal (corner = 1). The shader consumes fixed 16-entry
- * tables on the canonical grid knot[i] = (i + 0.5) / 15 — the same layout Sony
+ * tables on the canonical grid knot[i] = (i + 0.5) / 16 — the same layout Sony
  * writes, so resampling is an identity for ARW files. Semantics:
  *
  *   distortion[i]  sampling factor: a pixel at corrected radius r fetches the
@@ -34,11 +34,11 @@ export interface LensCorr {
 
 export const LENS_IDENTITY: readonly number[] = Object.freeze(new Array<number>(LENS_KNOTS).fill(1));
 
-const knotR = (i: number): number => (i + 0.5) / (LENS_KNOTS - 1);
+const knotR = (i: number): number => (i + 0.5) / LENS_KNOTS;
 
 /** Evaluate a canonical 16-entry table at normalised radius r (GLSL mirror). */
 export function lensInterp(table: readonly number[], r: number): number {
-  const t = Math.min(Math.max(r * (LENS_KNOTS - 1) - 0.5, 0), LENS_KNOTS - 1);
+  const t = Math.min(Math.max(r * LENS_KNOTS - 0.5, 0), LENS_KNOTS - 1);
   const i = Math.min(Math.floor(t), LENS_KNOTS - 2);
   return table[i] + (table[i + 1] - table[i]) * (t - i);
 }
@@ -73,15 +73,41 @@ export function mixLensTable(table: readonly number[], amount: number): number[]
 }
 
 /**
- * Fill scale for pincushion correction. Sampling factor > 1 at the corner
- * would fetch outside the recorded frame, so pre-scale corrected coordinates
- * by s solving s * f(s) = 1 — the same slight FOV crop-in cameras apply.
- * Barrel correction (f <= 1) needs no scale. Fixed-point iteration: f is
- * smooth and near 1, so a handful of steps converge far past float precision.
+ * Fill scale: pre-scale corrected coordinates by s so that no point on the
+ * output frame's border samples outside the recorded frame. For a border point
+ * at radius r_p that means s * f(s * r_p) <= 1, and the binding constraint is
+ * whichever border point solves it smallest.
+ *
+ * Which point binds follows the sign of the distortion, so BOTH directions
+ * matter and neither can be skipped:
+ *
+ *   pincushion (f rises with r)  -> the corner binds, s < 1, the frame crops in
+ *   barrel     (f falls with r)  -> the SHORT EDGE midpoint binds, s > 1
+ *
+ * The barrel branch is easy to miss: sampling never leaves the frame diagonally,
+ * so anchoring at the corner looks safe — but it pushes the short edge past the
+ * recorded border, and the camera does not. Measured against 5 in-camera JPEGs
+ * (FE 50-150mm F2 GM, 50..104mm, both directions) this rule lands within 1.5e-4
+ * of the scale Sony actually applied, which is the noise floor of the
+ * measurement; anchoring at the corner alone was off by 1.1% at 50mm.
+ *
+ * `shortEdge` is that midpoint's radius, min(w, h) / hypot(w, h) — a property of
+ * the frame's aspect ratio, which is why the caller has to supply it.
+ *
+ * Fixed-point iteration: f is smooth and near 1, so a handful of steps converge
+ * far past float precision. The border is sampled rather than reasoned about so
+ * a non-monotonic table cannot slip past the binding point.
  */
-export function lensFillScale(distortion: readonly number[]): number {
-  if (lensInterp(distortion, 1) <= 1) return 1;
-  let s = 1;
-  for (let i = 0; i < 12; i++) s = 1 / lensInterp(distortion, s);
-  return s;
+const FILL_SAMPLES = 16;   // border points tested, short edge to corner
+const FILL_ITERS = 16;     // fixed-point steps per point
+
+export function lensFillScale(distortion: readonly number[], shortEdge: number): number {
+  let out = Infinity;
+  for (let k = 0; k <= FILL_SAMPLES; k++) {
+    const anchor = shortEdge + ((1 - shortEdge) * k) / FILL_SAMPLES;
+    let s = 1;
+    for (let i = 0; i < FILL_ITERS; i++) s = 1 / lensInterp(distortion, s * anchor);
+    out = Math.min(out, s);
+  }
+  return out;
 }

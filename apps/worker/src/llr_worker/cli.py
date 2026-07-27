@@ -1276,8 +1276,18 @@ def look_from_exif(exif: dict[str, Any]) -> LookTweaks:
     )
 
 
+def _exif_switch_on(value: Any) -> bool:
+    """An exif on/off switch, read as on unless it says otherwise.
+
+    Absent reads as off: a body that never wrote the tag never applied the
+    thing it gates. The values are not a clean enum across tags, so this can
+    only test for the off states by name.
+    """
+    return str(value or "Off").strip().lower() not in ("off", "none")
+
+
 def dro_from_exif(exif: dict[str, Any]) -> bool:
-    return str(exif.get("DynamicRangeOptimizer") or "Off").strip().lower() != "off"
+    return _exif_switch_on(exif.get("DynamicRangeOptimizer"))
 
 
 def _exif_int(value: Any) -> int:
@@ -1313,11 +1323,37 @@ def sony_lens_corrections(exif: dict[str, Any]) -> dict[str, Any] | None:
     VignettingCorrParams / ChromaticAberrationCorrParams) to vendor-neutral
     factor tables. Each array is `nc` followed by nc int16 knot values (CA: 2*nc,
     R then B), knots evenly spaced in radius normalised to the frame's
-    half-diagonal: knots[i] = (i + 0.5) / (nc - 1). Fixed-point scales are the
+    half-diagonal: knots[i] = (i + 0.5) / nc. Fixed-point scales are the
     community-documented ones (exiftool / darktable's reverse engineering):
     distortion sampling factor p*2^-14 + 1 (corrected position -> distorted
     source position), vignetting gain 1 / 2^(0.5 - 2^(p*2^-13 - 1)), lateral CA
     per-channel radial factor p*2^-21 + 1.
+
+    The knot spacing is `/ nc`, not `/ (nc - 1)`: the latter puts the last knot
+    at r = 1.033, outside the frame, and measures ~14% short on the correction
+    it does apply. Fitted against 5 in-camera JPEGs (FE 50-150mm F2 GM, 50..104mm)
+    the spacing lands at 0.93 +- 0.02 of the `/ (nc - 1)` grid, i.e. 15/16, and
+    at that spacing the fixed-point scale above needs no fudge factor.
+
+    Each correction has its own switch, and the parameters are written whether
+    or not the body used them — so reading them is not evidence that anything
+    was corrected. On a Tamron 28-200 with distortion correction off, the
+    in-camera JPEG measures at zero radial displacement while the tags still
+    describe a 1.3% correction; applying it warps a frame the camera never
+    warped. A switched-off correction comes back as an identity table rather
+    than being dropped, so the other two survive independently.
+
+    The vignetting scale is the one piece here that is NOT confirmed against the
+    camera, and its switch does not settle it either — the FE 50-150mm writes
+    "Unknown (3)" rather than a name. Measured in scene-linear (tone curve
+    inverted out, on frames at Fade 0 with DRO off), the in-camera JPEG needs no
+    vignetting gain at all whatever the switch says: the ratio against an
+    uncorrected decode is flat to within 2% out to the corner on five frames
+    across two lenses, while applying this table overshoots by 40-47%. The RAW
+    itself still falls off (one Bayer green at 27% of centre at the corner), so
+    the body is not pre-correcting — it simply leaves these parameters to
+    downstream software. Kept as-is because it is a user-facing slider rather
+    than part of reproducing the camera.
 
     The output frames these as "sample the recorded frame at factor*r and
     multiply by gain(r)", which is exactly the form the WebGL sampler consumes.
@@ -1330,12 +1366,20 @@ def sony_lens_corrections(exif: dict[str, Any]) -> dict[str, Any] | None:
     nc = dist[0]
     if nc < 2 or nc > 16 or len(dist) < nc + 1 or vig[0] != nc or len(vig) < nc + 1:
         return None
+
+    def gated(tag: str, values: list[float]) -> list[float]:
+        """`values` if the body's switch for this correction is on, else identity."""
+        return values if _exif_switch_on(exif.get(tag)) else [1.0] * nc
+
     out: dict[str, Any] = {
-        "knots": [(i + 0.5) / (nc - 1) for i in range(nc)],
-        "distortion": [dist[i + 1] * 2**-14 + 1 for i in range(nc)],
-        "vignetting": [1 / 2 ** (0.5 - 2 ** (vig[i + 1] * 2**-13 - 1)) for i in range(nc)],
+        "knots": [(i + 0.5) / nc for i in range(nc)],
+        "distortion": gated("DistortionCorrection",
+                            [dist[i + 1] * 2**-14 + 1 for i in range(nc)]),
+        "vignetting": gated("VignettingCorrection",
+                            [1 / 2 ** (0.5 - 2 ** (vig[i + 1] * 2**-13 - 1)) for i in range(nc)]),
     }
-    if ca and ca[0] == 2 * nc and len(ca) >= 2 * nc + 1:
+    if (ca and ca[0] == 2 * nc and len(ca) >= 2 * nc + 1
+            and _exif_switch_on(exif.get("ChromaticAberrationCorrection"))):
         out["caR"] = [ca[i + 1] * 2**-21 + 1 for i in range(nc)]
         out["caB"] = [ca[nc + i + 1] * 2**-21 + 1 for i in range(nc)]
     return out
@@ -1373,6 +1417,11 @@ def _read_exiftool_metadata_cached(path: str, size: int, mtime_ns: int) -> dict[
                 "-DefaultCropSize",
                 "-DistortionCorrParams",
                 "-VignettingCorrParams",
+                # Each correction's own switch. The parameters are written even
+                # when the body applied nothing (see sony_lens_corrections).
+                "-DistortionCorrection",
+                "-VignettingCorrection",
+                "-ChromaticAberrationCorrection",
                 "-ChromaticAberrationCorrParams",
                 # The in-camera Creative Look tweaks. Group-qualified on
                 # purpose: Sony writes these alongside ExifIFD tags of the same
@@ -1403,6 +1452,9 @@ def _read_exiftool_metadata_cached(path: str, size: int, mtime_ns: int) -> dict[
         "DistortionCorrParams",
         "VignettingCorrParams",
         "ChromaticAberrationCorrParams",
+        "DistortionCorrection",
+        "VignettingCorrection",
+        "ChromaticAberrationCorrection",
         "Highlights",
         "Shadows",
         "Fade",

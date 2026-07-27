@@ -6,7 +6,7 @@
  */
 
 import { MASK_BLUR_SHADER, MASK_DOWNSAMPLE_SHADER, MASK_VERTEX_SHADER, PASSES, VERTEX_SHADER } from "./passes";
-import { LENS_IDENTITY, LENS_KNOTS } from "./lens";
+import { LENS_IDENTITY, LENS_KNOTS, lensFillScale } from "./lens";
 import { computeWbMatrix } from "./color-spaces";
 import { LUT_SIZE, buildToneCurveLUT, defaultToneCurve } from "./curve";
 import { LOG2_MID } from "./tonal-model";
@@ -30,9 +30,11 @@ export interface EditParams {
   // View transform: 0 = Lightroom-style, 1 = AgX. Display gamut: 0 = sRGB, 1 = P3.
   viewTransform: number; displayGamut: number;
   // Lens corrections: canonical 16-knot factor tables with the slider amounts
-  // already mixed in (all-1 = identity), plus the pincushion fill scale.
-  // Built in App.vue from colorProfile.lensCorr via lens.ts.
-  lensDist: number[]; lensVig: number[]; lensScale: number;
+  // already mixed in (all-1 = identity). Built in App.vue from
+  // colorProfile.lensCorr via lens.ts. The fill scale is not passed: it depends
+  // on the frame's aspect ratio (lens.ts lensFillScale), which only the
+  // renderer knows, so it is derived here from lensDist and the texture dims.
+  lensDist: number[]; lensVig: number[];
 }
 
 const HSL_ZERO = [0, 0, 0, 0, 0, 0, 0, 0];
@@ -105,7 +107,7 @@ export const DEFAULT_PARAMS: EditParams = {
   gradShTint: [1, 1, 1], gradMdTint: [1, 1, 1], gradHlTint: [1, 1, 1],
   gradBlend: 0, gradBalance: 0,
   viewTransform: 0, displayGamut: 0,
-  lensDist: [...LENS_IDENTITY], lensVig: [...LENS_IDENTITY], lensScale: 1,
+  lensDist: [...LENS_IDENTITY], lensVig: [...LENS_IDENTITY],
 };
 
 export class PipelineRenderer {
@@ -936,10 +938,14 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
         s(`u_lensDist[${k}]`, p.lensDist?.[k] ?? 1);
         s(`u_lensVig[${k}]`, p.lensVig?.[k] ?? 1);
       }
-      s("u_lensScale", p.lensScale ?? 1);
+      const diag = Math.hypot(this.texWidth, this.texHeight) || 1;
+      // The short edge's midpoint radius — the constraint that binds for barrel
+      // correction, and the reason the fill scale is computed here rather than
+      // handed in: it is a property of this texture's aspect ratio.
+      const shortEdge = Math.min(this.texWidth, this.texHeight) / diag;
+      s("u_lensScale", lensFillScale(p.lensDist ?? LENS_IDENTITY, shortEdge));
       const normLoc = this.uniforms["u_lensNorm"];
       if (normLoc) {
-        const diag = Math.hypot(this.texWidth, this.texHeight) || 1;
         gl.uniform2f(normLoc, (2 * this.texWidth) / diag, (2 * this.texHeight) / diag);
       }
     }

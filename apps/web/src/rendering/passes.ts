@@ -8,6 +8,7 @@
  */
 
 import { COLOR_GLSL, PROPHOTO_Y, glslFloat } from "./color-spaces";
+import { LENS_KNOTS } from "./lens";
 import { LUT_GLSL } from "./curve";
 import { HSL_GLSL } from "./hsl-bands";
 import { TONAL_GLSL } from "./tonal-model";
@@ -109,14 +110,15 @@ uniform int u_viewTransform;    // 0 = Lightroom-style, 1 = AgX
 uniform int u_displayGamut;     // 0 = sRGB, 1 = Display-P3
 uniform vec3 u_bgColor;         // display-encoded fill for areas outside the image (crop editor)
 // Lens corrections (per-shot radial tables from the RAW's metadata; lens.ts).
-// Both tables sit on knots (i+0.5)/15 in radius normalised to the source
+// Both tables sit on the canonical knot grid in radius normalised to the source
 // half-diagonal. u_lensDist is the sampling factor toward the recorded frame
 // (corrected r fetches r*f), u_lensVig the linear-light gain at the recorded
-// radius. u_lensScale is the pincushion fill scale (lens.ts lensFillScale),
+// radius. u_lensScale is the fill scale (lens.ts lensFillScale) — it goes below
+// 1 for pincushion and above 1 for barrel, so it is not a crop-in either way.
 // u_lensNorm = 2*(w,h)/diagonal so the frame corner lands at radius 1.
 uniform int u_lensActive;
-uniform float u_lensDist[16];
-uniform float u_lensVig[16];
+uniform float u_lensDist[${LENS_KNOTS}];
+uniform float u_lensVig[${LENS_KNOTS}];
 uniform float u_lensScale;
 uniform vec2 u_lensNorm;
 
@@ -232,12 +234,12 @@ const float GRAD_HL_EDGE1 = ${glslFloat(GRAD_HL_EDGE1)};
 const float GRAD_BAL_SPAN = ${glslFloat(GRAD_BAL_SPAN)};
 const float GRAD_RENORM_CAP = ${glslFloat(GRAD_RENORM_CAP)};
 
-// Evaluate a 16-knot lens table at normalised radius r. Knots at (i+0.5)/15;
-// outside the knot range clamp to the nearest knot (lens.ts lensInterp is the
-// tested TS mirror of this function).
-float lensInterp(float table[16], float r) {
-  float t = clamp(r * 15.0 - 0.5, 0.0, 15.0);
-  int i = int(min(t, 14.0));
+// Evaluate a lens table at normalised radius r. Knots at (i+0.5)/N; outside the
+// knot range clamp to the nearest knot. lens.ts lensInterp is the tested TS
+// mirror of this function, and N is injected from there so the two cannot drift.
+float lensInterp(float table[${LENS_KNOTS}], float r) {
+  float t = clamp(r * ${glslFloat(LENS_KNOTS)} - 0.5, 0.0, ${glslFloat(LENS_KNOTS - 1)});
+  int i = int(min(t, ${glslFloat(LENS_KNOTS - 2)}));
   return mix(table[i], table[i + 1], t - float(i));
 }
 
@@ -557,7 +559,7 @@ export const PASSES: PassDef[] = [
     "u_sonyChromaActive", "u_sonyCross", "u_sonyGain", "u_sonyLuma", "u_sonySat",
     "u_sepiaActive", "u_sepiaWeights", "u_sepia_lut",
     "u_lensActive", "u_lensScale", "u_lensNorm",
-    ...Array.from({ length: 16 }, (_, k) => `u_lensDist[${k}]`),
-    ...Array.from({ length: 16 }, (_, k) => `u_lensVig[${k}]`),
+    ...Array.from({ length: LENS_KNOTS }, (_, k) => `u_lensDist[${k}]`),
+    ...Array.from({ length: LENS_KNOTS }, (_, k) => `u_lensVig[${k}]`),
   ]},
 ];
