@@ -383,6 +383,20 @@ export class PipelineRenderer {
     this.previewScale = Math.min(1, Math.max(0.05, scale));
   }
 
+  /**
+   * Write a LUT that is already on the shared grid: create the texture on the
+   * first call, then re-upload in place. Every LUT here is `LUT_SIZE`×1, so
+   * this is the whole difference between them.
+   */
+  private writeLut(tex: WebGLTexture | null, data: Float32Array, channels: 1 | 4 = 1): WebGLTexture {
+    const gl = this.gl;
+    if (!tex) return this.makeLutTexture(data, channels);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, LUT_SIZE, 1, channels === 4 ? gl.RGBA : gl.RED, gl.FLOAT, data);
+    return tex;
+  }
+
   private makeLutTexture(lut: Float32Array, channels: 1 | 4 = 1): WebGLTexture {
     const gl = this.gl;
     const tex = gl.createTexture()!;
@@ -410,7 +424,6 @@ export class PipelineRenderer {
    * so delete+create would churn a fresh GPU allocation per frame.
    */
   uploadCurveLUT(lut: Float32Array): void {
-    const gl = this.gl;
     // Identity detection (one 8k-float scan per bake): the shader skips the
     // curve block's 5 LUT fetches per pixel when the bake does nothing — the
     // default-slider state and the hold-to-compare baseline.
@@ -423,13 +436,7 @@ export class PipelineRenderer {
         break;
       }
     }
-    if (!this.curveLutTex) {
-      this.curveLutTex = this.makeLutTexture(lut, 4);
-      return;
-    }
-    gl.bindTexture(gl.TEXTURE_2D, this.curveLutTex);
-    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, LUT_SIZE, 1, gl.RGBA, gl.FLOAT, lut);
+    this.curveLutTex = this.writeLut(this.curveLutTex, lut, 4);
   }
 
   /**
@@ -438,19 +445,12 @@ export class PipelineRenderer {
    * to disable it (e.g. no profile / monochrome profile) and fall back to identity.
    */
   uploadProfileCurveLUT(curve: ProfileCurve): void {
-    const gl = this.gl;
     let data = curve?.lut;
     if (!data) {
       data = new Float32Array(LUT_SIZE);
       for (let i = 0; i < LUT_SIZE; i++) data[i] = i / (LUT_SIZE - 1);
     }
-    if (!this.profileLutTex) {
-      this.profileLutTex = this.makeLutTexture(data);
-    } else {
-      gl.bindTexture(gl.TEXTURE_2D, this.profileLutTex);
-      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, LUT_SIZE, 1, gl.RED, gl.FLOAT, data);
-    }
+    this.profileLutTex = this.writeLut(this.profileLutTex, data);
     this.hasProfileCurve = curve != null;
     this.profileCurveSrgb = curve?.srgbBasis ?? false;
     this.profileChroma = curve?.chroma ?? null;
@@ -463,7 +463,6 @@ export class PipelineRenderer {
    * and uploaded as RGBA so one texture fetch reads all three channels.
    */
   private uploadSepiaLUT(sepia: SepiaToning | null): void {
-    const gl = this.gl;
     this.sepiaActive = sepia != null;
     if (!sepia) return;
     const knots = sepia.lut;
@@ -476,13 +475,7 @@ export class PipelineRenderer {
       }
       data[i * 4 + 3] = 1;
     }
-    if (!this.sepiaLutTex) {
-      this.sepiaLutTex = this.makeLutTexture(data, 4);
-    } else {
-      gl.bindTexture(gl.TEXTURE_2D, this.sepiaLutTex);
-      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, LUT_SIZE, 1, gl.RGBA, gl.FLOAT, data);
-    }
+    this.sepiaLutTex = this.writeLut(this.sepiaLutTex, data, 4);
   }
 
   draw(params: Partial<EditParams> = {}): void {
