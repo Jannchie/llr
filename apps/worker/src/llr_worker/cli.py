@@ -475,11 +475,11 @@ def daemon_look_profile(request: dict[str, Any], root: Path) -> dict[str, Any]:
     """The Sony profile for a set of Creative Look tweaks, with no pixels at all.
 
     Not one of the five reaches the matrix (sony.profile.look_render_info), so a
-    moved slider needs nothing more than this: a few hundred bytes of curve and
-    chroma terms, against the tens of megabytes a re-decode would send back for
-    a frame the browser is already holding. Reading the calibration means
-    reading and decrypting the RAW's SR2 block, which is cached, and the exif
-    read alongside it is memoised — no decode happens on this path.
+    moved slider needs nothing more than this: ~75 kB of curve and chroma terms,
+    against the tens of megabytes a re-decode would send back for a frame the
+    browser is already holding. Reading the calibration means reading and
+    decrypting the RAW's SR2 block, which is cached, and the exif read alongside
+    it is memoised — no decode happens on this path.
 
     A null profile is the honest answer for a shot this path cannot render (a
     non-Sony body, a look with no calibration): the caller keeps what it has.

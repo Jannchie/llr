@@ -123,7 +123,10 @@ const sonyLook = ref("");
 // Both are null until a decode reports a Sony rendering.
 const lookAsShot = ref<LookTweaks | null>(null);
 const look = ref<LookTweaks | null>(null);
-const ZERO_LOOK: LookTweaks = { highlights: 0, shadows: 0, contrast: 0, fade: 0, saturation: 0 };
+// A type-level floor, not a state the panel can reach: everything that reads
+// effectiveLook is gated on lookAsShot. Derived from LOOK_SLIDERS so the key
+// list is written once (as SLIDER_DEFAULTS is, and for the same reason).
+const ZERO_LOOK = Object.fromEntries(LOOK_SLIDERS.map(s => [s.key, 0])) as LookTweaks;
 const effectiveLook = computed<LookTweaks>(() => look.value ?? lookAsShot.value ?? ZERO_LOOK);
 const lookEdited = computed(() =>
   !!look.value && !!lookAsShot.value
@@ -622,8 +625,9 @@ let denoiseReloadTimer = 0; // debounce for the denoise watcher below
 
 // A moved Creative Look slider needs no pixels: the five tweaks reshape the
 // tone curve and the chroma terms the shader applies, and the decoded frame is
-// already on the GPU. So this re-fetches the profile alone (a few hundred
-// bytes) and re-uploads the LUT, instead of re-decoding like dcp/denoise do.
+// already on the GPU. So this re-fetches the profile alone (~75 kB, most of it
+// the tone curve) and re-uploads the LUT, instead of re-decoding like
+// dcp/denoise do — the frame it replaces is tens of megabytes.
 // Sequenced, not debounced: the request is cheap and a drag should track.
 let lookProfileSeq = 0;
 async function reloadLookProfile(): Promise<void> {

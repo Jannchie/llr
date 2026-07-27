@@ -291,8 +291,8 @@ def look_render_info(
 
     Split out from apply_sony_profile because none of the five tweaks reaches
     the matrix: moving one changes this report and nothing else, so the frontend
-    can ask for a new one over a few hundred bytes rather than re-decoding tens
-    of megabytes of pixels it already has.
+    can ask for a new one over ~75 kB (mostly the 1024-point tone curve) rather
+    than re-decoding tens of megabytes of pixels it already has.
     """
     cross, gain = chroma_terms(cal)
     # Named apart from `contrast` on purpose: that one is the tone-curve tweak,
@@ -329,8 +329,7 @@ def look_render_info(
 
 def apply_sony_profile(
     camera_rgb: np.ndarray, cal: LookCalibration, style: str,
-    tweaks: LookTweaks = NO_TWEAKS, as_shot: LookTweaks | None = None,
-    dro: bool = False,
+    tweaks: LookTweaks = NO_TWEAKS, dro: bool = False,
 ) -> tuple[np.ndarray, SonyRenderInfo]:
     """Camera RGB -> scene-linear ProPhoto (D50), plus the matching tone curve.
 
@@ -338,11 +337,16 @@ def apply_sony_profile(
     can_render first, because the tone curve is per-channel and a wrong one
     shifts hue rather than just brightness — an Instant frame rendered through
     the Film curve turns its warm tones yellow.
+
+    No as_shot parameter: a decode always renders the settings the body itself
+    recorded, so `tweaks` is the shot's own answer and look_render_info reports
+    it as both. Client overrides ride on the cached profile instead, through
+    apply_look_overrides.
     """
     matrix = SegmentedMatrix(unpack_param_block(cal.param_block))
     rec709 = matrix.apply(camera_rgb)
     linear_prophoto = np.clip(rec709 @ REC709_TO_PROPHOTO_D50.T, 0, None)
-    return linear_prophoto, look_render_info(cal, style, tweaks, as_shot, dro)
+    return linear_prophoto, look_render_info(cal, style, tweaks, dro=dro)
 
 
 def apply_look_overrides(
