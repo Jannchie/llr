@@ -28,6 +28,7 @@
   --accent: #0a84ff;
   --accent-strong: #409cff;
   --accent-soft: rgba(10, 132, 255, 0.18);
+  --accent-ring: rgba(10, 132, 255, 0.42);  /* selection halo on a slider knob */
   --error: #ff6961;
   --danger: rgba(255, 69, 58, 0.92);  /* destructive fills (iOS dark system red) */
 
@@ -626,6 +627,24 @@ input[type="range"]::-moz-range-thumb {
 
 input[type="range"]:active::-webkit-slider-thumb {
   transform: scale(1.1);
+}
+
+/* Scroll-to-nudge only answers to the selected slider, so selection has to be
+   legible: the thumb takes an accent halo once the row is clicked or tabbed to.
+   The global :focus-visible outline would box the whole 22px-tall track — far
+   louder than the 16px knob it is reporting on. */
+input[type="range"]:focus {
+  outline: none;
+}
+
+input[type="range"]:focus-visible::-webkit-slider-thumb,
+input[type="range"]:focus::-webkit-slider-thumb {
+  box-shadow: var(--shadow-knob), 0 0 0 5px var(--accent-ring);
+}
+
+input[type="range"]:focus-visible::-moz-range-thumb,
+input[type="range"]:focus::-moz-range-thumb {
+  box-shadow: var(--shadow-knob), 0 0 0 5px var(--accent-ring);
 }
 
 /* ---------- Number inputs ----------

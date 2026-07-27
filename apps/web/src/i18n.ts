@@ -99,7 +99,7 @@ const en = {
   "slider.saturation": "Saturation",
   "slider.lensDistortion": "Distortion",
   "slider.lensVignetting": "Vignetting",
-  "slider.dblclickReset": "Double-click to reset",
+  "slider.hint": "Click to select, then scroll to nudge (Shift ×10) · Double-click to reset",
 
   // The shot's in-camera Creative Look tweaks (Sony engine only). Named apart
   // from the Tone sliders on purpose: these drive the camera's own stages and
@@ -256,7 +256,7 @@ const zh: Record<MessageKey, string> = {
   "slider.saturation": "饱和度",
   "slider.lensDistortion": "扭曲度",
   "slider.lensVignetting": "晕影",
-  "slider.dblclickReset": "双击复位",
+  "slider.hint": "点击选中后可滚轮微调（Shift ×10）· 双击复位",
 
   "panel.creativeLook": "创意外观",
   "lookSlider.contrast": "对比度",

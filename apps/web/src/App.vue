@@ -1189,38 +1189,65 @@ const WB_TRACK: Partial<Record<RecipeKey, string>> = {
   tint: "linear-gradient(to right, #4fc26a, #d8d8d8 50%, #d264d8)",
 };
 
-// Lightroom-style scroll-to-nudge: hovering any range slider and scrolling steps
-// the value by one `step` (Shift ×10), instead of scrolling the panel. Applied via
-// event delegation on the settings rail so every slider — base, HSL, grading,
-// denoise, crop angle — gets it without per-input wiring.
+// Lightroom-style scroll-to-nudge: scrolling over the *selected* range slider
+// steps the value by one `step` (Shift ×10) instead of scrolling the panel.
+// Applied via event delegation on the settings rail so every slider — base, HSL,
+// grading, denoise, crop angle — gets it without per-input wiring.
+//
+// Hover alone must not be enough: the rail is a tall scrolling column of sliders,
+// so a plain wheel gesture aimed at the panel would land on whatever slider
+// happened to be under the pointer and silently edit the photo. Two guards:
+// the slider has to hold focus (a click selects it), and ownership is decided
+// once per gesture — a scroll that starts on the panel keeps scrolling the panel
+// even as sliders slide beneath the pointer.
+const WHEEL_GESTURE_GAP_MS = 200;
+
+type WheelAdjustHandlers = {
+  onWheel: (e: WheelEvent) => void;
+  onPointerDown: (e: PointerEvent) => void;
+};
+
+const rangeUnder = (e: Event): HTMLInputElement | null =>
+  ((e.target as HTMLElement | null)?.closest?.('input[type="range"]') ?? null) as HTMLInputElement | null;
+
 const vWheelAdjust = {
   mounted(el: HTMLElement) {
+    let gestureEnd = 0;
+    let owner: HTMLInputElement | null = null;
+    // Selecting by click is the other half of the rule, so it lives here too —
+    // and a mousedown does not focus a range input in Safari, so the UA cannot
+    // be trusted to do it.
+    const onPointerDown = (e: PointerEvent) => rangeUnder(e)?.focus();
     const onWheel = (e: WheelEvent) => {
-      const input = (e.target as HTMLElement | null)?.closest?.(
-        'input[type="range"]',
-      ) as HTMLInputElement | null;
-      if (!input || input.disabled) return;
+      const input = rangeUnder(e);
+      const selected = !!input && !input.disabled && document.activeElement === input;
+      if (e.timeStamp > gestureEnd) owner = selected ? input : null;
+      gestureEnd = e.timeStamp + WHEEL_GESTURE_GAP_MS;
+      if (!owner || owner !== input) return; // let the rail scroll
       e.preventDefault();
-      const step = Number(input.step) || 1;
-      const min = Number(input.min);
-      const max = Number(input.max);
-      const cur = Number(input.value);
+      const step = Number(owner.step) || 1;
+      const min = Number(owner.min);
+      const max = Number(owner.max);
+      const cur = Number(owner.value);
       const mult = e.shiftKey ? 10 : 1;
       const dir = e.deltaY < 0 ? 1 : -1; // scroll up → increase
       let next = clamp(cur + dir * step * mult, min, max);
       const decimals = (String(step).split(".")[1] || "").length;
       if (decimals) next = Number(next.toFixed(decimals));
       if (next === cur) return;
-      input.value = String(next);
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      input.dispatchEvent(new Event("change", { bubbles: true }));
+      owner.value = String(next);
+      owner.dispatchEvent(new Event("input", { bubbles: true }));
+      owner.dispatchEvent(new Event("change", { bubbles: true }));
     };
     el.addEventListener("wheel", onWheel, { passive: false });
-    (el as unknown as { _wheelAdjust?: (e: WheelEvent) => void })._wheelAdjust = onWheel;
+    el.addEventListener("pointerdown", onPointerDown);
+    (el as unknown as { _wheelAdjust?: WheelAdjustHandlers })._wheelAdjust = { onWheel, onPointerDown };
   },
   unmounted(el: HTMLElement) {
-    const fn = (el as unknown as { _wheelAdjust?: (e: WheelEvent) => void })._wheelAdjust;
-    if (fn) el.removeEventListener("wheel", fn);
+    const h = (el as unknown as { _wheelAdjust?: WheelAdjustHandlers })._wheelAdjust;
+    if (!h) return;
+    el.removeEventListener("wheel", h.onWheel);
+    el.removeEventListener("pointerdown", h.onPointerDown);
   },
 };
 </script>
@@ -1617,15 +1644,15 @@ const vWheelAdjust = {
             :label="t(`curveRegion.${r}`)" :min="-100" :max="100" />
           <div class="curve-splits">
             <span class="curve-splits-label">{{ t('curve.splits') }}</span>
-            <input type="range" min="4" max="96" step="1"
+            <input type="range" min="4" max="96" step="1" :title="t('slider.hint')"
               :value="paramValue('shadowSplit')"
               :style="{ '--track': trackFill(paramValue('shadowSplit'), 0, 100) }"
               @input="setParam('shadowSplit', Math.min(($event.target as HTMLInputElement).valueAsNumber, paramValue('midtoneSplit') - 4))" />
-            <input type="range" min="4" max="96" step="1"
+            <input type="range" min="4" max="96" step="1" :title="t('slider.hint')"
               :value="paramValue('midtoneSplit')"
               :style="{ '--track': trackFill(paramValue('midtoneSplit'), 0, 100) }"
               @input="setParam('midtoneSplit', Math.min(Math.max(($event.target as HTMLInputElement).valueAsNumber, paramValue('shadowSplit') + 4), paramValue('highlightSplit') - 4))" />
-            <input type="range" min="4" max="96" step="1"
+            <input type="range" min="4" max="96" step="1" :title="t('slider.hint')"
               :value="paramValue('highlightSplit')"
               :style="{ '--track': trackFill(paramValue('highlightSplit'), 0, 100) }"
               @input="setParam('highlightSplit', Math.max(($event.target as HTMLInputElement).valueAsNumber, paramValue('midtoneSplit') + 4))" />

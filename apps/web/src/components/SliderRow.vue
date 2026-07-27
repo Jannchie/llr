@@ -63,7 +63,7 @@ async function onCommit(e: Event): Promise<void> {
     <input :id="inputId" type="range" :min="min" :max="max" :step="step"
       :value="modelValue" :style="{ '--track': trackStyle }"
       @input="onInput" @dblclick="emit('update:modelValue', resetValue)"
-      :title="t('slider.dblclickReset')" />
+      :title="t('slider.hint')" />
     <input :class="numberClass" type="number" :min="min" :max="max" :step="step"
       :value="modelValue" :aria-label="label"
       @input="onInput" @change="onCommit" @blur="onCommit" />
