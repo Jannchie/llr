@@ -82,7 +82,10 @@ const server = createServer((request, response) => {
       response.destroy();
       return;
     }
-    console.error(error);
+    // Same reasoning for the 4xx we raise ourselves: a stale tab asking for a
+    // source the TTL sweep already removed is the client's problem, not a
+    // failure worth a stack trace. 5xx and anything unrecognised still log.
+    if (!(error instanceof HttpError) || error.status >= 500) console.error(error);
     if (!response.headersSent) {
       sendJson(response, { error: errorMessage(error) }, error instanceof HttpError ? error.status : 500);
     } else {
@@ -196,6 +199,17 @@ function sessionDirFor(sourceId: string): string {
   return resolve(sessionsRoot, sourceId);
 }
 
+// Every handler that works on an uploaded source opens the same three doors:
+// the id must be there, it must be well-formed, and the file must still exist
+// (sessions are swept on a TTL, so a long-idle tab can outlive its upload).
+async function resolveSource(sourceId: string | undefined): Promise<{ sessionDir: string; sourcePath: string }> {
+  if (!sourceId) throw new HttpError(400, "Missing sourceId");
+  const sessionDir = sessionDirFor(sourceId);
+  const sourcePath = await findSource(sessionDir);
+  if (!sourcePath) throw new HttpError(404, "Unknown sourceId");
+  return { sessionDir, sourcePath };
+}
+
 // Backpressure for the heavy decode path: each render buffers tens of MB on
 // disk and occupies one of the daemon's three workers, so an unbounded pile-up
 // (a stuck client in a retry loop, a tab spamming slider changes) would queue
@@ -205,16 +219,7 @@ const RENDER_INFLIGHT_LIMIT = 8;
 
 async function handleRenderLinear(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const body = await readJson<RenderLinearBody>(request);
-  if (!body.sourceId) {
-    sendJson(response, { error: "Missing sourceId" }, 400);
-    return;
-  }
-  const sessionDir = sessionDirFor(body.sourceId);
-  const sourcePath = await findSource(sessionDir);
-  if (!sourcePath) {
-    sendJson(response, { error: "Unknown sourceId" }, 404);
-    return;
-  }
+  const { sessionDir, sourcePath } = await resolveSource(body.sourceId);
 
   if (daemon.outstanding("render-linear") >= RENDER_INFLIGHT_LIMIT) {
     throw new HttpError(429, "Too many concurrent renders");
@@ -269,15 +274,7 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
 // pulling tens of megabytes back through /render-linear for a slider drag.
 async function handleLookProfile(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const body = await readJson<RenderLinearBody>(request);
-  if (!body.sourceId) {
-    sendJson(response, { error: "Missing sourceId" }, 400);
-    return;
-  }
-  const sourcePath = await findSource(sessionDirFor(body.sourceId));
-  if (!sourcePath) {
-    sendJson(response, { error: "Unknown sourceId" }, 404);
-    return;
-  }
+  const { sourcePath } = await resolveSource(body.sourceId);
   const meta = await daemon.send({
     command: "look-profile",
     input: sourcePath,
@@ -302,17 +299,7 @@ async function handleExport(request: IncomingMessage, response: ServerResponse):
     sendJson(response, { error: "Invalid meta field" }, 400);
     return;
   }
-  if (!meta.sourceId) {
-    sendJson(response, { error: "Missing sourceId" }, 400);
-    return;
-  }
-
-  const sessionDir = sessionDirFor(meta.sourceId);
-  const sourcePath = await findSource(sessionDir);
-  if (!sourcePath) {
-    sendJson(response, { error: "Unknown sourceId" }, 404);
-    return;
-  }
+  const { sessionDir, sourcePath } = await resolveSource(meta.sourceId);
 
   // Per-request filename: concurrent exports of the same source must not
   // overwrite each other's file between the write, the daemon's in-place XMP
