@@ -59,18 +59,8 @@ export const PROPHOTO_TO_P3: Mat3 = [
   [-0.15368251, 1.16666920, -0.01300361],
   [0.01038671, -0.06279176, 1.05218759],
 ];
-// AgX: linear ProPhoto -> AgX inset basis, and outset back to Rec.709
-export const AGX_INSET_FROM_PROPHOTO: Mat3 = [
-  [1.69504067, -0.52829863, -0.16660567],
-  [-0.11558474, 1.03911435, 0.07643346],
-  [0.06071460, -0.06897309, 1.00821074],
-];
-export const AGX_OUTSET: Mat3 = [
-  [1.19687901, -0.09802088, -0.09902974],
-  [-0.05289685, 1.15190313, -0.09896118],
-  [-0.05297164, -0.09804345, 1.15107367],
-];
-// linear sRGB/Rec.709 -> linear ProPhoto(D50) (AgX outputs Rec.709 -> back to working)
+// linear sRGB/Rec.709 -> linear ProPhoto(D50) — the inverse trip for a stage
+// that has to run on Rec.709 primaries (a camera curve defined in sRGB).
 export const SRGB_TO_PROPHOTO: Mat3 = [
   [0.52934593, 0.33007277, 0.14058129],
   [0.09837427, 0.87346103, 0.02816463],
@@ -279,8 +269,6 @@ const MATRICES: ReadonlyArray<readonly [string, Mat3]> = [
   ["PROPHOTO_TO_SRGB", PROPHOTO_TO_SRGB],
   ["PROPHOTO_TO_P3", PROPHOTO_TO_P3],
   ["SRGB_TO_PROPHOTO", SRGB_TO_PROPHOTO],
-  ["AGX_INSET_FROM_PROPHOTO", AGX_INSET_FROM_PROPHOTO],
-  ["AGX_OUTSET", AGX_OUTSET],
 ];
 
 /**

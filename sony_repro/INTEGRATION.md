@@ -10,7 +10,7 @@
 |---|---|---|
 | 解码 | rawpy/LibRaw,`output_color=raw`,`gamma=(1,1)`,`use_camera_wb` | Preprocess → DemosaicRough |
 | 色彩 | DCP:ForwardMatrix → XYZ(D50) → ProPhoto,再 HueSatMap / LookTable | **SIMDLinearMatrix16** 一个分段矩阵,就这一步 |
-| 视图变换 | 前端 `viewTransformLR`,用 DCP profile tone curve 作 `u_profile_lut` | **MainGamma** 一张 32768xint16 的 1D LUT |
+| 视图变换 | 前端 `viewTransform`,用 DCP profile tone curve 作 `u_profile_lut` | **MainGamma** 一张 32768xint16 的 1D LUT |
 | 之后 | 曲线 / 调色 / gamut map / sRGB 编码(display-referred) | RGB2YCC → NR → YGamma → ITP → SSCS → AreaComp → Sharpness |
 | 交付 | worker 出 scene-linear ProPhoto(D50) f16,前端渲染 | 引擎直接出 8-bit,GPU 只贴图 |
 
@@ -83,9 +83,9 @@ MainGamma 是**逐通道**曲线,作用在 camera/Rec.709-ish 空间;
 前端的 `u_profile_lut` 也是逐通道,但作用在 **ProPhoto**。同一条曲线在不同基色下逐通道
 应用,结果并不相同,直接复用会有偏差。
 
-**实际解法**(比原计划更省):不加第三个 view transform,而是给 `viewTransformLR`
+**实际解法**(比原计划更省):不加第二个 view transform,而是给 `viewTransform`
 加一个 `u_profileCurveSrgb` 开关 —— 曲线所在的基色是 **profile 的属性**,不是用户的
-外观选择,所以它跟着 `colorProfile.kind` 走,而 Lightroom/AgX 仍是用户选的:
+外观选择,所以它跟着 `colorProfile.kind` 走:
 
 ```glsl
 vec3 s = (u_profileCurveSrgb == 1) ? PROPHOTO_TO_SRGB * c : c;

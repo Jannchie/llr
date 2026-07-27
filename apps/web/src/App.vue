@@ -215,10 +215,10 @@ const GRADING_BANDS = [
   { band: "hl", hueKey: "hlH", satKey: "hlS" },
 ] as const;
 
-// View settings (not part of the per-image recipe): tone-mapping look + display gamut.
+// View settings (not part of the per-image recipe): display gamut + EXIF policy.
 // exportStripPrivate: exports copy the RAW's full EXIF by default; 1 opts into
 // stripping GPS/serials/owner/maker notes for exports meant to be shared.
-const viewSettings = reactive({ viewTransform: 0, displayGamut: 0, exportStripPrivate: 0 });
+const viewSettings = reactive({ displayGamut: 0, exportStripPrivate: 0 });
 
 // ── Crop & Straighten ──
 //
@@ -490,7 +490,17 @@ const {
     errorMessage.value = null;
   },
   isRestoring: () => isRestoring,
-  sessionExtras: { get: () => ({ ...viewSettings }), apply: (v) => Object.assign(viewSettings, v) },
+  // Restore only keys this build still has: a stored session outlives the
+  // settings it was written with (it carried a view-transform choice until the
+  // AgX look was dropped), and a blind assign would revive dead state.
+  sessionExtras: {
+    get: () => ({ ...viewSettings }),
+    apply: (v) => {
+      for (const k of Object.keys(viewSettings) as (keyof typeof viewSettings)[]) {
+        if (typeof v[k] === "number") viewSettings[k] = v[k];
+      }
+    },
+  },
 });
 
 // Camera style names are the manufacturer's own product names (Sony's Creative
@@ -679,7 +689,6 @@ function buildPipelineParams(s?: Snapshot): Partial<EditParams> {
     gradHlTint: gradingTint(g.hlH, g.hlS / 100),
     gradBlend: g.blend / 100,
     gradBalance: g.balance / 100,
-    viewTransform: viewSettings.viewTransform,
     displayGamut: viewSettings.displayGamut,
   };
 }
@@ -753,12 +762,12 @@ function scheduleWebGLDraw(): void {
   rafId = requestAnimationFrame(() => { drawPending = false; drawWebGL(); scheduleHistogram(); });
 }
 
-// Edit-free baseline for hold-to-compare: keep view-only settings (look / display
+// Edit-free baseline for hold-to-compare: keep view-only settings (display
 // gamut) but drop every per-image adjustment. The matching identity tone curve is
 // swapped in by the showOriginal watcher (the curve lives in a GPU LUT, not params).
 const IDENTITY_CURVE_LUT = buildToneCurveLUT(defaultToneCurve());
 function baselineParams(): Partial<EditParams> {
-  return { viewTransform: viewSettings.viewTransform, displayGamut: viewSettings.displayGamut };
+  return { displayGamut: viewSettings.displayGamut };
 }
 
 // On-screen device-pixel footprint of the preview, as a fraction of the image's
@@ -1483,13 +1492,6 @@ const vWheelAdjust = {
             <input id="camera-match" type="checkbox" v-model="cameraMatch" />
             <span class="switch-track"><span class="switch-thumb" /></span>
           </label>
-        </div>
-        <div class="control-row" v-if="activeSource">
-          <label class="control-label">{{ t('settings.look') }}</label>
-          <select v-model.number="viewSettings.viewTransform" class="control-select">
-            <option :value="0">{{ t('look.lightroom') }}</option>
-            <option :value="1">{{ t('look.agx') }}</option>
-          </select>
         </div>
         <div class="control-row" v-if="activeSource && p3Supported">
           <label class="control-label">{{ t('settings.display') }}</label>

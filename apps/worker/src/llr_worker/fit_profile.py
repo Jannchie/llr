@@ -109,7 +109,7 @@ def inverse_tone_curve(display: np.ndarray, curve: np.ndarray) -> np.ndarray:
 
     The curve is monotonic, so np.interp with the axes swapped is its inverse.
     Applied per channel because that is how the renderer applies the forward
-    direction (passes.ts viewTransformLR).
+    direction (passes.ts viewTransform).
     """
     x, y = curve[:, 0].astype(np.float64), curve[:, 1].astype(np.float64)
     order = np.argsort(y)

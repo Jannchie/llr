@@ -1,6 +1,6 @@
 r"""整条主管线离线跑一遍,对机内 JPEG —— 接入 RGB2YCC 到底值不值。
 
-顺序严格照着前端 shader(`passes.ts` 的 `viewTransformLR`)来,一步都不能挪:
+顺序严格照着前端 shader(`passes.ts` 的 `viewTransform`)来,一步都不能挪:
 
     worker: 相机 RGB -> 分段矩阵 -> 线性 ProPhoto
     shader: 转到 sRGB 原色 -> profile 曲线(逐通道) -> **RGB2YCC** -> 转回 ProPhoto

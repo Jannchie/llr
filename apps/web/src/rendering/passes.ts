@@ -106,7 +106,6 @@ uniform float u_sonySat;
 uniform int u_sepiaActive;
 uniform vec3 u_sepiaWeights;
 uniform sampler2D u_sepia_lut;
-uniform int u_viewTransform;    // 0 = Lightroom-style, 1 = AgX
 uniform int u_displayGamut;     // 0 = sRGB, 1 = Display-P3
 uniform vec3 u_bgColor;         // display-encoded fill for areas outside the image (crop editor)
 // Lens corrections (per-shot radial tables from the RAW's metadata; lens.ts).
@@ -159,8 +158,8 @@ vec3 sonyChroma(vec3 s) {
   return srgbDecode(o);
 }
 
-// (a) Lightroom-style: hue-stable luminance shoulder + highlight desaturation.
-vec3 viewTransformLR(vec3 c) {
+// The view transform: scene-referred light -> display-referred, hue-stable.
+vec3 viewTransform(vec3 c) {
   c = max(c, 0.0);
   if (u_hasProfileCurve == 1) {
     // The profile tone curve IS the camera's display rendering — apply it per
@@ -183,27 +182,6 @@ vec3 viewTransformLR(vec3 c) {
   // Fallback (no profile curve): identity here; the display sRGB encode supplies the
   // gamma so mid gray (0.18) lands at ~0.46 and white reaches white.
   return c;
-}
-
-// (b) AgX (Troy Sobotka / Blender 4.0): per-channel sigmoid in an inset basis.
-const float AGX_MIN_EV = -12.47393;
-const float AGX_MAX_EV = 4.026069;
-vec3 agxContrast(vec3 x) {
-  vec3 x2 = x * x;
-  vec3 x4 = x2 * x2;
-  return 15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4
-       - 6.868 * x2 * x + 0.4298 * x2 + 0.1191 * x - 0.00232;
-}
-vec3 viewTransformAgX(vec3 c) {
-  vec3 v = AGX_INSET_FROM_PROPHOTO * max(c, 0.0);
-  v = clamp((log2(max(v, 1e-10)) - AGX_MIN_EV) / (AGX_MAX_EV - AGX_MIN_EV), 0.0, 1.0);
-  v = agxContrast(v);
-  vec3 rec709 = pow(max(AGX_OUTSET * v, 0.0), vec3(2.2));  // -> display-linear Rec.709
-  return SRGB_TO_PROPHOTO * rec709;                        // -> display-linear ProPhoto
-}
-
-vec3 viewTransform(vec3 c) {
-  return (u_viewTransform == 1) ? viewTransformAgX(c) : viewTransformLR(c);
 }
 
 // Exposure shoulder / tonal-region constants + expoShoulder come from
@@ -546,7 +524,7 @@ export interface PassDef {
 export const PASSES: PassDef[] = [
   { name: "process", fsSource: PROCESS_SHADER, uniforms: [
     "u_texXform", "u_bgColor",
-    "u_wbMatrix", "u_exposure", "u_viewTransform", "u_displayGamut",
+    "u_wbMatrix", "u_exposure", "u_displayGamut",
     "u_highlights", "u_shadows",
     "u_vibrance", "u_saturation", "u_clarity", "u_dehaze",
     "u_tonalActive", "u_hslActive", "u_maskShift", "u_hasMask",

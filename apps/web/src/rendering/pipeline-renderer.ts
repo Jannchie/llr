@@ -27,8 +27,8 @@ export interface EditParams {
   gradMdTint: [number, number, number];
   gradHlTint: [number, number, number];
   gradBlend: number; gradBalance: number;
-  // View transform: 0 = Lightroom-style, 1 = AgX. Display gamut: 0 = sRGB, 1 = P3.
-  viewTransform: number; displayGamut: number;
+  // Display gamut: 0 = sRGB, 1 = P3.
+  displayGamut: number;
   // Lens corrections: canonical 16-knot factor tables with the slider amounts
   // already mixed in (all-1 = identity). Built in App.vue from
   // colorProfile.lensCorr via lens.ts. The fill scale is not passed: it depends
@@ -106,7 +106,7 @@ export const DEFAULT_PARAMS: EditParams = {
   hslH: [...HSL_ZERO], hslS: [...HSL_ZERO], hslL: [...HSL_ZERO],
   gradShTint: [1, 1, 1], gradMdTint: [1, 1, 1], gradHlTint: [1, 1, 1],
   gradBlend: 0, gradBalance: 0,
-  viewTransform: 0, displayGamut: 0,
+  displayGamut: 0,
   lensDist: [...LENS_IDENTITY], lensVig: [...LENS_IDENTITY],
 };
 
@@ -875,7 +875,6 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
       }
       gl.uniformMatrix3fv(wbLoc, true, this.wbMat); // transpose: row-major in
     }
-    i("u_viewTransform", p.viewTransform);
     i("u_displayGamut", p.displayGamut);
     i("u_hasProfileCurve", this.hasProfileCurve ? 1 : 0);
     i("u_profileCurveSrgb", this.profileCurveSrgb ? 1 : 0);

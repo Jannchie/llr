@@ -35,10 +35,11 @@ per full parameter set → repeat requests skip everything.
 ## Render: web (`apps/web`)
 
 `rendering/pipeline-renderer.ts` owns a single fused WebGL2 shader pass, split
-by the view transform. Scene-referred: white balance (Bradford CAT), exposure,
+by the view transform into a scene-referred and a display-referred half.
+Scene-referred: white balance (Bradford CAT), exposure,
 tonal model (PV2012-style) and clarity — the latter two over a blurred
 log-luminance mask — then dehaze, vibrance/saturation, HSL. The view transform
-(Lightroom-style or AgX) then takes the pixel display-referred, and the tone
+(the camera profile's own tone curve) then takes the pixel display-referred, and the tone
 curves (as baked LUT textures) and color grading run *after* it, on [0,1], as
 does the final gamut map and sRGB/P3 encode. Uniform-only edits redraw in real
 time; Contrast/Blacks are display-referred and re-bake the curve LUT; crop is a
