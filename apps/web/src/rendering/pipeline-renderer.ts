@@ -233,14 +233,14 @@ export class PipelineRenderer {
     const gl = this.gl;
     // texImage2D past MAX_TEXTURE_SIZE only raises GL_INVALID_VALUE: the draw
     // then "succeeds" against an empty texture and the export encodes black.
-    // The preview is capped well below any real limit, but export decodes the
-    // full sensor resolution — and a software fallback (blocklisted GPU) caps
-    // at 8192, under a 61 MP frame's long edge. Fail loudly instead.
+    // Preview and export both decode the full sensor resolution, so both can
+    // reach this — a software fallback (blocklisted GPU) caps at 8192, under a
+    // 61 MP frame's long edge. Fail loudly instead.
     const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
     if (width > maxTex || height > maxTex) {
       throw new Error(
         `Image is ${width}×${height}px, but this device's graphics limit is ${maxTex}px per side. `
-        + "Export at a smaller size, or enable hardware acceleration.");
+        + "Enable hardware acceleration to raise it.");
     }
     this.texWidth = width; this.texHeight = height;
     if (this.sourceTex) gl.deleteTexture(this.sourceTex);

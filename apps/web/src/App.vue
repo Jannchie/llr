@@ -572,7 +572,13 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     // look is sent only when it overrides the shot's own settings; without it
     // the worker renders what the body recorded, which is what a fresh import
     // wants and what the panel is then populated from.
-    const lin = await fetchLinear({ sourceId: id, halfSize: false, maxSize: 2560, profileId: profileId.value, dcpCode: dcpCode.value, denoise: denoisePayload(), cameraMatch: cameraMatch.value, look: look.value ?? undefined });
+    // Full sensor resolution, same as the export path: a capped preview is
+    // visibly soft the moment the view is zoomed past fit. The per-frame cost of
+    // that does not follow the decode — computePreviewScale sizes the drawing
+    // buffer by on-screen device pixels, so a fit view shades the same number of
+    // fragments it always did. What it does cost is transfer and VRAM (~140 MB
+    // for 24 MP, ~360 MB for 61 MP, as float16).
+    const lin = await fetchLinear({ sourceId: id, halfSize: false, maxSize: 0, profileId: profileId.value, dcpCode: dcpCode.value, denoise: denoisePayload(), cameraMatch: cameraMatch.value, look: look.value ?? undefined });
     if (stale()) return false;
     if (!lin) { markInvalid(id); return false; }
     const { meta: linMeta, pixels: linearFloat } = lin;

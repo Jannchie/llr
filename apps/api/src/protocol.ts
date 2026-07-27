@@ -33,12 +33,18 @@ export interface RenderLinearBody {
   cameraMatch?: boolean;
   denoise?: { enabled?: boolean; model?: string; amount?: number };
   look?: LookTweaks;
+  purpose?: string;
 }
 
 export interface RenderParams {
   profile: string;
   halfSize: boolean;
   maxSize: number;
+  // What the decode is for. Both the preview and an export ask for full sensor
+  // resolution, so the request shape alone no longer says which is which — and
+  // the worker needs to know: a preview decode is cached (a DCP or denoise
+  // change must not re-decode the RAW), a one-off export must not be.
+  purpose: "preview" | "export";
   dcpCode: string | undefined;
   cameraMatch: boolean;
   denoise: { enabled: boolean; model: string | undefined; amount: number };
@@ -78,6 +84,10 @@ export function clampRenderParams(body: RenderLinearBody): RenderParams {
       amount: Number.isFinite(denoiseAmount) ? Math.min(1, Math.max(0, denoiseAmount)) : 1,
     },
     look: clampLookTweaks(body.look),
+    // Defaults to the cacheable path: a client that never states its intent is
+    // treated as a preview, so at worst it costs memory rather than making
+    // every subsequent edit re-decode.
+    purpose: body.purpose === "export" ? "export" : "preview",
   };
 }
 

@@ -77,18 +77,25 @@ class PreparedLinear:
     color_profile: dict[str, Any]
 
 
+# The pixel caches below are bounded by bytes rather than entry count: the
+# preview decodes at full sensor resolution, so one entry is ~290 MB for a 24 MP
+# frame and ~730 MB for a 61 MP one. A fixed entry count would swing between
+# holding almost nothing and pinning several GB depending on the body in use.
+_MIB = 1 << 20
+
 # Cache raw-decoded camera RGB data keyed by (sourcePath, halfSize, maxSize,
 # denoiseModel). DCP code changes re-apply DCP on cached data instead of
 # re-decoding the RAW file. Noisy and denoised variants of a source are cached
 # under separate keys (denoiseModel = "" vs the model id).
 RAW_CAMERA_CACHE: OrderedDict[tuple[Any, ...], tuple[np.ndarray, RawMetadata]] = OrderedDict()
-RAW_CAMERA_CACHE_MAX = 6
+RAW_CAMERA_CACHE_BYTES_MAX = 1536 * _MIB
 
 # No-DCP fallback decode cache, keyed like RAW_CAMERA_CACHE. There is no DCP step
 # to re-apply, so this stores the final ProPhoto linear — important once denoise
 # makes a re-decode cost seconds (so amount tweaks must not re-run inference).
+# Smaller budget than the two above: it only fills for a body with no profile.
 _FALLBACK_CACHE: OrderedDict[tuple[Any, ...], tuple[np.ndarray, RawMetadata, dict[str, Any]]] = OrderedDict()
-_FALLBACK_CACHE_MAX = 6
+_FALLBACK_CACHE_BYTES_MAX = 768 * _MIB
 
 
 # The worker only decodes; the browser owns every pixel operation, so a profile
@@ -213,6 +220,22 @@ def _remember(cache: OrderedDict[Any, Any], key: Any, value: Any, cap: int) -> N
         cache[key] = value
         while len(cache) > cap:
             cache.popitem(last=False)
+
+
+def _remember_pixels(cache: OrderedDict[Any, Any], key: Any, value: Any, cap_bytes: int) -> None:
+    """LRU-insert a tuple whose first element is the pixel array, bounded by bytes.
+
+    The newest entry is always retained, even when it alone exceeds `cap_bytes`:
+    a single 61 MP frame is ~730 MB, and evicting it on arrival would mean
+    re-decoding the RAW on every DCP, denoise or profile change.
+    """
+    with _CACHE_LOCK:
+        cache[key] = value
+        cache.move_to_end(key)  # plain assignment keeps an existing key's position
+        total = sum(v[0].nbytes for v in cache.values())
+        while len(cache) > 1 and total > cap_bytes:
+            _, evicted = cache.popitem(last=False)
+            total -= evicted[0].nbytes
 _SOURCE_LOCKS: dict[str, threading.Lock] = {}
 _SOURCE_LOCKS_GUARD = threading.Lock()
 
@@ -299,7 +322,7 @@ def _linear_cache_key(
 
 
 _LINEAR_CACHE: OrderedDict[tuple[Any, ...], tuple[np.ndarray, dict[str, Any]]] = OrderedDict()
-_LINEAR_CACHE_MAX = 8
+_LINEAR_CACHE_BYTES_MAX = 1536 * _MIB
 
 
 def _write_linear_f16(linear_arr: np.ndarray, output_path: Path) -> int:
@@ -387,10 +410,12 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
             shared_raw = rawpy.imread(str(input_path))
         return shared_raw
 
-    # Same reasoning as the _LINEAR_CACHE gate below: a full-resolution export
-    # decode must not be pinned in any cache, so the intent is passed down to
-    # the decode caches rather than re-derived there.
-    store_cache = half_size or bool(max_size)
+    # Same reasoning as the _LINEAR_CACHE gate below: a one-off export decode
+    # must not be pinned in any cache, so the intent is passed down to the decode
+    # caches rather than re-derived there. It has to be stated by the caller —
+    # the preview decodes at full resolution too, so the request shape no longer
+    # tells the two apart.
+    store_cache = request.get("purpose") != "export"
 
     try:
         if dn_model is not None and dn_amount >= 1.0:
@@ -449,11 +474,12 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     # decode/DCP/downsample paths already yield C-contiguous float32, so this is a
     # no-op there (avoids a full ~tens-of-MB copy) and only copies when it must.
     linear_arr = np.ascontiguousarray(prepared.linear, dtype=np.float32)
-    # Skip caching full-resolution exports (half_size off and no max_size cap): a
-    # single entry can be hundreds of MB and exports are one-off, so caching them
-    # would pin gigabytes with no reuse. Previews (half/max-size capped) still cache.
+    # Skip caching exports: they are one-off, so an entry that can run to
+    # hundreds of MB would pin memory with no reuse and evict live preview
+    # entries. Previews still cache — that is what keeps a DCP or denoise change
+    # off the RAW decode path.
     if store_cache:
-        _remember(_LINEAR_CACHE, cache_key, (linear_arr, prepared.color_profile), _LINEAR_CACHE_MAX)
+        _remember_pixels(_LINEAR_CACHE, cache_key, (linear_arr, prepared.color_profile), _LINEAR_CACHE_BYTES_MAX)
 
     bytes_written = _write_linear_f16(linear_arr, output_path)
 
@@ -1007,9 +1033,9 @@ def prepare_linear(
     it is only invoked on a cache miss. A denoise variant mutates the shared
     handle's Bayer data in place, so decode the noisy variant first.
 
-    `store_cache=False` decodes without populating the decode caches: a
-    full-resolution export is hundreds of MB and one-off, so caching it would
-    pin gigabytes with no reuse and evict the cheap preview entries.
+    `store_cache=False` decodes without populating the decode caches: an export
+    is one-off, so caching it would pin hundreds of MB with no reuse and evict
+    the preview entries that a DCP or denoise change is about to want.
     """
     if not is_raw(input_path):
         return prepare_rendered_image(input_path, half_size=half_size, max_size=max_size)
@@ -1078,7 +1104,7 @@ def prepare_linear(
                 linear = downsample_linear(linear, max_size)
             color_profile = libraw_color_profile_info()
             if store_cache:
-                _remember(_FALLBACK_CACHE, cache_key, (linear, metadata, color_profile), _FALLBACK_CACHE_MAX)
+                _remember_pixels(_FALLBACK_CACHE, cache_key, (linear, metadata, color_profile), _FALLBACK_CACHE_BYTES_MAX)
         else:
             camera_rgb = postprocess_camera_native(raw, half_size=half_size)
             camera_rgb = apply_camera_crop(camera_rgb, metadata.camera_crop)
@@ -1088,7 +1114,7 @@ def prepare_linear(
                 camera_rgb = downsample_linear(camera_rgb, max_size)
             # Cache camera RGB so colour-pipeline changes skip RAW re-decode
             if store_cache:
-                _remember(RAW_CAMERA_CACHE, cache_key, (camera_rgb, metadata), RAW_CAMERA_CACHE_MAX)
+                _remember_pixels(RAW_CAMERA_CACHE, cache_key, (camera_rgb, metadata), RAW_CAMERA_CACHE_BYTES_MAX)
             linear, color_profile = render_color(renderer, camera_rgb, metadata, root, recipe)
 
     return PreparedLinear(linear=linear, metadata=metadata, color_profile=color_profile)

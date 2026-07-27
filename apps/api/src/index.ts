@@ -245,6 +245,7 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
       cameraMatch: params.cameraMatch,
       denoise: params.denoise,
       look: params.look,
+      purpose: params.purpose,
     });
   } catch (error) {
     await rm(outputPath, { force: true });

@@ -54,9 +54,11 @@ export function useExport(opts: {
     opts.status.value = "rendering";
     let renderer: PipelineRenderer | null = null;
     try {
-      // 1. Decode full-resolution linear data (no half-size / no max-size cap)
+      // 1. Decode full-resolution linear data (no half-size / no max-size cap).
+      // Same dimensions the preview asks for; purpose is what keeps this one-off
+      // decode out of the worker's caches.
       const lin = await fetchLinear({
-        sourceId: plan.sourceId, halfSize: false, maxSize: 0,
+        sourceId: plan.sourceId, halfSize: false, maxSize: 0, purpose: "export",
         profileId: plan.profileId, dcpCode: plan.dcpCode, cameraMatch: plan.cameraMatch, denoise: plan.denoise,
         look: plan.look,
       });

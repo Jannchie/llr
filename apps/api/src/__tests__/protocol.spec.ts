@@ -33,7 +33,15 @@ describe("clampRenderParams", () => {
       cameraMatch: true,
       denoise: { enabled: false, model: undefined, amount: 1 },
       look: {},
+      purpose: "preview",
     });
+  });
+
+  it("treats anything but an explicit export as a cacheable preview decode", () => {
+    expect(clampRenderParams({ purpose: "export" }).purpose).toBe("export");
+    expect(clampRenderParams({ purpose: "preview" }).purpose).toBe("preview");
+    expect(clampRenderParams({ purpose: "Export" }).purpose).toBe("preview");
+    expect(clampRenderParams({ purpose: 1 as unknown as string }).purpose).toBe("preview");
   });
 
   it("keeps only the Creative Look keys, as whole numbers", () => {
