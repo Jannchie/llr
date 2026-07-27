@@ -242,7 +242,6 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
       maxSize: params.maxSize,
       recipe: { autoTone: false },
       dcpCode: params.dcpCode,
-      cameraMatch: params.cameraMatch,
       denoise: params.denoise,
       look: params.look,
       purpose: params.purpose,

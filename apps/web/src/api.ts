@@ -45,8 +45,15 @@ export type ColorProfileMeta = {
   // is also what a double-click resets a slider to.
   lookTweaks?: LookTweaks | null;
   lookAsShot?: LookTweaks | null;
-  // A fitted camera-match table layered on the DCP (present only when applied);
-  // cameraMatchAvailable reports whether one exists regardless of the toggle.
+  // The DCP's HueSatMaps, each with its samples inline (worker dcp.py
+  // table_payload). The worker no longer applies them — they are 3D LUTs, which
+  // is one GPU fetch and thirty-odd whole-array numpy passes — so these are what
+  // the shader runs. See pipeline-renderer parseDcpTables for the shape.
+  profileHueSatMap?: unknown;
+  profileLookTable?: unknown;
+  // The table fitted against this body's own JPEG rendering. Always sent when
+  // one exists, since the toggle that governs it is a shader uniform now;
+  // cameraMatchAvailable says whether the control is worth offering at all.
   cameraMatch?: unknown;
   cameraMatchAvailable?: boolean;
   // Per-shot lens correction splines from the RAW's maker notes (vendor-neutral

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import struct
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -201,6 +202,7 @@ def apply_dcp_profile(
     camera_rgb: np.ndarray,
     profile: DcpProfile,
     correction: tuple[DcpHueSatMap, int] | None = None,
+    defer_tables: bool = False,
 ) -> tuple[np.ndarray, DcpRenderInfo]:
     """Render camera RGB to scene-linear ProPhoto through a DCP.
 
@@ -208,6 +210,14 @@ def apply_dcp_profile(
     JPEG rendering (see fit_profile.py). It rides on top of Adobe's chain rather
     than replacing any of it, so the calibration underneath stays intact and the
     match can be turned off for comparison.
+
+    `defer_tables` returns after the matrix and ships each HueSatMap in the
+    render info instead of applying it, for the shader to run as a 3D LUT. That
+    is where these belong: the tables *are* trilinear lookups, which is one GPU
+    instruction and thirty-odd whole-array numpy passes — 25 s per table at 33 MP
+    here. It also takes the tables off the decode path entirely, so switching DCP
+    style or camera match stops re-decoding. The numpy path stays for the offline
+    camera-match fit (fit_profile.py), which has no GPU to hand.
     """
     matrix_name, camera_to_xyz = camera_to_xyz_matrix(profile)
     xyz_d50 = camera_rgb @ camera_to_xyz.T
@@ -218,21 +228,27 @@ def apply_dcp_profile(
     look_table_info: dict[str, Any] | None = None
     limitations: list[str] = []
 
+    def describe(table: DcpHueSatMap, encoding: int) -> dict[str, Any]:
+        return table_payload(table, encoding) if defer_tables else table_info(table, encoding)
+
     if hue_sat_map is not None:
-        linear_prophoto = apply_hsv_table(linear_prophoto, hue_sat_map, profile.hue_sat_map_encoding)
-        hue_sat_map_info = table_info(hue_sat_map, profile.hue_sat_map_encoding)
+        if not defer_tables:
+            linear_prophoto = apply_hsv_table(linear_prophoto, hue_sat_map, profile.hue_sat_map_encoding)
+        hue_sat_map_info = describe(hue_sat_map, profile.hue_sat_map_encoding)
         if profile.hue_sat_map_2 is not None or profile.hue_sat_map_3 is not None:
             limitations.append("Only ProfileHueSatMapData1 is applied; white-balance interpolation is not implemented yet.")
 
     if profile.look_table is not None:
-        linear_prophoto = apply_hsv_table(linear_prophoto, profile.look_table, profile.look_table_encoding)
-        look_table_info = table_info(profile.look_table, profile.look_table_encoding)
+        if not defer_tables:
+            linear_prophoto = apply_hsv_table(linear_prophoto, profile.look_table, profile.look_table_encoding)
+        look_table_info = describe(profile.look_table, profile.look_table_encoding)
 
     camera_match_info: dict[str, Any] | None = None
     if correction is not None:
         match_table, match_encoding = correction
-        linear_prophoto = apply_hsv_table(linear_prophoto, match_table, match_encoding)
-        camera_match_info = table_info(match_table, match_encoding)
+        if not defer_tables:
+            linear_prophoto = apply_hsv_table(linear_prophoto, match_table, match_encoding)
+        camera_match_info = describe(match_table, match_encoding)
 
     # Scene-referred pipeline: do NOT bake the profile tone curve here and do NOT
     # convert to display sRGB. Deliver linear ProPhoto (D50) so the browser edits
@@ -437,6 +453,23 @@ def srgb_decode_float(encoded: np.ndarray) -> np.ndarray:
 
 def table_info(table: DcpHueSatMap, encoding: int) -> dict[str, Any]:
     return {"dimensions": list(table.dimensions), "encoding": encoding_name(encoding)}
+
+
+def table_payload(table: DcpHueSatMap, encoding: int) -> dict[str, Any]:
+    """table_info plus the samples themselves, for the shader to upload as a 3D LUT.
+
+    `data` is base64 float16 in the array's own (val, hue, sat, 3) order, which is
+    already what texImage3D wants for a sat-by-hue-by-val texture — no transpose either
+    side. The hue shift is carried as turns rather than the table's own degrees:
+    float16 resolves ~0.125° near the ±180 end but ~0.01° once divided by 360,
+    and the shader wants turns anyway.
+    """
+    samples = np.asarray(table.data, dtype=np.float32).copy()
+    samples[..., 0] /= 360.0
+    return {
+        **table_info(table, encoding),
+        "data": base64.b64encode(samples.astype(np.float16).tobytes()).decode("ascii"),
+    }
 
 
 def encoding_name(encoding: int) -> str:

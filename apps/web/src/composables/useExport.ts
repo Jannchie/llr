@@ -1,5 +1,5 @@
 import { ref, type Ref } from "vue";
-import { PipelineRenderer, type EditParams, type ProfileCurve } from "../rendering/pipeline-renderer";
+import { PipelineRenderer, parseDcpTables, type EditParams, type ProfileCurve } from "../rendering/pipeline-renderer";
 import { API, fetchLinear, type LinearMeta, type LookTweaks } from "../api";
 import { t } from "../i18n";
 
@@ -19,7 +19,6 @@ export interface ExportPlan {
   dcpCode: string | undefined;
   /** Which colour engine renders camera RGB — must match the preview's. */
   profileId: string;
-  cameraMatch: boolean;
   denoise: { enabled: boolean; model: string; amount: number };
   /** Creative Look tweaks; undefined renders the shot's own (Sony path only). */
   look: LookTweaks | undefined;
@@ -59,7 +58,7 @@ export function useExport(opts: {
       // decode out of the worker's caches.
       const lin = await fetchLinear({
         sourceId: plan.sourceId, halfSize: false, maxSize: 0, purpose: "export",
-        profileId: plan.profileId, dcpCode: plan.dcpCode, cameraMatch: plan.cameraMatch, denoise: plan.denoise,
+        profileId: plan.profileId, dcpCode: plan.dcpCode, denoise: plan.denoise,
         look: plan.look,
       });
       if (!lin) throw new Error(t("error.exportSourceGone"));
@@ -70,6 +69,10 @@ export function useExport(opts: {
       renderer.uploadImage(pixels, meta.width, meta.height);
       renderer.uploadCurveLUT(plan.curveLUT);
       renderer.uploadProfileCurveLUT(plan.profileLUT(meta));
+      // The DCP HueSatMaps are the shader's job now, so this off-screen renderer
+      // needs them as much as the preview does — without them the export would
+      // come out unprofiled while the preview looked right.
+      renderer.uploadDcpTables(parseDcpTables(meta.colorProfile));
       const out = plan.output(meta);
       renderer.setOutput(out.width, out.height, out.texXform, plan.background);
       renderer.draw(plan.params);

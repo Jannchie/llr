@@ -48,6 +48,9 @@ void main() {
 
 export const PROCESS_SHADER = `#version 300 es
 precision highp float;
+// sampler3D has no default precision in GLSL ES 3.0 (unlike sampler2D), so
+// omitting this is a compile error, not a silent downgrade.
+precision highp sampler3D;
 in vec2 v_texCoord;
 out vec4 outColor;
 uniform sampler2D u_input;
@@ -106,6 +109,22 @@ uniform float u_sonySat;
 uniform int u_sepiaActive;
 uniform vec3 u_sepiaWeights;
 uniform sampler2D u_sepia_lut;
+// --- DCP HueSatMaps (Adobe's ProfileHueSatMap / ProfileLookTable, plus the
+// fitted camera match) --- Each is a 3D LUT of (hue shift in turns, saturation
+// scale, value scale), laid out sat × hue × val, so the hardware's trilinear
+// fetch *is* the interpolation dcp.py's sample_hsv_table did by hand. They ran
+// in the worker until it became clear what that costs: thirty-odd whole-array
+// numpy passes each, 25 s per table at 33 MP, versus one texture fetch here.
+// Dims carry (hueCount, satCount, valCount, 1 if the table is sRGB-encoded);
+// hueCount 0 means "no such table", and the sampler still has an identity LUT
+// bound so the fetch is always legal.
+uniform sampler3D u_dcp_hsm;
+uniform sampler3D u_dcp_look;
+uniform sampler3D u_dcp_match;
+uniform vec4 u_dcpHsmDims;
+uniform vec4 u_dcpLookDims;
+uniform vec4 u_dcpMatchDims;
+uniform int u_dcpMatchActive;   // the Camera Match toggle, now a uniform
 uniform int u_displayGamut;     // 0 = sRGB, 1 = Display-P3
 uniform vec3 u_bgColor;         // display-encoded fill for areas outside the image (crop editor)
 // Lens corrections (per-shot radial tables from the RAW's metadata; lens.ts).
@@ -184,6 +203,83 @@ vec3 viewTransform(vec3 c) {
   return c;
 }
 
+// --- DCP HueSatMap application (the GPU half of dcp.py apply_hsv_table_chunk) ---
+//
+// HSV here is Adobe's, not the graphics-standard one: hue in turns, saturation
+// delta/max, value max — and the table's three samples are a hue *shift*, a
+// saturation *scale* and a value *scale*. The tie-breaking order below (red,
+// then green, then blue) mirrors np.argmax, which returns the first maximum.
+
+vec3 dcpRgbToHsv(vec3 c) {
+  float mx = max(max(c.r, c.g), c.b);
+  float mn = min(min(c.r, c.g), c.b);
+  float d = mx - mn;
+  float h = 0.0;
+  if (d > 1e-8) {
+    if (c.r >= c.g && c.r >= c.b) h = mod((c.g - c.b) / d, 6.0);
+    else if (c.g >= c.b)          h = (c.b - c.r) / d + 2.0;
+    else                          h = (c.r - c.g) / d + 4.0;
+  }
+  return vec3(fract(h / 6.0), mx > 1e-8 ? d / mx : 0.0, mx);
+}
+
+vec3 dcpHsvToRgb(vec3 hsv) {
+  float h = fract(hsv.x) * 6.0;
+  float s = clamp(hsv.y, 0.0, 1.0);
+  float v = clamp(hsv.z, 0.0, 1.0);
+  float f = fract(h);
+  float p = v * (1.0 - s);
+  float q = v * (1.0 - s * f);
+  float t = v * (1.0 - s * (1.0 - f));
+  int sector = int(floor(h)) % 6;
+  if (sector == 0) return vec3(v, t, p);
+  if (sector == 1) return vec3(q, v, p);
+  if (sector == 2) return vec3(p, v, t);
+  if (sector == 3) return vec3(p, q, v);
+  if (sector == 4) return vec3(t, p, v);
+  return vec3(v, p, q);
+}
+
+vec3 dcpSrgbEncode(vec3 c) {
+  c = clamp(c, 0.0, 1.0);
+  return mix(1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, c * 12.92, lessThanEqual(c, vec3(0.0031308)));
+}
+
+vec3 dcpSrgbDecode(vec3 c) {
+  c = clamp(c, 0.0, 1.0);
+  return mix(pow((c + 0.055) / 1.055, vec3(2.4)), c / 12.92, lessThanEqual(c, vec3(0.04045)));
+}
+
+// The two axis conventions are the table's own and differ, so they cannot share
+// a mapping: hue is periodic with the grid point at i/hueCount (GL_REPEAT on
+// that axis closes the loop), while saturation and value are endpoint-aligned
+// at i/(count-1) and clamp.
+vec3 applyHsvTable(vec3 c, sampler3D tbl, vec4 dims) {
+  if (dims.x < 0.5) return c;
+  vec3 nonneg = max(c, 0.0);
+  // Scene-linear carries highlight headroom above 1.0, but the table is defined
+  // on [0,1]: look it up clamped, then put the headroom back, so highlights are
+  // not crushed to white. Below 1.0 the scale is exactly 1.
+  float valueIn = max(max(nonneg.r, nonneg.g), nonneg.b);
+  vec3 working = clamp(nonneg, 0.0, 1.0);
+  if (dims.w > 0.5) working = dcpSrgbEncode(working);
+
+  vec3 hsv = dcpRgbToHsv(working);
+  vec3 uvw = vec3(
+    (clamp(hsv.y, 0.0, 1.0) * (dims.y - 1.0) + 0.5) / dims.y,
+    (fract(hsv.x) * dims.x + 0.5) / dims.x,
+    dims.z > 1.5 ? (clamp(hsv.z, 0.0, 1.0) * (dims.z - 1.0) + 0.5) / dims.z : 0.5);
+  vec3 d = texture(tbl, uvw).rgb;
+
+  hsv.x = fract(hsv.x + d.r);            // already turns, scaled worker-side
+  hsv.y = clamp(hsv.y * d.g, 0.0, 1.0);
+  hsv.z = clamp(hsv.z * d.b, 0.0, 1.0);
+
+  vec3 mapped = dcpHsvToRgb(hsv);
+  if (dims.w > 0.5) mapped = dcpSrgbDecode(mapped);
+  return mapped * max(valueIn, 1.0);
+}
+
 // Exposure shoulder / tonal-region constants + expoShoulder come from
 // TONAL_GLSL above — generated from tonal-model.ts, the tested TS mirror.
 
@@ -245,6 +341,13 @@ void main() {
 
   // Input is scene-linear ProPhoto (D50). Edit here in wide-gamut scene-linear.
   vec3 c = max(texture(u_input, lensUV).rgb, 0.0) * lensGain;
+
+  // --- DCP HueSatMaps --- Adobe's order, and the position the worker applied
+  // them in: straight after the colour matrix, before anything tonal. Each is
+  // skipped by its own dims when the profile carries no such table.
+  c = applyHsvTable(c, u_dcp_hsm, u_dcpHsmDims);
+  c = applyHsvTable(c, u_dcp_look, u_dcpLookDims);
+  if (u_dcpMatchActive == 1) c = applyHsvTable(c, u_dcp_match, u_dcpMatchDims);
 
   // --- White Balance (Bradford adaptation, identity at temp=6500 / tint=0) ---
   c = max(u_wbMatrix * c, 0.0);
@@ -536,6 +639,8 @@ export const PASSES: PassDef[] = [
     "u_curve_lut", "u_curveActive", "u_hasProfileCurve", "u_profileCurveSrgb",
     "u_sonyChromaActive", "u_sonyCross", "u_sonyGain", "u_sonyLuma", "u_sonySat",
     "u_sepiaActive", "u_sepiaWeights", "u_sepia_lut",
+    "u_dcp_hsm", "u_dcp_look", "u_dcp_match",
+    "u_dcpHsmDims", "u_dcpLookDims", "u_dcpMatchDims", "u_dcpMatchActive",
     "u_lensActive", "u_lensScale", "u_lensNorm",
     ...Array.from({ length: LENS_KNOTS }, (_, k) => `u_lensDist[${k}]`),
     ...Array.from({ length: LENS_KNOTS }, (_, k) => `u_lensVig[${k}]`),

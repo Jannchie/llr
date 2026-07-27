@@ -30,7 +30,6 @@ describe("clampRenderParams", () => {
       halfSize: true,
       maxSize: 1600,
       dcpCode: undefined,
-      cameraMatch: true,
       denoise: { enabled: false, model: undefined, amount: 1 },
       look: {},
       purpose: "preview",
@@ -55,10 +54,8 @@ describe("clampRenderParams", () => {
     expect(clampRenderParams({ look: "all of them" as never }).look).toEqual({});
   });
 
-  it("defaults cameraMatch on, off only when explicitly false", () => {
-    expect(clampRenderParams({}).cameraMatch).toBe(true);
-    expect(clampRenderParams({ cameraMatch: false }).cameraMatch).toBe(false);
-    expect(clampRenderParams({ cameraMatch: true }).cameraMatch).toBe(true);
+  it("does not forward cameraMatch — the shader owns that table now", () => {
+    expect(clampRenderParams({ cameraMatch: false } as never)).not.toHaveProperty("cameraMatch");
   });
 
   it("clamps out-of-range and malformed numbers instead of forwarding them", () => {

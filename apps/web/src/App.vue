@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
-import { PipelineRenderer, type EditParams, type ProfileCurve } from "./rendering/pipeline-renderer";
+import { PipelineRenderer, parseDcpTables, type EditParams, type ProfileCurve } from "./rendering/pipeline-renderer";
 import {
   curveToLUT, buildToneCurveLUT, defaultToneCurve, normalizeToneCurve,
   DEFAULT_BASIC, sameBasic,
@@ -578,7 +578,7 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     // buffer by on-screen device pixels, so a fit view shades the same number of
     // fragments it always did. What it does cost is transfer and VRAM (~140 MB
     // for 24 MP, ~360 MB for 61 MP, as float16).
-    const lin = await fetchLinear({ sourceId: id, halfSize: false, maxSize: 0, profileId: profileId.value, dcpCode: dcpCode.value, denoise: denoisePayload(), cameraMatch: cameraMatch.value, look: look.value ?? undefined });
+    const lin = await fetchLinear({ sourceId: id, halfSize: false, maxSize: 0, profileId: profileId.value, dcpCode: dcpCode.value, denoise: denoisePayload(), look: look.value ?? undefined });
     if (stale()) return false;
     if (!lin) { markInvalid(id); return false; }
     const { meta: linMeta, pixels: linearFloat } = lin;
@@ -623,6 +623,7 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     webglRenderer.uploadImage(linearFloat, linMeta.width, linMeta.height);
     bakeCurveLUT();
     webglRenderer.uploadProfileCurveLUT(profileCurveLUT);
+    webglRenderer.uploadDcpTables(parseDcpTables(linMeta.colorProfile));
     // Apply the current crop/straighten (sets output dims, fit, draws, histogram).
     applyCropRender();
     src.invalid = false;
@@ -696,6 +697,9 @@ function buildPipelineParams(s?: Snapshot): Partial<EditParams> {
     gradBlend: g.blend / 100,
     gradBalance: g.balance / 100,
     displayGamut: viewSettings.displayGamut,
+    // Not read off the snapshot: the match is a global profile setting, like the
+    // display gamut, not a per-image edit that undo should travel with.
+    cameraMatch: cameraMatch.value ? 1 : 0,
   };
 }
 
@@ -773,7 +777,9 @@ function scheduleWebGLDraw(): void {
 // swapped in by the showOriginal watcher (the curve lives in a GPU LUT, not params).
 const IDENTITY_CURVE_LUT = buildToneCurveLUT(defaultToneCurve());
 function baselineParams(): Partial<EditParams> {
-  return { displayGamut: viewSettings.displayGamut };
+  // Camera match survives the hold for the same reason the gamut does: it is
+  // part of how this camera is rendered, not an edit being compared against.
+  return { displayGamut: viewSettings.displayGamut, cameraMatch: cameraMatch.value ? 1 : 0 };
 }
 
 // On-screen device-pixel footprint of the preview, as a fraction of the image's
@@ -1041,10 +1047,12 @@ watch([dcpCode, profileId], async () => {
   await loadSource(currentSourceId, { resetView: false });
 });
 
-// Camera-match rides the DCP into linear.bin, so toggling it re-decodes too.
-watch(cameraMatch, async () => {
-  if (suppressDcpReload || !currentSourceId) return;
-  await loadSource(currentSourceId, { resetView: false });
+// The camera-match table is a HueSatMap, and every HueSatMap now travels to the
+// shader rather than being baked into linear.bin — so this is a redraw, not a
+// re-decode. It used to cost a full RAW round-trip.
+watch(cameraMatch, () => {
+  if (!currentSourceId) return;
+  scheduleWebGLDraw();
 });
 
 // Denoise is baked into linear.bin, so changes re-decode like dcpCode. Debounced
@@ -1164,7 +1172,6 @@ function buildExportPlan(): ExportPlan | null {
     stripPrivate: viewSettings.exportStripPrivate === 1,
     dcpCode: settings.dcp,
     profileId: settings.profile ?? "standard",
-    cameraMatch: cameraMatch.value,
     denoise: denoisePayload(settings.denoise),
     // Absent means as shot, same as everywhere else — the full-res decode then
     // rebuilds the profile the preview was showing (plan.profileLUT).

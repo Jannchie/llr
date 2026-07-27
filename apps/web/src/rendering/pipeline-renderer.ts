@@ -35,6 +35,10 @@ export interface EditParams {
   // on the frame's aspect ratio (lens.ts lensFillScale), which only the
   // renderer knows, so it is derived here from lensDist and the texture dims.
   lensDist: number[]; lensVig: number[];
+  // Whether to apply the fitted camera-match HueSatMap (1) or show Adobe's
+  // uncorrected rendering (0). A parameter rather than a per-image upload
+  // because it is a user toggle, and it no longer costs a decode to flip.
+  cameraMatch: number;
 }
 
 const HSL_ZERO = [0, 0, 0, 0, 0, 0, 0, 0];
@@ -70,6 +74,87 @@ export type ProfileChroma = {
 };
 /** Weighted sum of the encoded RGB, then one curve per channel. */
 export type SepiaToning = { weights: number[]; lut: number[][] };
+/**
+ * One of a DCP's HueSatMaps, as the worker ships it (dcp.py table_payload):
+ * `data` is base64 float16 in the table's own (val, hue, sat, 3) order — which
+ * is already the row-major order texImage3D wants for a sat×hue×val texture —
+ * holding (hue shift in turns, saturation scale, value scale) per grid point.
+ */
+export type DcpHueSatTable = {
+  dimensions: [number, number, number];   // hue, sat, val counts
+  encoding: string;                       // "sRGB" | "Linear"
+  data: string;
+};
+
+/**
+ * The three tables a DCP render can carry, in the order they apply. Adobe's own
+ * two come off the profile; `cameraMatch` is the table fitted against the body's
+ * JPEG rendering and is the one the Camera Match toggle governs — the toggle is
+ * a shader uniform now, so switching it costs a redraw rather than a decode.
+ */
+export type DcpTables = {
+  hueSatMap: DcpHueSatTable | null;
+  lookTable: DcpHueSatTable | null;
+  cameraMatch: DcpHueSatTable | null;
+};
+
+/**
+ * Pull the three HueSatMaps out of a decode's colour profile. Returns null when
+ * the render carries none — Sony's engine, or an already-rendered JPEG — which
+ * is what switches all three off in the shader.
+ *
+ * Tolerant by design: a table missing its samples (an older worker, which sent
+ * only the dimensions) is dropped rather than thrown on, so the image still
+ * renders, just without that stage.
+ */
+export function parseDcpTables(meta: {
+  profileHueSatMap?: unknown; profileLookTable?: unknown; cameraMatch?: unknown;
+} | null | undefined): DcpTables | null {
+  const one = (raw: unknown): DcpHueSatTable | null => {
+    if (!raw || typeof raw !== "object") return null;
+    const t = raw as Record<string, unknown>;
+    const dims = t["dimensions"];
+    if (typeof t["data"] !== "string" || !Array.isArray(dims) || dims.length !== 3) return null;
+    if (!dims.every(n => typeof n === "number" && n >= 1)) return null;
+    return {
+      dimensions: dims as [number, number, number],
+      encoding: typeof t["encoding"] === "string" ? t["encoding"] : "Linear",
+      data: t["data"],
+    };
+  };
+  const tables: DcpTables = {
+    hueSatMap: one(meta?.profileHueSatMap),
+    lookTable: one(meta?.profileLookTable),
+    cameraMatch: one(meta?.cameraMatch),
+  };
+  return tables.hueSatMap || tables.lookTable || tables.cameraMatch ? tables : null;
+}
+
+/** Shader slot each table binds to, in application order. */
+type DcpSlot = "hsm" | "look" | "match";
+const DCP_SLOTS: readonly DcpSlot[] = ["hsm", "look", "match"];
+const DCP_SAMPLER: Record<DcpSlot, string> = {
+  hsm: "u_dcp_hsm", look: "u_dcp_look", match: "u_dcp_match",
+};
+const DCP_DIMS_UNIFORM: Record<DcpSlot, string> = {
+  hsm: "u_dcpHsmDims", look: "u_dcpLookDims", match: "u_dcpMatchDims",
+};
+// Texture units 0–4 are taken (source, curve, profile curve, mask, sepia);
+// these follow on.
+const DCP_TEX_UNIT: Record<DcpSlot, number> = { hsm: 5, look: 6, match: 7 };
+
+/**
+ * base64 IEEE half floats -> the Uint16Array texImage3D takes for HALF_FLOAT.
+ * The bytes stay untouched: numpy wrote them little-endian and every platform
+ * that runs a browser reads them back the same way.
+ */
+function decodeHalfFloats(b64: string): Uint16Array {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Uint16Array(bytes.buffer);
+}
+
 export type ProfileCurve =
   | { lut: Float32Array; srgbBasis: boolean; chroma?: ProfileChroma | null }
   | null;
@@ -108,6 +193,7 @@ export const DEFAULT_PARAMS: EditParams = {
   gradBlend: 0, gradBalance: 0,
   displayGamut: 0,
   lensDist: [...LENS_IDENTITY], lensVig: [...LENS_IDENTITY],
+  cameraMatch: 1,
 };
 
 export class PipelineRenderer {
@@ -140,6 +226,14 @@ export class PipelineRenderer {
   // fraction of the logical output size and CSS-upscaled to fit. 1 = full res;
   // off-screen / export renderers never shrink it.
   private previewScale = 1;
+  // The DCP HueSatMaps, as 3D LUTs. Each sampler always has a texture bound —
+  // an unbound sampler3D is undefined behaviour on some drivers even when the
+  // fetch is branched around — so a missing table gets the 1×1×1 identity and
+  // is skipped by its dims (hueCount 0) instead.
+  private dcpTableTex: Record<DcpSlot, WebGLTexture | null> = { hsm: null, look: null, match: null };
+  private dcpTableDims: Record<DcpSlot, [number, number, number, number]> = {
+    hsm: [0, 0, 0, 0], look: [0, 0, 0, 0], match: [0, 0, 0, 0],
+  };
   // Affine output→source-texcoord map (crop / straighten / flip / rotate) and
   // the workspace fill used for out-of-image areas in the crop editor.
   private texXform: Float32Array = new Float32Array([1, 0, 0, 0, -1, 0, 0, 1, 1]); // identity (full frame)
@@ -373,6 +467,57 @@ export class PipelineRenderer {
   }
 
   /**
+   * Upload a DCP's HueSatMaps as 3D LUTs. Pass null for a render that has none
+   * (Sony's engine, a plain JPEG), which binds identities and switches all three
+   * off. Costs one small upload per decoded image and nothing per frame — which
+   * is the point: these used to be baked into the decode, so changing the DCP
+   * style or the camera match meant re-reading the RAW.
+   */
+  uploadDcpTables(tables: DcpTables | null): void {
+    const bySlot: Record<DcpSlot, DcpHueSatTable | null> = {
+      hsm: tables?.hueSatMap ?? null,
+      look: tables?.lookTable ?? null,
+      match: tables?.cameraMatch ?? null,
+    };
+    for (const slot of DCP_SLOTS) {
+      const table = bySlot[slot];
+      this.dcpTableTex[slot] = this.writeHsvTable(this.dcpTableTex[slot], table);
+      this.dcpTableDims[slot] = table
+        ? [table.dimensions[0], table.dimensions[1], table.dimensions[2],
+           table.encoding === "sRGB" ? 1 : 0]
+        : [0, 0, 0, 0];
+    }
+  }
+
+  /**
+   * (Re)create one HueSatMap texture. sat × hue × val, matching the payload's
+   * (val, hue, sat, 3) row-major order with no transpose. Hue wraps because the
+   * table's hue axis is periodic — grid point i sits at i/hueCount, and REPEAT
+   * is what closes the seam between the last point and the first. Saturation and
+   * value are endpoint-aligned instead, so they clamp.
+   */
+  private writeHsvTable(prev: WebGLTexture | null, table: DcpHueSatTable | null): WebGLTexture {
+    const gl = this.gl;
+    if (prev) gl.deleteTexture(prev);
+    const [hue, sat, val] = table?.dimensions ?? [1, 1, 1];
+    // Identity delta: no hue shift, unit saturation and value scales.
+    const data = table ? decodeHalfFloats(table.data) : new Uint16Array([0x0000, 0x3c00, 0x3c00]);
+    const tex = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_3D, tex);
+    // f16 rows are 2-byte aligned; an odd saturation count would tear otherwise.
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 2);
+    gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGB16F, sat, hue, val, 0, gl.RGB, gl.HALF_FLOAT, data);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);  // saturation
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.REPEAT);         // hue
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);  // value
+    gl.bindTexture(gl.TEXTURE_3D, null);
+    return tex;
+  }
+
+  /**
    * Set the preview render scale (0–1): the fraction of the logical output
    * resolution the canvas drawing buffer is rendered at. The caller sizes this to
    * the preview's on-screen device-pixel footprint so the GPU never shades more
@@ -533,6 +678,16 @@ export class PipelineRenderer {
       gl.activeTexture(gl.TEXTURE4);
       gl.bindTexture(gl.TEXTURE_2D, this.sepiaLutTex);
       gl.uniform1i(this.uniforms["u_sepia_lut"], 4);
+    }
+    // Bound unconditionally, unlike the 2D LUTs above: a sampler3D left pointing
+    // at unit 0 would read the (2D) source texture, which is an incomplete-
+    // texture error on some drivers even though the fetch is branched around.
+    for (const slot of DCP_SLOTS) {
+      const unit = DCP_TEX_UNIT[slot];
+      gl.activeTexture(gl.TEXTURE0 + unit);
+      gl.bindTexture(gl.TEXTURE_3D, this.dcpTableTex[slot]);
+      gl.uniform1i(this.uniforms[DCP_SAMPLER[slot]], unit);
+      gl.uniform4fv(this.uniforms[DCP_DIMS_UNIFORM[slot]], this.dcpTableDims[slot]);
     }
     gl.activeTexture(gl.TEXTURE0);
     this.setUniforms(p);
@@ -833,6 +988,10 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     if (this.curveLutTex) gl.deleteTexture(this.curveLutTex);
     if (this.profileLutTex) gl.deleteTexture(this.profileLutTex);
     if (this.sepiaLutTex) gl.deleteTexture(this.sepiaLutTex);
+    for (const slot of DCP_SLOTS) {
+      if (this.dcpTableTex[slot]) gl.deleteTexture(this.dcpTableTex[slot]);
+      this.dcpTableTex[slot] = null;
+    }
     if (this.histoTex) gl.deleteTexture(this.histoTex);
     if (this.histoFbo) gl.deleteFramebuffer(this.histoFbo);
     if (this.histoBinTex) gl.deleteTexture(this.histoBinTex);
@@ -869,6 +1028,9 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
       gl.uniformMatrix3fv(wbLoc, true, this.wbMat); // transpose: row-major in
     }
     i("u_displayGamut", p.displayGamut);
+    // Gated on the table existing as well as the toggle, so a body with no
+    // fitted match renders the same either way instead of branching on nothing.
+    i("u_dcpMatchActive", p.cameraMatch !== 0 && this.dcpTableDims.match[0] > 0 ? 1 : 0);
     i("u_hasProfileCurve", this.hasProfileCurve ? 1 : 0);
     i("u_profileCurveSrgb", this.profileCurveSrgb ? 1 : 0);
     const chroma = this.profileChroma;

@@ -311,14 +311,20 @@ def _linear_cache_key(
     dcp_code: str | None,
     denoise_model: str | None,
     denoise_amount: float,
-    camera_match: bool,
 ) -> tuple[Any, ...]:
+    """Everything that changes a decoded pixel, and nothing that does not.
+
+    cameraMatch is deliberately absent: its table is a HueSatMap, and every
+    HueSatMap now travels to the shader instead of being baked in here, so the
+    toggle serves one cached decode. `dcp_code` stays — it still selects the
+    colour matrix, which is baked.
+    """
     try:
         st = input_path.stat()
         base = (str(input_path), st.st_size, int(st.st_mtime_ns))
     except OSError:
         base = (str(input_path),)
-    return (*base, profile_id, bool(half_size), int(max_size or 0), dcp_code or "", denoise_model or "", round(float(denoise_amount), 3), bool(camera_match))
+    return (*base, profile_id, bool(half_size), int(max_size or 0), dcp_code or "", denoise_model or "", round(float(denoise_amount), 3))
 
 
 _LINEAR_CACHE: OrderedDict[tuple[Any, ...], tuple[np.ndarray, dict[str, Any]]] = OrderedDict()
@@ -351,11 +357,10 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     if isinstance(max_size, str):
         max_size = int(max_size) if max_size else None
     dcp_code: str | None = request.get("dcpCode")
-    # Fitted camera-match table is layered on top of the DCP. Defaults on — it is
-    # the whole point of the profile — but the frontend can switch it off to
-    # compare against Adobe's uncorrected rendering. Baked into linear.bin (it
-    # rides the DCP), so toggling it re-decodes, hence it keys the linear cache.
-    camera_match = bool(request.get("cameraMatch", True))
+    # The fitted camera-match table now travels to the shader with the rest of
+    # the HueSatMaps, so the toggle is the frontend's alone: the table always
+    # ships, and whether to apply it is decided there. Nothing here reads it —
+    # it is off both the decode and the cache key.
 
     # RAW-domain denoise request. amount<=0 (or disabled) is treated as off so
     # the heavy inference and the second decode are skipped entirely.
@@ -374,7 +379,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     look_overrides = request.get("look")
 
     # Check processed sRGB cache first
-    cache_key = _linear_cache_key(input_path, profile_id, half_size, max_size, dcp_code, dn_model, dn_amount, camera_match)
+    cache_key = _linear_cache_key(input_path, profile_id, half_size, max_size, dcp_code, dn_model, dn_amount)
     with _CACHE_LOCK:
         cached_linear = _LINEAR_CACHE.get(cache_key)
         if cached_linear is not None:
@@ -395,7 +400,6 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
         }
 
     recipe = merge_recipe(PROFILES[profile_id], {})
-    recipe["cameraMatch"] = camera_match
     if dcp_code:
         recipe["dcpCode"] = dcp_code
 
@@ -1006,8 +1010,12 @@ def render_color(
         )
         return linear, info.to_json()
 
-    correction = find_camera_match(root, renderer.dcp_selection) if recipe.get("cameraMatch", True) else None
-    linear, dcp_info = apply_dcp_profile(camera_rgb, renderer.dcp_profile, correction)
+    # The camera-match table is looked up regardless of the toggle, and every
+    # table is deferred to the shader. Both follow from the same thing: a
+    # HueSatMap no longer touches these pixels, so it cannot key the decode.
+    # Switching the toggle (or the DCP style's tables) is now a uniform change.
+    correction = find_camera_match(root, renderer.dcp_selection)
+    linear, dcp_info = apply_dcp_profile(camera_rgb, renderer.dcp_profile, correction, defer_tables=True)
     color_profile = dcp_info.to_json()
     color_profile["selection"] = renderer.dcp_selection
     return linear, color_profile
