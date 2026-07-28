@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   applyAspectRatio, buildCropTransform, cloneCrop, constrainCrop, cornersInsideImage,
-  cropOutputRect, cropOutputSize, cropOutputSizeForAspect, customAspectKey, defaultCrop,
+  cropOutputRect, cropOutputSize, cropOutputSizeForAspect, cssRecomposeMatrix, customAspectKey, defaultCrop,
   imageDims, isDefaultCrop, parseCustomAspect, ratioToFraction, resolveAspectFraction,
   resolveAspectRatio, rotate90, straightenedBBox, type CropState,
 } from "../crop";
@@ -71,6 +71,44 @@ describe("buildCropTransform", () => {
       expect(u).toBeLessThanOrEqual(1 + 1e-3);
       expect(v).toBeGreaterThanOrEqual(-1e-3);
       expect(v).toBeLessThanOrEqual(1 + 1e-3);
+    }
+  });
+});
+
+describe("cssRecomposeMatrix", () => {
+  /** Parse "matrix(a, b, c, d, e, f)" and apply it to a source-space px point. */
+  function applyCss(css: string, x: number, y: number): [number, number] {
+    const m = css.slice("matrix(".length, -1).split(",").map(Number);
+    return [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
+  }
+
+  // Every recompose the compare overlay can meet: 90° steps, flips, straighten,
+  // and an off-center box.
+  const CASES: Array<[string, CropState]> = [
+    ["default", defaultCrop()],
+    ["orientation 90", { ...defaultCrop(), orientation: 90 }],
+    ["orientation 270 + flipV", { ...defaultCrop(), orientation: 270, flipV: true }],
+    ["flipH", { ...defaultCrop(), flipH: true }],
+    ["off-center box", { ...defaultCrop(), cx: 0.4, cy: 0.55, w: 0.5, h: 0.3 }],
+    ["straightened", constrainCrop({ ...defaultCrop(), angle: 8, w: 0.7, h: 0.6 }, SRC_W, SRC_H)],
+    ["everything", constrainCrop(
+      { cx: 0.45, cy: 0.5, w: 0.6, h: 0.5, angle: -6, flipH: true, flipV: false, orientation: 90 },
+      SRC_W, SRC_H)],
+  ];
+
+  it.each(CASES)("inverts buildCropTransform for %s", (_name, c) => {
+    const [iw, ih] = imageDims(SRC_W, SRC_H, c.orientation);
+    const rect = cropOutputRect(c, iw, ih);
+    const [ow, oh] = cropOutputSize(c, SRC_W, SRC_H);
+    const css = cssRecomposeMatrix(c, SRC_W, SRC_H, rect, ow, oh);
+    for (const [px, py] of [[0, 0], [1, 0], [0, 1], [1, 1], [0.5, 0.5], [0.25, 0.75]] as const) {
+      // Where the render samples this output point, back in source pixels
+      // (undoing the FLIP_Y upload convention)...
+      const [u, v] = probe(c, px, py);
+      const [bx, by] = applyCss(css, u * SRC_W, (1 - v) * SRC_H);
+      // ...must land on the same output point once the CSS matrix places it.
+      expect(bx / ow).toBeCloseTo(px, 4);
+      expect(by / oh).toBeCloseTo(py, 4);
     }
   });
 });

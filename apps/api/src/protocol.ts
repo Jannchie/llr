@@ -21,7 +21,7 @@ export function isValidSourceId(sourceId: string): boolean {
 // fields the client is actually overriding: the worker fills the rest in from
 // what the body recorded, so a moved slider does not have to echo the others.
 // Ranges are the camera's and are enforced worker-side (sony/profile.py).
-export const LOOK_TWEAK_KEYS = ["highlights", "shadows", "contrast", "fade", "saturation"] as const;
+export const LOOK_TWEAK_KEYS = ["highlights", "shadows", "contrast", "fade", "saturation", "clarity"] as const;
 export type LookTweaks = Partial<Record<(typeof LOOK_TWEAK_KEYS)[number], number>>;
 
 export interface RenderLinearBody {
@@ -32,6 +32,9 @@ export interface RenderLinearBody {
   dcpCode?: string;
   denoise?: { enabled?: boolean; model?: string; amount?: number };
   look?: LookTweaks;
+  style?: string;
+  dro?: number;
+  droLevel?: number;
   purpose?: string;
 }
 
@@ -47,6 +50,44 @@ export interface RenderParams {
   dcpCode: string | undefined;
   denoise: { enabled: boolean; model: string | undefined; amount: number };
   look: LookTweaks;
+  style: string | undefined;
+  dro: number | undefined;
+  droLevel: number | undefined;
+}
+
+// DRO strength, where 1 is what the camera itself applied. Absent means "as
+// shot", which is not the same as 0 — the worker reads the shot's own answer
+// out of the RAW. The ceiling matches sony/dro.py's DRO_MAX_STRENGTH.
+export const DRO_MAX_STRENGTH = 2;
+export function clampDroStrength(dro: unknown): number | undefined {
+  if (dro === undefined || dro === null) return undefined;
+  const value = Number(dro);
+  if (!Number.isFinite(value)) return undefined;
+  return Math.min(DRO_MAX_STRENGTH, Math.max(0, value));
+}
+
+// Which of Edit.exe's built-in DRO curves to use, on the engine's own 0..99
+// level scale, where -1 means Auto — the curve the body wrote into this
+// particular RAW. Absent means the client said nothing, which leaves whatever
+// the profile already had, so -1 is a real choice and has to survive the clamp
+// rather than being folded into "unset". Mirrors sony/dro_presets.py.
+export const DRO_LEVEL_AUTO = -1;
+export const DRO_LEVEL_MAX = 99;
+export function clampDroLevel(level: unknown): number | undefined {
+  if (level === undefined || level === null) return undefined;
+  const value = Number(level);
+  if (!Number.isFinite(value)) return undefined;
+  return Math.min(DRO_LEVEL_MAX, Math.max(DRO_LEVEL_AUTO, Math.round(value)));
+}
+
+// Which Creative Look to render, when the client wants one other than the body's
+// own. Only the shape is checked here: which looks a RAW actually carries is a
+// property of that file, so the worker decides whether this one resolves and
+// falls back to the shot's own look when it does not.
+export function clampLookStyle(style: unknown): string | undefined {
+  if (typeof style !== "string") return undefined;
+  const trimmed = style.trim();
+  return trimmed && trimmed.length <= 16 ? trimmed : undefined;
 }
 
 // Keep only the known keys carrying a real number. An absent field means "leave
@@ -82,6 +123,9 @@ export function clampRenderParams(body: RenderLinearBody): RenderParams {
       amount: Number.isFinite(denoiseAmount) ? Math.min(1, Math.max(0, denoiseAmount)) : 1,
     },
     look: clampLookTweaks(body.look),
+    style: clampLookStyle(body.style),
+    dro: clampDroStrength(body.dro),
+    droLevel: clampDroLevel(body.droLevel),
     // Defaults to the cacheable path: a client that never states its intent is
     // treated as a preview, so at worst it costs memory rather than making
     // every subsequent edit re-decode.

@@ -8,18 +8,19 @@ import {
 } from "./rendering/curve";
 import {
   defaultCrop, cloneCrop, isDefaultCrop, imageDims, buildCropTransform,
-  cropOutputRect, cropOutputSize, straightenedBBox,
+  cropOutputRect, cropOutputSize, straightenedBBox, cssRecomposeMatrix,
   applyAspectRatio, resolveAspectFraction, cropOutputSizeForAspect,
   ASPECT_PRESETS,
   type AspectPreset, type CropState,
 } from "./rendering/crop";
-import { API, fetchLinear, fetchLookProfile, type ColorProfileMeta, type LookTweaks } from "./api";
+import { API, fetchLinear, fetchLookProfile, type ColorProfileMeta, type LookTweaks, type LookTweakKey } from "./api";
 import { type PersistedEdit } from "./persistence";
 import { gradingTint, gradingHueDeg } from "./rendering/grading";
 import { parseLensCorr, mixLensTable, LENS_IDENTITY, type LensCorr } from "./rendering/lens";
 import { trackFill, formatBytes, clamp, IMPORT_ACCEPT, IMPORT_FORMAT_HINT } from "./ui";
-import { t, locale, setLocale, LOCALES, type Locale } from "./i18n";
+import { t, locale, setLocale, LOCALES } from "./i18n";
 import SliderRow from "./components/SliderRow.vue";
+import SelectMenu from "./components/SelectMenu.vue";
 import Filmstrip from "./components/Filmstrip.vue";
 import { useViewport } from "./composables/useViewport";
 import { useHistory } from "./composables/useHistory";
@@ -36,8 +37,10 @@ type Recipe = Record<RecipeKey, number>;
 // Labels are not stored: a slider's caption is always `slider.<key>` and a
 // group's is `panel.<title>`, so the catalog can't drift from the controls.
 type SliderSpec = { key: RecipeKey; min: number; max: number; step: number };
-// rawOnly: the group's controls read per-shot tables that only a RAW carries.
-type SliderGroup = { title: "tone" | "presence" | "color" | "lens"; items: SliderSpec[]; rawOnly?: boolean };
+// needsLensCorr: the group's controls do nothing but blend the shot's own
+// correction tables toward identity, so they only mean something when the file
+// carried a pair (see lensCorrAvailable).
+type SliderGroup = { title: "tone" | "presence" | "color" | "lens"; items: SliderSpec[]; needsLensCorr?: boolean };
 
 // Distortion correction defaults to fully applied (mirrorless glass is designed
 // around it — uncorrected geometry reads as broken). Vignetting stays off by
@@ -69,28 +72,33 @@ const groups: SliderGroup[] = [
     { key: "vibrance", min: -100, max: 100, step: 1 },
     { key: "saturation", min: -100, max: 100, step: 1 },
   ]},
-  { title: "lens", rawOnly: true, items: [
+  { title: "lens", needsLensCorr: true, items: [
     { key: "lensDistortion", min: 0, max: 100, step: 1 },
     { key: "lensVignetting", min: 0, max: 100, step: 1 },
   ]},
 ];
 
 // The in-camera Creative Look tweaks, in the order the camera's own menu lists
-// them. Ranges are Sony's: four run -9..+9 and Fade has no negative side. These
-// are not the Tone panel's sliders under another name — they drive Sony's own
-// stages (the look's tone curve, YGamma, RGB2YCC), which is why they live with
-// the look instead of with our edits.
-const LOOK_SLIDERS: { key: keyof LookTweaks; min: number; max: number }[] = [
-  { key: "contrast", min: -9, max: 9 },
-  { key: "highlights", min: -9, max: 9 },
-  { key: "shadows", min: -9, max: 9 },
-  { key: "fade", min: 0, max: 9 },
-  { key: "saturation", min: -9, max: 9 },
-];
+// them. These are not the Tone panel's sliders under another name — they drive
+// Sony's own stages (the look's tone curve, YGamma, RGB2YCC, and Clarity's blur
+// chain), which is why they live with the look instead of with our edits.
+//
+// Only the order is ours. Each one's range is the engine's and arrives with the
+// profile (lookRanges), the way DRO's level ladder does: Clarity, for one, has
+// no negative side at all — the engine clamps it at zero — and a slider that
+// let it go there would be offering stops that all render the same.
+const LOOK_TWEAK_ORDER = ["contrast", "highlights", "shadows", "fade", "saturation", "clarity"] as const;
 
 function aspectLabel(a: AspectPreset): string {
   return a.labelKey ? t(a.labelKey) : a.label;
 }
+
+// "custom" is not a preset — it is the entry that reveals the w × h boxes, and
+// a user-entered ratio selects it back through customAspect.
+const aspectOptions = computed(() => [
+  ...ASPECT_PRESETS.map(a => ({ value: a.key, label: aspectLabel(a) })),
+  { value: "custom", label: t("crop.custom") },
+]);
 
 // Derived from defaultRecipe so the two can't drift (double-click reset and
 // isEdited both compare against these).
@@ -116,23 +124,145 @@ const profileId = ref<ProfileId>("standard");
 // The engine the last decode actually used (see loadSource) and, on the Sony
 // path, which Creative Look's tone curve it applied.
 const activeProfileKind = ref<string | null>(null);
-const sonyLook = ref("");
 // The Creative Look tweaks the body recorded for this shot, and the ones in
 // force. `null` means "as shot" — the panel shows the camera's own numbers and
 // keeps following them, which is also where a double-click resets a slider to.
 // Both are null until a decode reports a Sony rendering.
 const lookAsShot = ref<LookTweaks | null>(null);
 const look = ref<LookTweaks | null>(null);
+// What the engine will render each tweak over, straight from the profile. Empty
+// until a Sony decode reports one, which is also when the panel appears; a
+// tweak the worker sent no range for gets no slider, since there would be
+// nothing to say about how far it goes.
+const lookRanges = ref<Partial<Record<LookTweakKey, [number, number]>>>({});
+const lookSliders = computed(() => LOOK_TWEAK_ORDER.flatMap(key => {
+  const range = lookRanges.value[key];
+  return range ? [{ key, min: range[0], max: range[1] }] : [];
+}));
+// The Creative Look picker. Every ARW carries the calibration for all of the
+// body's looks, not just the one that was selected when the shutter fired, so
+// switching is a choice this client gets to make — and it costs no pixels: the
+// looks share the body's one hue-segmented matrix, so only the tone curve and
+// the chroma terms differ, and both ride in the profile. `null` means "as shot".
+// The list comes from the file rather than a constant, so a body shipping looks
+// this build has never heard of (FL2, FL3) still fills the picker.
+const lookAsShotStyle = ref("");
+const availableLooks = ref<string[]>([]);
+// Set by the worker when the chosen look is not in this RAW at all — the body
+// predates it, so its curve and chroma came from a donor. Its own answer rather
+// than one derived here: the worker is what decides where a calibration is read
+// from, and only it knows whether the donor was actually used.
+const lookBorrowed = ref(false);
+// The body's own sharpening, for the panel to report rather than to control:
+// it is a camera setting, so nothing here can move it. Both ladder positions
+// plus whether the fine half (Spica) is doing anything — the two stages split
+// one control, and at the top of the range the split leaves nothing for the
+// fine end, which is worth saying rather than showing a stage that is off.
+const sharpening = ref<{ level: number; range: number; fine: boolean } | null>(null);
+const lookStyle = ref<string | null>(null);
+const effectiveLookStyle = computed(() => lookStyle.value ?? lookAsShotStyle.value);
+const lookStyleEdited = computed(() =>
+  !!lookStyle.value && !!lookAsShotStyle.value && lookStyle.value !== lookAsShotStyle.value);
 // A type-level floor, not a state the panel can reach: everything that reads
-// effectiveLook is gated on lookAsShot. Derived from LOOK_SLIDERS so the key
-// list is written once (as SLIDER_DEFAULTS is, and for the same reason).
-const ZERO_LOOK = Object.fromEntries(LOOK_SLIDERS.map(s => [s.key, 0])) as LookTweaks;
+// effectiveLook is gated on lookAsShot. Derived from LOOK_TWEAK_ORDER so the
+// key list is written once (as SLIDER_DEFAULTS is, and for the same reason).
+const ZERO_LOOK = Object.fromEntries(LOOK_TWEAK_ORDER.map(key => [key, 0])) as LookTweaks;
 const effectiveLook = computed<LookTweaks>(() => look.value ?? lookAsShot.value ?? ZERO_LOOK);
-const lookEdited = computed(() =>
-  !!look.value && !!lookAsShot.value
-  && LOOK_SLIDERS.some(s => look.value![s.key] !== lookAsShot.value![s.key]));
+// One reset for the whole panel: the look and its six tweaks are one setting
+// as far as the camera is concerned, and resetting to "as shot" means both.
+function resetLook(): void {
+  look.value = null;
+  lookStyle.value = null;
+  droStrength.value = null;
+  droLevel.value = DRO_AUTO;
+  void reloadLookProfile();
+}
 
-function setLookTweak(key: keyof LookTweaks, value: number): void {
+function setLookStyle(style: string): void {
+  lookStyle.value = style;
+  void reloadLookProfile();
+}
+
+// ── DRO ──
+//
+// Sony's Dynamic Range Optimizer, on the same free path as the look: it is one
+// gain per pixel, and a scalar gain commutes with the colour matrix, so the
+// shader applies it to pixels that are already decoded. 1 is what the camera
+// itself did; the ceiling matches the API's clampDroStrength.
+const DRO_MAX = 2;
+// True for any Sony RAW: Auto needs a curve in the file, but the manual levels
+// come from Edit.exe's own presets and so work even on a frame that has none.
+const droAvailable = ref(false);
+// What the body applied: 1 when it used DRO, 0 when it did not. The reset
+// target, and the value in force until someone moves the control.
+const droAsShot = ref(0);
+const droStrength = ref<number | null>(null);
+const effectiveDro = computed(() => droStrength.value ?? droAsShot.value);
+// The engine's own encoding: -1 is Auto (this shot's own curve), 0..99 picks one
+// of the ten built-in presets. The ladder of offered levels comes from the
+// worker rather than being repeated here, so the buttons cannot drift from the
+// curves it actually renders.
+const DRO_AUTO = -1;
+const droLevel = ref(DRO_AUTO);
+const droLevels = ref<number[]>([]);
+// Off / Auto / a level. Off is a strength of zero whatever the level says,
+// which is how the worker resolves the same three states.
+const droMode = computed<"off" | "auto" | "level">(() =>
+  effectiveDro.value <= 0 ? "off" : droLevel.value < 0 ? "auto" : "level");
+const droEdited = computed(() =>
+  droLevel.value >= 0
+  || (droStrength.value !== null && droStrength.value !== droAsShot.value));
+
+// The panel is "edited" if any of its three parts moved: the look, its tweaks,
+// or DRO. One flag, because one reset button clears all three.
+const lookEdited = computed(() =>
+  lookStyleEdited.value
+  || droEdited.value
+  || (!!look.value && !!lookAsShot.value
+    && LOOK_TWEAK_ORDER.some(key => look.value![key] !== lookAsShot.value![key])));
+
+function setDro(value: number): void {
+  droStrength.value = clamp(value, 0, DRO_MAX);
+  void reloadLookProfile();
+}
+
+// Off keeps the level it was on so switching back does not silently land on
+// Auto; the strength is what carries "off", exactly as on the worker side.
+// Choosing Auto or a level from off has to restore a strength, and 1 is the
+// only defensible one — it is what the camera itself would have applied.
+function setDroMode(mode: "off" | "auto" | "level", level?: number): void {
+  if (mode === "off") {
+    droStrength.value = 0;
+  } else {
+    if (effectiveDro.value <= 0) droStrength.value = 1;
+    droLevel.value = mode === "auto" ? DRO_AUTO : (level ?? droLevels.value[0] ?? 0);
+  }
+  void reloadLookProfile();
+}
+
+// Sony's own menu names, for both the Creative Look picker and the DCP style
+// picker. Untranslated in every locale, and shown code-first exactly as the
+// camera prints them ("ST Standard"), so the control reads the same as the
+// body's menu — the code is what the RAW stores and what a Sony shooter knows
+// the look by; the word is the reminder.
+const STYLE_NAMES: Record<string, string> = {
+  ST: "Standard", PT: "Portrait", LD: "Landscape", VV: "Vivid", VV2: "Vivid 2",
+  NT: "Neutral", FL: "Film", IN: "Instant", SH: "Soft High-key",
+  BW: "Black & White", SE: "Sepia", FL2: "Film 2", FL3: "Film 3",
+};
+
+// A look this build has never heard of still works — it just shows the bare
+// code Sony wrote, which is the whole reason the list is read from the file.
+function styleLabel(code: string): string {
+  return STYLE_NAMES[code] ? `${code} ${STYLE_NAMES[code]}` : code;
+}
+
+const lookOptions = computed(() => availableLooks.value.map(code => ({
+  value: code,
+  label: styleLabel(code) + (code === lookAsShotStyle.value ? t("look.asShotSuffix") : ""),
+})));
+
+function setLookTweak(key: LookTweakKey, value: number): void {
   look.value = { ...effectiveLook.value, [key]: value };
 }
 const usingDcp = computed(() => activeProfileKind.value === "dcp");
@@ -140,6 +270,10 @@ const usingDcp = computed(() => activeProfileKind.value === "dcp");
 // into the same linear ProPhoto working space but which carry no mosaic, no
 // camera profile and no embedded preview. Gates the controls that need those.
 const isRawSource = ref(true);
+// True when this shot brought lens correction splines of its own. Not every RAW
+// does — adapted or manual glass writes none — and the Lens panel is nothing
+// but a blend of those tables, so this is what says the panel has a job.
+const lensCorrAvailable = ref(false);
 // Fitted camera-match table (see worker fit_profile.py): pulls the DCP render
 // toward the camera's own JPEG. On by default — it is the point of the profile —
 // but toggleable to compare against Adobe's uncorrected look. Only meaningful
@@ -352,6 +486,13 @@ type Snapshot = {
   denoise?: typeof denoise;  // optional: absent in pre-denoise persisted sessions
   // Creative Look tweaks; null (or absent, in older sessions) means as shot.
   look?: LookTweaks | null;
+  // Which Creative Look to render, when it is not the body's own. Same "null
+  // means as shot" convention, and likewise absent in older sessions.
+  lookStyle?: string | null;
+  // DRO strength, on the same convention: null is what the camera applied.
+  dro?: number | null;
+  // Which DRO curve: -1 for the shot's own (Auto), 0..99 for a built-in preset.
+  droLevel?: number | null;
 };
 
 let isRestoring = false;
@@ -373,6 +514,8 @@ function defaultSnapshot(): Snapshot {
     profile: "standard",
     denoise: defaultDenoise(),
     look: null,
+    lookStyle: null,
+    dro: null,
   };
 }
 
@@ -399,6 +542,9 @@ function captureSnapshot(): Snapshot {
     profile: profileId.value,
     denoise: { ...denoise },
     look: look.value ? { ...look.value } : null,
+    lookStyle: lookStyle.value,
+    dro: droStrength.value,
+    droLevel: droLevel.value,
   };
 }
 
@@ -418,6 +564,11 @@ function setEditState(s: Snapshot): void {
   cropAspect.value = s.aspect ?? "free";
   Object.assign(denoise, s.denoise ?? defaultDenoise());
   look.value = s.look ? { ...s.look } : null;
+  lookStyle.value = s.lookStyle ?? null;
+  droStrength.value = s.dro ?? null;
+  // Snapshots taken before manual levels existed carry none, and Auto is what
+  // they were rendered with.
+  droLevel.value = s.droLevel ?? DRO_AUTO;
   dcpCode.value = s.dcp;
   profileId.value = s.profile ?? "standard";
   // Rebake with the snapshot's Basic values (bakeCurveLUT also syncs bakedBasic).
@@ -487,6 +638,7 @@ const {
     currentSourceId = "";
     hasLinearData = false;
     lensCorr = null;
+    lensCorrAvailable.value = false;
     isRawSource.value = true;
     hasCameraMatch.value = false;
     srcW.value = 0;
@@ -510,21 +662,23 @@ const {
   },
 });
 
-// Camera style names are the manufacturer's own product names (Sony's Creative
-// Style menu), so they stay in English in every locale — translating them would
-// stop them matching what the camera body shows.
-const DCP_STYLE_NAMES: Record<string, string> = {
-  ST: "Standard", PT: "Portrait", LD: "Landscape", VV: "Vivid", VV2: "Vivid 2",
-  FL: "Film", IN: "Instant", SH: "Soft Highkey", BW: "Black & White",
-  SE: "Sepia", NT: "Neutral",
-};
 // Styles this camera actually ships, from the worker. Empty for a body we have
 // no profiles for, which hides the picker rather than offering dead options.
 const dcpStyles = ref<string[]>([]);
+const dcpOptions = computed(() => dcpStyles.value.map(code => ({ value: code, label: styleLabel(code) })));
 
-function dcpStyleLabel(code: string): string {
-  return DCP_STYLE_NAMES[code] ? `${DCP_STYLE_NAMES[code]} (${code})` : code;
-}
+const engineOptions = computed<{ value: ProfileId; label: string }[]>(() => [
+  { value: "standard", label: t("engine.adobe") },
+  { value: "sony", label: t("engine.sony") },
+]);
+const gamutOptions = computed(() => [
+  { value: 0, label: "sRGB" },
+  { value: 1, label: t("display.p3") },
+]);
+const exifOptions = computed(() => [
+  { value: 0, label: t("exif.full") },
+  { value: 1, label: t("exif.private") },
+]);
 
 // Mirror the worker's choice into the picker. There is no "auto" entry: the
 // style the metadata resolved to is simply the selected one, so the control
@@ -539,11 +693,12 @@ function applyDcpSelection(selection: ColorProfileMeta["selection"]): void {
   void nextTick(() => { suppressDcpReload = false; });
 }
 
-// A rawOnly group is driven entirely by per-shot correction tables from the
-// RAW's maker notes; without them its sliders are inert, so hide the group
-// rather than show controls that do nothing.
+// The Lens group is driven entirely by the per-shot tables in the file's maker
+// notes, and both of its sliders only blend those toward identity — so without
+// a pair they move nothing at all. Gated on the tables themselves rather than
+// on "is a RAW": a RAW shot on adapted glass carries none either.
 const visibleGroups = computed(() =>
-  isRawSource.value ? groups : groups.filter(g => !g.rawOnly));
+  groups.filter(g => !g.needsLensCorr || lensCorrAvailable.value));
 
 // Full-res camera JPEG for the embedded-preview compare. Bound to the overlay
 // <img> whenever a source is active, so the browser has it fetched before the
@@ -552,6 +707,17 @@ const visibleGroups = computed(() =>
 // against it would show no difference — the mode only means something for RAW.
 const embeddedSrc = computed(() =>
   isRawSource.value && activeSource.value?.embeddedUrl ? resolveUrl(activeSource.value.embeddedUrl) : "");
+
+// The camera JPEG is the untouched full frame, so it has to go through the same
+// recompose the render did — otherwise the hold jumps to a different framing and
+// compares two different pictures. Only the committed view needs this: the
+// compare is disabled inside the crop editor.
+const embeddedTransform = computed(() => {
+  if (!srcW.value || !srcH.value || !imageW.value || !imageH.value) return "";
+  const [iw, ih] = imageDims(srcW.value, srcH.value, crop.orientation);
+  return cssRecomposeMatrix(
+    crop, srcW.value, srcH.value, cropOutputRect(crop, iw, ih), imageW.value, imageH.value);
+});
 
 // Denoise params for the render-linear request. amount is normalised to 0..1;
 // disabled (or amount 0) tells the worker to skip inference entirely.
@@ -585,7 +751,7 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     // buffer by on-screen device pixels, so a fit view shades the same number of
     // fragments it always did. What it does cost is transfer and VRAM (~140 MB
     // for 24 MP, ~360 MB for 61 MP, as float16).
-    const lin = await fetchLinear({ sourceId: id, halfSize: false, maxSize: 0, profileId: profileId.value, dcpCode: dcpCode.value, denoise: denoisePayload(), look: look.value ?? undefined });
+    const lin = await fetchLinear({ sourceId: id, halfSize: false, maxSize: 0, profileId: profileId.value, dcpCode: dcpCode.value, denoise: denoisePayload(), look: look.value ?? undefined, style: lookStyle.value ?? undefined, dro: droStrength.value ?? undefined, droLevel: droLevel.value });
     if (stale()) return false;
     if (!lin) { markInvalid(id); return false; }
     const { meta: linMeta, pixels: linearFloat } = lin;
@@ -593,16 +759,37 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     hasLinearData = true;
     profileCurveLUT = buildProfileLUT(linMeta.colorProfile);
     lensCorr = parseLensCorr(linMeta.colorProfile?.lensCorr);
+    // Whether this shot brought correction tables at all, which is what decides
+    // if the Lens group is worth offering. Reactive because lensCorr itself is
+    // not — it is read by the render path, not by the template.
+    lensCorrAvailable.value = lensCorr !== null;
     isRawSource.value = linMeta.colorProfile?.kind !== "rendered-image";
     // What the worker *actually* rendered with, which is not always what was
     // asked for: "sony" falls back to the DCP path on a RAW without Sony's
     // calibration. The DCP-only controls follow this, not profileId.
     activeProfileKind.value = linMeta.colorProfile?.kind ?? null;
-    sonyLook.value = linMeta.colorProfile?.creativeLook ?? "";
     // Reported by every Sony decode, so the panel shows the shot's own tweaks
     // the moment it appears rather than a row of zeros. Null on the DCP path,
     // which hides the panel — those stages are Sony's, not ours.
     lookAsShot.value = linMeta.colorProfile?.lookAsShot ?? null;
+    // The ranges those numbers move over, on the same terms: the engine's, so
+    // no slider here can offer a value the worker would clamp back.
+    lookRanges.value = linMeta.colorProfile?.lookRanges ?? {};
+    // The picker's own two facts. lookAsShotStyle is the reset target and comes
+    // from the body; availableLooks is empty on a decode that reported none, in
+    // which case the picker hides and the sliders still work.
+    lookAsShotStyle.value = linMeta.colorProfile?.lookAsShotStyle
+      ?? linMeta.colorProfile?.creativeLook ?? "";
+    availableLooks.value = linMeta.colorProfile?.availableLooks ?? [];
+    lookBorrowed.value = linMeta.colorProfile?.lookBorrowed === true;
+    sharpening.value = readSharpening(linMeta.colorProfile);
+    // What the body did with DRO, and whether there is a curve to scale at all.
+    // Both are the worker's answer: only it reads the RAW.
+    droAvailable.value = linMeta.colorProfile?.droAvailable === true;
+    droAsShot.value = linMeta.colorProfile?.droAsShot ?? 0;
+    // The offered ladder is the worker's, not ours. Empty simply leaves the
+    // level buttons out, which is the right answer for a build that has none.
+    droLevels.value = linMeta.colorProfile?.droLevels ?? [];
     applyDcpSelection(linMeta.colorProfile?.selection);
     // Availability is independent of the toggle, so the control stays visible
     // after the user switches the match off (which drops the applied cameraMatch).
@@ -647,20 +834,24 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
 
 let denoiseReloadTimer = 0; // debounce for the denoise watcher below
 
-// A moved Creative Look slider needs no pixels: the five tweaks reshape the
-// tone curve and the chroma terms the shader applies, and the decoded frame is
-// already on the GPU. So this re-fetches the profile alone (~75 kB, most of it
-// the tone curve) and re-uploads the LUT, instead of re-decoding like
-// dcp/denoise do — the frame it replaces is tens of megabytes.
+// A moved Creative Look slider needs no pixels: the six tweaks reshape the tone
+// curve, the chroma terms and Clarity's gain that the shader applies, and the
+// decoded frame is already on the GPU. So this re-fetches the profile alone
+// (~75 kB, most of it the tone curve) and re-uploads the LUT, instead of
+// re-decoding like dcp/denoise do — the frame it replaces is tens of megabytes.
 // Sequenced, not debounced: the request is cheap and a drag should track.
 let lookProfileSeq = 0;
 async function reloadLookProfile(): Promise<void> {
   if (!currentSourceId || !lookAsShot.value) return;
   const seq = ++lookProfileSeq;
   try {
-    const profile = await fetchLookProfile(currentSourceId, effectiveLook.value);
+    const profile = await fetchLookProfile(
+      currentSourceId, effectiveLook.value, lookStyle.value ?? undefined,
+      droStrength.value ?? undefined, droLevel.value);
     // A newer slider position (or a different image) owns the renderer now.
     if (seq !== lookProfileSeq || !profile || !webglRenderer) return;
+    lookBorrowed.value = profile.lookBorrowed === true;
+    sharpening.value = readSharpening(profile);
     profileCurveLUT = buildProfileLUT(profile);
     webglRenderer.uploadProfileCurveLUT(profileCurveLUT);
     scheduleWebGLDraw();
@@ -741,6 +932,47 @@ function buildProfileLUT(cp: ColorProfileMeta | null | undefined): ProfileCurve 
           sepia: cp?.profileSepia ?? null,
         }
       : null,
+    // DRO. Absent whenever there is nothing to apply — the worker sends no
+    // table at strength zero, so this is null both for a shot without DRO and
+    // for one where it has been turned off.
+    dro: cp?.profileDroGain?.length
+      ? {
+          lut: cp.profileDroGain,
+          logCeiling: cp.droLogCeiling ?? 1,
+          lumaWhite: cp.droLumaWhite ?? 1,
+          // The bilateral grid, when the worker could build one. Its presence
+          // switches the shader from indexing the curve by each pixel to
+          // indexing it by the local mean, which is what DRO actually is.
+          grid: cp.profileDroGrid ?? null,
+          gridLumaWhite: cp.droGridLumaWhite ?? cp.droLumaWhite ?? 1,
+        }
+      : null,
+    // Clarity, likewise absent when there is nothing to do — the worker sends a
+    // zero gain for a shot that never touched the setting.
+    clarity: cp?.profileClarity?.gain ? cp.profileClarity : null,
+    // Sharpening, on the same terms. It runs just before Clarity and shares its
+    // compose pass. Zero means there was no readable setting to reproduce, not
+    // that the camera had sharpening off — it has no such position.
+    sharpen: cp?.profileSharpness?.amount ? cp.profileSharpness : null,
+    // Spica, between the two. Sony splits one control across it and sharpening
+    // with complementary weights, so a shot can have this on with sharpening
+    // barely doing anything, or the reverse — each is gated on its own amount.
+    spica: cp?.profileSpica?.amount ? cp.profileSpica : null,
+  };
+}
+
+/**
+ * What the panel says about the body's sharpening, or null when there is
+ * nothing to say — an unreadable SharpnessRange, which is the only thing that
+ * turns the coarse stage off. `range` of -1 never reaches here for that reason.
+ */
+function readSharpening(cp: ColorProfileMeta | null | undefined) {
+  const sharpen = cp?.profileSharpness;
+  if (!sharpen?.amount || sharpen.range === undefined || sharpen.level === undefined) return null;
+  return {
+    level: sharpen.level,
+    range: sharpen.range,
+    fine: !!cp?.profileSpica?.amount,
   };
 }
 
@@ -949,9 +1181,7 @@ function renderCropEditor(): void {
   imageW.value = cw;
   imageH.value = ch;
   recomputeFit();
-  // The frame just changed size, so any window from the previous one is stated
-  // in coordinates that no longer mean the same thing. drawWebGL rebuilds it.
-  renderWindow.value = null;
+  renderWindow.value = null;   // same reason as renderNormal
   drawWebGL();
   scheduleHistogram();
 }
@@ -1256,6 +1486,8 @@ function buildExportPlan(): ExportPlan | null {
     // Absent means as shot, same as everywhere else — the full-res decode then
     // rebuilds the profile the preview was showing (plan.profileLUT).
     look: settings.look ?? undefined,
+    lookStyle: settings.lookStyle ?? undefined,
+    dro: settings.dro ?? undefined,
     params: buildPipelineParams(settings),
     curveLUT: buildToneCurveLUT(settings.curve, currentBasic(settings.recipe)),
     profileLUT: (meta) => buildProfileLUT(meta.colorProfile),
@@ -1445,14 +1677,17 @@ const vWheelAdjust = {
              the visible part of the frame; the compare overlays below stay
              full-frame and so keep displayTransform. -->
         <canvas v-show="webglRenderer != null && activeSource && !activeSource.invalid" ref="canvasRef" class="preview" :style="canvasBoxStyle" />
-        <!-- Camera-JPEG compare: opaque overlay in the canvas's exact box. The
-             src stays bound while a source is active so the JPEG is already
-             fetched when the hold starts; contain-fit letterboxes it when the
-             edit's crop changed the aspect ratio. -->
-        <img v-show="showEmbedded && webglRenderer != null && activeSource && !activeSource.invalid"
+        <!-- Camera-JPEG compare: opaque overlay in the canvas's exact box, with
+             the full-frame JPEG placed inside it through the edit's own crop /
+             straighten / flip so both sides show the same framing. The src stays
+             bound while a source is active so the JPEG is already fetched when
+             the hold starts. -->
+        <div v-show="showEmbedded && webglRenderer != null && activeSource && !activeSource.invalid"
           class="preview compare-embedded"
-          :style="{ transform: displayTransform, width: imageW + 'px', height: imageH + 'px' }"
-          :src="embeddedSrc || undefined" :alt="t('aria.cameraJpeg')" />
+          :style="{ transform: displayTransform, width: imageW + 'px', height: imageH + 'px' }">
+          <img :style="{ transform: embeddedTransform, width: srcW + 'px', height: srcH + 'px' }"
+            :src="embeddedSrc || undefined" :alt="t('aria.cameraJpeg')" />
+        </div>
         <div v-show="activeSource && webglRenderer && (status === 'rendering' || status === 'uploading')"
           class="viewport-busy" aria-live="polite">
           <span class="spinner" aria-hidden="true" />
@@ -1527,11 +1762,8 @@ const vWheelAdjust = {
         <div class="control-row">
           <label class="control-label">{{ t('crop.aspect') }}</label>
           <div class="crop-aspect">
-            <select class="control-select" :value="customAspect ? 'custom' : cropAspect"
-              @change="selectAspect(($event.target as HTMLSelectElement).value)">
-              <option v-for="a in ASPECT_PRESETS" :key="a.key" :value="a.key">{{ aspectLabel(a) }}</option>
-              <option value="custom">{{ t('crop.custom') }}</option>
-            </select>
+            <SelectMenu :model-value="customAspect ? 'custom' : cropAspect" :options="aspectOptions"
+              :aria-label="t('crop.aspect')" @update:model-value="selectAspect" />
             <button class="icon-mini" type="button" :title="t('crop.swap')" @click="swapAspect" :aria-label="t('aria.swapAspect')">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M16 3l4 4-4 4" /><path d="M20 7H8a4 4 0 0 0-4 4" />
@@ -1584,30 +1816,21 @@ const vWheelAdjust = {
         </header>
         <div class="control-row">
           <label class="control-label">{{ t('settings.language') }}</label>
-          <select class="control-select" :value="locale"
-            @change="setLocale(($event.target as HTMLSelectElement).value as Locale)">
-            <option v-for="l in LOCALES" :key="l.value" :value="l.value">{{ l.label }}</option>
-          </select>
+          <SelectMenu :model-value="locale" :options="LOCALES" :aria-label="t('settings.language')"
+            @update:model-value="setLocale" />
         </div>
         <div class="control-row" v-if="activeSource && isRawSource">
           <label class="control-label" :title="t('settings.engineHint')">{{ t('settings.engine') }}</label>
-          <select v-model="profileId" class="control-select">
-            <option value="standard">{{ t('engine.adobe') }}</option>
-            <option value="sony">{{ t('engine.sony') }}</option>
-          </select>
+          <SelectMenu v-model="profileId" :options="engineOptions" :aria-label="t('settings.engine')" />
         </div>
-        <div class="control-row" v-if="activeSource && isRawSource && sonyLook">
-          <label class="control-label">{{ t('settings.creativeLook') }}</label>
-          <span class="control-value">{{ sonyLook }}</span>
-        </div>
+        <!-- The look itself is picked in the Creative Look panel, next to the
+             tweaks it belongs with and the reset that returns both to as-shot. -->
         <p class="control-note" v-if="activeSource && isRawSource && profileId === 'sony' && usingDcp">
           {{ t('engine.sonyUnavailable') }}
         </p>
         <div class="control-row" v-if="activeSource && isRawSource && usingDcp && dcpStyles.length">
           <label class="control-label">{{ t('settings.dcp') }}</label>
-          <select v-model="dcpCode" class="control-select">
-            <option v-for="code in dcpStyles" :key="code" :value="code">{{ dcpStyleLabel(code) }}</option>
-          </select>
+          <SelectMenu v-model="dcpCode" :options="dcpOptions" :aria-label="t('settings.dcp')" />
         </div>
         <div class="control-row" v-if="activeSource && isRawSource && usingDcp && hasCameraMatch">
           <label class="control-label" for="camera-match" :title="t('settings.cameraMatchHint')">{{ t('settings.cameraMatch') }}</label>
@@ -1618,18 +1841,13 @@ const vWheelAdjust = {
         </div>
         <div class="control-row" v-if="activeSource && p3Supported">
           <label class="control-label">{{ t('settings.display') }}</label>
-          <select v-model.number="viewSettings.displayGamut" class="control-select">
-            <option :value="0">sRGB</option>
-            <option :value="1">{{ t('display.p3') }}</option>
-          </select>
+          <SelectMenu v-model="viewSettings.displayGamut" :options="gamutOptions"
+            :aria-label="t('settings.display')" />
         </div>
         <div class="control-row" v-if="activeSource">
           <label class="control-label">{{ t('settings.exportExif') }}</label>
-          <select v-model.number="viewSettings.exportStripPrivate" class="control-select"
-            :title="t('exif.hint')">
-            <option :value="0">{{ t('exif.full') }}</option>
-            <option :value="1">{{ t('exif.private') }}</option>
-          </select>
+          <SelectMenu v-model="viewSettings.exportStripPrivate" :options="exifOptions" :title="t('exif.hint')"
+            :aria-label="t('settings.exportExif')" />
         </div>
       </section>
       <!-- The shot's in-camera Creative Look tweaks. Its own panel because these
@@ -1641,15 +1859,69 @@ const vWheelAdjust = {
             {{ t('panel.creativeLook') }}
             <span v-if="lookEdited" class="panel-dot" aria-hidden="true" />
           </span>
-          <button class="ghost" type="button" :disabled="!lookEdited" @click="look = null">
+          <button class="ghost" type="button" :disabled="!lookEdited" @click="resetLook">
             {{ t('common.reset') }}
           </button>
         </header>
-        <SliderRow v-for="spec in LOOK_SLIDERS" :key="spec.key"
+        <!-- Every ARW carries all of the body's looks, so this switches between
+             calibrations already in the file. No re-decode: they share the one
+             hue-segmented matrix, so only the curve and chroma terms change. -->
+        <div v-if="availableLooks.length > 1" class="control-row">
+          <label class="control-label" for="look-style">{{ t('settings.creativeLook') }}</label>
+          <SelectMenu id="look-style" :model-value="effectiveLookStyle" :options="lookOptions"
+            @update:model-value="setLookStyle" />
+        </div>
+        <!-- Say so when the look is not in the RAW. The curve is exact; the
+             chroma is another body's, and that is worth admitting on screen. -->
+        <p class="control-note" v-if="lookBorrowed">{{ t('look.borrowedHint') }}</p>
+        <!-- Sharpening is a camera setting, not one of the six tweaks, so it is
+             reported rather than offered: there is no slider here that could
+             move it. The two ladder positions are what the body's own menu
+             showed; the note says which halves of the effect are running. -->
+        <div class="control-row" v-if="sharpening">
+          <span class="control-label">{{ t('look.sharpening') }}</span>
+          <span class="control-value">
+            {{ t('look.sharpeningValue', { level: `+${sharpening.level}`, range: `+${sharpening.range}` }) }}
+          </span>
+        </div>
+        <p class="control-note" v-if="sharpening">
+          {{ t(sharpening.fine ? 'look.sharpeningHint' : 'look.sharpeningCoarseOnly') }}
+        </p>
+        <SliderRow v-for="spec in lookSliders" :key="spec.key"
           :model-value="effectiveLook[spec.key]" @update:model-value="setLookTweak(spec.key, $event)"
           :label="t(`lookSlider.${spec.key}`)" :input-id="`look-${spec.key}`"
           :min="spec.min" :max="spec.max" :step="1"
           :reset-value="lookAsShot[spec.key]" show-modified />
+        <!-- DRO. Belongs here rather than in Tone: it is the camera's own curve
+             for this frame, not a grade of ours, and it resets to what the body
+             did like everything else in this panel. -->
+        <template v-if="droAvailable">
+          <div class="dro-modes" role="group" :aria-label="t('look.droModeLabel')">
+            <button type="button" class="dro-mode" :class="{ on: droMode === 'off' }"
+              :aria-pressed="droMode === 'off'" @click="setDroMode('off')">
+              {{ t('look.droOff') }}
+            </button>
+            <button type="button" class="dro-mode" :class="{ on: droMode === 'auto' }"
+              :aria-pressed="droMode === 'auto'" @click="setDroMode('auto')">
+              {{ t('look.droAuto') }}
+            </button>
+            <button v-for="(lv, i) in droLevels" :key="lv" type="button" class="dro-mode"
+              :class="{ on: droMode === 'level' && droLevel === lv }"
+              :aria-pressed="droMode === 'level' && droLevel === lv"
+              @click="setDroMode('level', lv)">
+              {{ t('look.droLevel', { n: i + 1 }) }}
+            </button>
+          </div>
+          <!-- Strength only qualifies Auto: a level already *is* the amount, and
+               scaling one would land between two curves Sony never ships. -->
+          <SliderRow v-if="droMode === 'auto'"
+            :model-value="effectiveDro" @update:model-value="setDro($event)"
+            :label="t('look.droStrength')" input-id="look-dro"
+            :min="0" :max="DRO_MAX" :step="0.05"
+            :reset-value="droAsShot" show-modified />
+          <p class="control-note" v-if="droMode === 'auto'">{{ t('look.droAutoHint') }}</p>
+          <p class="control-note" v-else-if="droMode === 'level'">{{ t('look.droLevelHint') }}</p>
+        </template>
       </section>
       <section v-for="group in visibleGroups" :key="group.title" class="panel" v-show="!cropMode">
         <header class="panel-head">

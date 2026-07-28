@@ -103,6 +103,63 @@ function imageNormToTexcoord(ix: number, iy: number, c: CropState): [number, num
   return [su, 1 - sv];
 }
 
+/** Source-space normalized (y-down) → image-space normalized. Inverse of the
+ *  orientation/flip half of `imageNormToTexcoord`. */
+function sourceNormToImageNorm(su: number, sv: number, c: CropState): [number, number] {
+  let ix: number, iy: number;
+  switch (c.orientation) {
+    case 90:  ix = 1 - sv; iy = su;     break;
+    case 180: ix = 1 - su; iy = 1 - sv; break;
+    case 270: ix = sv;     iy = 1 - su; break;
+    default:  ix = su;     iy = sv;     break;
+  }
+  if (c.flipH) ix = 1 - ix;
+  if (c.flipV) iy = 1 - iy;
+  return [ix, iy];
+}
+
+/**
+ * CSS `matrix()` placing an untouched full-frame image of the source through
+ * the same recompose the render applied — the forward direction of
+ * `buildCropTransform`, which maps the other way (output → texcoord).
+ *
+ * The element is assumed laid out at `srcW × srcH` px with `transform-origin:
+ * 0 0`; the matrix maps it into a box of `outW × outH` px covering `outRect` of
+ * the output frame. Used by the camera-JPEG compare overlay, which must show
+ * the same crop/straighten/flip as the canvas it covers.
+ */
+export function cssRecomposeMatrix(
+  c: CropState, srcW: number, srcH: number, outRect: Rect, outW: number, outH: number,
+): string {
+  const [iw, ih] = imageDims(srcW, srcH, c.orientation);
+  const b = pixelBox(c, iw, ih);
+  const a = (c.angle * Math.PI) / 180;
+  const cos = Math.cos(a);
+  const sin = Math.sin(a);
+  const kx = outW / outRect.w;
+  const ky = outH / outRect.h;
+
+  // Affine, so three samples of the element→box map determine it.
+  const sample = (x: number, y: number): [number, number] => {
+    const [ix, iy] = sourceNormToImageNorm(x / srcW, y / srcH, c);
+    // Image space → output frame: the inverse content rotation about the box center.
+    const dx = ix * iw - b.cx;
+    const dy = iy * ih - b.cy;
+    const ox = b.cx + (dx * cos + dy * sin);
+    const oy = b.cy + (-dx * sin + dy * cos);
+    return [(ox - outRect.x) * kx, (oy - outRect.y) * ky];
+  };
+  const p00 = sample(0, 0);
+  const p10 = sample(srcW, 0);
+  const p01 = sample(0, srcH);
+  const m = [
+    (p10[0] - p00[0]) / srcW, (p10[1] - p00[1]) / srcW,
+    (p01[0] - p00[0]) / srcH, (p01[1] - p00[1]) / srcH,
+    p00[0], p00[1],
+  ];
+  return `matrix(${m.map((v) => (Math.abs(v) < 1e-9 ? 0 : v)).join(", ")})`;
+}
+
 /** The 4 corners of the crop box, expressed in image space (clockwise from TL). */
 export function cropCornersImage(c: CropState, iw: number, ih: number): Array<[number, number]> {
   const b = pixelBox(c, iw, ih);

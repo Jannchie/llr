@@ -12,6 +12,9 @@ import { fileURLToPath } from "node:url";
 import {
   SOURCE_ID,
   buildLinearFrameHeader,
+  clampDroLevel,
+  clampDroStrength,
+  clampLookStyle,
   clampLookTweaks,
   clampRenderParams,
   isAllowedHost,
@@ -244,6 +247,9 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
       dcpCode: params.dcpCode,
       denoise: params.denoise,
       look: params.look,
+      style: params.style,
+      dro: params.dro,
+      droLevel: params.droLevel,
       purpose: params.purpose,
     });
   } catch (error) {
@@ -268,10 +274,12 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
   }
 }
 
-// The Creative Look sliders. They reshape the tone curve and the chroma terms
-// the browser applies but reach no pixel, so this returns the profile alone —
-// the client re-bakes its LUT and redraws the frame it already has, instead of
-// pulling tens of megabytes back through /render-linear for a slider drag.
+// The Creative Look sliders, and the choice of look itself. Neither reaches a
+// pixel — the looks share the body's one hue-segmented matrix, and all that
+// differs is the tone curve and the chroma terms the browser applies — so this
+// returns the profile alone. The client re-bakes its LUT and redraws the frame
+// it already has, instead of pulling tens of megabytes back through
+// /render-linear for a slider drag or a look change.
 async function handleLookProfile(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const body = await readJson<RenderLinearBody>(request);
   const { sourcePath } = await resolveSource(body.sourceId);
@@ -279,6 +287,9 @@ async function handleLookProfile(request: IncomingMessage, response: ServerRespo
     command: "look-profile",
     input: sourcePath,
     look: clampLookTweaks(body.look),
+    style: clampLookStyle(body.style),
+    dro: clampDroStrength(body.dro),
+    droLevel: clampDroLevel(body.droLevel),
   });
   sendJson(response, { colorProfile: meta.colorProfile ?? null });
 }

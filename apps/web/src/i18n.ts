@@ -105,11 +105,28 @@ const en = {
   // from the Tone sliders on purpose: these drive the camera's own stages and
   // start at what the body recorded, not at zero.
   "panel.creativeLook": "Creative Look",
+  // The look names themselves are not here: they are Sony's own menu entries
+  // ("ST Standard"), shown untranslated so the picker reads like the body's
+  // menu. See STYLE_NAMES in App.vue.
+  "look.asShotSuffix": " · as shot",
+  "look.borrowedHint": "This look is newer than the camera. Its tone curve is Sony's own, identical across bodies; its colour comes from a body that ships it.",
+  "look.sharpening": "Sharpening",
+  "look.sharpeningValue": "{level} · range {range}",
+  "look.sharpeningHint": "The body's own sharpening, reproduced on the finished frame. SharpnessRange splits it between a coarse pass and a fine one (Spica); both are applied. Its kernel reaches three sensor pixels, so only an export at full size matches the camera exactly.",
+  "look.sharpeningCoarseOnly": "The body's own sharpening, reproduced on the finished frame — coarse pass only, because SharpnessRange sends the whole effect there. Its kernel reaches three sensor pixels, so only an export at full size matches the camera exactly.",
+  "look.droOff": "Off",
+  "look.droAuto": "Auto",
+  "look.droLevel": "Lv{n}",
+  "look.droModeLabel": "DRO",
+  "look.droAutoHint": "The curve the camera chose for this frame, read out of the RAW.",
+  "look.droLevelHint": "One of Imaging Edge's ten built-in curves. Works on any frame, including one the camera wrote no curve for.",
+  "look.droStrength": "Strength",
   "lookSlider.contrast": "Contrast",
   "lookSlider.highlights": "Highlights",
   "lookSlider.shadows": "Shadows",
   "lookSlider.fade": "Fade",
   "lookSlider.saturation": "Saturation",
+  "lookSlider.clarity": "Clarity",
 
   // Detail panel
   "panel.detail": "Detail",
@@ -259,11 +276,25 @@ const zh: Record<MessageKey, string> = {
   "slider.hint": "点击选中后可滚轮微调（Shift ×10）· 双击复位",
 
   "panel.creativeLook": "创意外观",
+  "look.asShotSuffix": " · 拍摄时",
+  "look.borrowedHint": "该外观比这台机身新。色调曲线是索尼原厂的（跨机身逐字节一致），色彩取自搭载它的机身。",
+  "look.sharpening": "机内锐化",
+  "look.sharpeningValue": "{level} · 范围 {range}",
+  "look.sharpeningHint": "机身自己的锐化，在成片上复现。锐化范围把它拆成粗细两段（细端为 Spica），两段都已应用。核的跨度是三个传感器像素，因此只有全尺寸导出才与相机完全一致。",
+  "look.sharpeningCoarseOnly": "机身自己的锐化，在成片上复现。当前锐化范围把全部效果都给了粗端，细端不参与。核的跨度是三个传感器像素，因此只有全尺寸导出才与相机完全一致。",
+  "look.droOff": "关",
+  "look.droAuto": "自动",
+  "look.droLevel": "Lv{n}",
+  "look.droModeLabel": "DRO",
+  "look.droAutoHint": "相机为这一帧选定的曲线，从 RAW 里读出。",
+  "look.droLevelHint": "Imaging Edge 内置的十条曲线之一。任何一帧都能用，包括相机没写曲线的那些。",
+  "look.droStrength": "强度",
   "lookSlider.contrast": "对比度",
   "lookSlider.highlights": "高光",
   "lookSlider.shadows": "阴影",
   "lookSlider.fade": "褪色",
   "lookSlider.saturation": "饱和度",
+  "lookSlider.clarity": "清晰度",
 
   "panel.detail": "细节",
   "detail.denoising": "降噪中…",

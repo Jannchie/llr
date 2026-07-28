@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  DRO_MAX_STRENGTH,
   buildLinearFrameHeader,
+  clampDroStrength,
   clampRenderParams,
   isAllowedHost,
   isJsonContentType,
@@ -77,6 +79,31 @@ describe("clampRenderParams", () => {
     expect(params.halfSize).toBe(true);
     expect(params.denoise.enabled).toBe(false);
     expect(params.denoise.model).toBeUndefined();
+  });
+});
+
+describe("clampDroStrength", () => {
+  it("distinguishes as-shot from off", () => {
+    // Absent means "whatever the camera did", which the worker reads out of the
+    // RAW. Zero means someone turned it off. Collapsing the two would silently
+    // drop DRO from every render that did not mention it.
+    expect(clampDroStrength(undefined)).toBeUndefined();
+    expect(clampDroStrength(null)).toBeUndefined();
+    expect(clampDroStrength(0)).toBe(0);
+  });
+
+  it("clamps to the range the worker will accept", () => {
+    expect(clampDroStrength(1)).toBe(1);
+    expect(clampDroStrength(2.5)).toBe(DRO_MAX_STRENGTH);
+    expect(clampDroStrength(-3)).toBe(0);
+    expect(clampDroStrength(Number.NaN)).toBeUndefined();
+    expect(clampDroStrength("1.5")).toBe(1.5);
+    expect(clampDroStrength("nope")).toBeUndefined();
+  });
+
+  it("rides through clampRenderParams", () => {
+    expect(clampRenderParams({ dro: 9 }).dro).toBe(DRO_MAX_STRENGTH);
+    expect(clampRenderParams({}).dro).toBeUndefined();
   });
 });
 

@@ -30,13 +30,20 @@ import { fileURLToPath } from "node:url";
 
 import {
   MASK_BLUR_SHADER, MASK_DOWNSAMPLE_SHADER, MASK_VERTEX_SHADER,
-  PROCESS_SHADER, VERTEX_SHADER,
+  PROCESS_SHADER, SONY_POST_PROGRAMS, VERTEX_SHADER,
 } from "../src/rendering/passes";
 
 const PROGRAMS: [name: string, vs: string, fs: string][] = [
   ["process", VERTEX_SHADER, PROCESS_SHADER],
   ["mask downsample", MASK_VERTEX_SHADER, MASK_DOWNSAMPLE_SHADER],
   ["mask blur", MASK_VERTEX_SHADER, MASK_BLUR_SHADER],
+  // Sony's post chain, paired with MASK_VERTEX_SHADER the way
+  // pipeline-renderer.postProgram builds them. These were missing here, which
+  // left the largest shader in the app — Spica's, with its two lookup textures
+  // and three loops — with nothing checking that it compiles at all.
+  ...Object.entries(SONY_POST_PROGRAMS).map(
+    ([name, def]): [string, string, string] =>
+      [`sony ${name}`, MASK_VERTEX_SHADER, def.fsSource]),
 ];
 
 const page = `<meta charset="utf-8"><title>shader compile check</title>
