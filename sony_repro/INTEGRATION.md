@@ -151,7 +151,7 @@ IFD0 tag 0xc634 (DNGPrivateData,内联的 uint32 = SR2Private IFD 偏移)
 | `apps/worker/.../sony/linear_matrix.py` | 分段矩阵 + `data/hue_index_lut.npz` |
 | `apps/worker/.../sony/tone.py` | 曲线重建(x/128, y/16)+ 机内微调叠加 |
 | `apps/worker/.../sony/profile.py` | 接入层:矩阵 → Rec709→ProPhoto(D50),曲线打包 |
-| `apps/worker/.../sony/data/look_tuning.npz` | 40 条微调单位形状(145 KB) |
+| `apps/worker/.../sony/data/tone_family.npz` | 微调用的 37 条静态算子曲线(73 KB) |
 | `apps/worker/.../sony/clarity.py` | 机内 Clarity(第六项微调)的强度表与模糊链几何,烘焙自机身标定 |
 | `apps/worker/.../sony/sharpness.py` | 机内锐化:两条档位阶梯 + 死区,标定从 RAW 的 `0x78cd` 逐张读 —— **不需要 frida** |
 | `apps/worker/.../cli.py` | `ColorRenderer` / `resolve_color_renderer` / `render_color` |
@@ -175,9 +175,10 @@ IFD0 tag 0xc634 (DNGPrivateData,内联的 uint32 = SR2Private IFD 偏移)
 SR2DataIFD,每种创意外观一份完整标定(矩阵 + 曲线),与拍摄时选了哪一种无关。
 让引擎轮流按十种外观渲染同一张照片,十条曲线**全部命中,最大差 8/16384 = 0.05%**。
 
-机内微调按 exif 现叠:Highlights / Shadows 对档位严格线性,±9 定出的单位形状
-回推中间各档残差 3/16384;正负形状不同、每种外观各一套,共 40 条实测形状存在
-`sony/data/look_tuning.npz`。Fade 实测对色调曲线**完全无作用**。
+机内微调按 exif 现叠,而且是**直接复刻引擎的造表过程**(不是拟合):三个滑块相加
+成两个 gain,从 `sony/data/tone_family.npz` 的 37 条静态曲线里插出唯一一张作用在
+曲线**输出**上的表。`FAM[18]` 就是恒等。51 次渲染对引擎逐位相同,详见
+PIPELINE.md 6.2.3。Fade 实测对色调曲线**完全无作用**。
 
 ### 仍未复刻的:SSCS 饱和段
 
