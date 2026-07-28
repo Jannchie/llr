@@ -7,14 +7,17 @@ the invariants the segment matrices must hold, and the frontend contract.
 
 import struct
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
 
 from llr_worker.cli import (
+    DRO_VISIBLE_STOPS,
     _exif_int,
     daemon_look_profile,
     detect_exiftool,
+    dro_from_exif,
     prepare_linear,
     read_exiftool_metadata,
 )
@@ -23,8 +26,11 @@ from llr_worker.sony import (
     apply_look_overrides,
     apply_sony_profile,
     available_styles,
+    borrowed_looks,
     calibration_for,
     can_render,
+    is_borrowed,
+    looks_in_file,
 )
 from llr_worker.sony.chroma import (
     apply_chroma,
@@ -36,6 +42,32 @@ from llr_worker.sony.chroma import (
     unpack_params,
     ycc_to_rgb,
 )
+from llr_worker.sony.clarity import (
+    CLARITY_AMP,
+    CLARITY_AMP_SCALE,
+    CLARITY_CALIBRATION_BODY,
+    CLARITY_MAX,
+    clarity_amount,
+)
+from llr_worker.sony.dro import (
+    DRO_BLEND,
+    DRO_COARSE,
+    DRO_FINE_X,
+    DRO_FINE_Y,
+    DRO_GRID_BINS,
+    DRO_GRID_NX,
+    DRO_GRID_NY,
+    DRO_LUMA_WHITE,
+    DRO_W_B,
+    DRO_W_R,
+    _fine_means,
+    _grid_from_fine,
+    _image_to_grid_uv,
+    apply_dro,
+    dro_gain_table,
+    scale_dro_gain,
+)
+from llr_worker.sony.dro_presets import DRO_UI_LEVELS, dro_preset_curve
 from llr_worker.sony.linear_matrix import (
     KNOT_STEP,
     N_INDEX,
@@ -47,14 +79,32 @@ from llr_worker.sony.linear_matrix import (
 from llr_worker.sony.profile import (
     REC709_TO_PROPHOTO_D50,
     TONE_CURVE_POINTS,
+    TWEAK_RANGES,
     chroma_terms,
     look_render_info,
     sepia_toning,
     tone_curve_points,
 )
+from llr_worker.sony.sharpness import (
+    SHARPNESS_CALIB_DEFAULT,
+    SHARPNESS_DEFAULT,
+    SHARPNESS_MAX,
+    SHARPNESS_RANGE_BASE,
+    SHARPNESS_RANGE_DEFAULT,
+    SHARPNESS_RANGE_MAX,
+    SHARPNESS_RANGE_STEP,
+    SHARPNESS_RANGE_UNITY,
+    sharpness_amount,
+    sharpness_calibration,
+)
+from llr_worker.sony.spica import spica_amount, spica_iso_gain, spica_off
 from llr_worker.sony.sr2 import (
+    DRO_CURVE_POINTS,
+    DRO_LOG_CEILING,
     PARAM_BLOCK_SIZE,
     decrypt,
+    dro_curve,
+    dro_strength,
     look_calibrations,
     read_sr2_tag,
     unpack_param_block,
@@ -81,9 +131,11 @@ requires_exiftool = pytest.mark.skipif(detect_exiftool() is None, reason="exifto
 def test_dro_is_only_disclaimed_on_shots_that_used_it() -> None:
     """It is a per-shot stage, so an unconditional caveat would be wrong.
 
-    Sony runs ZcTaskVatr only when the shot asked for DRO — 2 frames in 65 of
-    the reference set. That was how the stage was identified: the census of a
-    DRO frame and a non-DRO one differ in exactly this one entry.
+    Sony runs ZcTaskVatr only when the shot asked for DRO. That was how the
+    stage was identified: the census of a DRO frame and a non-DRO one differ in
+    exactly this one entry. Whether a given shot is one of those is decided in
+    dro_from_exif, which is a harder question than it looks — see
+    test_auto_is_not_the_same_question_as_applied.
     """
     cal = calibration_for(SAMPLE_FL, "FL")
     assert cal is not None
@@ -611,6 +663,9 @@ def test_an_override_only_replaces_the_fields_it_names() -> None:
     assert as_shot.merged(None) == as_shot
     assert as_shot.merged({"fade": -5, "contrast": 99}).fade == 0
     assert as_shot.merged({"contrast": 99}).contrast == 9
+    # Clarity's floor is zero for the same reason Fade's is: below it the engine
+    # renders nothing different, so there is nothing there to set.
+    assert as_shot.merged({"clarity": -4}).clarity == 0
     assert LookTweaks.from_json({"highlights": "-6"}) == LookTweaks(highlights=-6)
     assert LookTweaks.from_json("nonsense") == LookTweaks()
 
@@ -629,15 +684,24 @@ def test_a_look_override_rebuilds_the_profile_without_touching_the_pixels() -> N
     assert cal is not None
     rgb = np.full((2, 2, 3), 0.3, dtype=np.float32)
     as_shot = LookTweaks(highlights=-6, shadows=1)
-    linear, info = apply_sony_profile(rgb, cal, "FL", as_shot, dro=True)
+    # The gain table the way a decode supplies it, so the rebuild has the same
+    # material to work from — it re-reads the curve rather than carrying it.
+    linear, info = apply_sony_profile(rgb, cal, "FL", as_shot, dro=True,
+                                      dro_gain=dro_gain_table(SAMPLE_FL))
     base = info.to_json()
 
     lifted = apply_look_overrides(base, SAMPLE_FL, {"highlights": 6})
     assert lifted["lookTweaks"] == {**as_shot.to_json(), "highlights": 6}
     assert lifted["lookAsShot"] == as_shot.to_json()
+    # Every tweak's range rides along, since the panel builds its sliders from
+    # these: one missing would silently drop a control, and one invented on the
+    # frontend could offer a stop this side clamps straight back.
+    assert lifted["lookRanges"] == {f: list(r) for f, r in TWEAK_RANGES.items()}
     assert lifted["profileToneCurve"] != base["profileToneCurve"]
-    # DRO belongs to the shot, not to any tweak, and the rebuild cannot see it.
+    # DRO belongs to the shot, not to any tweak, so a tweak leaves it alone.
     assert lifted["limitations"] == base["limitations"]
+    assert lifted["droStrength"] == base["droStrength"] == 1.0
+    assert lifted["profileDroGain"] == base["profileDroGain"]
 
     # Rebased on lookAsShot, so overriding an override still lands on the same
     # answer as overriding the original — and dropping it returns to as shot.
@@ -704,6 +768,38 @@ def test_contrast_is_linear_going_down_and_measured_going_up() -> None:
     assert mids == sorted(mids)
     half = apply_tuning(base, "FL", contrast=4)[1024]
     assert mids[3] <= half <= mids[5]
+
+
+@requires_sample
+def test_a_borrowed_look_s_tweaks_are_not_silently_dead() -> None:
+    """FL2 and FL3 are missing from older RAWs, and their sliders did nothing.
+
+    The tweak shapes used to be stored one set per look, so a look with no entry
+    kept its baseline without complaining — Contrast, Highlights and Shadows all
+    moved in the UI and nowhere else. They are now stored as a single operator on
+    the curve's output, which every look shares, measured to collapse across the
+    ten shipped looks even though their own curves differ by up to 3133/16384.
+
+    So a borrowed look must respond, and by exactly as much as a look the body
+    does ship. Checked against Edit.exe itself rendering FL2 and FL3 on a donor
+    body: Highlights and Shadows land within 1.6/16384 of it.
+    """
+    reference = calibration_for(SAMPLE_FL, "FL")
+    assert reference is not None
+    ref_base = base_curve(reference)
+    borrowed = borrowed_looks()
+    assert borrowed, "nothing borrowed means this test proves nothing"
+
+    for look in borrowed:
+        cal = calibration_for(SAMPLE_FL, look)
+        assert cal is not None, look
+        base = base_curve(cal)
+        for field in ("contrast", "highlights", "shadows"):
+            for value in (-TUNE_LIMIT, TUNE_LIMIT):
+                moved = np.abs(apply_tuning(base, look, **{field: value}) - base).max()
+                assert moved > 1e-3, f"{look} {field}{value:+d} did nothing"
+                ref = np.abs(apply_tuning(ref_base, "FL", **{field: value}) - ref_base).max()
+                assert moved == pytest.approx(ref, abs=1e-4), f"{look} {field}{value:+d}"
 
 
 @requires_sample
@@ -806,3 +902,739 @@ def test_a_shot_renders_through_the_sony_path_end_to_end() -> None:
     prepared = prepare_linear(SAMPLE_IN, {"profileId": "sony"}, root, None, False, half_size=True, max_size=400)
     assert prepared.color_profile["kind"] == "sony"
     assert prepared.color_profile["creativeLook"] == "IN"
+
+
+# ── Switching the Creative Look ────────────────────────────────────────────
+#
+# The whole feature rests on one measured fact: the looks share the body's one
+# hue-segmented matrix, so switching changes no pixel. That is what makes it a
+# ~75 kB profile refetch instead of a re-decode, so it is pinned first.
+
+
+@requires_sample
+def test_switching_look_changes_no_pixel() -> None:
+    """Every look puts the same param_block through the matrix, so linear is equal.
+
+    If this ever fails, the /look-profile route is no longer a valid way to
+    switch looks — the frontend would be showing one look's curve over another
+    look's pixels — and the switch has to go back through a full decode.
+    """
+    rng = np.random.default_rng(11)
+    camera_rgb = rng.random((24, 24, 3), dtype=np.float32).astype(np.float32)
+
+    base = None
+    for style in looks_in_file(SAMPLE_FL):
+        cal = calibration_for(SAMPLE_FL, style)
+        assert cal is not None, style
+        linear, _ = apply_sony_profile(camera_rgb, cal, style)
+        if base is None:
+            base = linear
+        else:
+            assert np.array_equal(linear, base), f"{style} moved the pixels"
+
+
+@requires_sample
+def test_the_file_lists_its_own_looks() -> None:
+    """Read from the RAW, not from LOOK_ORDER — that is what carries FL2/FL3."""
+    present = looks_in_file(SAMPLE_FL)
+    # This body's own ten, in Sony's order, before any borrowed ones.
+    assert present[:10] == ["ST", "VV", "NT", "PT", "FL", "VV2", "IN", "SH", "BW", "SE"]
+    # can_render given a file answers from that list rather than the constant.
+    assert can_render("VV2", SAMPLE_FL)
+    assert not can_render("XX", SAMPLE_FL)
+    assert looks_in_file(Path("/nonexistent.arw")) == []
+
+
+@requires_sample
+def test_look_profile_renders_the_requested_look() -> None:
+    root = Path(__file__).resolve().parents[3]
+    rel = str(SAMPLE_FL.relative_to(root))
+
+    as_shot = daemon_look_profile({"input": rel}, root)["colorProfile"]
+    assert as_shot["creativeLook"] == "FL"
+    assert as_shot["lookAsShotStyle"] == "FL"
+    assert as_shot["availableLooks"][:2] == ["ST", "VV"]
+
+    switched = daemon_look_profile({"input": rel, "style": "IN"}, root)["colorProfile"]
+    assert switched["creativeLook"] == "IN"
+    # The reset target still names what the body chose, not the pick.
+    assert switched["lookAsShotStyle"] == "FL"
+    assert switched["profileToneCurve"] != as_shot["profileToneCurve"]
+
+    # Black & White zeroes the chroma gains outright — its eight parameters are
+    # zero, so this is the whole of its desaturation.
+    bw = daemon_look_profile({"input": rel, "style": "BW"}, root)["colorProfile"]
+    assert bw["profileChromaGain"] == [0.0, 0.0, 0.0, 0.0]
+    # Sepia is the one look that also needs a toning stage.
+    se = daemon_look_profile({"input": rel, "style": "SE"}, root)["colorProfile"]
+    assert se["profileSepia"] is not None
+    assert switched["profileSepia"] is None
+
+
+@requires_sample
+def test_an_unknown_look_falls_back_to_the_shot_s_own() -> None:
+    """A session restored onto a body without that look must not stick.
+
+    Returning null here would read as "no Sony rendering" to the client, which
+    answers by keeping whatever profile is already on screen — the wrong look.
+    """
+    root = Path(__file__).resolve().parents[3]
+    rel = str(SAMPLE_FL.relative_to(root))
+    # A code neither the file nor the donor table has — FL2/FL3 do resolve now.
+    got = daemon_look_profile({"input": rel, "style": "FL9"}, root)["colorProfile"]
+    assert got is not None
+    assert got["creativeLook"] == "FL"
+
+
+@requires_sample
+def test_overrides_can_switch_the_look_on_a_cached_decode() -> None:
+    """The cached-linear path re-profiles for a look, the same way it does tweaks."""
+    cal = calibration_for(SAMPLE_FL, "FL")
+    assert cal is not None
+    rng = np.random.default_rng(7)
+    _, info = apply_sony_profile(rng.random((8, 8, 3), dtype=np.float32), cal, "FL")
+    cached = info.to_json()
+
+    switched = apply_look_overrides(cached, SAMPLE_FL, None, "SH")
+    assert switched["creativeLook"] == "SH"
+    assert switched["profileToneCurve"] != cached["profileToneCurve"]
+    # The shot's own tweaks still ride along; only the calibration changed.
+    assert switched["lookAsShot"] == cached["lookAsShot"]
+
+    # No style and no overrides is a no-op, not a rebuild.
+    assert apply_look_overrides(cached, SAMPLE_FL, None) is cached
+
+
+# ── Looks the body predates (FL2 / FL3) ────────────────────────────────────
+#
+# Sony added these after this body shipped, so its RAWs carry no calibration for
+# them. They are supplied from a donor table instead — defensible only because
+# the tone curve was measured to be byte-identical across bodies while the
+# chroma is not, which is why the render says so in its limitations.
+
+
+@requires_sample
+def test_borrowed_looks_are_offered_and_flagged() -> None:
+    present = looks_in_file(SAMPLE_FL)
+    assert borrowed_looks() == ["FL2", "FL3"]
+    # Appended after the file's own ten, not mixed in.
+    assert present[-2:] == ["FL2", "FL3"]
+    assert is_borrowed(SAMPLE_FL, "FL2")
+    assert not is_borrowed(SAMPLE_FL, "FL")
+
+
+@requires_sample
+def test_a_borrowed_look_still_uses_this_shot_s_own_matrix() -> None:
+    """The invariant that makes borrowing safe at all.
+
+    Only the curve and the chroma come from the donor. The hue-segmented matrix
+    is per-shot calibration from this file's own top level, so a borrowed look
+    must leave the linear pixels exactly where every other look leaves them.
+    """
+    rng = np.random.default_rng(3)
+    camera_rgb = rng.random((16, 16, 3), dtype=np.float32).astype(np.float32)
+    own = calibration_for(SAMPLE_FL, "FL")
+    borrowed = calibration_for(SAMPLE_FL, "FL2")
+    assert own is not None and borrowed is not None
+    assert borrowed.param_block == own.param_block
+    # Shot-level fields stay the shot's; only the look's own tables differ.
+    assert np.array_equal(borrowed.chroma_weights, own.chroma_weights)
+    assert borrowed.chroma_final is None
+    assert not np.array_equal(borrowed.curve_y, own.curve_y)
+
+    a, _ = apply_sony_profile(camera_rgb, own, "FL")
+    b, _ = apply_sony_profile(camera_rgb, borrowed, "FL2")
+    assert np.array_equal(a, b)
+
+
+@requires_sample
+def test_a_borrowed_look_declares_itself() -> None:
+    root = Path(__file__).resolve().parents[3]
+    rel = str(SAMPLE_FL.relative_to(root))
+
+    own = daemon_look_profile({"input": rel, "style": "FL"}, root)["colorProfile"]
+    assert own["lookBorrowed"] is False
+    assert not any("not in the RAW" in m for m in own["limitations"])
+
+    fl2 = daemon_look_profile({"input": rel, "style": "FL2"}, root)["colorProfile"]
+    assert fl2["lookBorrowed"] is True
+    assert any("not in the RAW" in m for m in fl2["limitations"])
+    # A borrowed look is a real look, not a copy of the nearest one.
+    assert fl2["profileToneCurve"] != own["profileToneCurve"]
+
+    # Switching off a borrowed look drops the note again; switching onto one
+    # through the cached-decode path adds it.
+    back = apply_look_overrides(fl2, SAMPLE_FL, None, "FL")
+    assert back["lookBorrowed"] is False
+    assert not any("not in the RAW" in m for m in back["limitations"])
+    onto = apply_look_overrides(own, SAMPLE_FL, None, "FL3")
+    assert onto["lookBorrowed"] is True
+    assert any("not in the RAW" in m for m in onto["limitations"])
+
+
+# --- DRO: what the body armed vs what it actually did -----------------------
+
+
+@requires_sample
+def test_the_dro_curve_comes_out_of_the_raw() -> None:
+    """The camera writes its Auto decision as a curve, so nothing is guessed.
+
+    Rebuilt from tags 0x781b/0x781c this matched the engine's own 104-float
+    buffer on all 16 frames checked, to 3e-6. Here we can only check the shape,
+    but the shape is what carries the claim: log2 in, log2 out, monotone, and
+    pinned to identity at both ends because DRO reshapes the middle.
+    """
+    curve = dro_curve(SAMPLE_IN)
+    assert curve is not None
+    assert curve.shape == (DRO_CURVE_POINTS,)
+    x = np.arange(DRO_CURVE_POINTS) * (DRO_LOG_CEILING / DRO_CURVE_POINTS)
+    assert np.all(np.diff(curve) > 0)
+    assert abs(curve[0] - x[0]) < 0.05
+    assert abs(curve[-1] - x[-1]) < 0.05
+    # It lifts the shadows: the departure is positive and in the lower middle.
+    assert curve[np.argmax(curve - x)] > x[np.argmax(curve - x)]
+    assert dro_strength(SAMPLE_IN) == pytest.approx(float(np.abs(curve - x).max()))
+
+
+@requires_sample
+@requires_exiftool
+def test_auto_is_not_the_same_question_as_applied() -> None:
+    """Both samples say Auto; only one of them got any DRO.
+
+    This is the whole reason dro_from_exif reads the file rather than trusting
+    the tag. Three of 22 Auto frames measured graded out flat, and a caveat
+    about an effect that is not in the picture is just noise.
+    """
+    for sample in (SAMPLE_FL, SAMPLE_IN):
+        assert read_exiftool_metadata(sample).get("DynamicRangeOptimizer") == "Auto"
+
+    assert dro_strength(SAMPLE_FL) < DRO_VISIBLE_STOPS
+    assert dro_strength(SAMPLE_IN) > DRO_VISIBLE_STOPS
+
+    assert not dro_from_exif(read_exiftool_metadata(SAMPLE_FL), SAMPLE_FL)
+    assert dro_from_exif(read_exiftool_metadata(SAMPLE_IN), SAMPLE_IN)
+    # Without the file there is nothing better than the tag, so it stays trusted.
+    assert dro_from_exif(read_exiftool_metadata(SAMPLE_FL))
+    # And "Off" is still off no matter what the curve says.
+    assert not dro_from_exif({"DynamicRangeOptimizer": "Off"}, SAMPLE_IN)
+
+
+def test_a_file_with_no_curve_reads_as_no_curve(tmp_path: Path) -> None:
+    """Absent is None, not zero — the engine falls back to a preset there."""
+    blank = tmp_path / "not-a-raw.arw"
+    blank.write_bytes(b"II*\x00" + b"\x00" * 64)
+    assert dro_curve(blank) is None
+    assert dro_strength(blank) is None
+    assert dro_gain_table(blank) is None
+    # None must not read as "no DRO": the stage still runs, off a preset table.
+    assert dro_from_exif({"DynamicRangeOptimizer": "Auto"}, blank)
+
+
+@requires_sample
+def test_dro_strength_scales_in_the_log_domain() -> None:
+    """Doubling the strength squares the gain, and zero is exactly identity.
+
+    The curve family is 98.8% one principal component across the frames
+    measured, so a shot's DRO really is one scalar times a fixed shape and
+    scaling the departure stays on that family instead of leaving it.
+    """
+    table = dro_gain_table(SAMPLE_IN)
+    assert table is not None
+    assert max(table) > 1.05          # this frame has real DRO to scale
+    off = scale_dro_gain(table, 0.0)
+    assert off == [1.0] * len(table)
+    assert scale_dro_gain(table, 1.0) == table
+    doubled = scale_dro_gain(table, 2.0)
+    for a, b in zip(table, doubled, strict=True):
+        assert b == pytest.approx(a * a, rel=1e-12)
+    # Clamped, so a client cannot ask for an arbitrary power.
+    assert scale_dro_gain(table, 99.0) == scale_dro_gain(table, 2.0)
+    assert scale_dro_gain(table, -1.0) == off
+
+
+@requires_sample
+def test_dro_lifts_shadows_and_leaves_white_alone() -> None:
+    """What the control does to pixels, at the two ends that matter.
+
+    White has to stay put: the table stops just below normalised white, and
+    extrapolating the engine's own out-of-table rule there would dim every
+    clipped highlight — see sony/dro.py.
+    """
+    dark = np.full((2, 2, 3), 8.0 / DRO_LUMA_WHITE, dtype=np.float64)
+    white = np.ones((2, 2, 3), dtype=np.float64)
+    assert apply_dro(dark, SAMPLE_IN, 1.0).mean() > dark.mean() * 1.05
+    assert apply_dro(white, SAMPLE_IN, 1.0).mean() == pytest.approx(1.0, abs=0.01)
+    # Neutral in, neutral out: one gain for all three channels is why DRO never
+    # shifts colour, and it is the reason the shader can apply it after the
+    # matrix instead of before.
+    lifted = apply_dro(dark, SAMPLE_IN, 1.0)
+    assert lifted[..., 0] == pytest.approx(lifted[..., 2])
+    assert np.array_equal(apply_dro(dark, SAMPLE_IN, 0.0), dark)
+
+
+def test_the_dro_grid_builder_weights_green_like_the_engine_not_like_luma() -> None:
+    """The grid's luma is not BT.601, and that is deliberate.
+
+    ZcTaskVatr's grid builder multiplies its averaged green by vatr+0x50 rather
+    than vatr+0x4c, so red outweighs green and the weights sum to 0.2635 instead
+    of 0.5. It reads like a slip in Sony's code and it is very tempting to
+    "correct" — the decompiler even shows the offset twice, which looks like an
+    artefact. It is not: using the BT.601 green shifts the whole grid by about
+    1.35 stops. This pins the engine's arithmetic so that correction fails loudly.
+    """
+    black = 512
+    rows, cols = DRO_FINE_Y * 15, DRO_FINE_X * 16
+    bayer = np.zeros((rows * 4 + 40, cols * 4 + 2), dtype=np.uint16)
+    # RGGB with R at the quad's top-left, which is the slot the engine reads.
+    bayer[0::2, 0::2] = black + 1000   # R
+    bayer[0::2, 1::2] = black + 4000   # G
+    bayer[1::2, 0::2] = black + 4000   # G
+    bayer[1::2, 1::2] = black + 2000   # B
+
+    fine = _fine_means(bayer, black)
+    assert fine is not None and fine.shape == (DRO_FINE_Y, DRO_FINE_X)
+    expected = np.log2(1000 * DRO_W_R + 4000 * DRO_W_B + 2000 * DRO_W_B)
+    assert fine == pytest.approx(expected, abs=2e-4)
+    # BT.601 over the same quad would land a long way off, which is the whole point.
+    assert abs(np.log2(1000 * 0.299 + 4000 * 0.587 + 2000 * 0.114) - expected) > 1.3
+
+
+def test_the_dro_grid_reduces_to_the_local_mean_where_it_should() -> None:
+    """A flat field pins the grid's arithmetic end to end.
+
+    With every fine cell at the same log luminance the whole chain collapses to
+    `M[j] = A[j]*j + (1 - A[j])*b`, where b is the bin the field falls in: the
+    kernel cancels between num and den, and the four-neighbour smoothing is a
+    no-op because every block is identical. So the midtone bins, where A is
+    zero, must come back as exactly b — the local mean and nothing else — while
+    the two ends, where A is one, must ignore the field entirely and return the
+    bin index. That is what makes DRO local in the middle and inert at the edges.
+    """
+    level = 6.5
+    fine = np.full((DRO_FINE_Y, DRO_FINE_X), level)
+    num, den = _grid_from_fine(fine)
+    assert num.shape == (DRO_GRID_NY, DRO_GRID_NX, DRO_GRID_BINS)
+    assert np.all(den > 0)
+
+    bin_of = int(level / DRO_LOG_CEILING * DRO_GRID_BINS)
+    j = np.arange(DRO_GRID_BINS)
+    expected = DRO_BLEND * j + (1.0 - DRO_BLEND) * bin_of
+    mean = num / den
+    for row in range(DRO_GRID_NY):
+        for col in range(DRO_GRID_NX):
+            assert mean[row, col] == pytest.approx(expected, abs=1e-9)
+    # Spelled out for the two states that matter, so the intent survives a
+    # refactor of the line above.
+    assert mean[0, 0, 5] == pytest.approx(bin_of)      # A = 0: purely local
+    assert mean[0, 0, 0] == pytest.approx(0.0)         # A = 1: purely the bin
+    assert mean[0, 0, DRO_GRID_BINS - 1] == pytest.approx(DRO_GRID_BINS - 1.0)
+
+
+def test_the_dro_grid_smoothing_borrows_from_neighbours() -> None:
+    """One bright block must lift its neighbours and nothing further.
+
+    The engine smooths each block's histogram with its four edge neighbours —
+    not a 3x3 — at half itself and half the neighbours. So a lone bright block
+    has to move the four blocks orthogonally adjacent to it and leave the
+    diagonal ones alone; catching a diagonal here is what would tell you the
+    smoothing had been widened by mistake.
+    """
+    fine = np.full((DRO_FINE_Y, DRO_FINE_X), 3.0)
+    row, col = 2, 3
+    fine[row * DRO_COARSE:(row + 1) * DRO_COARSE,
+         col * DRO_COARSE:(col + 1) * DRO_COARSE] = 10.0
+    mean = np.divide(*_grid_from_fine(fine))
+    flat = mean[0, 0]
+
+    def moved(r: int, c: int) -> bool:
+        return not np.allclose(mean[r, c], flat, atol=1e-9)
+
+    assert moved(row, col)
+    assert all(moved(r, c) for r, c in
+               ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1)))
+    assert not any(moved(r, c) for r, c in
+                   ((row - 1, col - 1), (row - 1, col + 1),
+                    (row + 1, col - 1), (row + 1, col + 1)))
+
+
+def test_the_dro_grid_map_follows_the_camera_flip() -> None:
+    """The grid is addressed in sensor space; the render is flipped and cropped.
+
+    The affine map is the only thing bridging the two, and getting a flip's sign
+    wrong there does not fail loudly — it lands DRO's local means on the wrong
+    part of the picture, which reads as a vague haze rather than as a bug. So
+    the corners are checked directly: for an upright frame the image's top-left
+    is the sensor's, and for the two 90-degree flips the u and v axes swap, so
+    u must stop depending on image x and start depending on image y.
+    """
+    class _Sizes:
+        def __init__(self, flip: int) -> None:
+            self.width, self.height = 7028, 4688
+            self.left_margin, self.top_margin, self.flip = 0, 0, flip
+
+    class _Raw:
+        def __init__(self, flip: int) -> None:
+            self.sizes = _Sizes(flip)
+            self.raw_image = np.zeros((5120, 7168), dtype=np.uint16)
+
+    span_x, span_y = DRO_COARSE * 64, DRO_COARSE * 60
+
+    upright = _image_to_grid_uv(_Raw(0), None)
+    assert upright is not None
+    a0, a1, a2, b0, b1, b2 = upright
+    # Sensor origin, offset by half a cell because the map is to cell centres.
+    assert a0 == pytest.approx(-0.5)
+    assert b0 == pytest.approx((-40 - span_y / 2) / span_y)
+    assert a1 == pytest.approx(7028 / span_x) and b2 == pytest.approx(4688 / span_y)
+    assert a2 == 0.0 and b1 == 0.0   # no transpose, so no cross terms
+
+    for flip in (5, 6):
+        _, ra1, ra2, _, rb1, rb2 = _image_to_grid_uv(_Raw(flip), None) or ()
+        assert ra1 == 0.0 and rb2 == 0.0, "a 90-degree flip must transpose the axes"
+        assert ra2 != 0.0 and rb1 != 0.0
+        # Same patch of sensor either way: the spans are unchanged, it is only
+        # which image axis carries them that swaps. The two flips differ in sign.
+        assert abs(ra2) == pytest.approx(a1) and abs(rb1) == pytest.approx(b2)
+    assert _image_to_grid_uv(_Raw(5), None)[2] == -_image_to_grid_uv(_Raw(6), None)[2]
+
+    # 180 degrees keeps the axes but reverses both, so the spans go negative.
+    half_turn = _image_to_grid_uv(_Raw(3), None)
+    assert half_turn is not None
+    assert half_turn[1] == pytest.approx(-7028 / span_x)
+    assert half_turn[5] == pytest.approx(-4688 / span_y)
+
+
+@requires_sample
+@requires_exiftool
+def test_the_dro_control_rebuilds_the_profile_without_a_decode() -> None:
+    """Moving DRO is a profile rebuild, like the look and the five tweaks.
+
+    A per-pixel scalar gain commutes with the colour matrix, so the shader can
+    apply it to pixels the matrix already went through. That is what keeps the
+    strength off the linear cache key.
+    """
+    root = Path(__file__).resolve().parents[3]
+    rel = str(SAMPLE_IN.relative_to(root))
+
+    shot = daemon_look_profile({"input": rel}, root)["colorProfile"]
+    assert shot["droAvailable"] is True
+    assert shot["droAsShot"] == 1.0 and shot["droStrength"] == 1.0
+    assert shot["profileDroGain"] is not None
+    # This sample is a Bayer ARW, so the grid builds and DRO runs as the local
+    # operator it actually is — which is precisely when the approximation note
+    # is not earned. A shot that falls back to the global path still gets it.
+    grid = shot["profileDroGrid"]
+    assert grid is not None
+    assert len(grid["num"]) == grid["nx"] * grid["ny"] * grid["bins"]
+    assert len(grid["den"]) == len(grid["num"]) and len(grid["uv"]) == 6
+    assert not any("DRO uses this shot's own curve" in m for m in shot["limitations"])
+
+    off = daemon_look_profile({"input": rel, "dro": 0}, root)["colorProfile"]
+    assert off["droStrength"] == 0.0
+    # Nothing to apply, so nothing is sent and nothing is disclaimed.
+    assert off["profileDroGain"] is None
+    assert not any("DRO" in m for m in off["limitations"])
+    # Turning it off must not touch anything else about the render.
+    assert off["profileToneCurve"] == shot["profileToneCurve"]
+    assert off["droAsShot"] == 1.0
+
+    up = daemon_look_profile({"input": rel, "dro": 2}, root)["colorProfile"]
+    assert up["droStrength"] == 2.0
+    assert max(up["profileDroGain"]) > max(shot["profileDroGain"])
+
+    # And the same through the cached-decode path the client actually uses.
+    assert apply_look_overrides(shot, SAMPLE_IN, None, None, 0.0)["profileDroGain"] is None
+    back = apply_look_overrides(off, SAMPLE_IN, None, None, 1.0)
+    assert back["profileDroGain"] == shot["profileDroGain"]
+    assert back["limitations"] == shot["limitations"]
+
+
+def test_the_dro_presets_reproduce_the_engines_own_ladder() -> None:
+    """The baked preset table, checked against what the live engine hands out.
+
+    These ten curves were read out of Edit.exe's memory rather than derived, so
+    nothing else in this repo can catch a transcription slip in them. The lifts
+    below are the measurements from that dump (sony_repro/tools/dro_presets.py);
+    if a digit in the table moves, one of them moves with it.
+
+    The ladder is also not a straight line — 0.175 a step for the first six and
+    accelerating after — so a table quietly replaced by an interpolation of its
+    endpoints would fail here too.
+    """
+    x = np.arange(DRO_CURVE_POINTS) * (DRO_LOG_CEILING / DRO_CURVE_POINTS)
+    measured = [0.250, 0.425, 0.600, 0.775, 0.950, 1.125, 1.346, 1.624, 1.919, 2.222]
+    for i, want in enumerate(measured):
+        lift = float(np.abs(dro_preset_curve(i * 10) - x).max())
+        assert lift == pytest.approx(want, abs=1e-3), f"preset {i}"
+
+    # Every tenth level lands on a stored preset; the nine between interpolate.
+    # Level 5 is the one the engine itself selects when the body says Auto and
+    # the RAW carries no curve, so it has to land between P0 and P1 — but not at
+    # their midpoint, and asserting that would be wrong. The engine blends the
+    # knots and control points and *then* samples, and sampling is nonlinear in
+    # the knots: the segment lookup and the u it normalises against both move.
+    # Betweenness is the invariant that survives, so it is the one pinned here.
+    low, half, high = (dro_preset_curve(n) for n in (0, 5, 10))
+    assert np.all(half >= low - 1e-9) and np.all(half <= high + 1e-9)
+    assert float(np.abs(half - x).max()) == pytest.approx(0.337, abs=2e-3)
+    # Levels past the top pin to the last preset rather than running off the end.
+    assert np.allclose(dro_preset_curve(99), dro_preset_curve(90), atol=2e-3)
+
+
+def test_a_manual_dro_level_ignores_the_shots_own_curve_but_off_still_wins() -> None:
+    """The three DRO states, and which one takes precedence.
+
+    A level has to be independent of the frame — that is the whole point of the
+    presets, and it is what lets DRO work on a shot the body wrote no curve for.
+    Off has to beat a level that is merely still selected, or turning DRO off
+    would silently do nothing whenever someone had picked a level earlier.
+    """
+    root = Path(__file__).resolve().parents[3]
+    rel = str(SAMPLE_IN.relative_to(root))
+
+    def lift(profile: dict[str, Any]) -> float:
+        return float(np.abs(np.log2(np.array(profile["profileDroGain"]))).max())
+
+    auto = daemon_look_profile({"input": rel}, root)["colorProfile"]
+    assert auto["droLevel"] == -1
+    assert auto["droLevels"] == list(DRO_UI_LEVELS)
+
+    for level, want in zip(DRO_UI_LEVELS, (0.425, 0.775, 1.125, 1.624, 2.222), strict=True):
+        got = daemon_look_profile({"input": rel, "droLevel": level}, root)["colorProfile"]
+        assert got["droLevel"] == level
+        # The preset's own lift, not this shot's 0.26 — the frame is not
+        # consulted. Loose against the curve's own figure because the wire table
+        # is 512 samples of it and the peak falls between two of them.
+        assert lift(got) == pytest.approx(want, abs=1e-2)
+        # A level is a different curve, not a scaled one: the grid it is indexed
+        # by belongs to the file and has to survive the switch untouched.
+        assert got["profileDroGrid"] == auto["profileDroGrid"]
+
+    off = daemon_look_profile({"input": rel, "droLevel": 90, "dro": 0}, root)["colorProfile"]
+    assert off["profileDroGain"] is None
+
+    # And the level survives a look change through the no-decode path, which is
+    # the only way the client can keep it while switching Creative Looks.
+    picked = daemon_look_profile({"input": rel, "droLevel": 50}, root)["colorProfile"]
+    moved = apply_look_overrides(picked, SAMPLE_IN, None, "VV")
+    assert moved["droLevel"] == 50
+    assert moved["profileDroGain"] == picked["profileDroGain"]
+
+
+def test_clarity_follows_the_engines_own_ladder_and_offers_no_inert_stop() -> None:
+    """The setting -> detail-gain lookup, as ZcTaskSIMDMarble does it.
+
+    `clr = max(0, 10 * clarity)` indexes a ten-entry calibration table, so the
+    positive half walks the table one entry per step and the *whole* negative
+    half renders exactly like zero — Clarity does not soften, it only stops.
+    Which is why the offered range starts at zero: a slider reaching further
+    left would be handing the user nine stops that all render identically.
+    """
+    for setting in range(CLARITY_MAX + 1):
+        assert clarity_amount(setting) == CLARITY_AMP[setting] / CLARITY_AMP_SCALE
+    # Monotone and strictly increasing past zero: an amp table that repeated a
+    # value would make two adjacent settings indistinguishable. Over the offered
+    # range that is the whole claim — every stop on it renders differently.
+    assert TWEAK_RANGES["clarity"] == (0, CLARITY_MAX)
+    gains = [clarity_amount(n) for n in range(CLARITY_MAX + 1)]
+    assert gains == sorted(gains)
+    assert len(set(gains)) == len(gains)
+    # Outside it the value clamps rather than running off the table, which is
+    # what stops a hand-written request from raising IndexError. A negative one
+    # still lands on zero, i.e. on what the engine would have rendered it as.
+    for setting in range(-20, 0):
+        assert clarity_amount(setting) == 0.0
+    assert clarity_amount(99) == clarity_amount(CLARITY_MAX)
+
+
+def test_the_profile_carries_clarity_as_the_shaders_own_constants() -> None:
+    """Clarity reaches the browser as a gain plus the blur chain's geometry.
+
+    It is the one Creative Look tweak that is spatial, so unlike the other five
+    it cannot be folded into the tone curve — the shader has to rebuild the
+    engine's base layer, and these are the numbers it needs. They come from the
+    body's calibration, so they stay put while only the gain tracks the slider.
+    """
+    root = Path(__file__).resolve().parents[3]
+    rel = str(SAMPLE_IN.relative_to(root))
+
+    base = daemon_look_profile({"input": rel}, root)["colorProfile"]
+    shot = base["lookAsShot"]["clarity"]
+    assert base["profileClarity"]["gain"] == pytest.approx(clarity_amount(shot))
+
+    geometry = {k: v for k, v in base["profileClarity"].items() if k != "gain"}
+    for setting in (-9, 0, 1, 9):
+        got = daemon_look_profile({"input": rel, "look": {"clarity": setting}},
+                                  root)["colorProfile"]
+        # A negative comes back as the zero it renders as, rather than being
+        # echoed: what the client is told the setting is has to be a setting the
+        # panel can show, and the ranges it builds those sliders from say 0..9.
+        assert got["lookTweaks"]["clarity"] == max(0, setting)
+        assert got["lookRanges"]["clarity"] == [0, CLARITY_MAX]
+        # Exact, not approx, at the bottom: zero gain is how the renderer is told
+        # to skip the chain outright, so the bottom of the range must not come
+        # out as a small positive.
+        gain = got["profileClarity"]["gain"]
+        assert gain == (0.0 if setting <= 0 else pytest.approx(clarity_amount(setting)))
+        # Only the gain moves: the downsample factor, the edge threshold and the
+        # rolloff knee are the camera's, not the setting's.
+        assert {k: v for k, v in got["profileClarity"].items() if k != "gain"} == geometry
+        # And a shot that is actually getting Clarity says whose calibration it
+        # is using, since there is no way to read this body's own.
+        assert (CLARITY_CALIBRATION_BODY in " ".join(got["limitations"])) == (gain > 0)
+
+
+def test_sharpening_walks_two_ladders_that_disagree_about_invalid_values() -> None:
+    """Both settings map to the amplitude, and they fail differently.
+
+    `lvl = 10*(sharpness - 4)` lands on a table index, so an impossible value
+    falls back to the camera's default. `rng = 10*range + 20` is a *factor*, so
+    an impossible one leaves it at zero and multiplies the whole stage out. That
+    asymmetry is measured (tools/sharp_sweep.py), not assumed, and it is the
+    easiest thing here to get backwards.
+    """
+    # The camera's own defaults with this body's calibration are the constant
+    # Edit.exe's tiles were reproduced against.
+    assert sharpness_amount(SHARPNESS_DEFAULT, SHARPNESS_RANGE_DEFAULT, 1.7) == 85 / 1024
+    # Sharpness is linear in the setting and strictly increasing.
+    gains = [sharpness_amount(n, SHARPNESS_RANGE_DEFAULT, 1.7) for n in range(SHARPNESS_MAX + 1)]
+    assert gains == sorted(gains)
+    assert len(set(gains)) == len(gains)
+    assert gains[0] > 0        # even +0 sharpens: lvl = -40 is a weaker gain, not off
+    # Out of range: the fallback, not a clamp to the nearest end.
+    for bad in (-1, -9, 10, 99):
+        assert sharpness_amount(bad, SHARPNESS_RANGE_DEFAULT, 1.7) == gains[SHARPNESS_DEFAULT]
+    # Range, by contrast, switches the stage off outright when it is invalid.
+    for bad in (-1, -5, 6, 99):
+        assert sharpness_amount(SHARPNESS_DEFAULT, bad, 1.7) == 0.0
+    # Its ladder lands on unity at the camera's default, which is why that
+    # default neither boosts nor cuts what the Sharpness ladder asked for.
+    # Stated against the ladder's own constants, so that moving one of them
+    # without the other is what fails.
+    assert (SHARPNESS_RANGE_STEP * SHARPNESS_RANGE_DEFAULT
+            + SHARPNESS_RANGE_BASE) == SHARPNESS_RANGE_UNITY
+    ratios = [sharpness_amount(SHARPNESS_DEFAULT, r, 1.7) / (85 / 1024)
+              for r in range(SHARPNESS_RANGE_MAX + 1)]
+    assert ratios == sorted(ratios)
+
+
+def test_the_sharpen_scale_comes_out_of_the_raw_not_out_of_a_table() -> None:
+    """`calib[0x1060]` is tag 0x78cd, which is what makes this stage offline.
+
+    Clarity's amplitudes had to be dumped from a live body; this one is in the
+    file, per shot. A reader that silently returned the default instead would
+    look right — every frame would still sharpen — while being wrong by up to
+    70%, so the value is pinned against the sample rather than just checked for
+    plausibility.
+    """
+    assert sharpness_calibration(SAMPLE_IN) == pytest.approx(1.7)
+    # Anything that is not a readable Sony RAW is the engine's initialised 1.0,
+    # not an exception: callers asked what the body did, and "no adjustment" is
+    # a real answer.
+    assert sharpness_calibration(Path(__file__)) == SHARPNESS_CALIB_DEFAULT
+    assert sharpness_calibration(SAMPLE_IN.with_name("no-such-file.ARW")) == SHARPNESS_CALIB_DEFAULT
+
+
+def test_the_profile_carries_sharpening_and_it_survives_a_look_change() -> None:
+    """Sharpening reaches the browser as one amplitude, and stays put.
+
+    It is a camera setting rather than a Creative Look tweak, so no slider the
+    client can move may disturb it — but a profile rebuild goes back through
+    look_render_info, which is exactly where it could get quietly reset to a
+    default. Carrying the block forward, the way the DRO grid is, is what stops
+    that; rebuilding it would mean re-reading the RAW for a number that cannot
+    have moved.
+    """
+    root = Path(__file__).resolve().parents[3]
+    rel = str(SAMPLE_IN.relative_to(root))
+
+    base = daemon_look_profile({"input": rel}, root)["colorProfile"]
+    block = base["profileSharpness"]
+    # The sample is a +4 / +3 frame, so its amplitude is the ladder's default
+    # scaled by the calibration read out of this very file — which is the whole
+    # point of the stage being computable offline.
+    assert block["amount"] == pytest.approx(
+        sharpness_amount(SHARPNESS_DEFAULT, SHARPNESS_RANGE_DEFAULT,
+                         sharpness_calibration(SAMPLE_IN)))
+    assert block["amount"] > 0
+
+    # A shot that is sharpening says what it cannot match; one that is not has
+    # nothing to qualify. Both halves are running on this frame, so both notes
+    # are there — and neither may still claim Spica is unreproduced, which is
+    # what this list said before spica.py existed.
+    notes = " ".join(base["limitations"])
+    assert "full resolution" in notes
+    assert "not reproduced" not in notes.replace("ITP stage is not reproduced", "")
+
+    # The panel reads these; the shader does not. A block that carried only the
+    # amplitude would render identically and show nothing.
+    assert block["level"] == SHARPNESS_DEFAULT
+    assert block["range"] == SHARPNESS_RANGE_DEFAULT
+
+    # Neither a look change nor a moved tweak may touch either block.
+    spica = base["profileSpica"]
+    assert spica["amount"] == pytest.approx(spica_amount(SHARPNESS_DEFAULT, SHARPNESS_RANGE_DEFAULT))
+    for overrides, style in (({"contrast": 3}, None), (None, "VV"), ({"clarity": 9}, "ST")):
+        moved = apply_look_overrides(base, SAMPLE_IN, overrides, style)
+        assert moved["profileSharpness"] == block
+        assert moved["profileSpica"] == spica
+
+
+def test_spica_is_weighted_against_sharpening_rather_than_beside_it() -> None:
+    """One control, split across two stages — so the two move in opposition.
+
+    The easy mistake is to treat this as a second independent strength. It is
+    not: `(100 - st[0x2c4])` is the same ladder sharpening uses, read the other
+    way, and the two weights are what decides how much of the effect lands on
+    each end. A shot at the camera's defaults puts exactly half here.
+    """
+    assert spica_amount(SHARPNESS_DEFAULT, SHARPNESS_RANGE_DEFAULT) == 0.5
+
+    # Range moves the split: up sends the effect to the coarse stage, so this
+    # one falls as sharpening's rises. Strictly, at every step.
+    fine = [spica_amount(SHARPNESS_DEFAULT, r) for r in range(SHARPNESS_RANGE_MAX + 1)]
+    coarse = [sharpness_amount(SHARPNESS_DEFAULT, r, 1.7) for r in range(SHARPNESS_RANGE_MAX + 1)]
+    assert fine == sorted(fine, reverse=True)
+    assert coarse == sorted(coarse)
+    # Never off at either end of the ladder: the split moves the effect between
+    # the two, it does not switch one of them out.
+    assert min(fine) > 0
+
+    # Sharpness itself is the shared strength, so it raises both.
+    levels = [spica_amount(n, SHARPNESS_RANGE_DEFAULT) for n in range(SHARPNESS_MAX + 1)]
+    assert levels == sorted(levels)
+    assert len(set(levels)) == len(levels)
+
+    # An unreadable range is where the two stages genuinely disagree. It zeroes
+    # sharpening's amplitude, so the same tag has to send *more* here, not zero
+    # — the term is `100 - opts[0x2c4]` and the engine leaves that field at 0.
+    # spica_off is what a caller with nothing to read should use instead.
+    assert sharpness_amount(SHARPNESS_DEFAULT, -1, 1.7) == 0.0
+    assert spica_amount(SHARPNESS_DEFAULT, -1) > spica_amount(SHARPNESS_DEFAULT,
+                                                              SHARPNESS_RANGE_DEFAULT)
+    assert spica_off()["amount"] == 0.0
+
+
+def test_spica_iso_gain_bends_only_above_the_knee() -> None:
+    """Three breakpoints, of which the first segment is flat.
+
+    Read two ways that had to agree: out of the preset's config block
+    (400 / 1600 / 25600 -> 1 / 1 / 0.75) and solved from the engine's own pixels
+    across twelve ISOs. The one measured point on the ramp is ISO 4000 at
+    0.975, which is what pins the slope — a curve that started bending at 400
+    instead would still be 1.0 at 100 and 0.75 at 25600.
+    """
+    for iso in (50, 100, 400, 800, 1600):
+        assert spica_iso_gain(iso) == 1.0
+    assert spica_iso_gain(4000) == pytest.approx(0.975)
+    assert spica_iso_gain(25600) == pytest.approx(0.75)
+    # Flat past the top rather than continuing down through zero.
+    assert spica_iso_gain(51200) == pytest.approx(0.75)
+    assert spica_iso_gain(409600) == pytest.approx(0.75)
+    # Monotone in between, and never outside the two endpoints.
+    ramp = [spica_iso_gain(i) for i in range(1600, 25601, 800)]
+    assert ramp == sorted(ramp, reverse=True)
+    assert min(ramp) >= 0.75 and max(ramp) <= 1.0
+    # An unreadable ISO renders at what most frames get, not at a neutral
+    # invented for the occasion.
+    assert spica_iso_gain(None) == 1.0

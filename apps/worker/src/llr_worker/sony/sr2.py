@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass
+from functools import lru_cache, partial
 from pathlib import Path
 
 import numpy as np
@@ -58,6 +59,20 @@ LUMA_PIVOT_TAG = 0x780B     # uint16[10], on the engine's 0..16383 luma scale
 LUMA_CONTRAST_TAG = 0x780E  # uint16[10], 16384 = x1.0
 FADE_STEPS = 10             # Fade 0..9, one table entry each
 LUMA_CONTRAST_UNIT = 16384
+
+# DRO's tone curve, as a piecewise cubic Bezier in log2 luma. The camera decides
+# the Auto level and writes the *result* here, so nothing about Sony's grading
+# logic has to be re-derived to know what DRO did to a shot (Edit.exe
+# 0x14018ad50, reached from 0x140188ae9 with calib+0x10f2 / +0x1106).
+DRO_KNOTS_TAG = 0x781B   # uint16[10], /1024 -> log2 luma, the segment boundaries
+DRO_CTRL_TAG = 0x781C    # uint16[28] = 9 segments x 3 + 1 control points
+DRO_CURVE_POINTS = 104   # the engine builds this many samples
+DRO_SEGMENTS = 9
+_DRO_UNIT = 1024.0
+# vatr[0x70], the log-domain ceiling the engine clamps the curve to. It computes
+# it as log2(vatr[0x54] * 8191) with vatr[0x54] = 1.0; measured 12.99982 on all
+# 16 frames checked against the engine's own buffer.
+DRO_LOG_CEILING = 12.999823410347818
 
 # TIFF field type -> bytes per unit
 _TYPE_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8}
@@ -141,6 +156,25 @@ def _find_tag(buf: bytes, pos: int, endian: str, tag: int):
     return None
 
 
+def _top_array(
+    dec: bytes, sub_pos: int, endian: str, tag: int, *,
+    fmt: str, dtype: type, want: int | None = None,
+) -> np.ndarray | None:
+    """A top-level SR2SubIFD tag as an array, or None if it is absent or short.
+
+    `want` pins the count the caller needs (the DRO tags are fixed-length and a
+    shorter one is unusable); left off, the file's own count is read.
+    """
+    e = _find_tag(dec, sub_pos, endian, tag)
+    if e is None:
+        return None
+    _, cnt, tpos, _ = e
+    n = cnt if want is None else want
+    if cnt < n:
+        return None
+    return np.array(struct.unpack_from(f"{endian}{n}{fmt}", dec, tpos), dtype=dtype)
+
+
 def _decrypted_sr2(path: str | Path) -> tuple[bytes, int, str]:
     """Decrypt the SR2SubIFD -> (whole buffer, its offset, byte order).
 
@@ -191,6 +225,107 @@ def read_sr2_tag(path: str | Path, tag: int = SR2_PARAM_TAG) -> bytes:
     return dec[vpos:vpos + size]
 
 
+@lru_cache(maxsize=8)
+def _cached_dro_curve(path: str, size: int, mtime: int) -> np.ndarray | None:
+    """dro_curve keyed on the file's identity, as _cached_calibrations is.
+
+    Reaching the curve means reading and decrypting the whole RAW, and both the
+    strength and the gain table are asked for it on every profile rebuild — a
+    DRO slider tick would otherwise re-read tens of megabytes twice. The array
+    is handed to several callers at once, so it goes out read-only.
+    """
+    curve = _read_dro_curve(path)
+    if curve is not None:
+        curve.flags.writeable = False
+    return curve
+
+
+def dro_curve(path: str | Path) -> np.ndarray | None:
+    """The DRO tone curve this shot was rendered with, or None if it has none.
+
+    104 samples of output log2 luma against input log2 luma, evenly spaced over
+    [0, DRO_LOG_CEILING). None means the RAW carries no curve, which for a shot
+    whose exif says Auto sends the engine to its built-in level-5 preset instead
+    — a different question, and one this cannot answer offline because those
+    preset tables live in Edit.exe's .data rather than in the file.
+
+    Rebuilt offline, this matched the engine's own buffer on all 16 frames
+    checked, to within float32 noise (max 3e-6). See sony_repro/PIPELINE.md
+    section 7.10.2 and tools/vatr_verify.py.
+
+    The result is read-only: it is shared out of a cache.
+    """
+    try:
+        st = Path(path).stat()
+    except OSError:
+        return None
+    return _cached_dro_curve(str(path), st.st_size, int(st.st_mtime_ns))
+
+
+def _read_dro_curve(path: str | Path) -> np.ndarray | None:
+    try:
+        dec, sub_pos, endian = _decrypted_sr2(path)
+    except (KeyError, OSError, struct.error, IndexError, ValueError):
+        # A file that is not a Sony RAW can fail anywhere in the walk, not just
+        # at the missing-tag check: a truncated IFD runs the entry loop off the
+        # end of the buffer. Callers asked what DRO did, and the answer for such
+        # a file is "nothing here to read", not an exception.
+        return None
+
+    top = partial(_top_array, dec, sub_pos, endian, fmt="H", dtype=np.float64)
+    knots = top(DRO_KNOTS_TAG, want=10)
+    ctrl = top(DRO_CTRL_TAG, want=3 * DRO_SEGMENTS + 1)
+    # All-zero knots are the engine's own "no curve here" flag (calib+0x10f0 is
+    # set from exactly this test), not a curve that happens to be flat.
+    if knots is None or ctrl is None or not knots.any():
+        return None
+    knots /= _DRO_UNIT
+    ctrl /= _DRO_UNIT
+    return sample_dro_curve(knots, ctrl)
+
+
+def sample_dro_curve(knots: np.ndarray, ctrl: np.ndarray) -> np.ndarray:
+    """The engine's piecewise cubic Bezier, sampled the way the engine samples it.
+
+    Shared with the built-in level presets, which are the same nine segments in
+    the same units — only their source differs (Edit.exe's own table rather than
+    this file's tags), so the sampling must not diverge between the two.
+    """
+    step = DRO_LOG_CEILING / DRO_CURVE_POINTS
+    out = np.empty(DRO_CURVE_POINTS, dtype=np.float64)
+    for i in range(DRO_CURVE_POINTS):
+        xx = i * step
+        # The engine walks the segments in order and takes the first that ends
+        # past xx. Its fallback indexes one segment past the last, which is out
+        # of bounds; the top sample sits below the final knot on every frame
+        # measured, so clamping here changes nothing that has been observed.
+        j = next((t for t in range(DRO_SEGMENTS) if xx < knots[t + 1]), DRO_SEGMENTS - 1)
+        width = knots[j + 1] - knots[j]
+        u = 0.0 if width == 0 else (xx - knots[j]) / width
+        b = 3 * j
+        out[i] = min(
+            (1 - u) ** 3 * ctrl[b] + 3 * (1 - u) ** 2 * u * ctrl[b + 1]
+            + 3 * u**2 * (1 - u) * ctrl[b + 2] + u**3 * ctrl[b + 3],
+            DRO_LOG_CEILING,
+        )
+    return out
+
+
+def dro_strength(path: str | Path) -> float | None:
+    """How far this shot's DRO curve departs from identity, in stops.
+
+    None when the RAW carries no curve. 0.0 means the camera chose Auto and then
+    graded the shot at level zero — the stage runs and does nothing. Measured
+    across 22 Auto frames this ranged 0.000 to 0.727, and three of them were
+    exactly zero, so "exif says Auto" is not the same question.
+    """
+    curve = dro_curve(path)
+    if curve is None:
+        return None
+    x = np.arange(DRO_CURVE_POINTS) * (DRO_LOG_CEILING / DRO_CURVE_POINTS)
+    return float(np.abs(curve - x).max())
+
+
 def look_calibrations(path: str | Path) -> list[LookCalibration]:
     """Every Creative Look's calibration, in Sony's own order.
 
@@ -215,12 +350,7 @@ def look_calibrations(path: str | Path) -> list[LookCalibration]:
     _, _, mpos, msize = shared
     param_block = dec[mpos:mpos + msize]
 
-    def _top_shorts(tag: int) -> np.ndarray | None:
-        e = _find_tag(dec, sub_pos, endian, tag)
-        if e is None:
-            return None
-        _, cnt, tpos, _ = e
-        return np.array(struct.unpack_from(f"{endian}{cnt}h", dec, tpos), dtype=np.int64)
+    _top_shorts = partial(_top_array, dec, sub_pos, endian, fmt="h", dtype=np.int64)
 
     # The illuminant weights and the as-shot look's finished parameters are both
     # top-level: they describe the frame, not a look.

@@ -28,10 +28,20 @@ from .dcp import DcpProfile, apply_dcp_profile, load_dcp_profile
 from .denoise import DEFAULT_MODEL, denoise_raw_inplace, get_denoiser
 from .fit_profile import camera_match_path, postprocess_camera_native
 from .imported import decode_image_linear
-from .sony import NO_TWEAKS, LookTweaks, apply_look_overrides, apply_sony_profile, calibration_for
+from .sony import NO_TWEAKS, LookTweaks, apply_look_overrides, apply_sony_profile, calibration_for, looks_in_file
 from .sony import can_render as sony_can_render
+from .sony import is_borrowed as sony_is_borrowed
+from .sony.dro import dro_gain_table, dro_grid, dro_grid_json
+from .sony.dro_presets import DRO_LEVEL_AUTO, DRO_LEVEL_MAX
 from .sony.profile import look_render_info
-from .sony.sr2 import LookCalibration
+from .sony.sharpness import (
+    SHARPNESS_DEFAULT,
+    SHARPNESS_RANGE_DEFAULT,
+    sharpness_block,
+    sharpness_calibration,
+)
+from .sony.spica import spica_block, spica_iso_gain
+from .sony.sr2 import LookCalibration, dro_strength
 
 RAW_EXTENSIONS = {".arw", ".srf", ".sr2", ".dng", ".cr2", ".cr3", ".nef", ".raf", ".rw2", ".orf"}
 LOCAL_CAMERA_PROFILE_ROOT = Path("vendor/adobe-camera-profiles/Camera")
@@ -64,10 +74,27 @@ class RawMetadata:
     # pulls luma toward a pivot and Saturation (-9..+9) scales the chroma either
     # side of a clamp (sony/chroma.py). Reproducing Sony's rendering needs all.
     look: LookTweaks = NO_TWEAKS
-    # Whether the shot asked for DRO. Sony runs a whole extra stage for it
-    # (ZcTaskVatr) that this pipeline does not reproduce, so the render is
-    # honest about it only on the shots where it actually applies.
+    # In-camera sharpening, already in wire form (sony/sharpness.py). A setting
+    # of its own rather than one of the look tweaks, and read here for the same
+    # reason the DRO curve is — this is where the file is already open.
+    sharpen: dict[str, Any] | None = None
+    # The fine half of the same control (sony/spica.py), also in wire form. Its
+    # ISO term needs the exif this function already has, which is the other
+    # reason it is read here rather than derived in the browser.
+    spica: dict[str, Any] | None = None
+    # Whether DRO actually shaped this shot — not merely whether the body was in
+    # Auto, which is a weaker claim (see dro_from_exif).
     dro_active: bool = False
+    # The camera's own DRO curve for this shot, as a gain against log luminance
+    # (sony/dro.py). None when the RAW carries no curve. Read here because this
+    # is where the file is open; the render only ever applies a scaled copy.
+    dro_gain: list[float] | None = None
+    # The engine's bilateral grid for this shot, in wire form. Built here for
+    # the same reason as dro_gain — it is the only point the RAW is open — but
+    # it costs a pass over the Bayer data, so it is only built when there is a
+    # curve to index with it. None means the shader falls back to the global
+    # approximation.
+    dro_grid: dict[str, Any] | None = None
 
 
 @dataclass
@@ -330,6 +357,43 @@ def _linear_cache_key(
 _LINEAR_CACHE: OrderedDict[tuple[Any, ...], tuple[np.ndarray, dict[str, Any]]] = OrderedDict()
 _LINEAR_CACHE_BYTES_MAX = 1536 * _MIB
 
+# Sony's DRO bilateral grid, keyed by file identity alone — it comes off the
+# Bayer data, so no render setting can change it. The look-profile path exists
+# precisely to answer without touching pixels, and rebuilding the grid there
+# would put a full raw read behind the look picker; a decode fills this first.
+_DRO_GRID_CACHE: OrderedDict[tuple[Any, ...], dict[str, Any] | None] = OrderedDict()
+_DRO_GRID_CACHE_MAX = 6
+
+
+def _file_stamp(input_path: Path) -> tuple[Any, ...]:
+    try:
+        st = input_path.stat()
+        return (str(input_path), st.st_size, int(st.st_mtime_ns))
+    except OSError:
+        return (str(input_path),)
+
+
+def dro_grid_cached(input_path: Path, exif: dict[str, Any]) -> dict[str, Any] | None:
+    """This shot's DRO grid, opening the RAW only if a decode has not already.
+
+    Returns None both for "no grid possible" and for a file that cannot be read;
+    the consumer's fallback is the same either way, so they do not need telling
+    apart. A cached None is a real answer and is honoured rather than retried.
+    """
+    key = _file_stamp(input_path)
+    with _CACHE_LOCK:
+        if key in _DRO_GRID_CACHE:
+            _DRO_GRID_CACHE.move_to_end(key)
+            return _DRO_GRID_CACHE[key]
+    try:
+        with rawpy.imread(str(input_path)) as raw:
+            crop = camera_crop_rect(raw, exif)
+            value = dro_grid_json(dro_grid(raw, crop[0] if crop else None))
+    except (rawpy.LibRawError, OSError, ValueError):
+        value = None
+    _remember(_DRO_GRID_CACHE, key, value, _DRO_GRID_CACHE_MAX)
+    return value
+
 
 def _write_linear_f16(linear_arr: np.ndarray, output_path: Path) -> int:
     """Write scene-linear pixels as float16, halving the transfer size.
@@ -343,6 +407,21 @@ def _write_linear_f16(linear_arr: np.ndarray, output_path: Path) -> int:
     with open(output_path, "wb") as f:
         out.tofile(f)
     return out.nbytes
+
+
+def _stamp_look_choices(profile: dict[str, Any], input_path: Path) -> dict[str, Any]:
+    """Add the picker's two facts: which looks this file has, and the shot's own.
+
+    Properties of the RAW rather than of the request, but the frontend needs them
+    the moment a decode lands or the picker cannot be drawn until something else
+    asks for a profile. Read from the file so a body shipping more than the ten
+    known looks offers its own instead of a hardcoded list.
+    """
+    if profile.get("kind") != "sony":
+        return profile
+    profile["availableLooks"] = looks_in_file(input_path)
+    profile.setdefault("lookAsShotStyle", profile.get("creativeLook"))
+    return profile
 
 
 def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
@@ -373,10 +452,22 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     if bool(denoise_req.get("enabled", False)) and dn_amount > 0.0 and is_raw(input_path):
         dn_model = str(denoise_req.get("model") or DEFAULT_MODEL)
 
-    # Overrides for the shot's Creative Look tweaks. Deliberately absent from the
-    # cache key: not one of the five reaches the pixels, so a cached decode
-    # serves every setting and only the profile that rides along is re-derived.
+    # Overrides for the shot's Creative Look tweaks, and for which look to render
+    # at all. Both are deliberately absent from the cache key: neither the five
+    # tweaks nor the choice of look reaches the pixels — the looks share the
+    # body's one hue-segmented matrix — so a cached decode serves every setting
+    # and only the profile that rides along is re-derived.
     look_overrides = request.get("look")
+    look_style = normalize_style(request.get("style"))
+    # DRO belongs in this list too: it is one gain per pixel, and a gain
+    # commutes with the colour matrix, so the shader applies it to the same
+    # cached pixels and only the table riding along changes.
+    dro_request = request.get("dro")
+    dro_override = None if dro_request is None else float(dro_request)
+    # Absent means "leave the level alone", which is not the same as Auto — the
+    # rebuild has to be able to keep a manual level across a look change.
+    dro_level_override = (None if request.get("droLevel") is None
+                          else dro_level_from_request(request))
 
     # Check processed sRGB cache first
     cache_key = _linear_cache_key(input_path, profile_id, half_size, max_size, dcp_code, dn_model, dn_amount)
@@ -386,7 +477,12 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
             _LINEAR_CACHE.move_to_end(cache_key)
     if cached_linear is not None:
         linear_arr, color_profile = cached_linear
-        color_profile = apply_look_overrides(color_profile, input_path, look_overrides)
+        # Stamped before the overrides so lookAsShotStyle captures the look the
+        # body chose — what is cached is always the camera's own rendering, and
+        # after an override creativeLook is the client's pick instead.
+        color_profile = _stamp_look_choices(color_profile, input_path)
+        color_profile = apply_look_overrides(color_profile, input_path, look_overrides, look_style, dro_override,
+                                             dro_level_override)
         bytes_written = _write_linear_f16(linear_arr, output_path)
         return {
             "width": linear_arr.shape[1],
@@ -473,6 +569,10 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     # was applied this render. The frontend needs this to keep showing the toggle
     # after the user switches the match off (at which point cameraMatch goes null).
     prepared.color_profile["cameraMatchAvailable"] = has_camera_match(root, prepared.color_profile.get("selection"))
+    # Before the cache insert and before the overrides: these describe the file,
+    # so they belong on the cached profile too, and lookAsShotStyle has to be
+    # read while creativeLook still names the look the body chose.
+    _stamp_look_choices(prepared.color_profile, input_path)
 
     # Cache processed sRGB so switching back to this DCP code is instant. The
     # decode/DCP/downsample paths already yield C-contiguous float32, so this is a
@@ -495,7 +595,8 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
         "output": str(output_path),
         # After the cache insert, so what is cached stays the camera's own
         # rendering and this request's overrides do not outlive it.
-        "colorProfile": apply_look_overrides(prepared.color_profile, input_path, look_overrides),
+        "colorProfile": apply_look_overrides(prepared.color_profile, input_path, look_overrides, look_style, dro_override,
+                                             dro_level_override),
         "dtype": "float16",
         "bytesWritten": bytes_written,
     }
@@ -511,19 +612,44 @@ def daemon_look_profile(request: dict[str, Any], root: Path) -> dict[str, Any]:
     decrypting the RAW's SR2 block, which is cached, and the exif read alongside
     it is memoised — no decode happens on this path.
 
+    The same holds for the choice of look itself: every ARW carries all of them
+    and they share the body's one matrix, so switching is this request too, not a
+    re-decode. `style` picks one; absent, the shot renders as the body recorded.
+
     A null profile is the honest answer for a shot this path cannot render (a
     non-Sony body, a look with no calibration): the caller keeps what it has.
     """
     input_path = resolve_path(root, request["input"])
     exif = read_exiftool_metadata(input_path)
-    style = normalize_style(exif.get("CreativeStyle"))
-    cal = calibration_for(input_path, style) if sony_can_render(style) else None
+    as_shot_style = normalize_style(exif.get("CreativeStyle"))
+    style = normalize_style(request.get("style")) or as_shot_style
+    cal = calibration_for(input_path, style) if sony_can_render(style, input_path) else None
+    if cal is None and style != as_shot_style:
+        # A look this file does not carry — a session restored onto a different
+        # body, say. Render what the body chose rather than returning null, which
+        # the client reads as "no Sony rendering" and answers by keeping a
+        # profile for the wrong look on screen.
+        style = as_shot_style
+        cal = calibration_for(input_path, style) if sony_can_render(style, input_path) else None
     if style is None or cal is None:
         return {"colorProfile": None}
     as_shot = look_from_exif(exif)
+    dro_strength = request.get("dro")
     info = look_render_info(cal, style, as_shot.merged(request.get("look")), as_shot,
-                            dro=dro_from_exif(exif))
-    return {"colorProfile": info.to_json()}
+                            dro=dro_from_exif(exif, input_path), borrowed=sony_is_borrowed(input_path, style),
+                            dro_gain=dro_gain_table(input_path),
+                            dro_strength=None if dro_strength is None else float(dro_strength),
+                            dro_grid=dro_grid_cached(input_path, exif),
+                            dro_level=dro_level_from_request(request),
+                            sharpen=sharpness_from_exif(exif, input_path),
+                            spica=spica_from_exif(exif))
+    profile = info.to_json()
+    # Which looks this particular file can offer, and which one the body chose.
+    # Read from the RAW rather than from a constant so a body shipping more than
+    # the ten known looks populates the picker with its own.
+    profile["availableLooks"] = looks_in_file(input_path)
+    profile["lookAsShotStyle"] = as_shot_style
+    return {"colorProfile": profile}
 
 
 def daemon_extract_preview(request: dict[str, Any], root: Path) -> dict[str, Any]:
@@ -1006,7 +1132,9 @@ def render_color(
             # linear cache holds this profile, and a request that overrode a
             # slider must not leave its answer behind for the next one. Overrides
             # are re-derived per request instead (sony.apply_look_overrides).
-            tweaks=metadata.look, dro=metadata.dro_active,
+            tweaks=metadata.look, dro=metadata.dro_active, dro_gain=metadata.dro_gain,
+            dro_grid=metadata.dro_grid, sharpen=metadata.sharpen,
+            spica=metadata.spica,
         )
         return linear, info.to_json()
 
@@ -1279,6 +1407,18 @@ def read_raw_metadata(input_path: Path, raw: rawpy.RawPy) -> RawMetadata:
     else:
         full_width = int(sizes.iwidth) if sizes else None
         full_height = int(sizes.iheight) if sizes else None
+    # Shipped whenever the RAW holds a curve, not only when the body used it:
+    # that is what lets someone dial DRO in on a frame shot without it. Whether
+    # the body used it rides on dro_active, which is what sets the default.
+    dro_gain = dro_gain_table(input_path)
+    # Only worth the raw pass when there is a curve for it to index. Needs the
+    # camera crop because the grid is addressed in sensor coordinates while the
+    # render is the cropped, flipped frame.
+    grid = dro_grid_json(
+        dro_grid(raw, camera_crop[0] if camera_crop else None)) if dro_gain else None
+    # The RAW is already open here, so this is the cheap place to fill the cache
+    # the look-profile path reads from.
+    _remember(_DRO_GRID_CACHE, _file_stamp(input_path), grid, _DRO_GRID_CACHE_MAX)
     return RawMetadata(
         make=exif.get("Make"),
         model=exif.get("Model"),
@@ -1294,19 +1434,60 @@ def read_raw_metadata(input_path: Path, raw: rawpy.RawPy) -> RawMetadata:
         camera_crop=camera_crop,
         lens_corr=sony_lens_corrections(exif),
         look=look_from_exif(exif),
-        dro_active=dro_from_exif(exif),
+        sharpen=sharpness_from_exif(exif, input_path),
+        spica=spica_from_exif(exif),
+        dro_active=dro_from_exif(exif, input_path),
+        dro_gain=dro_gain,
+        dro_grid=grid,
     )
 
 
 def look_from_exif(exif: dict[str, Any]) -> LookTweaks:
-    """The five Creative Look tweaks the body recorded for this shot."""
-    return LookTweaks(
-        highlights=_exif_int(exif.get("Highlights")),
-        shadows=_exif_int(exif.get("Shadows")),
-        fade=_exif_int(exif.get("Fade")),
+    """The six Creative Look tweaks the body recorded for this shot.
+
+    Through merged() rather than the constructor so a tag outside what the
+    engine renders (a negative Clarity, which it clamps at zero) lands inside
+    it: as-shot is the panel's reset target, and a slider has to be able to
+    return to it.
+    """
+    return NO_TWEAKS.merged({
+        "highlights": _exif_int(exif.get("Highlights")),
+        "shadows": _exif_int(exif.get("Shadows")),
+        "fade": _exif_int(exif.get("Fade")),
         # exiftool prints Sony's zero for these as "Normal", not "0".
-        contrast=_exif_int(exif.get("Contrast")),
-        saturation=_exif_int(exif.get("Saturation")),
+        "contrast": _exif_int(exif.get("Contrast")),
+        "saturation": _exif_int(exif.get("Saturation")),
+        "clarity": _exif_int(exif.get("Clarity")),
+    })
+
+
+def sharpness_from_exif(exif: dict[str, Any], input_path: Path) -> dict[str, Any]:
+    """The body's sharpening for this shot, as the shader needs it.
+
+    Two MakerNotes ladders and one scale out of the RAW itself — which is why
+    this sits here beside look_from_exif and dro_from_exif rather than in
+    sony/sharpness.py: reading the file is the caller's job in this package,
+    and the module stays a pure description of the engine's arithmetic.
+    """
+    return sharpness_block(
+        _exif_int(exif.get("Sharpness"), SHARPNESS_DEFAULT),
+        _exif_int(exif.get("SharpnessRange"), SHARPNESS_RANGE_DEFAULT),
+        sharpness_calibration(input_path),
+    )
+
+
+def spica_from_exif(exif: dict[str, Any]) -> dict[str, Any]:
+    """The fine half of sharpening for this shot.
+
+    The same two ladders sharpening reads, weighted the other way, plus the
+    shot's ISO — and no file read at all, because unlike sharpening this stage
+    has no per-shot calibration in the SR2 block. `Sharpness` and `ISO` are
+    plain exif, so this one takes only the tags.
+    """
+    return spica_block(
+        _exif_int(exif.get("Sharpness"), SHARPNESS_DEFAULT),
+        _exif_int(exif.get("SharpnessRange"), SHARPNESS_RANGE_DEFAULT),
+        spica_iso_gain(_exif_int(exif.get("ISO")) or None),
     )
 
 
@@ -1320,21 +1501,63 @@ def _exif_switch_on(value: Any) -> bool:
     return str(value or "Off").strip().lower() not in ("off", "none")
 
 
-def dro_from_exif(exif: dict[str, Any]) -> bool:
-    return _exif_switch_on(exif.get("DynamicRangeOptimizer"))
+# Below this the curve moves the darkest tones by under a percent, which is not
+# something the render owes the user a warning about. The 22 Auto frames
+# measured split cleanly around it: three sat at 0.001 or less, the rest at
+# 0.029 and above.
+DRO_VISIBLE_STOPS = 0.01
 
 
-def _exif_int(value: Any) -> int:
-    """One signed exif integer, 0 when absent or unparseable.
+def dro_level_from_request(request: dict[str, Any]) -> int:
+    """The manual DRO level a request asked for, or Auto when it asked for none.
+
+    Auto is -1 rather than absent because that is the engine's own encoding, and
+    because a level of 0 is a real, weak setting that must not read as "unset".
+    """
+    value = request.get("droLevel")
+    if value is None:
+        return DRO_LEVEL_AUTO
+    try:
+        return max(DRO_LEVEL_AUTO, min(DRO_LEVEL_MAX, int(value)))
+    except (TypeError, ValueError):
+        return DRO_LEVEL_AUTO
+
+
+def dro_from_exif(exif: dict[str, Any], input_path: Path | None = None) -> bool:
+    """Whether DRO actually shaped this shot, not merely whether it was armed.
+
+    Both questions have an answer in the file and they disagree. The exif switch
+    only says which mode the body was in; the curve the body then chose is
+    written into the RAW, and on three of 22 Auto frames measured it came out
+    flat — the stage ran and changed nothing. Reporting those as "DRO applied,
+    not reproduced" would be a warning about an effect that is not there.
+
+    Falls back to the exif switch alone when the RAW carries no curve, which is
+    where the engine falls back to a built-in preset (PIPELINE.md 7.10.2).
+    """
+    if not _exif_switch_on(exif.get("DynamicRangeOptimizer")):
+        return False
+    if input_path is None:
+        return True
+    try:
+        strength = dro_strength(input_path)
+    except Exception:
+        return True
+    return True if strength is None else strength >= DRO_VISIBLE_STOPS
+
+
+def _exif_int(value: Any, default: int = 0) -> int:
+    """One signed exif integer, `default` when absent or unparseable.
 
     exiftool renders these as "+1" / "-6" strings, which int() handles, but a
-    body that doesn't write the tag at all is the common case and simply means
-    no tweak was applied.
+    body that doesn't write the tag at all is the common case. For the look
+    tweaks that means no tweak was applied, hence a default of 0; sharpening
+    has no "off" position, so it passes the camera's own default instead.
     """
     try:
         return int(value)
     except (TypeError, ValueError):
-        return 0
+        return default
 
 
 def _exif_int_list(value: Any) -> list[int] | None:
@@ -1465,10 +1688,24 @@ def _read_exiftool_metadata_cached(path: str, size: int, mtime_ns: int) -> dict[
                 "-Sony:Fade",
                 "-Sony:Contrast",
                 "-Sony:Saturation",
+                "-Sony:Clarity",
+                # Sharpening is a camera setting rather than a Creative Look
+                # tweak, but it needs the same qualifier for the same reason:
+                # ExifIFD carries its own Sharpness ("Normal"), and an
+                # unqualified request returns that one instead of the ladder.
+                "-Sony:Sharpness",
+                "-Sony:SharpnessRange",
                 # DRO is a whole stage (ZcTaskVatr) that this pipeline does not
-                # reproduce, and it runs only when the shot asked for it — 2 of
-                # 65 in the reference set. Knowing which shots those are is the
-                # difference between a limitation and a lie.
+                # reproduce, and it runs only when the shot asked for it.
+                # Knowing which shots those are is the difference between a
+                # limitation and a lie — but this tag only gets us half way, so
+                # dro_from_exif goes on to read the curve out of the RAW.
+                #
+                # Sony writes two tags under this one name, 0xb025 (the mode)
+                # and 0xb04f, and both land in Sony:Camera — so unlike the
+                # Highlights/Shadows pair above, a group qualifier cannot
+                # separate them. Without -a exiftool returns the first, which is
+                # the mode, and that is the one wanted here.
                 "-DynamicRangeOptimizer",
                 str(input_path),
             ],
@@ -1494,6 +1731,9 @@ def _read_exiftool_metadata_cached(path: str, size: int, mtime_ns: int) -> dict[
         "Fade",
         "Contrast",
         "Saturation",
+        "Clarity",
+        "Sharpness",
+        "SharpnessRange",
         "DynamicRangeOptimizer",
     ]:
         out[key] = record.get(key)
