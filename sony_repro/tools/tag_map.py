@@ -31,12 +31,13 @@ import pe_scan as P  # noqa: E402
 DEFAULT = (0x15F400, 0x163200)
 TAG = re.compile(r"^\s*([0-9a-f]+):.*\bmov\s+e[a-z]x,0x(78[0-9a-f]{2})\b")
 DST = re.compile(r"^\s*([0-9a-f]+):.*\blea\s+r[0-9a-z]+,\[rsi\+0x([0-9a-f]+)\]")
-FIN = re.compile(r"^\s*([0-9a-f]+):.*\blea\s+rdx,\[rsi\+0x([0-9a-f]+)\]")
 
 
 def main():
-    lo = int(sys.argv[1], 0) if len(sys.argv) > 2 else DEFAULT[0]
-    hi = int(sys.argv[2], 0) if len(sys.argv) > 2 else DEFAULT[1]
+    args = sys.argv[1:]
+    if len(args) not in (0, 2):
+        raise SystemExit("要么不给范围,要么给起止两个 —— 只给一个会被悄悄忽略")
+    lo, hi = (int(a, 0) for a in args) if args else DEFAULT
     lines = P.disasm(P.load(), lo, hi - lo).splitlines()
 
     pending = None

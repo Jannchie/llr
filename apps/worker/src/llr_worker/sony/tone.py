@@ -69,13 +69,13 @@ CURVE_Y_FULL = 16.0 * TONE_OUTPUT_FULL  # tag 0x7806 units at full scale
 # body can never write, not a statement about the curve, so this pipeline
 # carries on past it (see apply_tuning).
 TUNE_LIMIT = 9
-TUNE_EXTRAPOLATION_LIMIT = 30
 
 # The engine's own tone-operator construction, read out of Edit.exe.
 TUNE_NEUTRAL_GAIN = 18.0      # family[18] is the identity
 TUNE_GAIN_MAX = 35.0          # the engine clamps here, and the family ends at 36
 TUNE_SPLIT = 471              # where the shadow gain hands over to the highlight one
 TUNE_TABLE_LEN = 1025
+TUNE_TABLE_TOP = TUNE_TABLE_LEN - 2   # last entry the engine will interpolate from
 TUNE_TABLE_MAX = 65535.0      # the table's full scale is 65536, which a u16 cannot hold
 TUNE_TABLE_STEP = 64          # table entries per unit of index
 
@@ -91,24 +91,32 @@ def _family() -> np.ndarray:
         return z["family"].astype(np.float64)
 
 
+def _segment(gain: float, lo: int, hi: int) -> np.ndarray:
+    """One stretch of the operator table, at one gain, blended out of the family."""
+    family = _family()
+    g = min(max(gain, 0.0), TUNE_GAIN_MAX)
+    k = int(g)
+    blend = np.float32(g - k)
+    mixed = family[k, lo:hi] + (family[k + 1, lo:hi] - family[k, lo:hi]) * blend
+    return np.clip(np.trunc(mixed.astype(np.float32) + np.float32(0.5)),
+                   0.0, TUNE_TABLE_MAX)
+
+
+@lru_cache(maxsize=32)
 def _operator_table(highlights: float, shadows: float, contrast: float) -> np.ndarray:
     """One operator table for a whole set of tweaks, exactly as the engine builds it.
 
     The two halves take different gains but share the family, so a tweak never
     acts on what another tweak produced — they meet as a sum inside the gain.
+
+    Cached because a look switch, or any of the other four tweaks, rebuilds the
+    profile without touching these three. The result is shared, hence read-only.
     """
-    family = _family()
-    table = np.empty(TUNE_TABLE_LEN)
-    for gain, lo, hi in ((TUNE_NEUTRAL_GAIN + contrast - shadows, 0, TUNE_SPLIT),
-                         (TUNE_NEUTRAL_GAIN + contrast + highlights,
-                          TUNE_SPLIT, TUNE_TABLE_LEN)):
-        g = float(np.clip(gain, 0.0, TUNE_GAIN_MAX))
-        k = int(g)
-        blend = np.float32(g - k)
-        lower, upper = family[k, lo:hi], family[k + 1, lo:hi]
-        mixed = lower + (upper - lower) * blend
-        table[lo:hi] = np.clip(np.trunc(mixed.astype(np.float32) + np.float32(0.5)),
-                               0.0, TUNE_TABLE_MAX)
+    table = np.empty(TUNE_TABLE_LEN, dtype=np.float32)
+    table[:TUNE_SPLIT] = _segment(TUNE_NEUTRAL_GAIN + contrast - shadows, 0, TUNE_SPLIT)
+    table[TUNE_SPLIT:] = _segment(TUNE_NEUTRAL_GAIN + contrast + highlights,
+                                  TUNE_SPLIT, TUNE_TABLE_LEN)
+    table.flags.writeable = False
     return table
 
 
@@ -126,7 +134,7 @@ def base_curve(cal: LookCalibration, n: int = TONE_INDEX_WHITE + 1) -> np.ndarra
     )
 
 
-def apply_tuning(curve: np.ndarray, style: str, highlights: int = 0, shadows: int = 0,
+def apply_tuning(curve: np.ndarray, highlights: int = 0, shadows: int = 0,
                  contrast: int = 0) -> np.ndarray:
     """Run the in-camera tone tweaks over a factory curve.
 
@@ -134,7 +142,10 @@ def apply_tuning(curve: np.ndarray, style: str, highlights: int = 0, shadows: in
     over the curve's output, built by _operator_table, then looked up with the
     engine's own integer steps. Checked against Edit.exe on two bodies over 51
     renders — every setting of Highlights, Shadows and Contrast, singly and in
-    pairs, on twelve looks — the resulting 32768-entry LUT is bit-identical.
+    pairs, on twelve looks. Driven from the engine's own integer curve the
+    32768-entry LUT comes out bit-identical; driven from base_curve, whose
+    interpolation is float64 where the engine's is float32, it lands within
+    1/16384 (sony_repro/tools/tone_verify.py checks both).
 
     Reaching that took replacing two earlier models, and both failures are worth
     remembering. Adding each tweak's measured delta independently misses a
@@ -146,31 +157,36 @@ def apply_tuning(curve: np.ndarray, style: str, highlights: int = 0, shadows: in
     Out-of-range settings are the one deliberate divergence. Edit.exe refuses
     them outright — +-10 renders identically to 0 — which is validation on a
     number the body can never write, not a claim that the curve stops there. So
-    this passes them through, and what bounds them is the engine's own clamp on
-    the gain rather than a rule of ours.
+    this passes them through, and the engine's own clamp on the gain is what
+    bounds them. Clamping the settings first would be worse than useless: the
+    three are summed, so a per-field cap lets a large pair cancel into no tweak
+    at all, which is the silent no-op this whole stage was rewritten to remove.
 
-    `style` selects nothing — a tweak has no idea which look it is riding on —
-    and is kept because callers name the look anyway.
+    A look does not come into it — the engine builds this table from the three
+    settings alone — which is why there is no `style` here to get wrong.
     """
-    limit = TUNE_EXTRAPOLATION_LIMIT
-    table = _operator_table(*(float(np.clip(v, -limit, limit))
-                              for v in (highlights, shadows, contrast)))
+    table = _operator_table(float(highlights), float(shadows), float(contrast))
 
     scaled = np.trunc(np.clip(curve, 0.0, 1.0) * CURVE_Y_FULL).astype(np.int64) >> 2
     index = scaled >> 6
-    # At the top the engine reads the last entry for both ends rather than
-    # stepping off it, which pins the result flat there instead of interpolating.
-    top = index >= TUNE_TABLE_LEN - 2
-    lower = table[np.where(top, TUNE_TABLE_LEN - 2, index)].astype(np.float32)
-    upper = table[np.where(top, TUNE_TABLE_LEN - 2, index + 1)].astype(np.float32)
+    # On the final step the engine reads the last entry for *both* ends rather
+    # than stepping off it, so the result is pinned flat there. Clamping both
+    # indices says that without touching the table, which has to stay exactly
+    # what the engine built for tone_verify to be able to check it.
+    lower = table[np.minimum(index, TUNE_TABLE_TOP)]
+    upper = table[np.minimum(index + 1, TUNE_TABLE_TOP)]
     blend = (scaled - (index << 6)).astype(np.float32) / np.float32(TUNE_TABLE_STEP)
     mixed = lower * (np.float32(1.0) - blend) + upper * blend
     return (np.trunc(mixed).astype(np.int64) >> 2) / TONE_OUTPUT_FULL
 
 
 def tone_curve(
-    cal: LookCalibration, style: str, highlights: int = 0, shadows: int = 0,
+    cal: LookCalibration, highlights: int = 0, shadows: int = 0,
     contrast: int = 0, n: int = TONE_INDEX_WHITE + 1,
 ) -> np.ndarray:
-    """A look's complete display-encoded curve for one shot's settings."""
-    return apply_tuning(base_curve(cal, n), style, highlights, shadows, contrast)
+    """A look's complete display-encoded curve for one shot's settings.
+
+    Which look this is comes from `cal` alone. There is deliberately no style
+    code alongside it: two ways to name the same thing is two ways to disagree.
+    """
+    return apply_tuning(base_curve(cal, n), highlights, shadows, contrast)

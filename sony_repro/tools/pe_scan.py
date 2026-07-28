@@ -15,6 +15,7 @@ r"""在 Edit.exe 里按常量找代码,并把某段 RVA 反汇编出来。
     python pe_scan.py where 0x1761f2           # 只报边界,不反汇编
     python pe_scan.py sections
 """
+import bisect
 import os
 import struct
 import subprocess
@@ -29,6 +30,12 @@ if not os.path.exists(EXE):
 def load():
     with open(EXE, "rb") as f:
         return f.read()
+
+
+def opt(name, default=None):
+    """读 ``--name=value``。用 maxsplit=1,不然值里带 ``=`` 会被截断。"""
+    return next((a.split("=", 1)[1] for a in sys.argv if a.startswith(f"--{name}=")),
+                default)
 
 
 def sections(blob):
@@ -99,11 +106,11 @@ def runtime_functions(blob):
     return []
 
 
-def enclosing(blob, rva):
-    """包含这个 RVA 的函数 (起, 止);找不到就返回 None。"""
-    for begin, end in runtime_functions(blob):
-        if begin <= rva < end:
-            return begin, end
+def enclosing(rva, funcs):
+    """包含这个 RVA 的函数 (起, 止);找不到就返回 None。`funcs` 由 runtime_functions 给。"""
+    i = bisect.bisect_right(funcs, (rva, float("inf"))) - 1
+    if i >= 0 and funcs[i][0] <= rva < funcs[i][1]:
+        return funcs[i]
     return None
 
 
@@ -114,22 +121,26 @@ def xrefs(blob, target, secname=".text"):
     ``lea reg,[rip+disp32]``。都是 4 字节相对位移,起点是**下一条指令**,所以直接
     按「目标 - 位移 = 下一条指令地址」反推,再验一下操作码。够用了 —— 这不是完整的
     反汇编器,是一把够钝但够快的刀。
+
+    **先找操作码,再解位移。** 反过来写要在 .text 的每一个字节上做一次 unpack
+    (四百万次),而操作码这一步就能筛掉其中的 99.9%。
     """
     out = []
     for name, srva, _vsize, roff, rsize in sections(blob):
         if name != secname:
             continue
         data = blob[roff:roff + rsize]
-        for i in range(len(data) - 4):
-            disp = struct.unpack_from("<i", data, i)[0]
-            nxt = srva + i + 4
-            if nxt + disp != target:
-                continue
-            op = data[i - 1]
-            if op in (0xE8, 0xE9) and i >= 1:
-                out.append(("call" if op == 0xE8 else "jmp", srva + i - 1))
-            elif i >= 3 and data[i - 2] == 0x8D and (data[i - 3] & 0xF8) == 0x48:
-                out.append(("lea", srva + i - 3))
+        # back = 操作码到位移起点的距离;lea 的 0x8D 前面还得有一个 REX 前缀
+        for op, back, rex, kind in ((0xE8, 1, False, "call"), (0xE9, 1, False, "jmp"),
+                                    (0x8D, 2, True, "lea")):
+            at = data.find(bytes([op]))
+            while at >= 0:
+                i = at + back                      # 位移的起点
+                if i + 4 <= len(data) and (not rex or (at and (data[at - 1] & 0xF8) == 0x48)):
+                    disp = struct.unpack_from("<i", data, i)[0]
+                    if srva + i + 4 + disp == target:
+                        out.append((kind, srva + at - (1 if rex else 0)))
+                at = data.find(bytes([op]), at + 1)
     return out
 
 
@@ -160,16 +171,15 @@ def main():
                   f"文件 {roff:#010x} 原始 {rsize:#010x}")
     elif cmd == "const":
         value = int(sys.argv[2], 0)
-        width = next((int(a.split("=")[1]) for a in sys.argv if a.startswith("--width=")), 4)
-        sec = next((a.split("=")[1] for a in sys.argv if a.startswith("--sec=")), ".text")
-        hits = scan_const(blob, value, width, sec)
-        print(f"{value:#x}(宽 {width})在 {sec} 里出现 {len(hits)} 次:")
+        hits = scan_const(blob, value, int(opt("width", 4)), opt("sec", ".text"))
+        print(f"{value:#x}(宽 {opt('width', 4)})在 {opt('sec', '.text')} 里出现 {len(hits)} 次:")
         for h in hits:
             print(f"  RVA {h:#x}")
     elif cmd == "xref":
         target = int(sys.argv[2], 0)
+        funcs = runtime_functions(blob)
         for kind, rva in xrefs(blob, target):
-            span = enclosing(blob, rva)
+            span = enclosing(rva, funcs)
             where = f"函数 {span[0]:#x}" if span else "不在 .pdata 里"
             print(f"  {kind:4} @ {rva:#x}   ({where})")
     elif cmd == "data":
@@ -185,7 +195,7 @@ def main():
         print(disasm(blob, int(sys.argv[2], 0), int(sys.argv[3], 0)))
     elif cmd in ("func", "where"):
         rva = int(sys.argv[2], 0)
-        span = enclosing(blob, rva)
+        span = enclosing(rva, runtime_functions(blob))
         if span is None:
             raise SystemExit(f"{rva:#x} 不在 .pdata 登记的任何函数里")
         begin, end = span

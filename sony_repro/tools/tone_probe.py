@@ -19,8 +19,6 @@ r"""把造 tone LUT 的**输入**和**输出**一起抓下来,看机内微调到
     python tone_probe.py <ARW> --look=FL                    # 基线
 """
 import os
-import shutil
-import struct
 import subprocess
 import sys
 import time
@@ -137,19 +135,7 @@ def main():
 
     offs, names = LS.find_offsets(src), LS.look_names(src)
     i = LS.look_codes(names).index(look)
-    shutil.copyfile(src, WORK)
-    with open(WORK, "r+b") as f:
-        f.seek(offs["stylestr"])
-        f.write(names[i].encode("ascii").ljust(16, b"\x00"))
-        f.seek(offs["style"])
-        f.write(struct.pack(LS.FMT["style"], LS.STYLE_BASE + i))
-        f.seek(offs["colormode"])
-        f.write(struct.pack(LS.FMT["colormode"], LS.STYLE_BASE + i + LS.COLORMODE_GAP))
-        for k, v in tune.items():
-            f.seek(offs[k])
-            f.write(struct.pack(LS.FMT[k], v))
-
-    got, meta = capture(os.path.abspath(WORK))
+    got, meta = capture(LS.patch(src, offs, names, i, tune, WORK))
     if "lut" not in got:
         raise SystemExit(f"{tag}: 没抓到 LUT")
     pack = {"head": np.frombuffer(got["head"], "<i4"),

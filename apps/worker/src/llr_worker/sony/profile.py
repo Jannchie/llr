@@ -470,7 +470,7 @@ def sepia_toning(style: str) -> dict[str, Any] | None:
 
 
 def tone_curve_points(
-    cal: LookCalibration, style: str, highlights: int = 0, shadows: int = 0,
+    cal: LookCalibration, highlights: int = 0, shadows: int = 0,
     contrast: int = 0, n: int = TONE_CURVE_POINTS,
 ) -> list[list[float]]:
     """Sony's MainGamma LUT as (x, y) points in the frontend's contract.
@@ -485,7 +485,7 @@ def tone_curve_points(
     The curve saturates just under x = 1.0, so [0, 1] is its whole domain and no
     highlight rolloff is lost by clamping there.
     """
-    lut = tone_curve(cal, style, highlights, shadows, contrast)
+    lut = tone_curve(cal, highlights, shadows, contrast)
     x = np.linspace(0.0, 1.0, n)
     y = np.interp(x, np.linspace(0.0, 1.0, lut.size), lut)
     y = _srgb_decode(np.clip(y, 0.0, 1.0))
@@ -599,7 +599,7 @@ def look_render_info(
 
     return SonyRenderInfo(
         style=style,
-        tone_curve=tone_curve_points(cal, style, tweaks.highlights, tweaks.shadows,
+        tone_curve=tone_curve_points(cal, tweaks.highlights, tweaks.shadows,
                                      tweaks.contrast),
         chroma_cross=[float(x) for x in cross],
         chroma_gain=[float(x) / sat for x in gain],

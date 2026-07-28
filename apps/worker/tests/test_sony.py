@@ -112,7 +112,6 @@ from llr_worker.sony.sr2 import (
 from llr_worker.sony.tone import (
     LOOK_ORDER,
     TONE_OUTPUT_FULL,
-    TUNE_EXTRAPOLATION_LIMIT,
     TUNE_LIMIT,
     apply_tuning,
     base_curve,
@@ -558,7 +557,7 @@ def test_rec709_white_lands_on_prophoto_neutral() -> None:
 def test_tone_curve_is_a_monotone_ramp_over_the_unit_domain(style: str) -> None:
     cal = calibration_for(SAMPLE_FL, style)
     assert cal is not None
-    pts = np.array(tone_curve_points(cal, style))
+    pts = np.array(tone_curve_points(cal))
     assert pts.shape == (TONE_CURVE_POINTS, 2)
     assert pts[0, 0] == 0.0 and pts[-1, 0] == 1.0
     assert np.all(np.diff(pts[:, 0]) > 0)
@@ -579,7 +578,7 @@ def test_tone_curve_lifts_the_shadows_hard() -> None:
     """
     cal = calibration_for(SAMPLE_FL, "FL")
     assert cal is not None
-    y = dict(tone_curve_points(cal, "FL"))
+    y = dict(tone_curve_points(cal))
     x = min(y, key=lambda v: abs(v - 0.05))
     assert 0.10 < y[x] < 0.25
 
@@ -593,11 +592,11 @@ def test_tweaks_move_the_curve_the_way_the_camera_labels_them() -> None:
     cal = calibration_for(SAMPLE_FL, "FL")
     assert cal is not None
     base = base_curve(cal)
-    assert apply_tuning(base, "FL", highlights=-6)[1024] < base[1024]
-    assert apply_tuning(base, "FL", highlights=+6)[1024] > base[1024]
-    assert apply_tuning(base, "FL", shadows=+6)[100] > base[100]
+    assert apply_tuning(base, highlights=-6)[1024] < base[1024]
+    assert apply_tuning(base, highlights=+6)[1024] > base[1024]
+    assert apply_tuning(base, shadows=+6)[100] > base[100]
     # Shadows acts on the deep toe only — the midtones must not follow it.
-    assert apply_tuning(base, "FL", shadows=+6)[4096] == pytest.approx(base[4096], abs=1e-4)
+    assert apply_tuning(base, shadows=+6)[4096] == pytest.approx(base[4096], abs=1e-4)
 
 
 @requires_sample
@@ -613,8 +612,8 @@ def test_a_tweak_is_near_linear_but_not_linear() -> None:
     cal = calibration_for(SAMPLE_FL, "FL")
     assert cal is not None
     base = base_curve(cal)
-    full = apply_tuning(base, "FL", highlights=-TUNE_LIMIT) - base
-    third = apply_tuning(base, "FL", highlights=-3) - base
+    full = apply_tuning(base, highlights=-TUNE_LIMIT) - base
+    third = apply_tuning(base, highlights=-3) - base
 
     residual = np.abs(third * 3 - full).max() * TONE_OUTPUT_FULL
     assert residual > 1.0, "linear scaling would be exact; the family is not evenly spaced"
@@ -763,12 +762,12 @@ def test_contrast_bends_only_where_the_family_changes_pitch() -> None:
     cal = calibration_for(SAMPLE_FL, "FL")
     assert cal is not None
     base = base_curve(cal)
-    assert apply_tuning(base, "FL", contrast=+6)[1024] > base[1024]
-    assert apply_tuning(base, "FL", contrast=-6)[1024] < base[1024]
+    assert apply_tuning(base, contrast=+6)[1024] > base[1024]
+    assert apply_tuning(base, contrast=-6)[1024] < base[1024]
 
     def delta(contrast: int, highlights: int) -> np.ndarray:
-        anchor = apply_tuning(base, "FL", highlights=highlights)
-        return apply_tuning(base, "FL", highlights=highlights, contrast=contrast) - anchor
+        anchor = apply_tuning(base, highlights=highlights)
+        return apply_tuning(base, highlights=highlights, contrast=contrast) - anchor
 
     def bend(highlights: int) -> float:
         return float(np.abs(3 * delta(3, highlights) - delta(9, highlights)).max())
@@ -778,9 +777,9 @@ def test_contrast_bends_only_where_the_family_changes_pitch() -> None:
     assert bend(-6) > 10 * bend(0)
 
     # Monotone across the whole range, and interpolating between whole settings.
-    mids = [apply_tuning(base, "FL", contrast=c)[1024] for c in range(10)]
+    mids = [apply_tuning(base, contrast=c)[1024] for c in range(10)]
     assert mids == sorted(mids)
-    half = apply_tuning(base, "FL", contrast=4)[1024]
+    half = apply_tuning(base, contrast=4)[1024]
     assert mids[3] <= half <= mids[5]
 
 
@@ -810,9 +809,9 @@ def test_a_borrowed_look_s_tweaks_are_not_silently_dead() -> None:
         base = base_curve(cal)
         for field in ("contrast", "highlights", "shadows"):
             for value in (-TUNE_LIMIT, TUNE_LIMIT):
-                moved = np.abs(apply_tuning(base, look, **{field: value}) - base).max()
+                moved = np.abs(apply_tuning(base, **{field: value}) - base).max()
                 assert moved > 1e-3, f"{look} {field}{value:+d} did nothing"
-                ref = np.abs(apply_tuning(ref_base, "FL", **{field: value}) - ref_base).max()
+                ref = np.abs(apply_tuning(ref_base, **{field: value}) - ref_base).max()
                 assert moved == pytest.approx(ref, abs=1e-4), f"{look} {field}{value:+d}"
 
 
@@ -824,19 +823,25 @@ def test_a_setting_past_the_camera_s_range_keeps_going() -> None:
     the body cannot write rather than the curve running out. The family it steps
     along has room past +-9, so the setting keeps meaning something — and the
     family does end, so a wild setting saturates instead of running away. That
-    bound is the engine's own clamp on the gain, not a rule of ours.
+    bound is the engine's own clamp on the gain, and it has to be the only one:
+    the three settings are summed before the clamp, so capping each of them
+    first would let a large pair cancel back into no tweak at all.
     """
     cal = calibration_for(SAMPLE_FL, "FL")
     assert cal is not None
     base = base_curve(cal)
 
-    at_limit = apply_tuning(base, "FL", highlights=-TUNE_LIMIT)
-    beyond = apply_tuning(base, "FL", highlights=-(TUNE_LIMIT + 1))
+    at_limit = apply_tuning(base, highlights=-TUNE_LIMIT)
+    beyond = apply_tuning(base, highlights=-(TUNE_LIMIT + 1))
     assert np.abs(beyond - base).max() > np.abs(at_limit - base).max(), "no longer ignored"
 
-    capped = apply_tuning(base, "FL", highlights=-(TUNE_EXTRAPOLATION_LIMIT + 50))
-    assert np.array_equal(capped, apply_tuning(base, "FL", highlights=-TUNE_EXTRAPOLATION_LIMIT))
+    # The highlight gain is 18 + highlights and stops at 0, so -18 is the end.
+    capped = apply_tuning(base, highlights=-1000)
+    assert np.array_equal(capped, apply_tuning(base, highlights=-18))
     assert capped.min() >= 0.0 and capped.max() <= 1.0
+
+    # A per-field cap would make this pair cancel; the sum has to reach the clamp.
+    assert not np.array_equal(apply_tuning(base, contrast=100, shadows=50), base)
 
 
 @requires_sample
@@ -848,8 +853,8 @@ def test_the_shot_s_own_tweaks_reach_the_curve() -> None:
     """
     cal = calibration_for(SAMPLE_FL, "FL")
     assert cal is not None
-    factory = tone_curve(cal, "FL")
-    as_shot = tone_curve(cal, "FL", highlights=-6, shadows=1)
+    factory = tone_curve(cal)
+    as_shot = tone_curve(cal, highlights=-6, shadows=1)
     assert not np.allclose(factory, as_shot)
     # Measured against the engine: 12025/16384 at index 1024.
     assert as_shot[1024] * 16384 == pytest.approx(12025, abs=2)

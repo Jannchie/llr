@@ -133,8 +133,13 @@ def capture(arw, wait=70.0):
     return buf.get("tone")
 
 
-def render(src, offs, names, i, tune=None, work="sweep_work.ARW", wait=70.0):
-    """按第 i 份 SR2DataIFD 的外观(和可选微调)渲染一次,返回 32768 项 tone LUT。"""
+def patch(src, offs, names, i, tune=None, work="sweep_work.ARW"):
+    """把 src 拷成 work,改成第 i 份 SR2DataIFD 的外观(和可选微调),返回 work 的绝对路径。
+
+    **三个字段必须一起改**:只动 ``0x0037`` / ``0xb029`` 那两个数值字段毫无效果,
+    改了字符串 ``0xb020`` 才切得动;而 ColorMode 恒比 CreativeStyle 大 3。
+    这段协议是整个 sweep 里最容易写错的地方,所以只此一份 —— 别再抄。
+    """
     shutil.copyfile(src, work)
     with open(work, "r+b") as f:
         f.seek(offs["stylestr"])
@@ -146,7 +151,12 @@ def render(src, offs, names, i, tune=None, work="sweep_work.ARW", wait=70.0):
         for k, v in (tune or {}).items():
             f.seek(offs[k])
             f.write(struct.pack(FMT[k], v))
-    return capture(os.path.abspath(work), wait)
+    return os.path.abspath(work)
+
+
+def render(src, offs, names, i, tune=None, work="sweep_work.ARW", wait=70.0):
+    """按第 i 份 SR2DataIFD 的外观(和可选微调)渲染一次,返回 32768 项 tone LUT。"""
+    return capture(patch(src, offs, names, i, tune, work), wait)
 
 
 def main():

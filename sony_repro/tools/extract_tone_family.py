@@ -23,12 +23,18 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pe_scan as P  # noqa: E402
 
 RVA, N, LEN = 0x484700, 37, 1025
+IDENTITY = 18          # FAM[18] 就是恒等,这条是整套解读的自证
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                    "..", "..", "apps", "worker", "src", "llr_worker",
                    "sony", "data", "tone_family.npz")
 
 
-def main():
+def family():
+    """直接从 Edit.exe 里读那 37 条曲线,顺带把该成立的都断言掉。
+
+    这里是曲线族的**唯一**归属地 —— RVA 是逐版本的,抄成两份就一定会有一份过期,
+    而过期的那份会以「模型崩了」的样子报错。`tone_verify.py` 从这里 import。
+    """
     blob = P.load()
     off = P.rva_to_off(blob, RVA)
     fam = np.frombuffer(blob[off:off + N * LEN * 4], dtype="<i4").reshape(N, LEN)
@@ -36,18 +42,22 @@ def main():
     assert fam.min() >= 0 and fam.max() <= 65535, "值域应当落在 uint16 内"
     ident = np.arange(LEN) * 64
     # 末项 i*64 = 65536 越界,引擎存的是 65535
-    assert np.array_equal(fam[18][:-1], ident[:-1]), "FAM[18] 前 1024 项必须是 i*64"
-    assert fam[18][-1] == 65535, "FAM[18] 末项应是 65535"
+    assert np.array_equal(fam[IDENTITY][:-1], ident[:-1]), "FAM[18] 前 1024 项必须是 i*64"
+    assert fam[IDENTITY][-1] == 65535, "FAM[18] 末项应是 65535"
     assert (np.diff(fam, axis=1) >= 0).all(), "每条都应当单调不减"
+    return fam
 
+
+def main():
+    fam = family()
     slope = fam[:, 1].astype(float) / 64.0
     print(f"{N} 条 x {LEN} 项,值域 {fam.min()}..{fam.max()}")
     print("低端斜率(相对恒等):")
-    for k in range(0, N, 4):
-        print(f"  k={k:2d} {slope[k]:5.2f}" + ("   <- 恒等" if k == 18 else ""))
-    print(f"  k=18 {slope[18]:5.2f}   <- 恒等")
+    for k in sorted({*range(0, N, 4), IDENTITY}):
+        print(f"  k={k:2d} {slope[k]:5.2f}" + ("   <- 恒等" if k == IDENTITY else ""))
     print("\n注意族的间距**不均匀**:k>18 每步约 "
-          f"{abs(fam[19, 1] - fam[18, 1])},k<18 每步约 {abs(fam[17, 1] - fam[18, 1])}。"
+          f"{abs(fam[IDENTITY + 1, 1] - fam[IDENTITY, 1])},k<18 每步约 "
+          f"{abs(fam[IDENTITY - 1, 1] - fam[IDENTITY, 1])}。"
           "\n正对比度「非线性」和「跨机身不一致」都是这个不均匀造成的,不是两回事。")
 
     if "--write" not in sys.argv:
