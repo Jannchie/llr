@@ -111,6 +111,7 @@ from llr_worker.sony.sr2 import (
 )
 from llr_worker.sony.tone import (
     LOOK_ORDER,
+    TONE_OUTPUT_FULL,
     TUNE_EXTRAPOLATION_LIMIT,
     TUNE_LIMIT,
     apply_tuning,
@@ -600,18 +601,24 @@ def test_tweaks_move_the_curve_the_way_the_camera_labels_them() -> None:
 
 
 @requires_sample
-def test_a_tweak_is_linear_in_its_setting() -> None:
-    """Only the two extremes are measured; everything between is interpolated.
+def test_a_tweak_is_near_linear_but_not_linear() -> None:
+    """A setting picks a curve out of a family whose spacing is uneven.
 
-    The engine's own steps are linear to within 3/16384, so this is the property
-    the stored unit shapes rely on.
+    An earlier model stored one shape per direction and scaled it, which made
+    the response linear by construction and hid this. The engine steps along 37
+    static curves instead, and their spacing is not uniform, so tripling the
+    delta at -3 does not land on the delta at -9. It lands close — which is why
+    the linear model survived as long as it did — but not on it.
     """
     cal = calibration_for(SAMPLE_FL, "FL")
     assert cal is not None
     base = base_curve(cal)
     full = apply_tuning(base, "FL", highlights=-TUNE_LIMIT) - base
     third = apply_tuning(base, "FL", highlights=-3) - base
-    assert np.allclose(third * 3, full, atol=1e-6)
+
+    residual = np.abs(third * 3 - full).max() * TONE_OUTPUT_FULL
+    assert residual > 1.0, "linear scaling would be exact; the family is not evenly spaced"
+    assert residual < 0.05 * np.abs(full).max() * TONE_OUTPUT_FULL, "but it is close"
 
 
 @requires_sample
@@ -740,14 +747,18 @@ def test_the_look_profile_command_answers_without_decoding_anything() -> None:
 
 
 @requires_sample
-def test_contrast_is_linear_going_down_and_measured_going_up() -> None:
-    """The one tweak whose two directions are not the same kind of thing.
+def test_contrast_bends_only_where_the_family_changes_pitch() -> None:
+    """Whether Contrast is linear in its setting depends on where it starts.
 
-    Negative Contrast behaves like Highlights and Shadows — one shape, scaled.
-    Positive Contrast changes shape as well as size: rescaling the +9 shape down
-    to +3 leaves 44/16384 against a total amplitude of 110, so every step is
-    measured. Interpolation between them still has to be monotone and to land
-    exactly on the measured steps at whole settings.
+    The family is spaced about four times tighter above neutral (18) than below,
+    so a run of Contrast that stays on one side is near-linear and one that
+    crosses is not. Which one happens is decided by the shot's own Highlights and
+    Shadows, because all three settings are summed into the same gain.
+
+    That is the whole of a long-standing puzzle. Positive Contrast measured as
+    nonlinear here and as a different set of steps on another body, and it was
+    one effect both times: the two files were shot with different Highlights, so
+    the same nine steps started from different places in the family.
     """
     cal = calibration_for(SAMPLE_FL, "FL")
     assert cal is not None
@@ -755,15 +766,18 @@ def test_contrast_is_linear_going_down_and_measured_going_up() -> None:
     assert apply_tuning(base, "FL", contrast=+6)[1024] > base[1024]
     assert apply_tuning(base, "FL", contrast=-6)[1024] < base[1024]
 
-    down_full = apply_tuning(base, "FL", contrast=-9) - base
-    down_third = apply_tuning(base, "FL", contrast=-3) - base
-    assert np.allclose(down_third * 3, down_full, atol=1e-6), "the negative side is linear"
+    def delta(contrast: int, highlights: int) -> np.ndarray:
+        anchor = apply_tuning(base, "FL", highlights=highlights)
+        return apply_tuning(base, "FL", highlights=highlights, contrast=contrast) - anchor
 
-    up_full = apply_tuning(base, "FL", contrast=+9) - base
-    up_third = apply_tuning(base, "FL", contrast=+3) - base
-    assert np.abs(up_third * 3 - up_full).max() > 1e-3, "the positive side is not"
+    def bend(highlights: int) -> float:
+        return float(np.abs(3 * delta(3, highlights) - delta(9, highlights)).max())
 
-    # Between measured steps, and monotone across the whole range.
+    # From neutral the run stays above 18; from -6 it crosses.
+    assert bend(0) * TONE_OUTPUT_FULL < 5.0
+    assert bend(-6) > 10 * bend(0)
+
+    # Monotone across the whole range, and interpolating between whole settings.
     mids = [apply_tuning(base, "FL", contrast=c)[1024] for c in range(10)]
     assert mids == sorted(mids)
     half = apply_tuning(base, "FL", contrast=4)[1024]
@@ -776,9 +790,9 @@ def test_a_borrowed_look_s_tweaks_are_not_silently_dead() -> None:
 
     The tweak shapes used to be stored one set per look, so a look with no entry
     kept its baseline without complaining — Contrast, Highlights and Shadows all
-    moved in the UI and nowhere else. They are now stored as a single operator on
-    the curve's output, which every look shares, measured to collapse across the
-    ten shipped looks even though their own curves differ by up to 3133/16384.
+    moved in the UI and nowhere else. The engine builds one table over the
+    curve's output from the three settings alone, so it cannot depend on a look
+    even in principle.
 
     So a borrowed look must respond, and by exactly as much as a look the body
     does ship. Checked against Edit.exe itself rendering FL2 and FL3 on a donor
@@ -804,21 +818,21 @@ def test_a_borrowed_look_s_tweaks_are_not_silently_dead() -> None:
 
 @requires_sample
 def test_a_setting_past_the_camera_s_range_keeps_going() -> None:
-    """Edit.exe refuses out-of-range values; this pipeline extrapolates them.
+    """Edit.exe refuses out-of-range values; this pipeline carries on past them.
 
     The engine renders +-10 identically to 0, which is validation on a number
-    the body cannot write rather than the curve running out. The response is
-    linear, so the same unit shape carries on — and it is capped, so a wild
-    setting cannot run away.
+    the body cannot write rather than the curve running out. The family it steps
+    along has room past +-9, so the setting keeps meaning something — and the
+    family does end, so a wild setting saturates instead of running away. That
+    bound is the engine's own clamp on the gain, not a rule of ours.
     """
     cal = calibration_for(SAMPLE_FL, "FL")
     assert cal is not None
     base = base_curve(cal)
-    unit = apply_tuning(base, "FL", highlights=-1) - base
 
-    beyond = apply_tuning(base, "FL", highlights=-(TUNE_LIMIT + 1)) - base
-    assert not np.array_equal(beyond, np.zeros_like(beyond)), "no longer ignored"
-    assert np.allclose(beyond, unit * (TUNE_LIMIT + 1), atol=1e-6)
+    at_limit = apply_tuning(base, "FL", highlights=-TUNE_LIMIT)
+    beyond = apply_tuning(base, "FL", highlights=-(TUNE_LIMIT + 1))
+    assert np.abs(beyond - base).max() > np.abs(at_limit - base).max(), "no longer ignored"
 
     capped = apply_tuning(base, "FL", highlights=-(TUNE_EXTRAPOLATION_LIMIT + 50))
     assert np.array_equal(capped, apply_tuning(base, "FL", highlights=-TUNE_EXTRAPOLATION_LIMIT))

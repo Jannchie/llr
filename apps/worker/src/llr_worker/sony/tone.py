@@ -14,29 +14,29 @@ measurements had already given. Rebuilt this way, the curve matches what Frida
 dumps out of the running engine to within 8/16384 (0.05%) on all ten looks.
 
 On top of that baseline the engine applies the in-camera tweaks that ride on the
-curve: Highlights, Shadows and Contrast, each -9..+9. Each one is a transform of
-the curve's own *output*, applied after the look curve rather than alongside it:
+curve: Highlights, Shadows and Contrast, each -9..+9. This is not a fit to
+measurements — it is the engine's own construction, read out of Edit.exe and
+checked against it (see apply_tuning). All three tweaks collapse into a single
+lookup over the curve's *output*, built from a family of 37 static curves that
+ships as data/tone_family.npz:
 
-    tweaked(x) = U(base(x))
+    gain_lo = 18 + contrast - shadows        over table indices [0, 471)
+    gain_hi = 18 + contrast + highlights     over table indices [471, 1025)
 
-which makes U independent of the look. That is measured, not assumed: indexed by
-output value, all ten looks collapse onto one U to within 0.15/16384, while the
-ten base curves themselves differ by up to 3133/16384 — so the collapse is a
-real invariance and not the looks being alike. Two bodies (ILCE-7CM2, ILCE-7M5)
-agree to 0.07-0.57/16384 on Highlights, Shadows and negative Contrast.
+family[18] is the identity, so all three at zero leaves the curve alone.
 
-Storing U instead of one shape per look is what lets FL2 and FL3 work. Those two
-looks exist only on newer bodies, so llr borrows their curve (see donor_looks);
-under per-look shapes they had no entry and the three sliders silently did
-nothing. A look-independent operator needs nothing borrowed.
+Two things follow from the family's spacing, which is far from uniform — a step
+above 18 moves the shadow end by about 3/65536, a step below it by about 12.
+Positive Contrast is nonlinear in the setting, and the same +1 of Contrast lands
+differently depending on where the shot's own Highlights and Shadows have already
+put the gain. That second effect looked for a while like a per-body difference,
+because the two bodies on hand happened to ship files with different tweaks.
 
-Highlights, Shadows and negative Contrast are strictly linear in the setting — a
-unit operator times the value reproduces every intermediate step to within
-3/16384 — but the two directions have different shapes. Positive Contrast is the
-exception and needs every step measured; see apply_tuning. The operators live in
-data/look_tuning.npz, built by sony_repro/tools/build_tuning_ops.py from the
-per-look measurements archived beside it; how those were captured is in
-../../../../sony_repro.
+Because the three tweaks are summed into a gain rather than applied one after
+another, a look has nothing to do with it, and neither does the order they are
+set in. That is what makes FL2 and FL3 work: those looks exist only on newer
+bodies and llr borrows their curve (see donor_looks), which under an earlier
+per-look table left the three sliders doing nothing at all.
 
 Fade is deliberately absent, and that was the clue that found it: it measures as
 exactly zero on this curve because it acts on YGamma instead, as a contrast pull
@@ -61,14 +61,23 @@ LOOK_ORDER = ("ST", "VV", "NT", "PT", "FL", "VV2", "IN", "SH", "BW", "SE")
 
 TONE_INDEX_WHITE = 8192       # LUT index of Sony's white
 CURVE_X_SCALE = 128.0         # tag 0x7805 units per LUT index
-CURVE_Y_FULL = 16.0 * 16384.0  # tag 0x7806 units at full scale
+TONE_OUTPUT_FULL = 16384.0    # the engine's LUT holds this as full scale
+CURVE_Y_FULL = 16.0 * TONE_OUTPUT_FULL  # tag 0x7806 units at full scale
 
 # The camera's own range. Edit.exe treats anything past it as no tweak at all —
 # +-10 renders identically to 0 — but that is input validation on a value the
 # body can never write, not a statement about the curve, so this pipeline
-# extrapolates instead (see apply_tuning).
+# carries on past it (see apply_tuning).
 TUNE_LIMIT = 9
 TUNE_EXTRAPOLATION_LIMIT = 30
+
+# The engine's own tone-operator construction, read out of Edit.exe.
+TUNE_NEUTRAL_GAIN = 18.0      # family[18] is the identity
+TUNE_GAIN_MAX = 35.0          # the engine clamps here, and the family ends at 36
+TUNE_SPLIT = 471              # where the shadow gain hands over to the highlight one
+TUNE_TABLE_LEN = 1025
+TUNE_TABLE_MAX = 65535.0      # the table's full scale is 65536, which a u16 cannot hold
+TUNE_TABLE_STEP = 64          # table entries per unit of index
 
 
 def look_index(style: str) -> int | None:
@@ -76,15 +85,31 @@ def look_index(style: str) -> int | None:
 
 
 @lru_cache(maxsize=1)
-def _tuning() -> dict[str, np.ndarray]:
-    """Measured tweak operators, keyed "<field>_<side>" -> deltas.
+def _family() -> np.ndarray:
+    """The 37 static operator curves, (37, 1025) over curve output in [0, 65536)."""
+    with np.load(_DATA / "tone_family.npz") as z:
+        return z["family"].astype(np.float64)
 
-    Each is sampled over curve *output* in [0, 1], not over scene value, so the
-    same operator serves every look. "contrast_steps" is (9, grid), one row per
-    positive step; the rest are unit operators, one setting's worth each.
+
+def _operator_table(highlights: float, shadows: float, contrast: float) -> np.ndarray:
+    """One operator table for a whole set of tweaks, exactly as the engine builds it.
+
+    The two halves take different gains but share the family, so a tweak never
+    acts on what another tweak produced — they meet as a sum inside the gain.
     """
-    with np.load(_DATA / "look_tuning.npz") as z:
-        return {k: z[k].astype(np.float64) for k in z.files}
+    family = _family()
+    table = np.empty(TUNE_TABLE_LEN)
+    for gain, lo, hi in ((TUNE_NEUTRAL_GAIN + contrast - shadows, 0, TUNE_SPLIT),
+                         (TUNE_NEUTRAL_GAIN + contrast + highlights,
+                          TUNE_SPLIT, TUNE_TABLE_LEN)):
+        g = float(np.clip(gain, 0.0, TUNE_GAIN_MAX))
+        k = int(g)
+        blend = np.float32(g - k)
+        lower, upper = family[k, lo:hi], family[k + 1, lo:hi]
+        mixed = lower + (upper - lower) * blend
+        table[lo:hi] = np.clip(np.trunc(mixed.astype(np.float32) + np.float32(0.5)),
+                               0.0, TUNE_TABLE_MAX)
+    return table
 
 
 def base_curve(cal: LookCalibration, n: int = TONE_INDEX_WHITE + 1) -> np.ndarray:
@@ -101,75 +126,46 @@ def base_curve(cal: LookCalibration, n: int = TONE_INDEX_WHITE + 1) -> np.ndarra
     )
 
 
-def _apply_operator(curve: np.ndarray, op: np.ndarray) -> np.ndarray:
-    """Run one tweak operator over a curve, sampling it at the curve's own values."""
-    return curve + np.interp(curve, np.linspace(0.0, 1.0, op.size), op)
-
-
-def _positive_contrast(ops: dict[str, np.ndarray], value: float) -> np.ndarray:
-    """Positive Contrast, which is the one tweak that is *not* linear.
-
-    Highlights, Shadows and negative Contrast all scale a single unit operator.
-    Positive Contrast changes shape as well as size — rescaling the +9 operator
-    to +3 leaves a residual of 44/16384 against a total amplitude of 110 — so
-    each step is measured separately and this interpolates between the measured
-    ones. Past +9 it keeps going along the last step's difference, on the same
-    reasoning as the linear tweaks.
-
-    This is also the one tweak that did *not* survive the cross-body check: the
-    ILCE-7M5 measures a different set of steps (+1 has amplitude 116.9/16384
-    there against 89.4 here). What ships is the ILCE-7CM2 measurement.
-    """
-    steps = ops["contrast_steps"]
-    i = min(int(value), steps.shape[0] - 1)          # 1-based settings, 0-based rows
-    lo = steps[i - 1] if i >= 1 else np.zeros(steps.shape[1])
-    return lo + (value - i) * (steps[i] - lo)
-
-
 def apply_tuning(curve: np.ndarray, style: str, highlights: int = 0, shadows: int = 0,
                  contrast: int = 0) -> np.ndarray:
-    """Add the in-camera tone tweaks to a factory curve.
+    """Run the in-camera tone tweaks over a factory curve.
 
-    Inside the camera's own -9..+9 this is the engine's behaviour. Highlights,
-    Shadows and negative Contrast are strictly linear in the setting, so a unit
-    shape times the value reproduces every intermediate step to within 3/16384.
-    Positive Contrast is not linear and is handled by _positive_contrast.
+    This is the engine's own construction rather than a fit to it: one table
+    over the curve's output, built by _operator_table, then looked up with the
+    engine's own integer steps. Checked against Edit.exe on two bodies over 51
+    renders — every setting of Highlights, Shadows and Contrast, singly and in
+    pairs, on twelve looks — the resulting 32768-entry LUT is bit-identical.
 
-    Past that range the two diverge deliberately. Edit.exe ignores out-of-range
-    values outright — +-10 renders identically to 0 — which is validation on a
-    number the body can never write, not a claim that the curve stops there.
-    Since the response is linear, the same unit operator keeps extrapolating, so
-    this carries on out to TUNE_EXTRAPOLATION_LIMIT and clamps beyond it. The
-    curve is clipped to [0, 1] at the end either way, which is what bounds a
-    large setting rather than the setting itself being refused.
+    Reaching that took replacing two earlier models, and both failures are worth
+    remembering. Adding each tweak's measured delta independently misses a
+    Highlights-with-Contrast pair by 152/16384; applying them one after another
+    misses it by 111. Neither is what the engine does, because the tweaks are
+    summed into a gain *before* a single table is built, so there is no order to
+    get right and nothing for a second tweak to act on.
 
-    Several tweaks at once are applied in sequence, each to what the previous one
-    produced. Two set together are not separately measurable, so this was checked
-    directly: against Edit.exe rendering Highlights +9 with Contrast +5, applying
-    them in sequence lands within 111/16384 of a 1962/16384 change, where adding
-    the two deltas independently is off by 152. Highlights with Shadows is exact
-    either way — they move disjoint parts of the curve. The residual on the
-    Contrast pairing is real and unexplained: positive Contrast appears to adapt
-    to the curve it is given rather than being a fixed operator, which would also
-    account for its nonlinearity and for it being the one tweak that differs
-    between bodies.
+    Out-of-range settings are the one deliberate divergence. Edit.exe refuses
+    them outright — +-10 renders identically to 0 — which is validation on a
+    number the body can never write, not a claim that the curve stops there. So
+    this passes them through, and what bounds them is the engine's own clamp on
+    the gain rather than a rule of ours.
 
-    `style` no longer selects anything — the operators are look-independent (see
-    the module docstring) — and is kept because callers name the look anyway.
+    `style` selects nothing — a tweak has no idea which look it is riding on —
+    and is kept because callers name the look anyway.
     """
-    out = curve
-    ops = _tuning()
-    for field, value in (("highlights", highlights), ("shadows", shadows),
-                         ("contrast", contrast)):
-        if not value:
-            continue
-        amount = float(np.clip(value, -TUNE_EXTRAPOLATION_LIMIT, TUNE_EXTRAPOLATION_LIMIT))
-        if field == "contrast" and amount > 0:
-            op = _positive_contrast(ops, amount)
-        else:
-            op = amount * ops[f"{field}_{'neg' if amount < 0 else 'pos'}"]
-        out = _apply_operator(out, op)
-    return np.clip(out, 0.0, 1.0)
+    limit = TUNE_EXTRAPOLATION_LIMIT
+    table = _operator_table(*(float(np.clip(v, -limit, limit))
+                              for v in (highlights, shadows, contrast)))
+
+    scaled = np.trunc(np.clip(curve, 0.0, 1.0) * CURVE_Y_FULL).astype(np.int64) >> 2
+    index = scaled >> 6
+    # At the top the engine reads the last entry for both ends rather than
+    # stepping off it, which pins the result flat there instead of interpolating.
+    top = index >= TUNE_TABLE_LEN - 2
+    lower = table[np.where(top, TUNE_TABLE_LEN - 2, index)].astype(np.float32)
+    upper = table[np.where(top, TUNE_TABLE_LEN - 2, index + 1)].astype(np.float32)
+    blend = (scaled - (index << 6)).astype(np.float32) / np.float32(TUNE_TABLE_STEP)
+    mixed = lower * (np.float32(1.0) - blend) + upper * blend
+    return (np.trunc(mixed).astype(np.int64) >> 2) / TONE_OUTPUT_FULL
 
 
 def tone_curve(

@@ -4,18 +4,19 @@ __pycache__/
 # Memory dumps and fitted arrays — regenerate them with tools/, don't commit them.
 *.npz
 *.bin
-# ...except these two. Regenerating either means re-driving Edit.exe for dozens
-# of renders, and one of them needs a body nobody here owns. The 7CM2 file is
-# what build_tuning_ops.py reads to build what worker ships; the a7 V file is the
-# cross-body control and the only ground truth we have for FL2/FL3.
+# ...except these two. worker 不再装它们(色调微调改成了直接复刻引擎的造表过程,
+# 见 PIPELINE.md 6.2.3),但它们是「微调与外观无关」这个结论的**独立实测佐证** ——
+# 那时还没读到代码,是先量出来的。重测要几百次渲染,其中一台机身这里也没有。
 !tools/look_tuning_perlook_7cm2.npz
 !tools/look_tuning_a7v.npz
 tools/sliderprobe_work.ARW
 tools/sweep_work.ARW
+tools/toneprobe_work.ARW
 tools/sliderprobe/*.npy
 # 探针 dump 目录。同样是重跑 tools/ 就有的东西,而且里面还有 .json,
 # 光靠上面的 *.npz / *.bin 拦不住 —— vatrprobe 一个就 27 MB。
 tools/comboprobe/
+tools/toneprobe/
 tools/sharpprobe/
 tools/vatrgrid/
 tools/vatrprobe/
