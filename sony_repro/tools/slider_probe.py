@@ -40,6 +40,7 @@ _SPEC = {
     0x2033: ("highlights", r"4 bytes, int32s\[1\]"),
     0x2034: ("fade", r"4 bytes, int32s\[1\]"),
     0x2035: ("sharpnessrange", r"4 bytes, int32s\[1\]"),
+    0x2036: ("clarity", r"4 bytes, int32s\[1\]"),
 }
 NAME = {t: n for t, (n, _) in _SPEC.items()}
 

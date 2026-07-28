@@ -1,0 +1,2198 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Imaging Edge Edit.exe 渲染管线复刻 · 工程全景</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  * { margin: 0; padding: 0; }
+  img, canvas, svg, video { display: block; max-width: 100%; }
+  button, input, select, textarea { font: inherit; color: inherit; }
+  html { -webkit-text-size-adjust: 100%; }
+</style>
+</head>
+<body>
+
+<style>
+  :root {
+    --ground: #ECEDEA;
+    --surface: #FAFBF8;
+    --surface-2: #F2F3EF;
+    --ink: #14181A;
+    --ink-2: #3A4245;
+    --muted: #6E7A7C;
+    --line: #D4D9D3;
+    --line-soft: #E2E6E0;
+    --accent: #0F6E68;
+    --accent-ink: #0B5450;
+    --accent-wash: rgba(15, 110, 104, .09);
+    --amber: #8E620F;
+    --amber-wash: rgba(142, 98, 15, .10);
+    --rust: #A3402C;
+    --rust-wash: rgba(163, 64, 44, .10);
+    --grey-wash: rgba(110, 122, 124, .10);
+
+    --serif: "Sitka Text", "Iowan Old Style", Cambria, "Palatino Linotype", Palatino, Georgia, "Songti SC", "Noto Serif SC", serif;
+    --sans: "Segoe UI Variable Text", "Segoe UI", -apple-system, BlinkMacSystemFont, "Microsoft YaHei UI", "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", sans-serif;
+    --mono: "Cascadia Mono", "Cascadia Code", Consolas, "SF Mono", "JetBrains Mono", ui-monospace, monospace;
+
+    --s--1: .8125rem;
+    --s--2: .7rem;
+    --s-0: 1rem;
+    --s-1: 1.2rem;
+    --s-2: 1.5rem;
+    --s-3: 1.95rem;
+    --s-4: 2.6rem;
+
+    --gap: 1.5rem;
+    --radius: 3px;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #101416;
+      --surface: #171D1F;
+      --surface-2: #1D2427;
+      --ink: #E6EAE8;
+      --ink-2: #B7C1BE;
+      --muted: #7E8C8A;
+      --line: #29322F;
+      --line-soft: #222A28;
+      --accent: #3FB5A8;
+      --accent-ink: #62C9BD;
+      --accent-wash: rgba(63, 181, 168, .12);
+      --amber: #D9A24B;
+      --amber-wash: rgba(217, 162, 75, .13);
+      --rust: #E08267;
+      --rust-wash: rgba(224, 130, 103, .13);
+      --grey-wash: rgba(126, 140, 138, .13);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground: #101416;
+    --surface: #171D1F;
+    --surface-2: #1D2427;
+    --ink: #E6EAE8;
+    --ink-2: #B7C1BE;
+    --muted: #7E8C8A;
+    --line: #29322F;
+    --line-soft: #222A28;
+    --accent: #3FB5A8;
+    --accent-ink: #62C9BD;
+    --accent-wash: rgba(63, 181, 168, .12);
+    --amber: #D9A24B;
+    --amber-wash: rgba(217, 162, 75, .13);
+    --rust: #E08267;
+    --rust-wash: rgba(224, 130, 103, .13);
+    --grey-wash: rgba(126, 140, 138, .13);
+  }
+
+  :root[data-theme="light"] {
+    --ground: #ECEDEA;
+    --surface: #FAFBF8;
+    --surface-2: #F2F3EF;
+    --ink: #14181A;
+    --ink-2: #3A4245;
+    --muted: #6E7A7C;
+    --line: #D4D9D3;
+    --line-soft: #E2E6E0;
+    --accent: #0F6E68;
+    --accent-ink: #0B5450;
+    --accent-wash: rgba(15, 110, 104, .09);
+    --amber: #8E620F;
+    --amber-wash: rgba(142, 98, 15, .10);
+    --rust: #A3402C;
+    --rust-wash: rgba(163, 64, 44, .10);
+    --grey-wash: rgba(110, 122, 124, .10);
+  }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: var(--s-0);
+    line-height: 1.7;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap {
+    max-width: 1240px;
+    margin: 0 auto;
+    padding: 0 1.5rem 6rem;
+  }
+
+  /* ---------- header ---------- */
+
+  .masthead {
+    border-bottom: 1px solid var(--line);
+    padding: 3.5rem 0 2rem;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 2.5rem;
+    align-items: start;
+  }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: var(--s--2);
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: .9rem;
+  }
+
+  h1 {
+    font-family: var(--serif);
+    font-size: var(--s-4);
+    line-height: 1.15;
+    font-weight: 600;
+    letter-spacing: -.01em;
+    text-wrap: balance;
+    margin-bottom: .8rem;
+  }
+
+  .standfirst {
+    color: var(--ink-2);
+    max-width: 62ch;
+    font-size: 1.05rem;
+  }
+
+  .colophon {
+    margin-top: 1.4rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: .4rem 1.4rem;
+    font-family: var(--mono);
+    font-size: var(--s--2);
+    color: var(--muted);
+  }
+
+  .colophon b {
+    font-weight: 600;
+    color: var(--ink-2);
+  }
+
+  #hue-ring {
+    display: block;
+    width: 190px;
+    height: 190px;
+  }
+
+  .ring-cap {
+    font-family: var(--mono);
+    font-size: var(--s--2);
+    color: var(--muted);
+    text-align: center;
+    max-width: 190px;
+    line-height: 1.5;
+    margin-top: .5rem;
+  }
+
+  /* ---------- scoreboard ---------- */
+
+  .scoreboard {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+    margin: 2rem 0 0;
+  }
+
+  .score {
+    background: var(--surface);
+    padding: 1.1rem 1.2rem;
+  }
+
+  .score-val {
+    font-family: var(--mono);
+    font-size: var(--s-2);
+    font-variant-numeric: tabular-nums;
+    color: var(--accent);
+    line-height: 1.2;
+  }
+
+  .score-key {
+    font-size: var(--s--1);
+    color: var(--ink-2);
+    margin-top: .3rem;
+  }
+
+  .score-note {
+    font-size: var(--s--2);
+    color: var(--muted);
+    font-family: var(--mono);
+    margin-top: .15rem;
+  }
+
+  /* ---------- layout ---------- */
+
+  .cols {
+    display: grid;
+    grid-template-columns: 190px minmax(0, 1fr);
+    gap: 3.5rem;
+    margin-top: 3rem;
+    align-items: start;
+  }
+
+  nav.toc {
+    position: sticky;
+    top: 1.5rem;
+    font-size: var(--s--1);
+  }
+
+  nav.toc p {
+    font-family: var(--mono);
+    font-size: var(--s--2);
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    padding-bottom: .6rem;
+    border-bottom: 1px solid var(--line);
+    margin-bottom: .7rem;
+  }
+
+  nav.toc ol {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: .35rem;
+  }
+
+  nav.toc a {
+    color: var(--ink-2);
+    text-decoration: none;
+    display: block;
+    padding: .1rem 0;
+    border-left: 2px solid transparent;
+    padding-left: .6rem;
+    margin-left: -.6rem;
+    transition: color .15s, border-color .15s;
+  }
+
+  nav.toc a:hover,
+  nav.toc a:focus-visible {
+    color: var(--accent);
+    border-left-color: var(--accent);
+  }
+
+  nav.toc .n {
+    font-family: var(--mono);
+    font-size: var(--s--2);
+    color: var(--muted);
+    margin-right: .45rem;
+  }
+
+  main {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4rem;
+  }
+
+  section {
+    scroll-margin-top: 1.5rem;
+  }
+
+  h2 {
+    font-family: var(--serif);
+    font-size: var(--s-3);
+    font-weight: 600;
+    line-height: 1.25;
+    text-wrap: balance;
+    padding-bottom: .5rem;
+    border-bottom: 2px solid var(--ink);
+    margin-bottom: 1.3rem;
+  }
+
+  h2 .h2n {
+    font-family: var(--mono);
+    font-size: var(--s--1);
+    color: var(--accent);
+    vertical-align: .55em;
+    margin-right: .7rem;
+    letter-spacing: .05em;
+  }
+
+  h3 {
+    font-family: var(--serif);
+    font-size: var(--s-1);
+    font-weight: 600;
+    margin-bottom: .5rem;
+  }
+
+  section > p,
+  section > .lede {
+    max-width: 68ch;
+    margin-bottom: 1rem;
+  }
+
+  .lede {
+    color: var(--ink-2);
+    font-size: 1.05rem;
+  }
+
+  p + h3 { margin-top: 1.8rem; }
+
+  code, .mono { font-family: var(--mono); }
+
+  p code, li code, dd code, td code {
+    font-size: .875em;
+    background: var(--grey-wash);
+    padding: .1em .35em;
+    border-radius: 2px;
+  }
+
+  strong { font-weight: 600; }
+
+  a { color: var(--accent-ink); }
+
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  /* ---------- pills ---------- */
+
+  .pill {
+    font-family: var(--mono);
+    font-size: var(--s--2);
+    letter-spacing: .04em;
+    padding: .15em .55em;
+    border-radius: 2px;
+    white-space: nowrap;
+    border: 1px solid;
+  }
+
+  .pill.exact { color: var(--accent); background: var(--accent-wash); border-color: var(--accent); }
+  .pill.solved { color: var(--amber); background: var(--amber-wash); border-color: var(--amber); }
+  .pill.open { color: var(--rust); background: var(--rust-wash); border-color: var(--rust); }
+  .pill.na { color: var(--muted); background: var(--grey-wash); border-color: var(--line); }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .5rem 1.1rem;
+    margin-bottom: 1.6rem;
+    font-size: var(--s--1);
+    color: var(--muted);
+    align-items: center;
+  }
+
+  /* ---------- the chain ---------- */
+
+  ol.chain {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .stage {
+    display: grid;
+    grid-template-columns: 3.4rem minmax(0, 1fr);
+    gap: 0 1.1rem;
+  }
+
+  .rail {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .rail::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    background: var(--line);
+  }
+
+  .stage:first-child .rail::before { top: 1.3rem; }
+  .stage:last-child .rail::before { bottom: calc(100% - 1.3rem); }
+
+  .dot {
+    position: relative;
+    margin-top: .95rem;
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    background: var(--ground);
+    border: 2px solid var(--muted);
+    flex: none;
+  }
+
+  .stage[data-state="exact"] .dot { border-color: var(--accent); background: var(--accent); }
+  .stage[data-state="solved"] .dot { border-color: var(--amber); background: var(--amber-wash); }
+  .stage[data-state="open"] .dot { border-color: var(--rust); background: var(--rust-wash); }
+  .stage[data-state="na"] .dot { border-color: var(--line); background: var(--ground); }
+
+  .num {
+    font-family: var(--mono);
+    font-size: var(--s--2);
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    margin-top: .3rem;
+    position: relative;
+    background: var(--ground);
+    padding: .1rem 0;
+  }
+
+  .stage-body {
+    padding: .75rem 0 1.4rem;
+    min-width: 0;
+  }
+
+  .stage.minor .stage-body { padding-bottom: 1rem; }
+
+  .stage-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: .4rem .7rem;
+    margin-bottom: .35rem;
+  }
+
+  .stage-head .name {
+    font-family: var(--mono);
+    font-size: 1.02rem;
+    font-weight: 600;
+    color: var(--ink);
+    letter-spacing: -.01em;
+  }
+
+  .stage.minor .stage-head .name {
+    font-size: var(--s--1);
+    font-weight: 500;
+    color: var(--ink-2);
+  }
+
+  .rva, .runs {
+    font-family: var(--mono);
+    font-size: var(--s--2);
+    color: var(--muted);
+  }
+
+  .cond {
+    font-size: var(--s--2);
+    color: var(--amber);
+    font-family: var(--mono);
+  }
+
+  .stage-what {
+    color: var(--ink-2);
+    max-width: 66ch;
+    font-size: var(--s--1);
+    line-height: 1.65;
+  }
+
+  dl.meta {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+    gap: .55rem 1.6rem;
+    margin-top: .7rem;
+    padding-top: .7rem;
+    border-top: 1px dashed var(--line-soft);
+    font-size: var(--s--1);
+  }
+
+  dl.meta dt {
+    font-family: var(--mono);
+    font-size: var(--s--2);
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: .1rem;
+  }
+
+  dl.meta dd {
+    color: var(--ink-2);
+    line-height: 1.55;
+  }
+
+  dl.meta dd code { font-size: .85em; }
+
+  /* ---------- tables ---------- */
+
+  .tw {
+    overflow-x: auto;
+    border: 1px solid var(--line);
+    background: var(--surface);
+    margin-bottom: 1.2rem;
+  }
+
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: var(--s--1);
+    min-width: 520px;
+  }
+
+  th, td {
+    text-align: left;
+    padding: .55rem .8rem;
+    border-bottom: 1px solid var(--line-soft);
+    vertical-align: top;
+  }
+
+  thead th {
+    font-family: var(--mono);
+    font-size: var(--s--2);
+    letter-spacing: .07em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 500;
+    background: var(--surface-2);
+    border-bottom: 1px solid var(--line);
+    white-space: nowrap;
+  }
+
+  tbody tr:last-child td { border-bottom: none; }
+
+  td.num-col, th.num-col {
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  td .tag {
+    font-family: var(--mono);
+    color: var(--accent-ink);
+    font-weight: 600;
+  }
+
+  /* ---------- callouts ---------- */
+
+  .note {
+    border-left: 3px solid var(--accent);
+    background: var(--accent-wash);
+    padding: .9rem 1.1rem;
+    font-size: var(--s--1);
+    line-height: 1.65;
+    margin-bottom: 1.2rem;
+  }
+
+  .note.warn {
+    border-left-color: var(--rust);
+    background: var(--rust-wash);
+  }
+
+  .note-label {
+    display: block;
+    font-family: var(--mono);
+    font-size: var(--s--2);
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: .3rem;
+  }
+
+  .note.warn .note-label { color: var(--rust); }
+
+  pre {
+    font-family: var(--mono);
+    font-size: var(--s--1);
+    line-height: 1.6;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    padding: .9rem 1.1rem;
+    overflow-x: auto;
+    margin-bottom: 1.2rem;
+    color: var(--ink-2);
+  }
+
+  /* ---------- method cards ---------- */
+
+  .methods {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+  }
+
+  .method {
+    background: var(--surface);
+    padding: 1.1rem 1.2rem 1.2rem;
+  }
+
+  .method h3 {
+    font-family: var(--sans);
+    font-size: var(--s-0);
+    margin-bottom: .3rem;
+  }
+
+  .method .tool {
+    font-family: var(--mono);
+    font-size: var(--s--2);
+    color: var(--accent);
+    display: block;
+    margin-bottom: .5rem;
+  }
+
+  .method p {
+    font-size: var(--s--1);
+    color: var(--ink-2);
+    line-height: 1.6;
+  }
+
+  /* ---------- gap list ---------- */
+
+  ol.gaps {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 1.1rem;
+    counter-reset: gap;
+  }
+
+  ol.gaps > li {
+    counter-increment: gap;
+    display: grid;
+    grid-template-columns: 2.2rem minmax(0, 1fr);
+    gap: 0 .8rem;
+    padding-bottom: 1.1rem;
+    border-bottom: 1px solid var(--line-soft);
+  }
+
+  ol.gaps > li:last-child { border-bottom: none; padding-bottom: 0; }
+
+  ol.gaps > li::before {
+    content: counter(gap, decimal-leading-zero);
+    font-family: var(--mono);
+    font-size: var(--s--1);
+    color: var(--rust);
+    padding-top: .15rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  ol.gaps h3 {
+    font-family: var(--sans);
+    font-size: var(--s-0);
+    margin-bottom: .25rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: .5rem;
+    align-items: baseline;
+  }
+
+  ol.gaps p {
+    font-size: var(--s--1);
+    color: var(--ink-2);
+    max-width: 68ch;
+    line-height: 1.65;
+  }
+
+  ol.gaps p + p { margin-top: .4rem; }
+
+  /* ---------- overturned ---------- */
+
+  ul.overturned {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: .1rem;
+  }
+
+  ul.overturned li {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: .15rem;
+    padding: .7rem 0;
+    border-bottom: 1px solid var(--line-soft);
+    font-size: var(--s--1);
+  }
+
+  ul.overturned li:last-child { border-bottom: none; }
+
+  .was {
+    color: var(--muted);
+    text-decoration: line-through;
+    text-decoration-thickness: 1px;
+    text-decoration-color: var(--rust);
+  }
+
+  .now { color: var(--ink-2); }
+
+  .now::before {
+    content: "→ ";
+    color: var(--accent);
+    font-family: var(--mono);
+  }
+
+  /* ---------- shipped ---------- */
+
+  ul.plain {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: .5rem;
+    font-size: var(--s--1);
+    color: var(--ink-2);
+    max-width: 68ch;
+  }
+
+  ul.plain li {
+    padding-left: 1.1rem;
+    position: relative;
+    line-height: 1.6;
+  }
+
+  ul.plain li::before {
+    content: "·";
+    position: absolute;
+    left: .25rem;
+    color: var(--accent);
+    font-weight: 700;
+  }
+
+  footer.end {
+    margin-top: 4rem;
+    padding-top: 1.2rem;
+    border-top: 1px solid var(--line);
+    font-family: var(--mono);
+    font-size: var(--s--2);
+    color: var(--muted);
+    display: flex;
+    flex-wrap: wrap;
+    gap: .3rem 1.5rem;
+  }
+
+  @media (max-width: 1000px) {
+    .cols { grid-template-columns: minmax(0, 1fr); gap: 2.5rem; }
+    nav.toc { position: static; }
+    nav.toc ol { flex-direction: row; flex-wrap: wrap; gap: .4rem 1.2rem; }
+    .masthead { grid-template-columns: minmax(0, 1fr); }
+    .ring { display: none; }
+  }
+
+  @media (max-width: 620px) {
+    h1 { font-size: var(--s-3); }
+    h2 { font-size: var(--s-2); }
+    .stage { grid-template-columns: 2.4rem minmax(0, 1fr); gap: 0 .8rem; }
+    .wrap { padding: 0 1.1rem 4rem; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+  }
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <div>
+      <p class="eyebrow">逆向工程 · 工程全景</p>
+      <h1>把 Imaging Edge <span class="mono">Edit.exe</span> 的渲染管线拆开重写</h1>
+      <p class="standfirst">
+        目标不是"看起来像索尼直出"，而是<strong>逐位复刻 <span class="mono">Edit.exe</span> 自己的成品</strong>——
+        机内 JPEG 只是旁证，判据始终是引擎最后一个阶段吐出来的那张图。
+        这份文档记录整条链上每一步做什么、参数从哪来、用什么手段挖出来的、现在还原到什么程度。
+      </p>
+      <div class="colophon">
+        <span>目标 <b>Edit.exe 4.0.00.10311</b></span>
+        <span>引擎命名空间 <b>sony_zhacai</b></span>
+        <span>机型 <b>ILCE-7CM2 / ILCE-7M4</b></span>
+        <span>语料 <b>87 张 ARW</b></span>
+        <span>落地 <b>llr / apps/worker + apps/web</b></span>
+      </div>
+    </div>
+    <div class="ring">
+      <canvas id="hue-ring" width="380" height="380" aria-label="色相环 1024 分段矩阵示意：16 个标定节点环形插值成 1024 张 3×3 矩阵"></canvas>
+      <p class="ring-cap">16 节点 → 环形插值 → 1024 张 3×3<br>SIMDLinearMatrix16</p>
+    </div>
+  </header>
+
+  <div class="scoreboard">
+    <div class="score">
+      <p class="score-val">0.9980</p>
+      <p class="score-key">色度比（1.0 = 对上）</p>
+      <p class="score-note">DRO 关 14 张 · MAD 0.0036</p>
+    </div>
+    <div class="score">
+      <p class="score-val">+0.14°</p>
+      <p class="score-key">色相偏移</p>
+      <p class="score-note">MAD 0.18 · 范围 −0.19~+0.47</p>
+    </div>
+    <div class="score">
+      <p class="score-val">6.8<span style="font-size:.6em;color:var(--muted)">/255</span></p>
+      <p class="score-key">RMSE（两边同样模糊后）</p>
+      <p class="score-note">未模糊 12.5 · 差额全是高频</p>
+    </div>
+    <div class="score">
+      <p class="score-val">19<span style="font-size:.6em;color:var(--muted)"> / 59</span></p>
+      <p class="score-key">实际执行的阶段数</p>
+      <p class="score-note">18 个已解 · 1 个不可复刻</p>
+    </div>
+  </div>
+
+  <div class="cols">
+
+    <nav class="toc" aria-label="目录">
+      <p>目录</p>
+      <ol>
+        <li><a href="#overview"><span class="n">01</span>整体判断</a></li>
+        <li><a href="#chain"><span class="n">02</span>执行链</a></li>
+        <li><a href="#data"><span class="n">03</span>参数从哪来</a></li>
+        <li><a href="#meta"><span class="n">04</span>元数据全表</a></li>
+        <li><a href="#method"><span class="n">05</span>探知手段</a></li>
+        <li><a href="#tally"><span class="n">06</span>还原度总账</a></li>
+        <li><a href="#gaps"><span class="n">07</span>剩下的缺口</a></li>
+        <li><a href="#overturned"><span class="n">08</span>被推翻的结论</a></li>
+        <li><a href="#traps"><span class="n">09</span>会骗人的手法</a></li>
+        <li><a href="#shipped"><span class="n">10</span>落地位置</a></li>
+      </ol>
+    </nav>
+
+    <main>
+
+      <!-- ============ 01 ============ -->
+      <section id="overview">
+        <h2><span class="h2n">01</span>整体判断</h2>
+
+        <p class="lede">
+          四个结构性事实决定了这个工程能不能做成，它们都是实测出来的，不是推断。
+        </p>
+
+        <h3>GPU 不参与颜色处理</h3>
+        <p>
+          拦截 OpenGL 实测：<code>wglGetProcAddress</code> 全程只被请求 1 个函数（即 OpenGL 1.1 固定管线），
+          全部纹理上传都是 <code>GL_BGRA / GL_UNSIGNED_BYTE</code> 的 1024×1024 图块，uniform 上传数量为 <strong>0</strong>。
+          结论：GPU 只负责把 CPU 算完的 8-bit 成品贴上屏幕，<strong>整条影像管线都在 CPU 上</strong>——所以它可以被逐指令读出来。
+        </p>
+
+        <h3>参数不在二进制里，在 RAW 里</h3>
+        <p>
+          最初以为要从 <span class="mono">Edit.exe</span> 里挖出色彩矩阵、色调曲线、饱和度系数。
+          实际上引擎里对应的全是<strong>纯解包函数</strong>——从加密的 SR2SubIFD 读一段字节，按位域拆开写进参数区，不做任何计算。
+          <strong>相机把整套标定逐帧写进了每一张 ARW。</strong>
+          这条一旦确认，离线复刻就不再需要 frida：<code>SegmentedMatrix.from_arw(path)</code> 一行到位。
+        </p>
+
+        <h3>判据必须是引擎自己的成品</h3>
+        <p>
+          早期拿整幅统计量去比机内 JPEG，把上下游若干段的误差混在一起，分不清是谁的问题——
+          由此得出的"缺口在 RGB2YCC"是错的（见 <a href="#overturned">§07</a>）。
+          真正的转折是 <code>stage_frame.py</code>：所有 <code>ZcTask</code> 共用同一套基类字段，
+          于是<strong>任意阶段边界上都能把整幅画面拼出来</strong>（DSC03015 是 7×5 = 35 块 1024×1024，拼出 7008×4672，与机内 JPEG 逐像素同尺寸）。
+          之后每一段都拿引擎自己的前后两份逐像素对，误差再也不用猜。
+        </p>
+
+        <h3>全自动化，无需 GUI</h3>
+        <p>
+          <span class="mono">Edit.exe</span> 接受命令行传图，配合 <code>frida.spawn([EXE, arw])</code>
+          可在渲染前装好钩子、全自动完成一次完整解码，<strong>单张约 6 秒</strong>。
+          此前卡住整个逆向的"必须人工载图"问题由此消除，才有了后面动辄一张图跑五十次的扫参实验。
+        </p>
+
+        <div class="note warn">
+          <span class="note-label">硬约束</span>
+          <span class="mono">Edit.exe</span> 有<strong>单实例转发</strong>：上一次的进程还活着时，新 spawn 的会把文件交给它然后自己退出，钩子永远不触发。
+          症状是"hooks installed"之后毫无动静——<strong>与"这个阶段不执行"完全无法区分</strong>。
+          每次 spawn 前必须 <code>taskkill /F /IM Edit.exe</code>。这也是多个仪器化任务无法并行的根本原因。
+        </div>
+      </section>
+
+      <!-- ============ 02 ============ -->
+      <section id="chain">
+        <h2><span class="h2n">02</span>执行链</h2>
+
+        <p class="lede">
+          把全部 59 个 <code>ZcTask*</code> 的执行函数一次全钩上数出来的（<code>stage_census.py</code>）。
+          无符号表（只有 9 个导出）但保留完整 MSVC RTTI，由名字符串反查 vtable，<strong>所有 <code>ZcTask*</code> 的 slot 7 即执行函数</strong>。
+          括号里是单张图的调用次数：36 = 35 块 tile + 1 张 880×588 缩略图。
+        </p>
+
+        <div class="legend">
+          <span class="pill exact">逐位/完全复刻</span>
+          <span class="pill solved">已解出，未接或无净效果</span>
+          <span class="pill open">未复刻</span>
+          <span class="pill na">不在复刻范围</span>
+        </div>
+
+        <ol class="chain">
+
+          <li class="stage minor" data-state="na">
+            <div class="rail"><div class="dot"></div><span class="num">01</span></div>
+            <div class="stage-body">
+              <div class="stage-head">
+                <span class="name">Preprocess</span><span class="runs">×2</span>
+                <span class="pill na">由 LibRaw 对位</span>
+              </div>
+              <p class="stage-what">黑电平、白平衡等前处理。主管线走 rawpy/LibRaw（<code>output_color=raw</code>、<code>gamma=(1,1)</code>、<code>use_camera_wb</code>），实测与索尼喂给矩阵的像素<strong>是同一个空间</strong>：整幅对齐后逐像素相对差中位 0.20%，白平衡一致到 0.3%，最佳对角增益 ≈ 1。</p>
+            </div>
+          </li>
+
+          <li class="stage minor" data-state="na">
+            <div class="rail"><div class="dot"></div><span class="num">02</span></div>
+            <div class="stage-body">
+              <div class="stage-head">
+                <span class="name">TileDivRough</span><span class="runs">×1</span>
+                <span class="pill na">无需复刻</span>
+              </div>
+              <p class="stage-what">粗分块。分块本身不改像素值，只决定后续任务的工作单元。</p>
+            </div>
+          </li>
+
+          <li class="stage" data-state="open">
+            <div class="rail"><div class="dot"></div><span class="num">03</span></div>
+            <div class="stage-body">
+              <div class="stage-head">
+                <span class="name">DemosaicRough</span><span class="runs">×1</span>
+                <span class="pill open">不可复刻</span>
+              </div>
+              <p class="stage-what">去马赛克。走 GPU 加密的神经 / Vulkan 路径，不在可复刻范围内。主管线用 LibRaw 的去马赛克代替——这是残余高频误差的来源之一。</p>
+            </div>
+          </li>
+
+          <li class="stage" data-state="solved">
+            <div class="rail"><div class="dot"></div><span class="num">04</span></div>
+            <div class="stage-body">
+              <div class="stage-head">
+                <span class="name">ZcTaskVatr</span>
+                <span class="rva">RVA 0x366920</span><span class="runs">×36</span>
+                <span class="cond">仅 DRO ≠ Off</span>
+                <span class="pill solved">主体已解，未接入</span>
+              </div>
+              <p class="stage-what">
+                <strong>这就是 DRO，而它是一个双边网格（bilateral grid）局部色调映射。</strong>
+                <code>gain = 2^(Tone(Mlog) − Mlog)</code>，三通道同乘——<strong>保色是结构性的</strong>，不是巧合，正对上动态实测的三通道增益 1.030 / 1.029 / 1.028。
+                网格是 <strong>8×6 空间格 × 14 亮度箱</strong>，第三个轴就是像素自己的 log 亮度。
+              </p>
+              <div class="note" style="margin:.8rem 0 0">
+                <span class="note-label">这解开了一对看似矛盾的观测</span>
+                「按输入值分箱解释掉 76% 增益方差」与「残差相关随核尺度单调上升、2052px 处还在升」——
+                前者是因为双边网格的 z 轴就是像素自身亮度（同格内只有亮度相近的像素被平均进 <code>Mlog</code>，于是 <code>Mlog ≈ Ylog + 小偏移</code>）；
+                后者是因为<strong>粗网格只有 8×6</strong>（整幅 7008 宽 ÷ 8 ≈ 876 像素一格）。
+              </div>
+              <dl class="meta">
+                <div><dt>Auto 档位的来源</dt><dd><strong>相机算好写进 RAW 了</strong>：<code class="tag">0x781b</code>（10×u16 节点）+ <code class="tag">0x781c</code>（28×u16 控制点），标度 1/1024，量纲 log2 亮度。引擎照搬，<strong>不是按画面现算的</strong></dd></div>
+                <div><dt>曲线形式</dt><dd>28 = 9 段 × 3 + 1，分段三次 Bézier，采样成 104 项查表</dd></div>
+                <div><dt>怎么定位的</dt><dd>执行普查双图对照定出它就是 DRO；逐指令读 <code>FUN_18ad50</code> 与标定解析器定出两个 tag</dd></div>
+                <div><dt>还差什么</dt><dd>网格累加的三个函数、tile 坐标 → 网格坐标的 ×1/×8 映射、手动档那 10 条内置预设的 <code>.data</code> 表</dd></div>
+              </dl>
+            </div>
+          </li>
+
+          <li class="stage minor" data-state="na">
+            <div class="rail"><div class="dot"></div><span class="num">05</span></div>
+            <div class="stage-body">
+              <div class="stage-head">
+                <span class="name">SIMDGeometricTransformCorrection</span><span class="runs">×36</span>
+                <span class="pill na">主管线自有实现</span>
+              </div>
+              <p class="stage-what">几何 / 镜头校正。主管线走自己的镜头校正路径，不追求与索尼一致。</p>
+            </div>
+          </li>
+
+          <li class="stage" data-state="exact">
+            <div class="rail"><div class="dot"></div><span class="num">06</span></div>
+            <div class="stage-body">
+              <div class="stage-head">
+                <span class="name">SIMDLinearMatrix16</span>
+                <span class="rva">RVA 0x37e530</span><span class="runs">×36</span>
+                <span class="pill exact">逐位 100.00%</span>
+              </div>
+              <p class="stage-what">
+                <strong>整条色彩链上唯一的一步</strong>，而且它不是一个全局 3×3 矩阵，是<strong>按色相分成 1024 段</strong>的一组矩阵。
+                逐像素索引由一个定点 atan 近似生成，是 0..1023 的色相角（整圈 1024）；
+                16 个标定节点<strong>环形</strong>插值成 1024 张——末段 960..1023 插回节点 0，不是钳位也不是外推。
+                每行和恒为 1，<strong>中性灰恒等映射</strong>。
+              </p>
+              <dl class="meta">
+                <div><dt>参数来源</dt><dd>ARW → SR2SubIFD <strong>根层</strong> <code class="tag">0x780f</code>，276 字节，23×12 按 14 位定点位域拆开</dd></div>
+                <div><dt>探知手段</dt><dd>frida 抓参数区 + ghidra 反编译解包函数 <code>+0x179390</code>；<code>src276_probe.py</code> 抓它<strong>实际读到</strong>的入参</dd></div>
+                <div><dt>还原效果</dt><dd>节点系数 vs 引擎参数区最大差 <strong>0.00000000</strong>；展开的 1024 张矩阵 vs 引擎 <strong>逐位相同</strong></dd></div>
+                <div><dt>本仓库的近似</dt><dd>色相索引改用真实 <code>atan2</code> + 标定 LUT；高彩度处残差中位 1/1024，低彩度处无害（矩阵在那里就是恒等的）</dd></div>
+              </dl>
+            </div>
+          </li>
+
+          <li class="stage" data-state="exact">
+            <div class="rail"><div class="dot"></div><span class="num">07</span></div>
+            <div class="stage-body">
+              <div class="stage-head">
+                <span class="name">MainGamma</span><span class="runs">×36</span>
+                <span class="pill exact">十条曲线全命中</span>
+              </div>
+              <p class="stage-what">
+                一张 32768 × int16 的逐通道色调 LUT，<strong>不是按图自适应的</strong>——
+                它等于「创意外观的出厂曲线」叠上「机内微调」，两层都不随场景变化。
+                输出是 display-<em>encoded</em> 的（原点斜率 ~12，正是 sRGB 的 toe），横轴白点 8192，曲线饱和于索引 8084~8140，
+                即<strong>索尼的显示白没有高光余量</strong>。
+              </p>
+              <dl class="meta">
+                <div><dt>出厂曲线</dt><dd>根层 <code class="tag">0x74c0</code>（uint32[10]）指向十份平行 SR2DataIFD，每份自带 128 点的 <code class="tag">0x7805</code>/<code class="tag">0x7806</code>。标度 <code>x/128</code> = 索引、<code>y/16</code> = 输出</dd></div>
+                <div><dt>机内微调</dt><dd>MakerNotes 明文 int32：Highlights <code class="tag">0x2033</code>、Shadows <code class="tag">0x2032</code>、Contrast <code class="tag">0x2004</code>。对档位严格线性，但<strong>正负形状不同、每种外观各一套</strong>——40 条实测单位形状</dd></div>
+                <div><dt>探知手段</dt><dd><code>look_sweep.py</code> 一张图跑五十次（十外观 × 微调档位）；换外观靠改 MakerNotes 字符串字段 <code class="tag">0xb020</code></dd></div>
+                <div><dt>还原效果</dt><dd>让引擎轮流按十种外观渲同一张图，<strong>十条曲线全部命中，最大差 8/16384 = 0.05%</strong></dd></div>
+              </dl>
+            </div>
+          </li>
+
+          <li class="stage" data-state="exact">
+            <div class="rail"><div class="dot"></div><span class="num">08</span></div>
+            <div class="stage-body">
+              <div class="stage-head">
+                <span class="name">RGB2YCC</span>
+                <span class="rva">RVA 0x36d690</span><span class="runs">×36</span>
+                <span class="pill exact">Y 逐位，色度差 ≤1</span>
+              </div>
+              <p class="stage-what">
+                <strong>饱和度与色相风格真正的产生处</strong>，而且它<em>不是</em> BT.601：
+                色差取的是<strong>绿色差</strong>（<code>u = R−G, v = B−G</code>）而不是 Y 差；两个色差<strong>交叉耦合</strong>、
+                各自看对方的符号；最后的增益也<strong>按符号分岔</strong>。
+                按符号分岔的增益产生随色相变化的增益，交叉耦合产生色相旋转——正是实测到的那两样东西。
+              </p>
+              <pre>Y  = (R*2432 + G*4864 + B*896) &gt;&gt; 13
+u  = R - G;   v = B - G
+v2 = cross[u &gt;= 0 ? p1 : p3] * u + v
+u2 = cross[v &gt;= 0 ? p0 : p2] * v + u
+Cr = gain[u2 &gt;= 0 ? p5 : p7] * u2
+Cb = gain[v2 &gt;= 0 ? p4 : p6] * v2</pre>
+              <dl class="meta">
+                <div><dt>八个参数</dt><dd><code class="tag">0x7842</code> 基准 + <code class="tag">0x7843..0x7846</code> 四组光源增量，按 <code class="tag">0x7848</code> 的四个权重（和为 1024）混合</dd></div>
+                <div><dt>探知手段</dt><dd>反编译 <code>FUN_14036dce0</code>；<code>scan_disp.py</code> 扫全 <code>.text</code> 发现权重<strong>一处写入都没有</strong>——没人写却被整段读写，那就只能是从文件灌进来的</dd></div>
+                <div><dt>还原效果</dt><dd>Y 平面 <strong>逐位相同 100.00%</strong>，Cr / Cb 最大差 <strong>1</strong>（取整）</dd></div>
+                <div><dt>顺带解释</dt><dd>BW 的八个值全是 0 → 增益为零 → <code>Cb = Cr = 0</code>。<strong>黑白外观的去色就发生在这里</strong>，不需要任何额外机制</dd></div>
+              </dl>
+            </div>
+          </li>
+
+          <li class="stage" data-state="solved">
+            <div class="rail"><div class="dot"></div><span class="num">09</span></div>
+            <div class="stage-body">
+              <div class="stage-head">
+                <span class="name">ChromaSuppres</span>
+                <span class="rva">RVA 0x36e920</span><span class="runs">×36</span>
+                <span class="pill solved">已解，待动态定标</span>
+              </div>
+              <p class="stage-what">
+                两头的色度衰减，是降噪用的不是风格。
+                <strong>两处旧记载要改：</strong>实际是 <code>* f &gt;&gt; 8</code> 而不是 <code>* f / 255</code>——所以 <code>f = 255</code> 时色度并非完全不动，而是<strong>掉 0.39%</strong>；
+                并且插值出来的是<strong>「一条阈值 + 一个斜率」</strong>，不是 lo / hi 两条线。
+              </p>
+              <dl class="meta">
+                <div><dt>ISO 插值轴</dt><dd><code class="tag">0x74a5</code> / 300，单位是<strong>档</strong>，锚点在 0 / −1 / −2</dd></div>
+                <div><dt>六个锚点</dt><dd><code class="tag">0x787e</code>[0..2]（斜率族）、<code class="tag">0x787f</code>[0..2]（阈值族），外加 <code class="tag">0x7880</code> / <code class="tag">0x7881</code>。五个机型码全部取自 RAW，老机型走二进制常量</dd></div>
+                <div><dt>接入前必做</dt><dd><code class="tag">0x74a5</code> 的物理量纲还没定死。按静态推断 ISO ≥ 400 会落到 <code>x &lt; −2</code> 而两个分支都不成立——<strong>必须动态读一次 <code>calib[0xc]</code> 定标，不能照推断写代码</strong></dd></div>
+                <div><dt>已知影响</dt><dd>用引擎自己的 YCC 走 YCC2RGB 时，中位差 2/16383、p99 118，<strong>那个残差正是还没加的 ChromaSuppres</strong></dd></div>
+              </dl>
+            </div>
+          </li>
+
+          <li class="stage" data-state="exact">
+            <div class="rail"><div class="dot"></div><span class="num">10</span></div>
+            <div class="stage-body">
+              <div class="stage-head">
+                <span class="name">YGamma</span>
+                <span class="rva">RVA 0x36f030</span><span class="runs">×36</span>
+                <span class="pill exact">逐位 100.0000%</span>
+              </div>
+              <p class="stage-what">
+                <strong>只动平面 0（Y）</strong>，两个色度平面改动比例 0.0000%。
+                <code>pivot</code>/<code>contrast</code> 这两个量就是 <strong>Fade 滑块</strong>——
+                <code>pivot = 10624/16383 = 0.6485</code>，低于它抬、高于它压，<code>contrast &lt; 1</code> 时整条曲线向 0.65 收拢，正是褪色的样子。
+              </p>
+              <pre>y = trunc(clamp(((max(0, lut[Y]) - black) * scale - pivot) * contrast + pivot, 0, 16383))</pre>
+              <dl class="meta">
+                <div><dt>参数来源</dt><dd>根层 <code class="tag">0x780b</code>（pivot）与 <code class="tag">0x780e</code>（contrast），各 10 项，按 <code>Fade×10 / 10</code> 查表线性插值</dd></div>
+                <div><dt>探知手段</dt><dd><code>slider_probe.py</code>：改一个机内滑块，一次同时抓 tone LUT + 八个色度 short + YGamma 四标量，<strong>"这个滑块落在哪一段"通常一次就定了</strong></dd></div>
+                <div><dt>还原效果</dt><dd>Fade=5 的 ARW 带公式复算，<strong>2 046 336 像素 100.0000% 逐位相同</strong>。取整是<em>截断</em>不是就近——就近只有 50.31% 命中</dd></div>
+                <div><dt>它修的是亮度</dt><dd>不是饱和度。Y 整体缩放时绝对色度不变（<code>R−Y = 1.402·Cr</code>），变的只是"色度/亮度"比</dd></div>
+              </dl>
+            </div>
+          </li>
+
+          <li class="stage" data-state="exact">
+            <div class="rail"><div class="dot"></div><span class="num">11</span></div>
+            <div class="stage-body">
+              <div class="stage-head">
+                <span class="name">YCC2RGB</span>
+                <span class="rva">RVA 0x3713e0</span><span class="runs">×36</span>
+                <span class="pill exact">逐位</span>
+              </div>
+              <p class="stage-what">标准 BT.601，定点系数 14020 / 7141 / 3441 / 17720 除以 10000，输出钳在 14 位，色度以 0x8000 为中点存成 uint16。<strong>回程没有任何风格化</strong>——全部风格都在正向那一步。</p>
+            </div>
+          </li>
+
+          <li class="stage" data-state="exact">
+            <div class="rail"><div class="dot"></div><span class="num">12</span></div>
+            <div class="stage-body">
+              <div class="stage-head">
+                <span class="name">SIMDHueSaturation</span><span class="runs">×36</span>
+                <span class="cond">仅 Saturation ≠ 0</span>
+                <span class="pill exact">同构复刻</span>
+              </div>
+              <p class="stage-what">
+                <strong>同一个因子被用了两次，方向相反。</strong>
+                改机内 Saturation 后 RGB2YCC 的四个增益成比例<em>变小</em>，而这一步<em>乘回来</em>（倍数 = <code>1 + v/100</code>，只动两个色度平面，Y 一动不动）。
+                两者相消，所以这个滑块的全部可见效果，<strong>就是夹在中间的那道 ±8192 钳位</strong>：实测成品 +9 时 ×0.990、−9 时 ×1.047。
+              </p>
+              <dl class="meta">
+                <div><dt>守卫</dt><dd>Imaging Edge 编辑参数 <code class="tag">0x8016</code> → <code>[rsi+0x1fc]</code>；<code>chain_map.py</code> 列出全部「守卫 → 阶段」对应</dd></div>
+                <div><dt>复刻做法</dt><dd>与引擎同构：钳位前除、钳位后乘。诚实地说在这批照片上几乎不产生可测差别，重饱和画面上才会体现</dd></div>
+              </dl>
+            </div>
+          </li>
+
+          <li class="stage" data-state="exact">
+            <div class="rail"><div class="dot"></div><span class="num">13</span></div>
+            <div class="stage-body">
+              <div class="stage-head">
+                <span class="name">ZcTaskEffect</span><span class="runs">×36</span>
+                <span class="cond">仅 Sepia</span>
+                <span class="pill exact">已复刻</span>
+              </div>
+              <p class="stage-what">
+                <strong>Sepia 的染色在这里</strong>——SE 的八个色度参数和 Standard 一模一样，所以染色一定在别处。
+                它把色度整个丢掉，输出只由输入的一个加权和决定，权重拟合出 <strong>(0.21, 0.71, 0.08)</strong>，<em>不是</em>引擎的亮度权重（用亮度权重残差翻倍）。
+              </p>
+              <dl class="meta">
+                <div><dt>怎么让它跑起来</dt><dd><code>patch_sr2.py</code>：索尼的 SR2 加密是 <strong>XOR 流、对合</strong>，解密 → 把根层标定整块换成第 9 份外观 → 再跑一遍 → 写回，长度和 IFD 偏移都不变</dd></div>
+                <div><dt>还原效果</dt><dd>三条 257 结点曲线存进 <code>sepia.npz</code>，三帧残差中位 <strong>11.7/16383</strong>；SE 从"回退 DCP"（色度 0.75 / 色相 +4.4°）变成 <strong>色度 1.019 / 色相 −0.28°</strong></dd></div>
+                <div><dt>一个必要的强制</dt><dd>顶端夹白的结点实测会回头（最大 −70/16383），按累积最大值强制单调——<strong>染色曲线回头会在高光里翻出色斑</strong></dd></div>
+              </dl>
+            </div>
+          </li>
+
+          <li class="stage minor" data-state="na">
+            <div class="rail"><div class="dot"></div><span class="num">14</span></div>
+            <div class="stage-body">
+              <div class="stage-head">
+                <span class="name">TileDiv</span><span class="runs">×35</span>
+                <span class="pill na">无需复刻</span>
+              </div>
+              <p class="stage-what">细分块。此后所有阶段都是 35 次（缩略图不再参与）。</p>
+            </div>
+          </li>
+
+          <li class="stage" data-state="open">
+            <div class="rail"><div class="dot"></div><span class="num">15</span></div>
+            <div class="stage-body">
+              <div class="stage-head">
+                <span class="name">RawNRSIMD</span><span class="runs">×35</span>
+                <span class="pill open">形态清楚，不能照搬</span>
+              </div>
+              <p class="stage-what">
+                <strong>多分辨率子带阈值收缩。</strong>32768 项阈值表的<em>生成公式</em>已完全解出，而且它的参数全是 RAW 标签
+                <code class="tag">0x78c5</code>..<code class="tag">0x78cb</code>（逐图噪声模型）——<strong>这部分可以白拿</strong>。
+              </p>
+              <dl class="meta">
+                <div><dt>为什么还不能写</dt><dd>正 / 逆变换核 <code>FUN_140385af0</code> / <code>FUN_1403857e0</code> <strong>没读</strong>，缺了它写不出可运行的复刻</dd></div>
+                <div><dt>一个未验证的假定</dt><dd>静态分析拿 <code>RawNRHalf</code> 当规范，<strong>「它与 SIMD 版同构」这条没有验证过</strong>——照搬前必须先确认</dd></div>
+              </dl>
+            </div>
+          </li>
+
+          <li class="stage" data-state="open">
+            <div class="rail"><div class="dot"></div><span class="num">16</span></div>
+            <div class="stage-body">
+              <div class="stage-head">
+                <span class="name">SIMDITP</span><span class="runs">×35</span>
+                <span class="pill open">定性已知</span>
+              </div>
+              <p class="stage-what">
+                把三个平面拆成<strong>「基底 + 两条差分」</strong>再重建（<code>out = base + delta</code>），配合按置信度在滤波版与原版之间混合。
+                形态像是亮度降噪后重建彩色 / 抑制伪色。
+              </p>
+              <dl class="meta">
+                <div><dt>可能顺带解开 SSCS</dt><dd>它是<strong>唯一重建平面数值的一步</strong>——SSCS 那个「量程只有 3043、来源未解」的悬案，源头很可能就在这里</dd></div>
+                <div><dt>一条要划掉的经验</dt><dd><strong>ITP 的「标量孪生更好读」不成立</strong>：标量版与 SIMD 版共用同一批槽函数，没有省事的那条路</dd></div>
+              </dl>
+            </div>
+          </li>
+
+          <li class="stage" data-state="solved">
+            <div class="rail"><div class="dot"></div><span class="num">17</span></div>
+            <div class="stage-body">
+              <div class="stage-head">
+                <span class="name">SSCS</span>
+                <span class="rva">RVA 0x3860f0</span><span class="runs">×35</span>
+                <span class="pill solved">完全解出，但触发率 0.00%</span>
+              </div>
+              <p class="stage-what">
+                <strong>高光去饱和</strong>，float 与整数两条路径同构。三个通道都超过各自的 lo 时，按 G 与 <code>min(R,B)</code> 算出一个保留比例 <code>k/128</code>，把色度按比例收向灰。
+                实测参数 hi = 7934、lo 全是 2380，权重 [32,64,32]/128 正是亮度权重。
+              </p>
+              <div class="note warn" style="margin:.8rem 0 0">
+                <span class="note-label">量程谜团</span>
+                <strong>它在 DSC03015 上一个像素都没改</strong>：35 块 tile 合计 3664 万像素，触发率 0.00%。
+                原因不是这张图特殊，是<strong>尺度对不上</strong>——整幅数据最大值只有 3043，而 lo = 2380、hi = 7934，数据量程只有 14 位的约 1/5。
+                这个量程怎么来的还没解出（试过"ITP 做 sRGB 解码"的假设，算出来应是 13874，不成立）。
+                <strong>别把它当成"永不执行"</strong>：真到了那个量程的图上它就会触发。
+              </div>
+            </div>
+          </li>
+
+          <li class="stage" data-state="solved">
+            <div class="rail"><div class="dot"></div><span class="num">18</span></div>
+            <div class="stage-body">
+              <div class="stage-head">
+                <span class="name">AreaCompSIMD</span>
+                <span class="rva">标量孪生 0x39a0d0</span><span class="runs">×35</span>
+                <span class="pill solved">已解，净效果 ×0.9999</span>
+              </div>
+              <p class="stage-what">
+                Cb-Cr 平面上的<strong>两个楔形加性修正</strong>——记忆色修正，不是全局缩放。
+                <code>s</code> 只在 Cb-Cr 平面的一个锥形区内非零；16 个 float 参数由 <code>FUN_14039b000</code> 按机型/模式从常量池里挑（全是 1/64 的整数倍），
+                外加一个 flag 决定两个楔形是各加各的还是取交集。<strong>实测整幅色度改动 ×0.9999</strong>，所以没有接入的必要。
+              </p>
+            </div>
+          </li>
+
+          <li class="stage" data-state="solved">
+            <div class="rail"><div class="dot"></div><span class="num">19</span></div>
+            <div class="stage-body">
+              <div class="stage-head">
+                <span class="name">SIMDSharpness</span>
+                <span class="rva">RVA 0x388c00</span><span class="runs">×35</span>
+                <span class="pill solved">算法已解，档位映射待定</span>
+              </div>
+              <p class="stage-what">
+                <strong>只动平面 0 的非锐化掩模。</strong>模糊 = 「3×3 十字核 <code>(1,1,4,1,1)/8</code>」与「7×7 可分离二项式 <code>[1,6,15,20,15,6,1]/4096</code>」按权重 <code>t</code> 混合；
+                高频过一个<strong>硬门限死区</strong> <code>[−hi, hi]</code>（不是软阈值），死区外按正 / 负两条斜率放大；
+                <code>out = src + d·gain·taper</code>，截断钳到 32767。
+              </p>
+              <div class="note" style="margin:.8rem 0 0">
+                <span class="note-label">最有价值的一条：Spica 是同一把锐化的另一端</span>
+                <code>ZcTaskSpica</code> 用<strong>同一个强度 <code>st[0x208]</code> 和同一个 <code>st[0x2c4]</code></strong>，但权重是 <code>(100−r)/50</code>——
+                与 Sharpness 的 <code>r/50</code> <strong>互补</strong>。两者是同一把锐化的粗端与细端，
+                <strong>只补 Sharpness 可能只解决一半残差。</strong>
+              </div>
+              <dl class="meta">
+                <div><dt>还差什么</dt><dd>机内档位 → 编辑参数 <code class="tag">0x801a</code> 的换算表还没定出来。<strong>87 张素材的机内 Sharpness 全部是 +4，没有对照组</strong></dd></div>
+                <div><dt>两个会让它整个失效的分支</dt><dd><code>st+0x2c4</code> 只在版本 &gt; 0x102 时才写——<strong>若残留 0 则锐化根本不生效</strong>；<code>calib[0x1060]</code> 在 <code class="tag">0x78cd</code> ≤ 256 时不被写，初值未知</dd></div>
+                <div><dt>EXIF 陷阱</dt><dd><code>Sony:0x2006</code> 才是真值（int32s，4 字节），<code>ExifIFD:0xa40a</code> 恒为 <code>Normal</code></dd></div>
+              </dl>
+            </div>
+          </li>
+
+          <li class="stage" data-state="solved">
+            <div class="rail"><div class="dot"></div><span class="num">20</span></div>
+            <div class="stage-body">
+              <div class="stage-head">
+                <span class="name">SIMDSpica</span><span class="runs">×35</span>
+                <span class="pill solved">= 锐化的粗端</span>
+              </div>
+              <p class="stage-what">
+                <strong>边缘自适应的细锐化</strong>，与 <code>SIMDSharpness</code> 共用强度参数、权重互补（<code>(100−r)/50</code> 对 <code>r/50</code>）。
+                「语义完全未知」这条已经作废——它不是一个独立阶段，是同一把锐化拆成的两半。
+              </p>
+            </div>
+          </li>
+
+          <li class="stage" data-state="solved">
+            <div class="rail"><div class="dot"></div><span class="num">21</span></div>
+            <div class="stage-body">
+              <div class="stage-head">
+                <span class="name">SIMDMarble</span><span class="runs">×35</span>
+                <span class="pill solved">逐位复刻，但<em>不该</em>接</span>
+              </div>
+              <p class="stage-what">
+                内部色域转换：查表线性化 → 3×3（每行和为 1）→ 钳 14 位 → 查表编码。
+                三张 65536 项的表<strong>运行时惰性生成，静态文件里是空的</strong>，必须实机抓；拿实抓的表复算三块 tile <strong>100.0000% 相同，最大差 0</strong>（纯解析的 sRGB / 2.2 近似不够，中位差 15、最大 260）。
+              </p>
+              <div class="note" style="margin:.8rem 0 0">
+                <span class="note-label">这不是输出色彩空间转换</span>
+                单看这一步色度会掉两成，曾据此以为找到了缺口——但整幅一比，<strong>Marble 入口 0.9637、出口 0.9738，整段只改了 1%</strong>。
+                它是 Marble 自己的工作空间，末尾会转回去。把它接在我们管线后面反而更糟：色度 0.8162 → 1.1628，色相 −7.7° → −13.3°。
+              </div>
+            </div>
+          </li>
+
+        </ol>
+
+        <h3 style="margin-top:2rem">一次都没跑的 38 个</h3>
+        <p>
+          其中和颜色有关的：<code>ZcTask3DLut</code>、<code>LinearMatrix</code>、<code>LinearMatrix16</code>（非 SIMD）、<code>ToneCurve</code>、<code>Effect</code>（非 SE 时）、<code>Dither</code>、<code>SIMDHueSaturation</code>（Saturation=0 时）、<code>ITP</code>、<code>AreaComp</code>、<code>Marble</code>、<code>Spica</code>、<code>HueSaturation</code>。
+        </p>
+        <div class="note">
+          <span class="note-label">它们照样值得反编译</span>
+          <strong>每个 SIMD 任务都有一个不带 SIMD 后缀的标量孪生版</strong>，结构逐行对应但没有 AVX intrinsic 的噪声，读起来省一个数量级。
+          SSCS、ITP、AreaComp、HueSaturation 都是这么解出来的。
+          唯一确定与复刻无关的是 <code>ZcTask3DLut</code>：它的守卫来自 Imaging Edge 自己的编辑参数 <code class="tag">0x8026</code>，
+          跑遍十种外观、DRO 开关、全部滑块、Sepia，<strong>一次都没执行过</strong>——那是用户 LUT 功能。
+        </div>
+      </section>
+
+      <!-- ============ 03 ============ -->
+      <section id="data">
+        <h2><span class="h2n">03</span>参数从哪来</h2>
+
+        <p class="lede">
+          这是整个工程最反直觉的结论：<strong>几乎所有渲染参数都不在 <span class="mono">Edit.exe</span> 里，而在每一张 ARW 自己的加密段里。</strong>
+          引擎那边对应的是一句 <code>memcpy</code> 和一个纯位域解包函数，不做任何计算。
+        </p>
+
+        <h3>寻址路径</h3>
+        <pre>IFD0 tag 0xc634 (DNGPrivateData,内联 uint32 = SR2Private IFD 偏移)
+  └─ SR2Private:  0x7200 offset / 0x7201 length / 0x7221 key
+  └─ XOR 流解密(同 exiftool Sony.pm 的 Decrypt,大端 uint32 异或密钥流)
+       └─ SR2SubIFD 根层  ← 引擎读的是这一层
+            └─ 0x74c0 = uint32[10] → 十份平行 SR2DataIFD（ST/VV/NT/PT/FL/VV2/IN/SH/BW/SE）</pre>
+
+        <div class="note warn">
+          <span class="note-label">一个代价高昂的分歧</span>
+          <code class="tag">0x780f</code> 在<strong>两个地方</strong>都有：根层一份，十份 DataIFD 各自还有一份。
+          <strong>引擎只读根层那份，逐外观的十份它根本不看</strong>——分段矩阵与创意外观无关，十种外观共用一个。
+          取错了会让蓝色差偏 45%、色相偏 7.6°，而且十种外观没有一种对得上。这个 bug 曾被当成"YCC 段少一步"追查了很久。
+        </div>
+
+        <h3>加密段（SR2SubIFD）</h3>
+        <div class="tw">
+          <table>
+            <thead>
+              <tr><th class="num-col">Tag</th><th class="num-col">标定块偏移</th><th>内容</th><th>用在哪</th></tr>
+            </thead>
+            <tbody>
+              <tr><td class="num-col"><span class="tag">0x780f</span></td><td class="num-col">+0xae</td><td>276 字节，分段矩阵的 16 节点系数（14 位定点，单位 1/1024）</td><td>SIMDLinearMatrix16</td></tr>
+              <tr><td class="num-col"><span class="tag">0x74c0</span></td><td class="num-col">—</td><td>uint32[10]，指向十份 SR2DataIFD</td><td>十种外观的完整标定</td></tr>
+              <tr><td class="num-col"><span class="tag">0x7805</span> / <span class="tag">0x7806</span></td><td class="num-col">—</td><td>128 点色调曲线（<code>x/128</code> = 索引，<code>y/16</code> = 输出）</td><td>MainGamma</td></tr>
+              <tr><td class="num-col"><span class="tag">0x780b</span> / <span class="tag">0x780e</span></td><td class="num-col">—</td><td>各 10 项：Fade 各档的 pivot 与 contrast</td><td>YGamma</td></tr>
+              <tr><td class="num-col"><span class="tag">0x7841</span></td><td class="num-col">+0xddc</td><td>相机<strong>已经混合好</strong>的八个色度参数（只对拍摄时那个外观有效）</td><td>RGB2YCC 捷径</td></tr>
+              <tr><td class="num-col"><span class="tag">0x7842</span></td><td class="num-col">+0xdec</td><td>色度参数基准（BW 全为 0 ⇒ 去色）</td><td>RGB2YCC</td></tr>
+              <tr><td class="num-col"><span class="tag">0x7843</span>..<span class="tag">0x7846</span></td><td class="num-col">+0xdfc..+0xe2c</td><td>四组光源增量</td><td>RGB2YCC</td></tr>
+              <tr><td class="num-col"><span class="tag">0x7848</span></td><td class="num-col">+0xe44</td><td><strong>四个混合权重，和为 1024</strong>（逐张，跟白平衡走，十外观共用）</td><td>RGB2YCC</td></tr>
+              <tr><td class="num-col"><span class="tag">0x7770</span></td><td class="num-col">—</td><td>外观名字符串（根层写的就是拍摄时那个）</td><td>标定归属校验</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          混合公式 <code>p[i] = base[i] + (Σ d<sub>k</sub>[i]·w<sub>k</sub>) &gt;&gt; 10</code>。
+          65 张实测：46 张权重是 <code>(1024,0,0,0)</code>（所以"只用基准"长期看着没问题），19 张不是，单个参数最多差 352。
+          混合结果与相机成品在 63 张上逐位相同，另 2 张增益差 1。
+        </p>
+
+        <h3>明文段（MakerNotes）</h3>
+        <div class="tw">
+          <table>
+            <thead>
+              <tr><th class="num-col">Tag</th><th>含义</th><th>落到哪个阶段</th></tr>
+            </thead>
+            <tbody>
+              <tr><td class="num-col"><span class="tag">0xb020</span></td><td>创意外观名字符串（<code>Standard</code> 而非 <code>ST</code>）</td><td>选哪份 DataIFD——<strong>改它只换曲线，换不动颜色</strong></td></tr>
+              <tr><td class="num-col"><span class="tag">0x2004</span></td><td>Contrast</td><td>MainGamma 的 LUT</td></tr>
+              <tr><td class="num-col"><span class="tag">0x2005</span></td><td>Saturation</td><td>RGB2YCC 的四个增益 + SIMDHueSaturation 的守卫</td></tr>
+              <tr><td class="num-col"><span class="tag">0x2032</span> / <span class="tag">0x2033</span></td><td>Shadows / Highlights</td><td>MainGamma 的 LUT（叠在出厂曲线之上）</td></tr>
+              <tr><td class="num-col"><span class="tag">0x2034</span></td><td>Fade</td><td>YGamma 的 pivot / contrast——<strong>对色调曲线完全无作用</strong></td></tr>
+              <tr><td class="num-col"><span class="tag">0x2006</span></td><td>Sharpness（<strong>真值在这里</strong>）</td><td>SIMDSharpness（未复刻）</td></tr>
+              <tr><td class="num-col"><span class="tag">0xb025</span></td><td>DynamicRangeOptimizer</td><td>ZcTaskVatr 是否上链</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="note warn">
+          <span class="note-label">主管线曾经整条读不到这三个值</span>
+          解析、字段、传参一路都在，唯独 exiftool 的参数表里没列 Highlights / Shadows / Fade，
+          于是 <code>exif.get("Highlights")</code> 恒为 <code>None</code>、取整干干净净地给出 0，<strong>每一张都按未微调渲染</strong>——而 65 张里有 56 张带微调。
+          <strong>没有测试发现得了：缺字段和真值为零长得一模一样。</strong>
+          补上之后对引擎成品：色度比 0.9263 → <strong>0.9983</strong>、色相 −0.69° → <strong>−0.01°</strong>。
+          此前追查的"系统性偏饱和 5%"主要就是这个，不是哪个未复刻的后段阶段。
+        </div>
+      </section>
+
+      <!-- ============ 04 ============ -->
+      <section id="meta">
+        <h2><span class="h2n">04</span>元数据全表</h2>
+
+        <p class="lede">
+          实测一张 ILCE-7CM2 的 ARW（DSC02961，DRO=Auto）。所有条目都是从解密后的 SR2SubIFD 现读的，
+          字节数 = <code>项数 × 类型宽度</code>，与文件里实际占用一致。
+        </p>
+
+        <div class="scoreboard" style="margin:0 0 1.5rem">
+          <div class="score"><p class="score-val">175</p><p class="score-key">根层条目</p><p class="score-note">合计 2 524 字节</p></div>
+          <div class="score"><p class="score-val">114<span style="font-size:.6em;color:var(--muted)"> ×10</span></p><p class="score-key">每份 DataIFD 条目</p><p class="score-note">每份 1 909 字节</p></div>
+          <div class="score"><p class="score-val">30<span style="font-size:.6em;color:var(--muted)"> / 175</span></p><p class="score-key">已命名</p><p class="score-note">17% · 覆盖全部已复刻阶段</p></div>
+          <div class="score"><p class="score-val">8</p><p class="score-key">明文 MakerNotes 项</p><p class="score-note">机内滑块与外观名</p></div>
+        </div>
+
+        <h3>容器结构</h3>
+        <pre>ARW (TIFF 容器, 小端)
+ └─ IFD0
+     └─ tag 0xc634  DNGPrivateData ──► 内联 uint32 = SR2Private 的绝对偏移
+         └─ SR2Private IFD
+             ├─ 0x7200  加密块偏移
+             ├─ 0x7201  加密块长度
+             └─ 0x7221  密钥         ──► XOR 流解密(对合,跑两遍回到原文)
+                 └─ SR2SubIFD 根层        175 条 / 2 524 B   ← 引擎读的是这一层
+                     └─ 0x74c0 LONG[10] ──► 十份平行 SR2DataIFD  各 114 条 / 1 909 B
+                                            顺序: Standard Vivid Neutral Portrait FL
+                                                  VV2 IN SH BW Sepia</pre>
+
+        <div class="note">
+          <span class="note-label">一条从差异统计里掉出来的新事实</span>
+          把十份 DataIFD 逐 tag 比对，<strong><code class="tag">0x7805</code>（曲线 A）十份完全相同，只有 <code class="tag">0x7806</code>（曲线 B）有 7 种不同取值。</strong>
+          此前笔记一直把这两个并列写成「128 点曲线」——实际上<strong>只有 0x7806 是外观的定义</strong>，0x7805 是所有外观共用的那一条。
+          同理 <code class="tag">0x7843</code> / <code class="tag">0x7846</code> 十份全同，真正随外观变的只有 <code class="tag">0x7844</code> / <code class="tag">0x7845</code>。
+        </div>
+
+        <h3>明文 MakerNotes</h3>
+        <p>这几项不加密，可以直接改（<code>0xb020</code> 是切换外观曲线的入口）。</p>
+        <div class="tw">
+          <table>
+            <thead><tr><th class="num-col">Tag</th><th>名称</th><th class="num-col">格式</th><th class="num-col">字节</th><th>作用</th></tr></thead>
+            <tbody><tr><td class="num-col"><span class="tag">0x2004</span></td><td>Contrast</td><td class="num-col" style="color:var(--muted)">int32s[1]</td><td class="num-col">4</td><td style="color:var(--ink-2)">MainGamma 的 LUT（叠在出厂曲线上）</td></tr>
+<tr><td class="num-col"><span class="tag">0x2005</span></td><td>Saturation</td><td class="num-col" style="color:var(--muted)">int32s[1]</td><td class="num-col">4</td><td style="color:var(--ink-2)">RGB2YCC 四个增益 + SIMDHueSaturation 的守卫</td></tr>
+<tr><td class="num-col"><span class="tag">0x2006</span></td><td>Sharpness</td><td class="num-col" style="color:var(--muted)">int32s[1]</td><td class="num-col">4</td><td style="color:var(--ink-2)">SIMDSharpness —— 真值在这里，不是 ExifIFD:0xa40a</td></tr>
+<tr><td class="num-col"><span class="tag">0xb020</span></td><td>CreativeStyle</td><td class="num-col" style="color:var(--muted)">string[16]</td><td class="num-col">16</td><td style="color:var(--ink-2)">选哪份 DataIFD —— 改它只换曲线，换不动颜色</td></tr>
+<tr><td class="num-col"><span class="tag">0xb025</span></td><td>DynamicRangeOptimizer</td><td class="num-col" style="color:var(--muted)">int32u[1]</td><td class="num-col">4</td><td style="color:var(--ink-2)">ZcTaskVatr 是否上链</td></tr>
+<tr><td class="num-col"><span class="tag">0x2032</span></td><td>Shadows</td><td class="num-col" style="color:var(--muted)">int32s[1]</td><td class="num-col">4</td><td style="color:var(--ink-2)">MainGamma 的 LUT，作用区间 index 1–441</td></tr>
+<tr><td class="num-col"><span class="tag">0x2033</span></td><td>Highlights</td><td class="num-col" style="color:var(--muted)">int32s[1]</td><td class="num-col">4</td><td style="color:var(--ink-2)">MainGamma 的 LUT，中调为主</td></tr>
+<tr><td class="num-col"><span class="tag">0x2034</span></td><td>Fade</td><td class="num-col" style="color:var(--muted)">int32s[1]</td><td class="num-col">4</td><td style="color:var(--ink-2)">YGamma 的 pivot / contrast —— 对色调曲线无作用</td></tr></tbody>
+          </table>
+        </div>
+
+        <h3>SR2SubIFD 根层 · 全部 175 条</h3>
+        <p>
+          <span class="pill exact">已复刻</span> 表示该 tag 的语义已解出并已进入主管线；
+          <span class="pill solved">新解出</span> 是本轮静态反编译刚定位、尚未接入的；
+          <span class="pill na">未解</span> 只知道形态。
+        </p>
+        <div class="tw" style="max-height:520px;overflow-y:auto">
+          <table>
+            <thead><tr><th class="num-col">Tag</th><th class="num-col">类型</th><th class="num-col">项数</th><th class="num-col">字节</th><th>名称 / 内容</th><th>用在哪</th><th>取值</th></tr></thead>
+            <tbody><tr><td class="num-col"><span class="tag">0x7310</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">4</td><td class="num-col">8</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">512, 512, 512, 512</td></tr>
+<tr><td class="num-col"><span class="tag">0x7311</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">256</td></tr>
+<tr><td class="num-col"><span class="tag">0x7312</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">4</td><td class="num-col">8</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">2455, 1024, 1024, 1782</td></tr>
+<tr><td class="num-col"><span class="tag">0x7313</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">4</td><td class="num-col">8</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">2455, 1024, 1024, 1782</td></tr>
+<tr><td class="num-col"><span class="tag">0x7314</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">3</td><td class="num-col">6</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1024, 1024, 1024</td></tr>
+<tr><td class="num-col"><span class="tag">0x7315</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">3</td><td class="num-col">6</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1024, 1024, 1024</td></tr>
+<tr><td class="num-col"><span class="tag">0x7841</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">8</td><td class="num-col">16</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>色度参数(相机已混合)<br><span style="color:var(--muted);font-size:.9em">8 项。只对拍摄时那个外观有效</span></td><td style="color:var(--ink-2)">RGB2YCC 捷径</td><td class="num-col" style="color:var(--muted);font-size:.9em">-407, -558, -169, -576, 612, 728, 604, 1092</td></tr>
+<tr><td class="num-col"><span class="tag">0x7842</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">8</td><td class="num-col">16</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>色度参数基准<br><span style="color:var(--muted);font-size:.9em">8 项。BW 全为 0 -&gt; Cb=Cr=0 -&gt; 去色</span></td><td style="color:var(--ink-2)">RGB2YCC</td><td class="num-col" style="color:var(--muted);font-size:.9em">-227, -487, -127, -455, 664, 658, 660, 1126</td></tr>
+<tr><td class="num-col"><span class="tag">0x7843</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">8</td><td class="num-col">16</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>光源增量 0<br><span style="color:var(--muted);font-size:.9em">8 项。十份外观全同</span></td><td style="color:var(--ink-2)">RGB2YCC</td><td class="num-col" style="color:var(--muted);font-size:.9em">0, 0, 0, 0, 0, 0, 0, 0</td></tr>
+<tr><td class="num-col"><span class="tag">0x7844</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">8</td><td class="num-col">16</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>光源增量 1<br><span style="color:var(--muted);font-size:.9em">8 项。十份里 8 种不同</span></td><td style="color:var(--ink-2)">RGB2YCC</td><td class="num-col" style="color:var(--muted);font-size:.9em">-270, -106, -63, -182, -76, 108, -82, -50</td></tr>
+<tr><td class="num-col"><span class="tag">0x7845</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">8</td><td class="num-col">16</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>光源增量 2<br><span style="color:var(--muted);font-size:.9em">8 项。十份里 8 种不同</span></td><td style="color:var(--ink-2)">RGB2YCC</td><td class="num-col" style="color:var(--muted);font-size:.9em">-36, -1, 3, 34, -58, 138, -14, -24</td></tr>
+<tr><td class="num-col"><span class="tag">0x7846</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">8</td><td class="num-col">16</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>光源增量 3<br><span style="color:var(--muted);font-size:.9em">8 项。十份外观全同</span></td><td style="color:var(--ink-2)">RGB2YCC</td><td class="num-col" style="color:var(--muted);font-size:.9em">0, 0, 0, 0, 0, 0, 0, 0</td></tr>
+<tr><td class="num-col"><span class="tag">0x7847</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">4</td><td class="num-col">8</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>混合权重(副本)<br><span style="color:var(--muted);font-size:.9em">4 项。实测与 0x7848 恒等</span></td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">344, 680, 0, 0</td></tr>
+<tr><td class="num-col"><span class="tag">0x7848</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">4</td><td class="num-col">8</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>光源混合权重<br><span style="color:var(--muted);font-size:.9em">4 项,和为 1024。逐张(跟白平衡),十外观共用</span></td><td style="color:var(--ink-2)">RGB2YCC</td><td class="num-col" style="color:var(--muted);font-size:.9em">344, 680, 0, 0</td></tr>
+<tr><td class="num-col"><span class="tag">0x7861</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">9</td><td class="num-col">18</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0, 0, 0, 0, 0, 0, 0, 0, 0</td></tr>
+<tr><td class="num-col"><span class="tag">0x7862</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">9</td><td class="num-col">18</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0, 0, 0, 0, 0, 0, 0, 0, 0</td></tr>
+<tr><td class="num-col"><span class="tag">0x7863</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">9</td><td class="num-col">18</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0, 0, 0, 0, 0, 0, 0, 0, 0</td></tr>
+<tr><td class="num-col"><span class="tag">0x7864</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">9</td><td class="num-col">18</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0, 0, 0, 0, 0, 0, 0, 0, 0</td></tr>
+<tr><td class="num-col"><span class="tag">0x7865</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">9</td><td class="num-col">18</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0, 0, 0, 0, 0, 0, 0, 0, 0</td></tr>
+<tr><td class="num-col"><span class="tag">0x7866</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">9</td><td class="num-col">18</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0, 0, 0, 0, 0, 0, 0, 0, 0</td></tr>
+<tr><td class="num-col"><span class="tag">0x7867</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">4</td><td class="num-col">8</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0, 0, 0, 0</td></tr>
+<tr><td class="num-col"><span class="tag">0x7868</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">4</td><td class="num-col">8</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0, 0, 0, 0</td></tr>
+<tr><td class="num-col"><span class="tag">0x781b</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">10</td><td class="num-col">20</td><td><span class="pill solved" style="margin-right:.4em">新解出</span>DRO 曲线节点<br><span style="color:var(--muted);font-size:.9em">10 x u16 / 1024,量纲 log2 亮度,值域 0~13</span></td><td style="color:var(--ink-2)">ZcTaskVatr</td><td class="num-col" style="color:var(--muted);font-size:.9em">0, 1, 1025, 5595, 6619, 6620, 9876, 10902, 12288, 13312</td></tr>
+<tr><td class="num-col"><span class="tag">0x781c</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">28</td><td class="num-col">56</td><td><span class="pill solved" style="margin-right:.4em">新解出</span>DRO 曲线控制点<br><span style="color:var(--muted);font-size:.9em">28 x u16 / 1024 = 9 段 x 3 + 1,分段三次 Bezier</span></td><td style="color:var(--ink-2)">ZcTaskVatr</td><td class="num-col" style="color:var(--muted);font-size:.9em">0, 0, 0, 1, 342, 683, 1030, 2579, 4133, 5682, 6029, 6370 …</td></tr>
+<tr><td class="num-col"><span class="tag">0x7800</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">9</td><td class="num-col">18</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1017, -78, 85, 64, 1015, -56, 115, -137, 1046</td></tr>
+<tr><td class="num-col"><span class="tag">0x7801</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">3</td><td class="num-col">6</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">19, 38, 7</td></tr>
+<tr><td class="num-col"><span class="tag">0x7804</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">3</td><td class="num-col">6</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0, 0, 0</td></tr>
+<tr><td class="num-col"><span class="tag">0x780f</span></td><td class="num-col" style="color:var(--muted)">UNDEF</td><td class="num-col">276</td><td class="num-col">276</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>分段矩阵节点表<br><span style="color:var(--muted);font-size:.9em">276 字节 = 23x12,16 节点 x 6 系数,14 位定点,单位 1/1024</span></td><td style="color:var(--ink-2)">SIMDLinearMatrix16</td><td class="num-col" style="color:var(--muted);font-size:.9em">64, 0, 0, 231, 0, 1, 6, 32, 192, 1, 12, 80 …</td></tr>
+<tr><td class="num-col"><span class="tag">0x7805</span></td><td class="num-col" style="color:var(--muted)">SLONG</td><td class="num-col">128</td><td class="num-col">512</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>色调曲线 A<br><span style="color:var(--muted);font-size:.9em">128 点 SLONG。十份外观全同 —— 不是外观的定义</span></td><td style="color:var(--ink-2)">MainGamma</td><td class="num-col" style="color:var(--muted);font-size:.9em">0, 1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192, 9216, 10240, 11264 …</td></tr>
+<tr><td class="num-col"><span class="tag">0x7806</span></td><td class="num-col" style="color:var(--muted)">SLONG</td><td class="num-col">128</td><td class="num-col">512</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>色调曲线 B<br><span style="color:var(--muted);font-size:.9em">128 点 SLONG。x/128=索引, y/16=输出。十份里 7 种不同</span></td><td style="color:var(--ink-2)">MainGamma</td><td class="num-col" style="color:var(--muted);font-size:.9em">0, 2458, 4836, 7148, 9408, 11620, 13798, 15946, 18074, 20182, 22280, 24370 …</td></tr>
+<tr><td class="num-col"><span class="tag">0x7807</span></td><td class="num-col" style="color:var(--muted)">BYTE</td><td class="num-col">1</td><td class="num-col">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">128</td></tr>
+<tr><td class="num-col"><span class="tag">0x7808</span></td><td class="num-col" style="color:var(--muted)">BYTE</td><td class="num-col">1</td><td class="num-col">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1</td></tr>
+<tr><td class="num-col"><span class="tag">0x7809</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">264</td></tr>
+<tr><td class="num-col"><span class="tag">0x780a</span></td><td class="num-col" style="color:var(--muted)">BYTE</td><td class="num-col">1</td><td class="num-col">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x74c6</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x780b</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">10</td><td class="num-col">20</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>Fade pivot<br><span style="color:var(--muted);font-size:.9em">10 项,每个 Fade 档一个 pivot(0 或 10624)</span></td><td style="color:var(--ink-2)">YGamma</td><td class="num-col" style="color:var(--muted);font-size:.9em">0, 10624, 10624, 10624, 10624, 10624, 10624, 10624, 10624, 10624</td></tr>
+<tr><td class="num-col"><span class="tag">0x780c</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">4096</td></tr>
+<tr><td class="num-col"><span class="tag">0x780d</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">16384</td></tr>
+<tr><td class="num-col"><span class="tag">0x780e</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">10</td><td class="num-col">20</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>Fade contrast<br><span style="color:var(--muted);font-size:.9em">10 项,标度 /16384,从 17280 递减到 10112</span></td><td style="color:var(--ink-2)">YGamma</td><td class="num-col" style="color:var(--muted);font-size:.9em">17280, 15616, 14976, 14208, 13568, 12928, 12160, 11520, 10752, 10112</td></tr>
+<tr><td class="num-col"><span class="tag">0x7820</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">3</td><td class="num-col">6</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">2493, 1024, 1677</td></tr>
+<tr><td class="num-col"><span class="tag">0x7821</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">3</td><td class="num-col">6</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">2696, 1024, 1537</td></tr>
+<tr><td class="num-col"><span class="tag">0x7822</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">3</td><td class="num-col">6</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1532, 1024, 3043</td></tr>
+<tr><td class="num-col"><span class="tag">0x7823</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">3</td><td class="num-col">6</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">2753, 1024, 1493</td></tr>
+<tr><td class="num-col"><span class="tag">0x7824</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">3</td><td class="num-col">6</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">2265, 1024, 1844</td></tr>
+<tr><td class="num-col"><span class="tag">0x7825</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">3</td><td class="num-col">6</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">2934, 1024, 1358</td></tr>
+<tr><td class="num-col"><span class="tag">0x7826</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">3</td><td class="num-col">6</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">2324, 1024, 2319</td></tr>
+<tr><td class="num-col"><span class="tag">0x7827</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">3</td><td class="num-col">6</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">2486, 1024, 1699</td></tr>
+<tr><td class="num-col"><span class="tag">0x7828</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">3</td><td class="num-col">6</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">2759, 1024, 1585</td></tr>
+<tr><td class="num-col"><span class="tag">0x7829</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">3</td><td class="num-col">6</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1808, 1024, 2890</td></tr>
+<tr><td class="num-col"><span class="tag">0x782a</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">3</td><td class="num-col">6</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">3014, 1024, 1285</td></tr>
+<tr><td class="num-col"><span class="tag">0x782b</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">3</td><td class="num-col">6</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">2645, 1024, 1532</td></tr>
+<tr><td class="num-col"><span class="tag">0x782c</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">3</td><td class="num-col">6</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1769, 1024, 2512</td></tr>
+<tr><td class="num-col"><span class="tag">0x782d</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">3</td><td class="num-col">6</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1398, 1024, 3410</td></tr>
+<tr><td class="num-col"><span class="tag">0x781d</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">288</td></tr>
+<tr><td class="num-col"><span class="tag">0x78b0</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">65535</td></tr>
+<tr><td class="num-col"><span class="tag">0x78a0</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1</td></tr>
+<tr><td class="num-col"><span class="tag">0x78a1</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1</td></tr>
+<tr><td class="num-col"><span class="tag">0x78c0</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">512</td></tr>
+<tr><td class="num-col"><span class="tag">0x78c1</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">512</td></tr>
+<tr><td class="num-col"><span class="tag">0x78c2</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">512</td></tr>
+<tr><td class="num-col"><span class="tag">0x78c3</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">512</td></tr>
+<tr><td class="num-col"><span class="tag">0x78c4</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">512</td></tr>
+<tr><td class="num-col"><span class="tag">0x78c5</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill solved" style="margin-right:.4em">部分</span>降噪噪声模型 0<br><span style="color:var(--muted);font-size:.9em">逐图噪声参数,喂给 32768 项阈值表的生成公式</span></td><td style="color:var(--ink-2)">RawNRSIMD</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x78c6</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill solved" style="margin-right:.4em">部分</span>降噪噪声模型 1<br><span style="color:var(--muted);font-size:.9em">逐图噪声参数,喂给 32768 项阈值表的生成公式</span></td><td style="color:var(--ink-2)">RawNRSIMD</td><td class="num-col" style="color:var(--muted);font-size:.9em">2560</td></tr>
+<tr><td class="num-col"><span class="tag">0x78c7</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill solved" style="margin-right:.4em">部分</span>降噪噪声模型 2<br><span style="color:var(--muted);font-size:.9em">逐图噪声参数,喂给 32768 项阈值表的生成公式</span></td><td style="color:var(--ink-2)">RawNRSIMD</td><td class="num-col" style="color:var(--muted);font-size:.9em">52</td></tr>
+<tr><td class="num-col"><span class="tag">0x78c8</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill solved" style="margin-right:.4em">部分</span>降噪噪声模型 3<br><span style="color:var(--muted);font-size:.9em">逐图噪声参数,喂给 32768 项阈值表的生成公式</span></td><td style="color:var(--ink-2)">RawNRSIMD</td><td class="num-col" style="color:var(--muted);font-size:.9em">300</td></tr>
+<tr><td class="num-col"><span class="tag">0x78c9</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill solved" style="margin-right:.4em">部分</span>降噪噪声模型 4<br><span style="color:var(--muted);font-size:.9em">逐图噪声参数,喂给 32768 项阈值表的生成公式</span></td><td style="color:var(--ink-2)">RawNRSIMD</td><td class="num-col" style="color:var(--muted);font-size:.9em">32</td></tr>
+<tr><td class="num-col"><span class="tag">0x78ca</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill solved" style="margin-right:.4em">部分</span>降噪噪声模型 5<br><span style="color:var(--muted);font-size:.9em">逐图噪声参数,喂给 32768 项阈值表的生成公式</span></td><td style="color:var(--ink-2)">RawNRSIMD</td><td class="num-col" style="color:var(--muted);font-size:.9em">32</td></tr>
+<tr><td class="num-col"><span class="tag">0x78cb</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill solved" style="margin-right:.4em">部分</span>降噪噪声模型 6<br><span style="color:var(--muted);font-size:.9em">逐图噪声参数,喂给 32768 项阈值表的生成公式</span></td><td style="color:var(--ink-2)">RawNRSIMD</td><td class="num-col" style="color:var(--muted);font-size:.9em">32</td></tr>
+<tr><td class="num-col"><span class="tag">0x78cc</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">216</td></tr>
+<tr><td class="num-col"><span class="tag">0x78cd</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill solved" style="margin-right:.4em">部分</span>降噪开关阈值<br><span style="color:var(--muted);font-size:.9em">&lt;= 256 时 calib[0x1060] 不被写</span></td><td style="color:var(--ink-2)">RawNRSIMD</td><td class="num-col" style="color:var(--muted);font-size:.9em">216</td></tr>
+<tr><td class="num-col"><span class="tag">0x78ce</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">216</td></tr>
+<tr><td class="num-col"><span class="tag">0x78cf</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1023</td></tr>
+<tr><td class="num-col"><span class="tag">0x78d0</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1023</td></tr>
+<tr><td class="num-col"><span class="tag">0x78d1</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1023</td></tr>
+<tr><td class="num-col"><span class="tag">0x78d2</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x78d3</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x78d4</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x78d5</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x78d6</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x78d7</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x78d8</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x78d9</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x78da</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x78db</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x78dc</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x78dd</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x78de</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x78df</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x7849</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">512</td></tr>
+<tr><td class="num-col"><span class="tag">0x784a</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1024</td></tr>
+<tr><td class="num-col"><span class="tag">0x784b</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">2048</td></tr>
+<tr><td class="num-col"><span class="tag">0x784c</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">4</td><td class="num-col">8</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0, 0, 0, 0</td></tr>
+<tr><td class="num-col"><span class="tag">0x784d</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">4</td><td class="num-col">8</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">8160, 2720, 2560, 3424</td></tr>
+<tr><td class="num-col"><span class="tag">0x784e</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">8</td><td class="num-col">16</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0, 0, -1280, 1536, 1920, -1600, -2240, -1152</td></tr>
+<tr><td class="num-col"><span class="tag">0x784f</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">2</td><td class="num-col">4</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">5681, 33</td></tr>
+<tr><td class="num-col"><span class="tag">0x7850</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x7870</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">166</td></tr>
+<tr><td class="num-col"><span class="tag">0x7871</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">9600</td></tr>
+<tr><td class="num-col"><span class="tag">0x787a</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">25600</td></tr>
+<tr><td class="num-col"><span class="tag">0x787b</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">32704</td></tr>
+<tr><td class="num-col"><span class="tag">0x787d</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x787e</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">3</td><td class="num-col">6</td><td><span class="pill solved" style="margin-right:.4em">新解出</span>ChromaSuppres 斜率族<br><span style="color:var(--muted);font-size:.9em">3 项锚点</span></td><td style="color:var(--ink-2)">ChromaSuppres</td><td class="num-col" style="color:var(--muted);font-size:.9em">512, 112, 128</td></tr>
+<tr><td class="num-col"><span class="tag">0x787f</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">3</td><td class="num-col">6</td><td><span class="pill solved" style="margin-right:.4em">新解出</span>ChromaSuppres 阈值族<br><span style="color:var(--muted);font-size:.9em">3 项锚点</span></td><td style="color:var(--ink-2)">ChromaSuppres</td><td class="num-col" style="color:var(--muted);font-size:.9em">15360, 15360, 15360</td></tr>
+<tr><td class="num-col"><span class="tag">0x7880</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill solved" style="margin-right:.4em">新解出</span>ChromaSuppres 附加项</td><td style="color:var(--ink-2)">ChromaSuppres</td><td class="num-col" style="color:var(--muted);font-size:.9em">512</td></tr>
+<tr><td class="num-col"><span class="tag">0x7881</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill solved" style="margin-right:.4em">新解出</span>ChromaSuppres 附加项</td><td style="color:var(--ink-2)">ChromaSuppres</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x7882</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">7934</td></tr>
+<tr><td class="num-col"><span class="tag">0x7883</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">2380</td></tr>
+<tr><td class="num-col"><span class="tag">0x7884</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">2380</td></tr>
+<tr><td class="num-col"><span class="tag">0x7885</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">2380</td></tr>
+<tr><td class="num-col"><span class="tag">0x7886</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">10880</td></tr>
+<tr><td class="num-col"><span class="tag">0x7887</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">19200</td></tr>
+<tr><td class="num-col"><span class="tag">0x7888</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">20480</td></tr>
+<tr><td class="num-col"><span class="tag">0x7889</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">128</td></tr>
+<tr><td class="num-col"><span class="tag">0x788a</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">8</td><td class="num-col">16</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0, 15, 31, 37, 39, 40, 41, 41</td></tr>
+<tr><td class="num-col"><span class="tag">0x788b</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">29</td><td class="num-col">58</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0, 12, 19, 24, 27, 30, 33, 35, 37, 39, 41, 42 …</td></tr>
+<tr><td class="num-col"><span class="tag">0x788c</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">29</td><td class="num-col">58</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0, 15, 20, 24, 27, 29, 31, 33, 35, 37, 39, 40 …</td></tr>
+<tr><td class="num-col"><span class="tag">0x788d</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">9600</td></tr>
+<tr><td class="num-col"><span class="tag">0x788e</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">19200</td></tr>
+<tr><td class="num-col"><span class="tag">0x788f</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">6400</td></tr>
+<tr><td class="num-col"><span class="tag">0x7890</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">16320</td></tr>
+<tr><td class="num-col"><span class="tag">0x7770</span></td><td class="num-col" style="color:var(--muted)">ASCII</td><td class="num-col">16</td><td class="num-col">16</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>外观名<br><span style="color:var(--muted);font-size:.9em">ASCII,根层写的是拍摄时选的那个</span></td><td style="color:var(--ink-2)">标定归属校验</td><td class="num-col" style="color:var(--muted);font-size:.9em">FL</td></tr>
+<tr><td class="num-col"><span class="tag">0x7771</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x74a5</span></td><td class="num-col" style="color:var(--muted)">RATIONAL</td><td class="num-col">1</td><td class="num-col">8</td><td><span class="pill solved" style="margin-right:.4em">部分</span>ChromaSuppres 插值轴<br><span style="color:var(--muted);font-size:.9em">RATIONAL。/300 = 档,锚点 0/-1/-2。量纲待动态定标</span></td><td style="color:var(--ink-2)">ChromaSuppres</td><td class="num-col" style="color:var(--muted);font-size:.9em">1953852527/1382969193</td></tr>
+<tr><td class="num-col"><span class="tag">0x74a6</span></td><td class="num-col" style="color:var(--muted)">RATIONAL</td><td class="num-col">1</td><td class="num-col">8</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1349872741/1768714095</td></tr>
+<tr><td class="num-col"><span class="tag">0x794a</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1</td></tr>
+<tr><td class="num-col"><span class="tag">0x794b</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">8192</td></tr>
+<tr><td class="num-col"><span class="tag">0x794c</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">-5</td></tr>
+<tr><td class="num-col"><span class="tag">0x794d</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1314</td></tr>
+<tr><td class="num-col"><span class="tag">0x794e</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">-1</td></tr>
+<tr><td class="num-col"><span class="tag">0x794f</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">164</td></tr>
+<tr><td class="num-col"><span class="tag">0x7950</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">-1</td></tr>
+<tr><td class="num-col"><span class="tag">0x7951</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">204</td></tr>
+<tr><td class="num-col"><span class="tag">0x7952</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">288</td></tr>
+<tr><td class="num-col"><span class="tag">0x7953</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">288</td></tr>
+<tr><td class="num-col"><span class="tag">0x7954</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">128</td></tr>
+<tr><td class="num-col"><span class="tag">0x7955</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">128</td></tr>
+<tr><td class="num-col"><span class="tag">0x7956</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">256</td></tr>
+<tr><td class="num-col"><span class="tag">0x7957</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">256</td></tr>
+<tr><td class="num-col"><span class="tag">0x7958</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1280</td></tr>
+<tr><td class="num-col"><span class="tag">0x7959</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">30</td></tr>
+<tr><td class="num-col"><span class="tag">0x795a</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">40</td></tr>
+<tr><td class="num-col"><span class="tag">0x795b</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">30</td></tr>
+<tr><td class="num-col"><span class="tag">0x795c</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">40</td></tr>
+<tr><td class="num-col"><span class="tag">0x795d</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">205</td></tr>
+<tr><td class="num-col"><span class="tag">0x795e</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x74c3</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">4</td><td class="num-col">8</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">12, 8, 7020, 4680</td></tr>
+<tr><td class="num-col"><span class="tag">0x74c5</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">2</td><td class="num-col">4</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">-15, 14</td></tr>
+<tr><td class="num-col"><span class="tag">0x74ca</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x74cb</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x74cc</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">9</td><td class="num-col">18</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0, 0, 0, 0, 0, 0, 0, 0, 0</td></tr>
+<tr><td class="num-col"><span class="tag">0x74c0</span></td><td class="num-col" style="color:var(--muted)">LONG</td><td class="num-col">10</td><td class="num-col">40</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>DataIFD 指针表<br><span style="color:var(--muted);font-size:.9em">LONG[10],指向十份平行外观标定</span></td><td style="color:var(--ink-2)">外观切换</td><td class="num-col" style="color:var(--muted);font-size:.9em">70252, 73362, 76472, 79582, 82692, 85802, 88912, 92022, 95132, 98242</td></tr>
+<tr><td class="num-col"><span class="tag">0x7921</span></td><td class="num-col" style="color:var(--muted)">BYTE</td><td class="num-col">4</td><td class="num-col">4</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1, 0, 0, 0</td></tr>
+<tr><td class="num-col"><span class="tag">0x797c</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">272</td></tr>
+<tr><td class="num-col"><span class="tag">0x797d</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">17</td><td class="num-col">34</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">16, 0, 0, 96, 352, 672, 1056, 1472, 1952, 2464, 3072, 3680 …</td></tr>
+<tr><td class="num-col"><span class="tag">0x797f</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1</td></tr>
+<tr><td class="num-col"><span class="tag">0x7980</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">33</td><td class="num-col">66</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">32, -128, -128, -128, -128, -128, -128, -128, -128, -256, -256, -256 …</td></tr>
+<tr><td class="num-col"><span class="tag">0x78a2</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">4</td><td class="num-col">8</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">19, 153, -19, -152</td></tr>
+<tr><td class="num-col"><span class="tag">0x7981</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1</td></tr>
+<tr><td class="num-col"><span class="tag">0x7982</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">17</td><td class="num-col">34</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">16, 0, 2, 7, 17, 31, 47, 67, 92, 119, 149, 183 …</td></tr>
+<tr><td class="num-col"><span class="tag">0x7983</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">2</td><td class="num-col">4</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1, 16</td></tr>
+<tr><td class="num-col"><span class="tag">0x7984</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">20</td><td class="num-col">40</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">19, 0, 4, 16, 35, 63, 97, 140, 189, 246, 309, 378 …</td></tr>
+<tr><td class="num-col"><span class="tag">0x7810</span></td><td class="num-col" style="color:var(--muted)">BYTE</td><td class="num-col">1</td><td class="num-col">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1</td></tr>
+<tr><td class="num-col"><span class="tag">0x7811</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x7812</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x7813</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1</td></tr>
+<tr><td class="num-col"><span class="tag">0x7814</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">1024</td></tr>
+<tr><td class="num-col"><span class="tag">0x7815</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">10</td><td class="num-col">20</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0, 28, 105, 182, 259, 336, 413, 490, 567, 646</td></tr>
+<tr><td class="num-col"><span class="tag">0x7816</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">10</td><td class="num-col">20</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0, 28, 105, 182, 259, 336, 413, 490, 567, 646</td></tr>
+<tr><td class="num-col"><span class="tag">0x7817</span></td><td class="num-col" style="color:var(--muted)">BYTE</td><td class="num-col">1</td><td class="num-col">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">2</td></tr>
+<tr><td class="num-col"><span class="tag">0x7818</span></td><td class="num-col" style="color:var(--muted)">BYTE</td><td class="num-col">1</td><td class="num-col">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">2</td></tr>
+<tr><td class="num-col"><span class="tag">0x7819</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">96</td></tr>
+<tr><td class="num-col"><span class="tag">0x781a</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">0</td></tr>
+<tr><td class="num-col"><span class="tag">0x78a3</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">5120</td></tr>
+<tr><td class="num-col"><span class="tag">0x7922</span></td><td class="num-col" style="color:var(--muted)">LONG</td><td class="num-col">2</td><td class="num-col">8</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td><td class="num-col" style="color:var(--muted);font-size:.9em">7008, 4672</td></tr></tbody>
+          </table>
+        </div>
+
+        <h3>SR2DataIFD（每种外观一份）· 全部 114 条</h3>
+        <p>
+          「几种取值」列是十份之间的差异数——<strong>这一列直接告诉你哪些 tag 才真正定义一种创意外观</strong>：
+          等于 1 的都是十份共用的机身常量，只有大于 1 的才携带外观信息。
+        </p>
+        <div class="tw" style="max-height:520px;overflow-y:auto">
+          <table>
+            <thead><tr><th class="num-col">Tag</th><th class="num-col">类型</th><th class="num-col">项数</th><th class="num-col">字节</th><th class="num-col">几种取值</th><th>名称</th><th>用在哪</th></tr></thead>
+            <tbody><tr><td class="num-col"><span class="tag">0x7312</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">4</td><td class="num-col">8</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7313</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">4</td><td class="num-col">8</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7314</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">3</td><td class="num-col">6</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7315</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">3</td><td class="num-col">6</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7770</span></td><td class="num-col" style="color:var(--muted)">ASCII</td><td class="num-col">16</td><td class="num-col">16</td><td class="num-col" style="color:var(--accent);font-weight:600">10</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>外观名</td><td style="color:var(--ink-2)">标定归属校验</td></tr>
+<tr><td class="num-col"><span class="tag">0x7771</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7800</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">9</td><td class="num-col">18</td><td class="num-col" style="color:var(--accent);font-weight:600">8</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7801</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">3</td><td class="num-col">6</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7804</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">3</td><td class="num-col">6</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7805</span></td><td class="num-col" style="color:var(--muted)">SLONG</td><td class="num-col">128</td><td class="num-col">512</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>色调曲线 A</td><td style="color:var(--ink-2)">MainGamma</td></tr>
+<tr><td class="num-col"><span class="tag">0x7806</span></td><td class="num-col" style="color:var(--muted)">SLONG</td><td class="num-col">128</td><td class="num-col">512</td><td class="num-col" style="color:var(--accent);font-weight:600">7</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>色调曲线 B</td><td style="color:var(--ink-2)">MainGamma</td></tr>
+<tr><td class="num-col"><span class="tag">0x7808</span></td><td class="num-col" style="color:var(--muted)">BYTE</td><td class="num-col">1</td><td class="num-col">1</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x780c</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--accent);font-weight:600">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x780d</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--accent);font-weight:600">2</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x780e</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">10</td><td class="num-col">20</td><td class="num-col" style="color:var(--accent);font-weight:600">2</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>Fade contrast</td><td style="color:var(--ink-2)">YGamma</td></tr>
+<tr><td class="num-col"><span class="tag">0x780f</span></td><td class="num-col" style="color:var(--muted)">UNDEF</td><td class="num-col">276</td><td class="num-col">276</td><td class="num-col" style="color:var(--accent);font-weight:600">9</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>分段矩阵节点表</td><td style="color:var(--ink-2)">SIMDLinearMatrix16</td></tr>
+<tr><td class="num-col"><span class="tag">0x7842</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">8</td><td class="num-col">16</td><td class="num-col" style="color:var(--accent);font-weight:600">8</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>色度参数基准</td><td style="color:var(--ink-2)">RGB2YCC</td></tr>
+<tr><td class="num-col"><span class="tag">0x7843</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">8</td><td class="num-col">16</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>光源增量 0</td><td style="color:var(--ink-2)">RGB2YCC</td></tr>
+<tr><td class="num-col"><span class="tag">0x7844</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">8</td><td class="num-col">16</td><td class="num-col" style="color:var(--accent);font-weight:600">8</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>光源增量 1</td><td style="color:var(--ink-2)">RGB2YCC</td></tr>
+<tr><td class="num-col"><span class="tag">0x7845</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">8</td><td class="num-col">16</td><td class="num-col" style="color:var(--accent);font-weight:600">8</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>光源增量 2</td><td style="color:var(--ink-2)">RGB2YCC</td></tr>
+<tr><td class="num-col"><span class="tag">0x7846</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">8</td><td class="num-col">16</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill exact" style="margin-right:.4em">已复刻</span>光源增量 3</td><td style="color:var(--ink-2)">RGB2YCC</td></tr>
+<tr><td class="num-col"><span class="tag">0x7849</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x784a</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x784b</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x784c</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">4</td><td class="num-col">8</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x784d</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">4</td><td class="num-col">8</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x784e</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">8</td><td class="num-col">16</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x784f</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">2</td><td class="num-col">4</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7850</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7862</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">9</td><td class="num-col">18</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7863</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">9</td><td class="num-col">18</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7864</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">9</td><td class="num-col">18</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7865</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">9</td><td class="num-col">18</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7866</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">9</td><td class="num-col">18</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7870</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7871</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x787a</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x787b</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x787d</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x787e</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">3</td><td class="num-col">6</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill solved" style="margin-right:.4em">新解出</span>ChromaSuppres 斜率族</td><td style="color:var(--ink-2)">ChromaSuppres</td></tr>
+<tr><td class="num-col"><span class="tag">0x787f</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">3</td><td class="num-col">6</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill solved" style="margin-right:.4em">新解出</span>ChromaSuppres 阈值族</td><td style="color:var(--ink-2)">ChromaSuppres</td></tr>
+<tr><td class="num-col"><span class="tag">0x7880</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill solved" style="margin-right:.4em">新解出</span>ChromaSuppres 附加项</td><td style="color:var(--ink-2)">ChromaSuppres</td></tr>
+<tr><td class="num-col"><span class="tag">0x7881</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill solved" style="margin-right:.4em">新解出</span>ChromaSuppres 附加项</td><td style="color:var(--ink-2)">ChromaSuppres</td></tr>
+<tr><td class="num-col"><span class="tag">0x7882</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7883</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7884</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7885</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7886</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7887</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7888</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7889</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x788a</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">8</td><td class="num-col">16</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x788b</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">29</td><td class="num-col">58</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x788c</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">29</td><td class="num-col">58</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x788d</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x788e</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x788f</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7890</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78a0</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78a1</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78b0</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78c0</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78c1</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78c2</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78c3</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78c4</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78c5</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill solved" style="margin-right:.4em">部分</span>降噪噪声模型 0</td><td style="color:var(--ink-2)">RawNRSIMD</td></tr>
+<tr><td class="num-col"><span class="tag">0x78c6</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill solved" style="margin-right:.4em">部分</span>降噪噪声模型 1</td><td style="color:var(--ink-2)">RawNRSIMD</td></tr>
+<tr><td class="num-col"><span class="tag">0x78c7</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill solved" style="margin-right:.4em">部分</span>降噪噪声模型 2</td><td style="color:var(--ink-2)">RawNRSIMD</td></tr>
+<tr><td class="num-col"><span class="tag">0x78c8</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill solved" style="margin-right:.4em">部分</span>降噪噪声模型 3</td><td style="color:var(--ink-2)">RawNRSIMD</td></tr>
+<tr><td class="num-col"><span class="tag">0x78c9</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill solved" style="margin-right:.4em">部分</span>降噪噪声模型 4</td><td style="color:var(--ink-2)">RawNRSIMD</td></tr>
+<tr><td class="num-col"><span class="tag">0x78ca</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill solved" style="margin-right:.4em">部分</span>降噪噪声模型 5</td><td style="color:var(--ink-2)">RawNRSIMD</td></tr>
+<tr><td class="num-col"><span class="tag">0x78cb</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill solved" style="margin-right:.4em">部分</span>降噪噪声模型 6</td><td style="color:var(--ink-2)">RawNRSIMD</td></tr>
+<tr><td class="num-col"><span class="tag">0x78cc</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78cd</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill solved" style="margin-right:.4em">部分</span>降噪开关阈值</td><td style="color:var(--ink-2)">RawNRSIMD</td></tr>
+<tr><td class="num-col"><span class="tag">0x78ce</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78cf</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78d0</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78d1</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78d2</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78d3</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78d4</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78d5</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78d6</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78d7</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78d8</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78d9</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78da</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78db</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78dc</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78dd</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78de</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x78df</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x794a</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x794b</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x794c</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x794d</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x794e</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x794f</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7950</span></td><td class="num-col" style="color:var(--muted)">SSHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7951</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7952</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7953</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7954</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7955</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7956</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7957</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7958</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x7959</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x795a</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x795b</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x795c</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x795d</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr>
+<tr><td class="num-col"><span class="tag">0x795e</span></td><td class="num-col" style="color:var(--muted)">SHORT</td><td class="num-col">1</td><td class="num-col">2</td><td class="num-col" style="color:var(--muted)">1</td><td><span class="pill na" style="margin-right:.4em">未解</span>—</td><td style="color:var(--ink-2)">—</td></tr></tbody>
+          </table>
+        </div>
+
+        <h3>未解条目里的形态线索</h3>
+        <p>
+          145 个未命名条目并非毫无信息——项数本身就是线索。几组值得优先查的：
+        </p>
+        <ul class="plain">
+          <li><strong><code>0x7815</code> / <code>0x7816</code>（各 SHORT×10）</strong>——紧邻 Fade 的 <code>0x780b</code> / <code>0x780e</code>，也是 10 项。<strong>10 项 = 一个滑块的十个档位</strong>，形态上极像另一个还没定位的机内滑块的查找表。</li>
+          <li><strong><code>0x7820</code>..<code>0x782d</code>（14 个 SSHORT×3）</strong>——连续 14 个同形条目。3 项 × 14 组，像是某个按条件选组的三系数族（与 ChromaSuppres 的 <code>0x787e</code>/<code>0x787f</code> 同为 3 项，可对照）。</li>
+          <li><strong><code>0x7861</code>..<code>0x7866</code>（6 个 SSHORT×9）</strong>——9 项正好是一个 3×3 矩阵，六组则对应六种条件。DataIFD 里只有 <code>0x7862</code>..<code>0x7866</code> 五组，根层多一组。</li>
+          <li><strong><code>0x788b</code> / <code>0x788c</code>（各 SHORT×29）</strong>——29 项曲线状。<code>0x781c</code> 是 28 项的 Bézier 控制点，29 = 28+1 值得比对。</li>
+          <li><strong><code>0x797d</code>（17）/ <code>0x7980</code>（33）/ <code>0x7982</code>（17）/ <code>0x7984</code>（20）</strong>——17 与 33 是典型的 LUT 采样数（2ⁿ+1）。<code>0x7980</code> 的 33 项与 3D-LUT 的 33×33×33 网格同数，但 3D-LUT 不执行，未必相关。</li>
+        </ul>
+      </section>
+
+      <!-- ============ 05 ============ -->
+      <section id="method">
+        <h2><span class="h2n">05</span>探知手段</h2>
+
+        <p class="lede">
+          九件工具，按"它解开了什么"排序而不是按技术栈。全部在 <code>sony_repro/tools/</code>。
+        </p>
+
+        <div class="methods">
+          <div class="method">
+            <h3>RTTI 反查 vtable</h3>
+            <span class="tool">dump_vtab.py · dump_execs.py</span>
+            <p>无符号表（只有 9 个导出）但保留完整 MSVC RTTI。由名字符串偏移 −0x10 得 TypeDescriptor，经 COL 反推 vtable。所有 <code>ZcTask*</code> 布局一致，<strong>slot 7 即执行函数</strong>——这一条打开了后面全部的钩子。</p>
+          </div>
+          <div class="method">
+            <h3>执行普查</h3>
+            <span class="tool">stage_census.py</span>
+            <p>把全部 59 个 task 的执行函数<strong>一次全钩上</strong>，数各跑几次。定出了执行顺序，也定位了 DRO——两张只差 DRO 开关的图，普查<strong>唯一的差异</strong>就是 <code>ZcTaskVatr</code> 的 36 次。</p>
+          </div>
+          <div class="method">
+            <h3>整幅拼接</h3>
+            <span class="tool">stage_frame.py</span>
+            <p>所有 task 共用同一套基类字段，<code>task+0x48</code> 是 tile 在整幅里的位置（1024 的整数倍）。于是<strong>任意阶段边界上都能拼出整幅</strong>，与机内 JPEG 逐像素同尺寸。误差定位从"拿整幅统计量猜"变成"逐像素对"。</p>
+          </div>
+          <div class="method">
+            <h3>标量孪生反编译</h3>
+            <span class="tool">pyg_scalar.py（ghidra）</span>
+            <p>每个 SIMD 任务都有一个不带 SIMD 后缀的孪生版，结构逐行对应但<strong>没有 AVX intrinsic 的噪声</strong>。SSCS、ITP、AreaComp、HueSaturation 全是这么解出来的。它们不在执行路径上，正好当读物。</p>
+          </div>
+          <div class="method">
+            <h3>写入点扫描</h3>
+            <span class="tool">scan_disp.py（capstone）</span>
+            <p>扫全 <code>.text</code> 找某个偏移的写入指令。<strong>"没人写、却被整段读写" ⇒ 只能是从文件灌进来的</strong>——光源权重就是这么从"要按色温插值猜规则"变成"直接读 tag <code class="tag">0x7848</code>"的。<em>坑：capstone 碰到解不开的字节直接停，不是跳过，必须前进一字节重扫。</em></p>
+          </div>
+          <div class="method">
+            <h3>抓实际入参</h3>
+            <span class="tool">src276_probe.py</span>
+            <p>不去猜解包函数<strong>应该</strong>读什么，直接抓它<strong>实际读到</strong>的 276 字节。与十种外观逐字节比，分歧恰好落在字节 24..215（48 个 dword 的系数区）——五分钟定案"读错了 IFD"。<strong>先确认喂进去的是不是同一份数据，再去怀疑算法。</strong></p>
+          </div>
+          <div class="method">
+            <h3>一次探针定位三处</h3>
+            <span class="tool">slider_probe.py</span>
+            <p>改一个机内滑块，一次运行同时抓 MainGamma 的 32768 项 tone LUT、RGB2YCC 的八个色度 short、YGamma 的四个标量。<strong>"这个滑块落在哪一段"通常一次就定了</strong>，不必先拼整幅再逐段比。</p>
+          </div>
+          <div class="method">
+            <h3>重写加密段</h3>
+            <span class="tool">patch_sr2.py</span>
+            <p>SR2 的 XOR 加密是<strong>对合</strong>的，跑两遍回到原文。解密 → 换掉根层标定 → 再跑一遍 → 写回，长度与 IFD 偏移都不变。这是<strong>真正</strong>切换外观的唯一办法，Sepia 的 <code>ZcTaskEffect</code> 就是这么逼出来的。</p>
+          </div>
+          <div class="method">
+            <h3>批量扫参</h3>
+            <span class="tool">look_sweep.py</span>
+            <p>命令行传图 + <code>frida.spawn</code>，单张约 6 秒，一张图跑五十次覆盖十种外观 × 全部微调档位。所有"对档位是否线性""正负形状是否相同"的结论都来自这里。</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 05 ============ -->
+      <section id="tally">
+        <h2><span class="h2n">06</span>还原度总账</h2>
+
+        <p class="lede">
+          <code>engine_tally.py</code>，16 张实测，判据是 <strong><span class="mono">Edit.exe</span> 自己的成品</strong>（拼 <code>SIMDMarble:out</code>），像素按引擎的色度筛。
+        </p>
+
+        <div class="tw">
+          <table>
+            <thead>
+              <tr><th>指标</th><th class="num-col">DRO 关（14 张）</th><th class="num-col">DRO 开（2 张）</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>色度比（1.0 = 对上）</td><td class="num-col"><strong>0.9980</strong> · MAD 0.0036 · 0.976~1.008</td><td class="num-col">1.066 / 1.084</td></tr>
+              <tr><td>色相</td><td class="num-col"><strong>+0.14°</strong> · MAD 0.18 · −0.19~+0.47</td><td class="num-col">−0.21° / −1.32°</td></tr>
+              <tr><td>亮度</td><td class="num-col"><strong>−0.0029</strong> · −0.0069~+0.0011</td><td class="num-col">+0.005 / +0.083</td></tr>
+              <tr><td>RMSE</td><td class="num-col">12.5/255 · 4.3~33.7</td><td class="num-col">8.5 / 24.4</td></tr>
+              <tr><td>RMSE（两边同样模糊后）</td><td class="num-col"><strong>6.8/255</strong></td><td class="num-col">4.6 / 16.9</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>
+          <strong>颜色本身已经基本对上。</strong>剩下的 RMSE 一模糊就掉一半，说明<strong>一半是高频</strong>——锐化 / 降噪 / 去马赛克。
+          低频那一半按色调和半径拆开：半径方向平坦（各档 ±0.003，没有暗角差异）；
+          色调方向有形状——引擎相对我们把深阴影抬起、把高光压下，但各档的<strong>绝对中位数都很小</strong>（0.005~0.05）而均值大，说明由离群像素主导，仍旧是细节层，不是全局曲线错位。
+        </p>
+
+        <p>
+          两张 DRO 开的图是仅有的离群点，正好对应唯一一个已定位但未复刻的<em>颜色</em>阶段。
+        </p>
+
+        <h3>与 DCP 路径的对照</h3>
+        <p>
+          与<strong>正确匹配</strong>的 DCP profile 相比互有胜负，sony 路径的 RMSE 普遍更好，色相误差在低饱和场景下本身就不可靠。
+          （原先"2~9° vs 9~15°"的压倒性对照<strong>不成立</strong>——那是拿 ST profile 去比 FL/VV2 的图，把 DCP 一方压低了一倍有余。）
+        </p>
+        <p>
+          顺带解答了一个悬念：<strong>索尼没有单独的 camera→标准空间转换矩阵。</strong>
+          16 个节点矩阵全部贴着单位阵（对角 0.96~1.03，非对角 ±0.17），整条色彩链就这一个近单位的分段微调——
+          也就是说 ILCE-7CM2 的原生基色本就接近 Rec.709，Adobe 绕道 XYZ 反而引入了误差。
+        </p>
+      </section>
+
+      <!-- ============ 06 ============ -->
+      <section id="gaps">
+        <h2><span class="h2n">07</span>剩下的缺口</h2>
+
+        <p class="lede">
+          静态反编译一轮之后，缺口的性质变了：<strong>从「不知道它在做什么」变成「知道公式，缺一两个标定量或一个未读的核」。</strong>
+        </p>
+
+        <ol class="gaps">
+          <li>
+            <div>
+              <h3>锐化的档位映射 <span class="pill solved">算法已解</span></h3>
+              <p>非锐化掩模的核、死区、双斜率全部解出，<strong>但机内档位 → 编辑参数 <code>0x801a</code> 的换算表还没定</strong>。障碍依旧是没有对照组：87 张素材的 <code>Sony:0x2006</code> 全部是 +4。</p>
+              <p>首选路线是 frida 在渲染前直接改内存里的锐度参数——同一张图上扫参数，画面完全受控。<strong>而且现在知道必须连 Spica 一起扫</strong>：两者共用强度、权重互补，只标定一半会得到系统性偏低的锐化量。</p>
+            </div>
+          </li>
+          <li>
+            <div>
+              <h3>DRO 的网格几何 <span class="pill solved">主体已解</span></h3>
+              <p>双边网格的形状、色调曲线的来源与求值方式都清楚了，<strong>而且 <code>Auto</code> 不再是障碍</strong>——曲线是相机算好写进 RAW 的。</p>
+              <p>剩下的是三个网格累加函数、tile 坐标 → 网格坐标的 ×1/×8 映射（预览图与全幅的对齐关系，得动态量一次），以及手动档那 10 条内置预设的 <code>.data</code> 表。</p>
+            </div>
+          </li>
+          <li>
+            <div>
+              <h3>RawNR 的变换核 <span class="pill open">缺一块</span></h3>
+              <p>阈值表的生成公式与它的全部输入（RAW 标签 <code>0x78c5</code>..<code>0x78cb</code>）都拿到了，<strong>但正 / 逆变换核没读</strong>，所以现在写不出可运行的复刻。</p>
+              <p>另有一个未验证的假定：静态分析拿 <code>RawNRHalf</code> 当规范，而<strong>「它与 SIMD 版同构」这条从没验证过</strong>。照搬之前必须先确认，否则会重演「读了不在执行路径上的那个类」那类错误。</p>
+            </div>
+          </li>
+          <li>
+            <div>
+              <h3>ITP 与 SSCS 的量程 <span class="pill open">同一个谜</span></h3>
+              <p>ITP 的形态（基底 + 两条差分重建）已知，但数值语义未定。<strong>它很可能同时是 SSCS 那个量程悬案的答案</strong>——SSCS 阈值 lo=2380/hi=7934 而实测数据最大值只有 3043，触发率 0.00%，而 ITP 是链上唯一重建平面数值的一步。</p>
+            </div>
+          </li>
+          <li>
+            <div>
+              <h3>ChromaSuppres 的插值轴定标 <span class="pill solved">差一次动态读数</span></h3>
+              <p>六个锚点与插值公式都齐了，<strong>只差 <code>0x74a5</code> 的物理量纲</strong>。按静态推断，ISO ≥ 400 会落到 <code>x &lt; −2</code>、而两个分支都不成立——这说明推断有误。<strong>必须动态读一次 <code>calib[0xc]</code> 定标，不能照推断写代码。</strong></p>
+            </div>
+          </li>
+          <li>
+            <div>
+              <h3>去马赛克 <span class="pill open">不可复刻</span></h3>
+              <p>GPU 加密的神经 / Vulkan 路径，不在范围内。主管线用 LibRaw 代替，这部分残差是结构性的，不会归零。</p>
+            </div>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ============ 07 ============ -->
+      <section id="overturned">
+        <h2><span class="h2n">08</span>被推翻的结论</h2>
+
+        <p class="lede">
+          这一节和上一节同样重要。以下每一条都曾经写进笔记、指导过若干天的工作，然后被实测推翻。
+        </p>
+
+        <ul class="overturned">
+          <li>
+            <span class="was">DRO 的 Auto 档位由引擎按画面自行决定，相机只写下 Auto</span>
+            <span class="now"><strong>决定的是相机</strong>，结果以 Bézier 曲线写进 RAW（<code class="tag">0x781b</code> / <code class="tag">0x781c</code>）。离线复刻<strong>不需要</strong>重建判级逻辑 —— 已离线核对：两个 tag 确实存在、项数正好 10 与 28、除以 1024 后值域正好落在 <code>[0, 13]</code>，与 <code>vatr[0x70] = log2(8191)</code> 吻合</span>
+          </li>
+          <li>
+            <span class="was">SIMDSpica 语义完全未知，是一个独立阶段</span>
+            <span class="now">它与 <code>SIMDSharpness</code> 共用强度参数、权重互补，<strong>是同一把锐化的粗端与细端</strong></span>
+          </li>
+          <li>
+            <span class="was">ChromaSuppres 中间调 f=255 时完全不动</span>
+            <span class="now">实际是 <code>* f &gt;&gt; 8</code> 而非 <code>/255</code>，f=255 时色度<strong>掉 0.39%</strong>；且插值出来的是「一条阈值 + 一个斜率」而非 lo/hi 两条</span>
+          </li>
+          <li>
+            <span class="was">ITP 的标量孪生版更好读</span>
+            <span class="now">标量版与 SIMD 版<strong>共用同一批槽函数</strong>，这条对 ITP 不成立（对 SSCS / AreaComp / HueSaturation 仍然成立）</span>
+          </li>
+          <li>
+            <span class="was">PIPELINE §4 的 lv 与各任务里的「标定块」是两块内存</span>
+            <span class="now"><strong>是同一块</strong>（ChromaSuppres 两条路都用、且同由 <code>FUN_14015f540</code> 写）。所以 <code>+0xf82</code>、<code>+0xdec</code>、<code>+0xae</code>、<code>+0x10f2</code> 这些偏移全在一块里</span>
+          </li>
+          <li>
+            <span class="was">0x7805 与 0x7806 是并列的一对 128 点外观曲线</span>
+            <span class="now">十份 DataIFD 里 <strong>0x7805 完全相同</strong>、只有 0x7806 有 7 种取值 —— 只有后者是外观的定义</span>
+          </li>
+          <li>
+            <span class="was">tone LUT 是按图自适应的</span>
+            <span class="now">是「外观出厂曲线 + 机内微调」，两层都不随场景变化。误判来自只比了两张外观不同的图</span>
+          </li>
+          <li>
+            <span class="was">节点表 = f(创意外观, 白平衡)，规则未解</span>
+            <span class="now">它不是任何东西的函数，是<strong>相机逐帧写进 RAW 的标定数据</strong>。所有怪象（45/56 张表相同、取值不随白平衡单调、连拍相邻帧跳表）一次全解释</span>
+          </li>
+          <li>
+            <span class="was">ZcTaskVatr 不在执行链上</span>
+            <span class="now">那份普查跑的全是 <code>DRO=Off</code> 的图。它就是 DRO</span>
+          </li>
+          <li>
+            <span class="was">DRO 对应 ZcTaskAreaComp</span>
+            <span class="now">AreaComp 从未执行；跑的是 AreaCompSIMD，而且只在 Cb-Cr 平面做楔形加性修正，整幅色度 ×0.9999</span>
+          </li>
+          <li>
+            <span class="was">DRO 没有空间成分（相关系数 ≈ 0）</span>
+            <span class="now">第一版用 33×33 核，实际只覆盖 132 个原始像素。相关随核尺度单调上升，2052px 处已到 −0.34</span>
+          </li>
+          <li>
+            <span class="was">缺口在 RGB2YCC，色度还差两成</span>
+            <span class="now">YCC 段<strong>逐像素正确</strong>（Y 逐位相同，色度差 ≤1）。真正的误差在上游：矩阵读错了 IFD</span>
+          </li>
+          <li>
+            <span class="was">BW / SE 的色彩矩阵是单位阵</span>
+            <span class="now">那是<strong>逐外观</strong>的 <code class="tag">0x780f</code>，引擎压根不读它。十种外观共用同一个矩阵，去色全在 YCC 段</span>
+          </li>
+          <li>
+            <span class="was">Marble 的色域转换就是那个缺失的两成色度</span>
+            <span class="now">整段净效果只有 1%（入口 0.9637 → 出口 0.9738）。那是它自己的工作空间，末尾会转回去；强行接上反而更糟</span>
+          </li>
+          <li>
+            <span class="was">SSCS 处理的帧与画面无关（相关系数 ≈ 0）</span>
+            <span class="now">那是拿整幅去比一块 <strong>tile</strong>。把那块 dump 出来渲成图，是画面一角的局部放大，内容完全对得上</span>
+          </li>
+          <li>
+            <span class="was">系统性偏饱和 5%，来自某个未复刻的后段阶段</span>
+            <span class="now">是 Highlights / Shadows <strong>整条读不到</strong>。补上之后色度 0.9263 → 0.9983、色相 −0.69° → −0.01°</span>
+          </li>
+          <li>
+            <span class="was">YGamma 的 pivot=0 / contrast=1.0547 是常数</span>
+            <span class="now">因为手上 65 张全是 <code>Fade=0</code>。<strong>一个"测出来是常数"的量，先确认样本里那个开关有没有被拨动过</strong></span>
+          </li>
+          <li>
+            <span class="was">sony 路径的色相精度压倒性优于 DCP（2~9° vs 9~15°）</span>
+            <span class="now">对照组拿的是 ST profile 而图是 FL/VV2。公平重测后互有胜负，sony 的 RMSE 普遍更好</span>
+          </li>
+        </ul>
+      </section>
+
+      <!-- ============ 08 ============ -->
+      <section id="traps">
+        <h2><span class="h2n">09</span>会骗人的手法</h2>
+
+        <p class="lede">
+          这些不是"结论错了"，是<strong>实验手法本身会给出看似合理的假读数</strong>。每一条都值得在动手前先读一遍。
+        </p>
+
+        <div class="note warn">
+          <span class="note-label">改 MakerNotes 换外观，只换得动曲线</span>
+          引擎的 <code>0x14036dce0</code> 一看到 <code>calib+0x1c != 0</code> 就直接抄根层那份"相机已混合好的"八个 short（<code class="tag">0x7841</code>），
+          <strong>根本不看你选了哪个外观</strong>。所以 <code>look=BW</code> 渲出来的图不是黑白的，<code>look=SE</code> 和 <code>look=BW</code> 输出完全一样。
+          用这种补丁看<strong>曲线</strong>的数据仍然有效，看<strong>颜色</strong>的结论一律不成立。要真的换外观，必须改加密段里的根层标定。
+        </div>
+
+        <div class="note warn">
+          <span class="note-label">exiftool 的同名标签</span>
+          Sony MakerNotes 和 ExifIFD 带同名标签：<code>Sony:0x2006 Sharpness = +4</code>（真值）vs <code>ExifIFD:0xa40a Sharpness = Normal</code>；
+          <code>Sony:0xb025</code> vs <code>Sony:0xb04f</code> 的 DynamicRangeOptimizer 同理。
+          <strong><code>exiftool -j</code> 只返回一个，而且返回哪个没有保证。</strong>必须用 <code>-a -G1:2 -H -s</code> 列全。
+          我曾据此差点把新语料判成"锐度对照组"。
+        </div>
+
+        <div class="note warn">
+          <span class="note-label">靠指针配对前后两份</span>
+          想法是：若两个阶段共用缓冲区，同一个 <code>data</code> 指针上就能拿到"曲线前"与"ITP 后"两份。指针确实重合了 6 个，<strong>但内容完全对不上</strong>（前后中位数之比在 0.09 到 228 之间，毫无规律）。
+          原因是<strong>缓冲区被内存池回收后复用</strong>——指针相同只说明这块内存被用过两次。要配对必须拿 tile 的矩形，不能靠地址。
+        </div>
+
+        <div class="note warn">
+          <span class="note-label">竖幅的图</span>
+          <code>stage_frame.py</code> 的画布写死是横的 7008×4672，而 rawpy 会按 EXIF 方向出片。
+          <strong>转错方向比不转还糟</strong>——会把色相差算成 30°。现在按相关性自动选 <code>rot90</code>。
+        </div>
+
+        <div class="note warn">
+          <span class="note-label">研究工具与产品实现脱节</span>
+          <code>e2e_pipeline.py</code> 有一份自己的 <code>sony_chroma</code>，给主管线加 YGamma 时忘了同步它，
+          于是这套工具量出来的亮度整体偏 +0.021，<strong>看着像"复刻偏暗"，其实只是工具没跟上</strong>。
+        </div>
+      </section>
+
+      <!-- ============ 09 ============ -->
+      <section id="shipped">
+        <h2><span class="h2n">10</span>落地位置</h2>
+
+        <p class="lede">
+          已接入主管线，走前端设置面板的「颜色引擎」下拉切换。<strong>worker 里完全不需要 frida</strong>——所有参数逐图从 RAW 现读。
+        </p>
+
+        <div class="tw">
+          <table>
+            <thead>
+              <tr><th>位置</th><th>内容</th></tr>
+            </thead>
+            <tbody>
+              <tr><td class="num-col"><code>sony/sr2.py</code></td><td>SR2 解密 + 位流解包 + <code>look_calibrations()</code> 读十份平行标定</td></tr>
+              <tr><td class="num-col"><code>sony/linear_matrix.py</code></td><td>分段矩阵 + <code>data/hue_index_lut.npz</code></td></tr>
+              <tr><td class="num-col"><code>sony/tone.py</code></td><td>曲线重建（<code>x/128, y/16</code>）+ 机内微调叠加</td></tr>
+              <tr><td class="num-col"><code>sony/chroma.py</code></td><td>RGB2YCC / YGamma / YCC2RGB 段</td></tr>
+              <tr><td class="num-col"><code>sony/profile.py</code></td><td>接入层：矩阵 → Rec709→ProPhoto(D50)，曲线打包下发</td></tr>
+              <tr><td class="num-col"><code>sony/data/*.npz</code></td><td>色相索引 LUT、40 条微调单位形状、Sepia 染色曲线</td></tr>
+              <tr><td class="num-col"><code>apps/web/.../passes.ts</code></td><td><code>u_profileCurveSrgb</code> + <code>sonyChroma</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>两个接入时的结构性决定</h3>
+        <p>
+          <strong>曲线所在的基色是 profile 的属性，不是用户的外观选择。</strong>
+          MainGamma 是逐通道曲线、作用在 camera/Rec.709-ish 空间，而前端的 <code>u_profile_lut</code> 也是逐通道但作用在 ProPhoto——同一条曲线在不同基色下逐通道应用结果并不相同。
+          解法是给视图变换加一个 <code>u_profileCurveSrgb</code> 开关，跟着 <code>colorProfile.kind</code> 走，<strong>协议零改动</strong>。
+        </p>
+        <p>
+          <strong>下发的 y 必须先解 sRGB 编码。</strong>
+          索尼的 LUT 输出是 display-<em>encoded</em> 的，而前端视图变换的契约是输出 display-<em>linear</em>，最后统一做一次 sRGB 编码。不解就会 gamma 两次。
+        </p>
+        <p>
+          此外<strong>不再烘焙任何曲线常量</strong>。"按外观烘焙曲线"那个设计本身就是错的——烘焙进去的所谓"FL 曲线"其实混进了那批照片的机内 Highlights −6，被当成了外观的定义。
+        </p>
+
+        <h3>十种外观现在全部可渲染，而且可以自由切换</h3>
+        <p>
+          <code>UNRENDERABLE_LOOKS</code> 已清空。BW 靠 <code class="tag">0x7842</code> 全零自然去色，SE 靠已复刻的 <code>ZcTaskEffect</code> 染色曲线，都不再回落 DCP。
+        </p>
+        <div class="note">
+          <span class="note-label">切换外观不需要重新解码</span>
+          分段矩阵是<strong>机身的</strong>，存在 SR2SubIFD 根层、十种外观共用一份，
+          所以换外观改变的只有色调曲线和色度项——两者都在下发给浏览器的那 75 kB profile 里。
+          实测确认而非推断：<strong>十种外观走同一个 276 字节 param_block，线性输出逐位相同（最大差 0）。</strong>
+          于是外观选择器与那五个微调滑块走同一条 <code>/look-profile</code> 通道，几十兆的画面留在 GPU 上不动。
+        </div>
+        <p>
+          外观清单<strong>从文件本身读</strong>（每份 DataIFD 的 <code class="tag">0x7770</code> 经与 exif 同一张表归一成代码），
+          不是硬编码的十个位置。所以一台写了 FL2 / FL3 的机身，它的 ARW 会<strong>自动</strong>在选择器里多出这两项——
+          客户端不需要先认识它们，认不出的代码就按原样显示。
+        </p>
+      </section>
+
+      <footer class="end">
+        <span>sony_repro/PIPELINE.md · INTEGRATION.md</span>
+        <span>tools/ 共 70+ 个探针与验证脚本</span>
+        <span>对象：用户自有软件，互操作用途</span>
+      </footer>
+
+    </main>
+  </div>
+</div>
+
+<script>
+  (function () {
+    var c = document.getElementById('hue-ring');
+    if (!c || !c.getContext) return;
+    var ctx = c.getContext('2d');
+    var S = 380, cx = S / 2, cy = S / 2;
+    var rOut = 168, rIn = 108;
+
+    function css(name) {
+      return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    }
+
+    function draw() {
+      var accent = css('--accent') || '#0F6E68';
+      var line = css('--line') || '#D4D9D3';
+      var muted = css('--muted') || '#6E7A7C';
+
+      ctx.clearRect(0, 0, S, S);
+
+      // 1024 段:环形插值出来的每一段各画一根细弧,亮度按段内位置起伏,
+      // 让「16 个节点之间被插满」这件事看得见。
+      for (var i = 0; i < 1024; i++) {
+        var a0 = (i / 1024) * Math.PI * 2 - Math.PI / 2;
+        var a1 = ((i + 1) / 1024) * Math.PI * 2 - Math.PI / 2;
+        var t = (i % 64) / 64;                    // 段内插值位置
+        var w = 1 - Math.abs(t - 0.5) * 2;        // 中点最远离节点
+        ctx.beginPath();
+        ctx.arc(cx, cy, rOut, a0, a1 + 0.004);
+        ctx.arc(cx, cy, rIn, a1 + 0.004, a0, true);
+        ctx.closePath();
+        ctx.fillStyle = accent;
+        ctx.globalAlpha = 0.14 + (1 - w) * 0.5;
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+
+      // 16 个标定节点
+      for (var k = 0; k < 16; k++) {
+        var a = (k / 16) * Math.PI * 2 - Math.PI / 2;
+        ctx.beginPath();
+        ctx.moveTo(cx + Math.cos(a) * (rIn - 12), cy + Math.sin(a) * (rIn - 12));
+        ctx.lineTo(cx + Math.cos(a) * (rOut + 12), cy + Math.sin(a) * (rOut + 12));
+        ctx.strokeStyle = accent;
+        ctx.lineWidth = 1.4;
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.arc(cx + Math.cos(a) * rOut, cy + Math.sin(a) * rOut, 4, 0, Math.PI * 2);
+        ctx.fillStyle = accent;
+        ctx.fill();
+      }
+
+      // 中性灰恒等:每行和为 1,圆心不动
+      ctx.beginPath();
+      ctx.arc(cx, cy, 34, 0, Math.PI * 2);
+      ctx.strokeStyle = line;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+
+      ctx.fillStyle = muted;
+      ctx.font = '500 19px "Cascadia Mono", Consolas, ui-monospace, monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('1024', cx, cy);
+    }
+
+    draw();
+    if (window.matchMedia) {
+      var mq = window.matchMedia('(prefers-color-scheme: dark)');
+      if (mq.addEventListener) mq.addEventListener('change', draw);
+    }
+    new MutationObserver(draw).observe(document.documentElement, {
+      attributes: true, attributeFilter: ['data-theme']
+    });
+  })();
+</script>
+</body>
+</html>

@@ -28,6 +28,21 @@ assume no same-source concurrency). The decode path:
 4. Result written to disk as **float16** and framed by the API into the
    response (see `apps/api/src/protocol.ts` for the wire format).
 
+Sony RAWs can take a second colour path at step 3 (`sony/`), reproducing
+Imaging Edge from calibration the body wrote into the file: its hue-segmented
+matrix, the chosen Creative Look's tone curve and chroma terms, and DRO. That
+path is reverse-engineered rather than documented — `sony_repro/PIPELINE.md` is
+the record, and the code carries the measured accuracy in its docstrings.
+
+Its parts split by what they cost. The matrix is the only half that touches
+pixels, and all ten Creative Looks share one, so switching looks — or moving any
+of the five tweaks, or DRO — needs no decode: `look-profile` returns a rebuilt
+profile and the shader re-applies it to pixels the browser already holds. DRO
+rides that same route because it is one scalar gain per pixel, and a scalar
+commutes with the matrix. What travels with the profile is a gain table plus the
+engine's 8×6×14 bilateral grid, which the shader interpolates to recover the
+local log mean the gain is indexed by.
+
 Layered LRU caches make slider-driven re-requests cheap: camera-RGB per
 (source, size, denoise) → re-applying a DCP skips the RAW decode; final linear
 per full parameter set → repeat requests skip everything.

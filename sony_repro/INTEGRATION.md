@@ -73,6 +73,15 @@ DCP 明显过亮发灰,sony 的暗部密度和整体基调更贴近直出。
 残余误差来自尚未复刻的 SSCS 饱和、AreaComp,以及 **DRO**(机内直出会提亮暗部),
 色相索引用的也是标定 LUT 而非引擎的定点 atan。
 
+> ⚠️ 本文这两处(以及下面「其余差距来自 AreaComp 与 DRO」)测于 DRO 解出之前。
+> **DRO 现在已经不是差距来源**:双边网格连同曲线都已解出并接进 `apps/worker` 和
+> shader,整帧对引擎 **RMSE 0.075/255、97.4% 逐位相同**
+> (PIPELINE.md §7.10.4.6 / §7.10.5)。这两段的数字没有重跑。
+>
+> 手动档位也已解出并落地(§7.10.7):引擎的 10 条内置预设已从运行时结构体抓下来
+> 烘进 `sony/dro_presets.py`,UI 提供 `关 / 自动 / Lv1..Lv5`。
+> 「机内开了 DRO 但 RAW 没曲线」这个旧缺口一并补上了。
+
 顺带解答了一个悬念:Sony **没有**单独的 camera→标准空间转换矩阵。16 个节点矩阵全部
 贴着单位阵(对角 0.96~1.03,非对角 ±0.17),整条色彩链就这一个近单位的分段微调 —— 也就是说
 ILCE-7CM2 的原生基色本就接近 Rec.709,Adobe 绕道 XYZ 反而引入了误差。
@@ -143,11 +152,14 @@ IFD0 tag 0xc634 (DNGPrivateData,内联的 uint32 = SR2Private IFD 偏移)
 | `apps/worker/.../sony/tone.py` | 曲线重建(x/128, y/16)+ 机内微调叠加 |
 | `apps/worker/.../sony/profile.py` | 接入层:矩阵 → Rec709→ProPhoto(D50),曲线打包 |
 | `apps/worker/.../sony/data/look_tuning.npz` | 40 条微调单位形状(145 KB) |
+| `apps/worker/.../sony/clarity.py` | 机内 Clarity(第六项微调)的强度表与模糊链几何,烘焙自机身标定 |
+| `apps/worker/.../sony/sharpness.py` | 机内锐化:两条档位阶梯 + 死区,标定从 RAW 的 `0x78cd` 逐张读 —— **不需要 frida** |
 | `apps/worker/.../cli.py` | `ColorRenderer` / `resolve_color_renderer` / `render_color` |
-| `apps/web/.../passes.ts` | `u_profileCurveSrgb` |
-| `apps/web/App.vue` | 「颜色引擎」下拉 + 创意外观显示 + 回落提示 |
+| `apps/web/.../passes.ts` | `u_profileCurveSrgb`;`CLARITY_*` 三个小 pass(降采样 / 保边均值 / 高斯)+ `SONY_POST_SHADER`(锐化与 Clarity 合成,按引擎的先后顺序) |
+| `apps/web/.../pipeline-renderer.ts` | 两级 post 的 FBO 链,挂在 `renderPass()` 里 —— 预览 / 导出 / 直方图共用那一个入口,不必各接一次 |
+| `apps/web/App.vue` | 「颜色引擎」下拉 + 创意外观显示 + 回落提示 + 六个微调滑块 |
 
-测试 `apps/worker/tests/test_sony.py`(32 个),含对 `samples/` 里真实 ARW 的断言。
+测试 `apps/worker/tests/test_sony.py`,含对 `samples/` 里真实 ARW 的断言。
 
 研究工具在 `tools/`:`look_sweep.py`(切外观 + 扫微调档位,一张图跑五十次)、
 `export_tuning.py`(归纳成单位形状)、`sat_probe.py` / `chroma_probe.py` /

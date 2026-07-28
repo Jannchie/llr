@@ -17,9 +17,14 @@ r"""让 Edit.exe 按任意创意外观 + 任意机内微调渲染同一张图,�
 档位对曲线的作用**严格线性**(±9 定出的单位形状回推中间各档,残差 3/16384),
 所以只需跑两端。超出 ±9 引擎当非法值处理,渲染结果与 0 完全一致。
 
+新机身的外观比 ``LOOK_ORDER`` 多(a7 V 有 12 个,末两个是 FL2/FL3)。代号取自
+文件自报的名字,所以 ``--looks=FL,FL2,FL3`` 这种写法对多出来的也成立。
+
 用法::
 
-    python look_sweep.py <ARW> [--base]      # --base 只跑十种外观的基线
+    python look_sweep.py <ARW> [--base]      # --base 只跑基线
+    python look_sweep.py <ARW> --looks=FL2,FL3
+    python look_sweep.py <ARW> --looks=FL2,FL3 --fields=contrast --values=-9,1,2,3
 """
 import os
 import re
@@ -84,8 +89,22 @@ def look_names(path):
             for d in data_ifds(path)]
 
 
+def look_codes(names):
+    """外观代号,顺序同文件里的 SR2DataIFD。
+
+    前十个用 ``LOOK_ORDER`` 的固定映射 —— 文件里写的是 ``Standard`` 而不是
+    ``ST``。多出来的直接用文件自报的名字:a7 V 的第 11/12 份自报就是
+    ``FL2``/``FL3``,和 worker 侧的代号一致,不用再翻译一层。
+    """
+    return [LOOK_ORDER[i] if i < len(LOOK_ORDER) else n for i, n in enumerate(names)]
+
+
 def capture(arw, wait=70.0):
     import frida
+    # Edit.exe 是单实例的:已经有一个在跑时,新进程会把参数转发过去然后自己退出,
+    # 于是 frida 挂到一个马上就死的进程上,一声不响地什么都抓不到。每次先杀干净。
+    subprocess.run(["taskkill", "/F", "/IM", "Edit.exe"], capture_output=True, check=False)
+    time.sleep(0.8)
     pid = frida.spawn([EXE, str(arw)])
     buf = {}
     try:
@@ -114,10 +133,9 @@ def capture(arw, wait=70.0):
     return buf.get("tone")
 
 
-def render(src, offs, names, look, tune=None, work="sweep_work.ARW", wait=70.0):
-    """按指定外观(和可选微调)渲染一次,返回 32768 项 tone LUT。"""
+def render(src, offs, names, i, tune=None, work="sweep_work.ARW", wait=70.0):
+    """按第 i 份 SR2DataIFD 的外观(和可选微调)渲染一次,返回 32768 项 tone LUT。"""
     shutil.copyfile(src, work)
-    i = LOOK_ORDER.index(look)
     with open(work, "r+b") as f:
         f.seek(offs["stylestr"])
         f.write(names[i].encode("ascii").ljust(16, b"\x00"))
@@ -152,12 +170,19 @@ def main():
     if not only_base:
         jobs += [(f"{f}{s:+d}", {f: s}) for f in fields for s in values]
 
-    for look in LOOK_ORDER:
+    codes = look_codes(names)
+    want = next((a.split("=")[1].split(",") for a in sys.argv if a.startswith("--looks=")), codes)
+    missing = [c for c in want if c not in codes]
+    if missing:
+        raise SystemExit(f"这个文件里没有 {missing};它有 {codes}")
+
+    for look in want:
+        i = codes.index(look)
         for tag, tune in jobs:
             dst = os.path.join(OUT, f"{look}_{tag}.npy")
             if os.path.exists(dst):
                 continue
-            got = render(src, offs, names, look, tune)
+            got = render(src, offs, names, i, tune)
             if got is None:
                 print(f"{look} {tag}: 没抓到", flush=True)
                 continue

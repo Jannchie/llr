@@ -4,6 +4,26 @@ __pycache__/
 # Memory dumps and fitted arrays — regenerate them with tools/, don't commit them.
 *.npz
 *.bin
+# ...except these two. Regenerating either means re-driving Edit.exe for dozens
+# of renders, and one of them needs a body nobody here owns. The 7CM2 file is
+# what build_tuning_ops.py reads to build what worker ships; the a7 V file is the
+# cross-body control and the only ground truth we have for FL2/FL3.
+!tools/look_tuning_perlook_7cm2.npz
+!tools/look_tuning_a7v.npz
 tools/sliderprobe_work.ARW
+tools/sweep_work.ARW
 tools/sliderprobe/*.npy
+# 探针 dump 目录。同样是重跑 tools/ 就有的东西,而且里面还有 .json,
+# 光靠上面的 *.npz / *.bin 拦不住 —— vatrprobe 一个就 27 MB。
+tools/comboprobe/
+tools/sharpprobe/
+tools/vatrgrid/
+tools/vatrprobe/
 looksweep/
+# 同理的几个大 dump(合计 4.7 MB),都只被写、没有脚本读它们。
+# 注意 tools/spica_wtab.json **不在**此列 —— 那个是 spica_model/recon/match/
+# export_tables 四个脚本的输入,删了就跑不起来。
+tools/spica_trace.json
+tools/spica_params.json
+tools/spica_pass2.json
+tools/spica_lbp.json
