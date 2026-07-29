@@ -6,8 +6,12 @@ r"""把 `0x3a1b00`(RawNRSIMD 的 R/B 滤波核)的**全部输入与输出**整�
 
 签名(见 PIPELINE.md 7.13.3):
 
-    filt(dstDesc, detailDesc, refDesc, tbl0, tbl3, limit, gain, offset)
-      rcx        rdx          r8       r9    [rsp+0x20..0x38]
+    R/B  0x3a1b00(dst, detail, ref,    tbl0, tbl3, limit, gain, offset)
+    绿   0x3a0c30(dst, detail, refOwn, refOther, tbl1, tbl4, limit, gain,
+                  offset, flagA, flagB)
+
+绿色多一个「另一个绿平面」和一对 `-1/0` 相位标志(两次调用互换)。
+`--kernel green` 抓绿色那个。
 
 平面描述符: +0 宽 +4 高 +8 行距(字节) +0x10 数据(float32)
 
@@ -35,7 +39,8 @@ import numpy as np
 
 EXE = r"C:\Program Files\Sony\Imaging Edge\Edit.exe"
 SCR = os.path.dirname(os.path.abspath(__file__))
-RVA = 0x3A1B00
+RVA_RB = 0x3A1B00
+RVA_GREEN = 0x3A0C30
 EXEC_RVA = 0x39FAB0
 TABLE_LEN = 1 << 15
 
@@ -86,14 +91,23 @@ Interceptor.attach(base.add(RVAJS), {
     mosaic(st.task);
     // 栈参数:返回地址在 [rsp],第 5 个参数在 [rsp+0x28]
     const sp = this.context.rsp;
-    const tbl3 = sp.add(0x28).readPointer();
-    send({tag: 'scalars',
-          limit: sp.add(0x30).readS32(), gain: sp.add(0x38).readS32(),
-          offset: sp.add(0x40).readS32()});
-    send({tag: 'tbl0'}, a[3].readByteArray(TLENJS * 4));
-    send({tag: 'tbl3'}, tbl3.readByteArray(TLENJS * 4));
-    plane(a[1], 'detail');
-    plane(a[2], 'ref');
+    if (GREENJS) {
+      send({tag: 'scalars', limit: sp.add(0x38).readS32(),
+            gain: sp.add(0x40).readS32(), offset: sp.add(0x48).readS32(),
+            flagA: sp.add(0x50).readS32(), flagB: sp.add(0x58).readS32()});
+      send({tag: 'tbl0'}, sp.add(0x28).readPointer().readByteArray(TLENJS * 4));
+      send({tag: 'tbl3'}, sp.add(0x30).readPointer().readByteArray(TLENJS * 4));
+      plane(a[1], 'detail');
+      plane(a[2], 'ref');
+      plane(a[3], 'ref2');
+    } else {
+      send({tag: 'scalars', limit: sp.add(0x30).readS32(),
+            gain: sp.add(0x38).readS32(), offset: sp.add(0x40).readS32()});
+      send({tag: 'tbl0'}, a[3].readByteArray(TLENJS * 4));
+      send({tag: 'tbl3'}, sp.add(0x28).readPointer().readByteArray(TLENJS * 4));
+      plane(a[1], 'detail');
+      plane(a[2], 'ref');
+    }
   },
   onLeave() { if (this.hit) { plane(this.dst, 'out'); send({tag: 'end'}); } }
 });
@@ -107,10 +121,12 @@ def main():
     arw = os.path.abspath(sys.argv[1])
     ex = int(sys.argv[sys.argv.index("--skip") + 1] if "--skip" in sys.argv else 0)
     which = int(sys.argv[sys.argv.index("--which") + 1] if "--which" in sys.argv else 0)
+    green = "green" in (sys.argv[sys.argv.index("--kernel") + 1] if "--kernel" in sys.argv else "")
     secs = float(sys.argv[sys.argv.index("--secs") + 1] if "--secs" in sys.argv else 60)
     # 先替长的:EXECJS 是 WANTSKIPJS 之外的子串来源,顺序反了会截断别的记号
     js = (JS.replace("WANTSKIPJS", str(ex)).replace("WANTWHICHJS", str(which))
-            .replace("EXECJS", str(EXEC_RVA)).replace("RVAJS", str(RVA))
+            .replace("EXECJS", str(EXEC_RVA)).replace("GREENJS", "true" if green else "false")
+            .replace("RVAJS", str(RVA_GREEN if green else RVA_RB))
             .replace("TLENJS", str(TABLE_LEN)))
 
     store, meta, done = {}, {}, []
@@ -129,7 +145,9 @@ def main():
             print(f"   命中 which={p['which']}(跳过 {p['skipped']} 次)", flush=True)
         elif tag == "scalars":
             meta.update(p)
-            print(f"   参数 limit={p['limit']} gain={p['gain']} offset={p['offset']}", flush=True)
+            extra = f" flags={p.get('flagA')},{p.get('flagB')}" if "flagA" in p else ""
+            print(f"   参数 limit={p['limit']} gain={p['gain']} offset={p['offset']}{extra}",
+                  flush=True)
         elif tag == "end":
             done.append(True)
         elif data is not None and tag.startswith("tbl"):
@@ -173,7 +191,7 @@ def main():
         if k != "tag":
             store[k] = np.array([v])
     stem = os.path.splitext(os.path.basename(arw))[0]
-    path = os.path.join(SCR, f"rawnr_kern_{stem}_s{ex}w{which}.npz")
+    path = os.path.join(SCR, f"rawnr_kern_{stem}_{'g' if green else 'rb'}_s{ex}w{which}.npz")
     np.savez_compressed(path, source=np.array([arw, str(ex), str(which)]), **store)
     print("SAVED", path)
 
