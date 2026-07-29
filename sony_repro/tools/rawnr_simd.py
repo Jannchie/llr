@@ -24,17 +24,27 @@ r"""`ZcTaskRawNRSIMD` 的 R/B 支路,按反汇编写出来的复刻。
 (`0x3a1c87..0x3a1d13`),列偏移 `-0x18,-0x10,-0x8,0,+0x8` 字节即同样的间距 2,
 中心在 `-0x8`。5 行 × 5 列 = 25 个抽头,和收尾处累加的 25 个掩码向量对得上。
 
-对实测的成绩(fl_test.ARW ISO 1250,tile12,见 `--score`):
+对实测的成绩(`rawnr_kern_probe.py` 抓的自带上下文捕获,fl_test.ARW ISO 1250):
 
-* **B 相位:解释掉 95.0%**(残差 2.10,delta std 9.39)。
-* R 相位只到 65.6%,而且要 offset≈768 才最好(B 要 0)。缺口未解 —— 但
-  `(真值 - 均值项)` 与本文的 `d` 相关 0.92(B 是 0.9967),所以差在分析/均值那一侧,
-  不在收尾公式。
+| 比什么 | 结果 |
+|---|---|
+| `analysis()` 对引擎的 detail / ref | **100.00% 逐位相同**(零误差) |
+| `filt()` 对引擎的 out | **99.9677% 逐位相同**(185481 点里 60 点不同) |
+| 端到端 马赛克相位 → out | 同上,解释掉 100.00% |
+
+那 60 个点(0.03%)是**一个抽头的取舍不同**:float32 比 float64 更贴引擎
+(60 点 vs 3170 点,证实引擎就是 float32);两种精度下被接纳的抽头数完全一致,
+所以不是我这边的阈值比较在翻转;这些点被接纳的抽头数中位只有 6(全体中位 21),
+误差量级(中位 6.8 / 最大 13.8)恰好等于小样本均值里一个抽头进出的幅度。
+
+> ⚠️ **不要跨工具按序号配对 tile。** tile 是多线程并行跑的,同一张图连抓两次,
+> 「第 0 次调用」的平面尺寸都能不一样。早先按序号配对得出「R 相位只有 65%」,
+> 是拿错了 tile,不是模型错。用 `rawnr_kern_probe.py` 的自带上下文捕获。
 
 用法::
 
-    python rawnr_simd.py            # 自检
-    python rawnr_simd.py --score    # 对 tile_dump/rawnr_probe 抓的真值打分
+    python rawnr_simd.py             # 自检
+    python rawnr_simd.py --verify    # 对 rawnr_kern_probe 的捕获逐位比对
 """
 import os
 import sys
@@ -64,7 +74,11 @@ def analysis(plane, offset):
 
 
 def filt(d, ref, tbl0, tbl3, gain, limit, offset, spacing=2, taps=2):
-    """0x3a1b00。`spacing` 是抽头间距,`taps` 是每边的抽头数(2 -> 5x5)。"""
+    """0x3a1b00。`spacing` 是抽头间距,`taps` 是每边的抽头数(2 -> 5x5)。
+
+    返回 (结果, 自身吃掉的边距)。**边距只算这一步的** —— 早先这里返回的是
+    `r+1`(把分析那一层也算了进去),单独调用 `filt` 验证时就对不齐了。
+    """
     r = spacing * taps
     idx = np.clip(ref, 0, LEVEL_MAX).astype(np.int32)
     thr = tbl0[idx].astype(np.float32)
@@ -93,14 +107,17 @@ def filt(d, ref, tbl0, tbl3, gain, limit, offset, spacing=2, taps=2):
 
     mean = total / np.maximum(count, 1.0)
     boost = np.clip(_shift(d, 0, 0, r) * np.float32(gain / 256.0), -limit, limit)
-    return np.clip(mean + boost - np.float32(offset), 0.0, LEVEL_MAX), r + 1
+    return np.clip(mean + boost - np.float32(offset), 0.0, LEVEL_MAX), r
 
 
 def denoise_phase(plane, tbl0, tbl3, gain, limit, offset, spacing=2, taps=2):
-    """一个相位平面进出;返回 (结果, 四周被吃掉的边距)。"""
+    """一个相位平面进出;返回 (结果, 四周被吃掉的边距)。
+
+    边距是分析的 1 加上滤波的 `spacing*taps`。
+    """
     d, ref = analysis(plane, offset)
     out, margin = filt(d, ref, tbl0, tbl3, gain, limit, offset, spacing, taps)
-    return out, margin
+    return out, margin + 1
 
 
 def _selfcheck():
@@ -113,34 +130,52 @@ def _selfcheck():
     print(f"常量场恒等(边距 {m})  ✓")
 
 
-def _score(tiles="tiles_NR_fl1250.npz", tables="rawnr_tables_fl_test.npz", tile="12"):
-    """对 `tile_dump.py` / `rawnr_probe.py` 抓的真值打分。
+def _verify(cap="rawnr_kern_fl_test_s0w0.npz"):
+    """对 `rawnr_kern_probe.py` 的捕获逐位比对。
 
-    **必须按有效矩形裁剪**(`task+0x30`):输出是新分配的缓冲区,矩形外从没写过。
+    捕获里马赛克和内核的 detail/ref/out 来自**同一次调用**,所以不存在配对问题。
+    引擎只写 `[5, n-5)`,比对区域按此裁剪。
     """
     scr = os.path.dirname(os.path.abspath(__file__))
-    t = np.load(os.path.join(scr, tiles))
-    k = np.load(os.path.join(scr, tables))
-    tbl0, tbl3 = k["tbl0"], k["tbl3"]
-    meta = t[f"t{tile}_meta"]
-    x0, y0, x1, y1 = (int(v) for v in meta[12:16])
-    src = t[f"t{tile}_in"][..., 0].astype(np.float32)[y0:y1, x0:x1]
-    dst = t[f"t{tile}_out"][..., 0].astype(np.float32)[y0:y1, x0:x1]
+    z = np.load(os.path.join(scr, cap))
+    mos = z["mosaic"].astype(np.float32)
+    d, ref, out = z["detail"], z["ref"], z["out"]
+    tbl0, tbl3 = z["tbl0"], z["tbl3"]
+    gain, limit, off = int(z["gain"][0]), int(z["limit"][0]), int(z["offset"][0])
+    h, w = ref.shape
+    W = 5
 
-    print(f"{'相位':>4} {'offset':>7} {'残差 std':>9} {'解释掉':>7} {'delta std':>10}")
-    for py, px, name in ((0, 0, "R"), (1, 1, "B")):
-        s, dd = src[py::2, px::2], dst[py::2, px::2]
-        for offset in (0, 512, 768):
-            out, mg = denoise_phase(s, tbl0, tbl3, 256, 1023, float(offset))
-            truth = dd[mg:-mg, mg:-mg]
-            resid = float((out - truth).std())
-            dstd = float((dd - s)[mg:-mg, mg:-mg].std())
-            print(f"{name:>4} {offset:>7} {resid:>9.3f} {1 - (resid / dstd) ** 2:>6.1%} "
-                  f"{dstd:>10.3f}")
+    phase = None
+    for py in (0, 1):
+        for px in (0, 1):
+            ph = mos[py::2, px::2]
+            if ph.shape != ref.shape:
+                continue
+            my_d, my_ref = analysis(ph, float(off))
+            if np.array_equal(my_ref, ref[1:-1, 1:-1]) and np.array_equal(my_d, d[1:-1, 1:-1]):
+                phase = (py, px)
+                print(f"analysis: 相位{phase} 的 detail 与 ref 都 100% 逐位相同  ✓")
+    if phase is None:
+        print("analysis: 没有相位逐位对上 —— 捕获与马赛克可能不同源")
+        return
+
+    got, mg = filt(d, ref, tbl0, tbl3, gain, limit, float(off))
+    sl = (slice(W - mg, h - W - mg), slice(W - mg, w - W - mg))
+    err = got[sl] - out[W:h - W, W:w - W]
+    n = int(np.count_nonzero(err))
+    print(f"filt:     逐位相同 {100 * np.mean(err == 0):.4f}%  "
+          f"({n} / {err.size} 点不同,|误差| 最大 {np.abs(err).max():.4g})")
+
+    e2e, mg2 = denoise_phase(mos[phase[0]::2, phase[1]::2], tbl0, tbl3, gain, limit, float(off))
+    sl2 = (slice(W - mg2, h - W - mg2), slice(W - mg2, w - W - mg2))
+    err2 = e2e[sl2] - out[W:h - W, W:w - W]
+    base = (out - ref)[W:h - W, W:w - W]
+    print(f"端到端:   逐位相同 {100 * np.mean(err2 == 0):.4f}%  "
+          f"解释掉 {1 - (err2.std() / base.std()) ** 2:.2%}")
 
 
 if __name__ == "__main__":
-    if "--score" in sys.argv:
-        _score()
+    if "--verify" in sys.argv:
+        _verify()
     else:
         _selfcheck()
