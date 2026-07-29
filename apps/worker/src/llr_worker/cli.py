@@ -34,6 +34,7 @@ from .sony import is_borrowed as sony_is_borrowed
 from .sony.dro import dro_gain_table, dro_grid, dro_grid_json
 from .sony.dro_presets import DRO_LEVEL_AUTO, DRO_LEVEL_MAX
 from .sony.profile import look_render_info
+from .sony.rawnr import detail_restore as sony_detail_restore
 from .sony.rawnr import noise_model as sony_noise_model
 from .sony.sharpness import (
     SHARPNESS_DEFAULT,
@@ -1221,14 +1222,25 @@ def prepare_linear(
             # A Sony RAW carries the body's own measurement of how its noise
             # grows with the signal; anything else returns None and the
             # denoiser fits that shape from the pixels as before.
-            stats = denoise_raw_inplace(raw, get_denoiser(denoise_model),
-                                        noise=sony_noise_model(input_path))
+            curve = sony_noise_model(input_path)
+            # Sony also records how much of the fine detail it puts back after
+            # denoising, and its bodies put back nearly all of it — which is
+            # why Edit.exe's RAW stage costs about a tenth of the fine detail
+            # where ours cost most of it. Only usable alongside the curve,
+            # since the halo clamp is expressed in units of its threshold.
+            restore = sony_detail_restore(input_path) if curve is not None else None
+            stats = denoise_raw_inplace(
+                raw, get_denoiser(denoise_model), noise=curve,
+                detail=None if restore is None
+                else (restore.fraction, restore.limit_in_thresholds(curve)))
             # Which of those two happened is invisible from the result, and it
             # is the one input that varies per *file* rather than per request —
             # so a frame that denoises unlike its neighbours is explained here
             # and nowhere else. The API forwards our stderr to its console.
+            kept = ("" if stats is None or stats.detail_restored is None
+                    else f" detail={stats.detail_restored:.2f}")
             note = (f"{stats.model} {stats.width}x{stats.height} "
-                    f"noise={stats.noise_source}" if stats is not None
+                    f"noise={stats.noise_source}{kept}" if stats is not None
                     else "skipped, sensor CFA is not 2x2 Bayer")
             sys.stderr.write(f"denoise {input_path.name}: {note}\n")
             sys.stderr.flush()

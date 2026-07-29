@@ -70,8 +70,22 @@ SLOPE_COEFF_TAG = 0x78C8   # rise per level, in 1/4096ths
 #: rather than being read on a partial group.
 STRENGTH_TAGS = (0x78C9, 0x78CA, 0x78CB)
 
+#: Detail re-injection, one per plane. Sony's filter smooths a *lowpassed*
+#: plane and then adds the original finest-scale detail back as
+#: ``clamp(d * gain / 256, ±limit)``, so `gain` is how much of the fine detail
+#: survives denoising and `limit` caps the excursion at an edge (a halo
+#: limiter). Measured on the bodies here `gain` sits just under 256, i.e. Sony
+#: puts nearly all of it back — which is why its RAW-domain stage removes only
+#: about a tenth of the fine detail (PIPELINE.md 7.13, notes/static-rawnr.md 7).
+DETAIL_GAIN_TAGS = (0x78CC, 0x78CD, 0x78CE)
+DETAIL_LIMIT_TAGS = (0x78CF, 0x78D0, 0x78D1)
+
+#: `gain` is 8.8 fixed point, so this is "restore all of it".
+DETAIL_GAIN_UNIT = 256
+
 _MODEL_TAGS = (LEVEL_LO_TAG, LEVEL_HI_TAG, BASE_COEFF_TAG, SLOPE_COEFF_TAG,
                *STRENGTH_TAGS)
+_DETAIL_TAGS = (DETAIL_GAIN_TAGS[0], DETAIL_LIMIT_TAGS[0])
 
 _STRENGTH_SHIFT = 8   # the >> 8 in base/slope
 _SLOPE_SHIFT = 12     # the >> 12 in the ramp
@@ -123,6 +137,54 @@ class NoiseModel:
         return self.threshold(scaled).astype(np.float64) / ENGINE_FULL_SCALE
 
 
+@dataclass(frozen=True)
+class DetailRestore:
+    """How much fine detail the body puts back after denoising.
+
+    ``gain`` is 8.8 fixed point (256 = all of it) and ``limit`` caps the
+    restored excursion, both exactly as Edit.exe's RawNR uses them. The Edge
+    Noise Reduction slider modulates the pair around these values; see
+    :func:`for_edge_slider` for the mapping, which is read out of the engine
+    rather than fitted.
+    """
+
+    gain: int
+    limit: int
+
+    @property
+    def fraction(self) -> float:
+        """``gain`` as a plain multiplier on the detail that was removed."""
+        return self.gain / DETAIL_GAIN_UNIT
+
+    def limit_in_thresholds(self, model: NoiseModel) -> float:
+        """``limit`` measured in units of the noise threshold at full signal.
+
+        Both are on the engine's 14-bit scale, so their ratio is dimensionless
+        and carries over to a denoiser working in any other units — which is
+        what lets this drive `llr`'s wavelet stage without reproducing Sony's
+        filter. Typically 15..25, i.e. the clamp only bites at a hard edge.
+        """
+        thr = float(model.threshold(model.hi))
+        return self.limit / max(thr, 1.0)
+
+    def for_edge_slider(self, ui: float) -> DetailRestore:
+        """This pair as Edit.exe's Edge NR slider (0..100, 50 neutral) sets it.
+
+        Read out of the engine, exact at every measured point once truncation
+        toward zero is applied (notes/static-rawnr.md 7.1). Below neutral the
+        gain climbs toward "restore everything" and the halo clamp opens up to
+        8x; above neutral the gain falls to zero and the clamp stays put.
+        """
+        t = (float(ui) - 50.0) * 2.0
+        if t >= 0.0:
+            return DetailRestore(gain=int(self.gain * (1.0 - t / 100.0)), limit=self.limit)
+        room = -t / 100.0
+        return DetailRestore(
+            gain=int(self.gain + (DETAIL_GAIN_UNIT - self.gain) * room),
+            limit=int(self.limit + 7 * self.limit * room),
+        )
+
+
 def noise_model(path: str | Path) -> NoiseModel | None:
     """This shot's noise model, or None for anything that does not carry one.
 
@@ -130,32 +192,53 @@ def noise_model(path: str | Path) -> NoiseModel | None:
     body that predates the group — because the caller's answer to all of them is
     the same: fall back to fitting the noise from the image.
     """
+    return _read(path)[0]
+
+
+def detail_restore(path: str | Path) -> DetailRestore | None:
+    """This shot's detail re-injection pair, or None if the RAW has no group.
+
+    Read alongside :func:`noise_model` — they share one decryption of the SR2
+    block — but reported separately because they answer different questions:
+    the curve says how much noise there is, this says how much of the fine
+    detail Sony chose to keep afterwards.
+    """
+    return _read(path)[1]
+
+
+def _read(path: str | Path) -> tuple[NoiseModel | None, DetailRestore | None]:
     try:
         st = Path(path).stat()
     except OSError:
-        return None
-    return _cached_model(str(path), st.st_size, int(st.st_mtime_ns))
+        return None, None
+    return _cached_read(str(path), st.st_size, int(st.st_mtime_ns))
 
 
 @lru_cache(maxsize=8)
-def _cached_model(path: str, size: int, mtime: int) -> NoiseModel | None:
+def _cached_read(path: str, size: int,
+                 mtime: int) -> tuple[NoiseModel | None, DetailRestore | None]:
     # Keyed on the file's identity like sharpness._cached_calibration: reaching
     # the tags means decrypting the SR2 block, and every render of the same file
-    # asks for the same answer.
+    # asks for the same answer. Both groups come out of the one walk.
     try:
-        tags = read_sr2_scalars(path, _MODEL_TAGS)
+        tags = read_sr2_scalars(path, (*_MODEL_TAGS, *_DETAIL_TAGS))
     except Exception:
         # The SR2 walk can fail at any step on a file that is not a Sony RAW,
         # not only at the missing-tag check.
-        return None
-    if not all(t in tags for t in _MODEL_TAGS):
-        return None
+        return None, None
 
-    strength = tags[STRENGTH_TAGS[0]]
-    fold = strength * _COEFF_NUMERATOR
-    return NoiseModel(
-        lo=tags[LEVEL_LO_TAG],
-        hi=tags[LEVEL_HI_TAG],
-        base=(fold * tags[BASE_COEFF_TAG]) >> _STRENGTH_SHIFT,
-        slope=(fold * tags[SLOPE_COEFF_TAG]) >> _STRENGTH_SHIFT,
-    )
+    model = None
+    if all(t in tags for t in _MODEL_TAGS):
+        strength = tags[STRENGTH_TAGS[0]]
+        fold = strength * _COEFF_NUMERATOR
+        model = NoiseModel(
+            lo=tags[LEVEL_LO_TAG],
+            hi=tags[LEVEL_HI_TAG],
+            base=(fold * tags[BASE_COEFF_TAG]) >> _STRENGTH_SHIFT,
+            slope=(fold * tags[SLOPE_COEFF_TAG]) >> _STRENGTH_SHIFT,
+        )
+
+    detail = None
+    if all(t in tags for t in _DETAIL_TAGS):
+        detail = DetailRestore(gain=tags[_DETAIL_TAGS[0]], limit=tags[_DETAIL_TAGS[1]])
+    return model, detail

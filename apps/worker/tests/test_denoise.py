@@ -209,17 +209,19 @@ def test_denoise_passes_the_cfa_and_the_noise_curve_through() -> None:
     class Spy:
         name = "spy"
 
-        def __call__(self, planes, sigma=None, cfa=None, noise=None):
+        def __call__(self, planes, sigma=None, cfa=None, noise=None, detail=None):
             seen["cfa"] = cfa
             seen["noise"] = noise
+            seen["detail"] = detail
             return planes
 
     raw = make_raw(random_mosaic(np.random.default_rng(31), 16, 16))
     raw.color_desc = b"RGBG"
     curve = _FlatThenRamp()
-    denoise_raw_inplace(raw, Spy(), noise=curve)
+    denoise_raw_inplace(raw, Spy(), noise=curve, detail=(0.97, 16.8))
     assert seen["cfa"] == ["R", "G", "G", "B"]
     assert seen["noise"] is curve
+    assert seen["detail"] == (0.97, 16.8)
 
 
 # ── End to end on synthetic sensor noise ──
@@ -332,6 +334,45 @@ def test_a_measured_curve_reaches_the_denoiser_and_denoises() -> None:
     measured = WaveletDenoiser()(planes.copy(), None, ["R", "G", "G", "B"], _FlatThenRamp())
     truth = clean[..., None]
     assert np.abs(measured - truth).mean() < np.abs(planes - truth).mean()
+
+
+def test_restoring_detail_keeps_texture_a_plain_shrinkage_flattens() -> None:
+    """The point of the parameter: measured against Edit.exe we smoothed 2-8x
+    too hard, and this is the knob that closes it.
+
+    A frame with fine texture *and* noise. Restoring the finest level has to
+    leave more of the texture standing than plain shrinkage does, while still
+    denoising -- if it merely undid the denoising, the error against the truth
+    would go back up to the noisy input's.
+    """
+    rng = np.random.default_rng(77)
+    yy, xx = np.mgrid[0:128, 0:128].astype(np.float32)
+    clean = 0.3 + 0.06 * np.sin(xx / 2.0) * np.cos(yy / 2.5)   # fine texture
+    clean = np.repeat(clean[..., None], 4, axis=-1).astype(np.float32)
+    noisy = np.clip(clean + rng.normal(0, 0.012, clean.shape).astype(np.float32), 0, 1)
+
+    dn = WaveletDenoiser()
+    flat = dn(noisy.copy(), None, ["R", "G", "G", "B"], None, None)
+    kept = dn(noisy.copy(), None, ["R", "G", "G", "B"], None, (0.97, 16.8))
+
+    def texture(a: np.ndarray) -> float:
+        y = a.mean(axis=-1)
+        return float((y[:, 1:] - y[:, :-1]).std())
+
+    assert texture(kept) > texture(flat) * 1.2, "restore did not keep more texture"
+    # …and it is still a denoiser, not a bypass.
+    err_in = float(np.abs(noisy - clean).mean())
+    assert float(np.abs(kept - clean).mean()) < err_in
+
+
+def test_detail_restore_is_bounded_by_its_limit() -> None:
+    """The clamp is the halo limiter; a limit of zero must restore nothing."""
+    rng = np.random.default_rng(78)
+    noisy = np.clip(0.3 + rng.normal(0, 0.01, (96, 96, 4)), 0, 1).astype(np.float32)
+    dn = WaveletDenoiser()
+    plain = dn(noisy.copy(), None, ["R", "G", "G", "B"], None, None)
+    clamped = dn(noisy.copy(), None, ["R", "G", "G", "B"], None, (1.0, 0.0))
+    assert np.allclose(plain, clamped, atol=1e-6)
 
 
 def test_denoise_stats_say_where_the_noise_model_came_from() -> None:

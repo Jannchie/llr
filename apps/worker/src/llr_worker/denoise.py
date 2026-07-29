@@ -140,6 +140,13 @@ class NoiseCurve(Protocol):
     def noise_shape_at(self, level: np.ndarray) -> np.ndarray: ...
 
 
+#: ``(fraction, limit_in_sigmas)``: how much of what shrinkage removed at the
+#: finest level to put back, and how far the restored excursion may run in
+#: units of that level's own noise. Both dimensionless, so a camera's own
+#: numbers carry over without matching its units (sony/rawnr.py DetailRestore).
+DetailRestore = tuple[float, float]
+
+
 class Denoiser(Protocol):
     """A denoiser maps normalised Bayer planes -> denoised planes, same shape.
 
@@ -153,7 +160,7 @@ class Denoiser(Protocol):
 
     def __call__(
         self, planes: np.ndarray, sigma: float | None = None, cfa: Sequence[str] | None = None,
-        noise: NoiseCurve | None = None,
+        noise: NoiseCurve | None = None, detail: DetailRestore | None = None,
     ) -> np.ndarray: ...
 
     name: str
@@ -167,7 +174,7 @@ class PassthroughDenoiser:
 
     def __call__(
         self, planes: np.ndarray, sigma: float | None = None, cfa: Sequence[str] | None = None,
-        noise: NoiseCurve | None = None,
+        noise: NoiseCurve | None = None, detail: DetailRestore | None = None,
     ) -> np.ndarray:
         return planes
 
@@ -382,7 +389,8 @@ def _level_sigmas(levels: int) -> tuple[float, ...]:
     return tuple(sigmas)
 
 
-def _shrink_starlet(chan: np.ndarray, k: float, levels: int) -> np.ndarray:
+def _shrink_starlet(chan: np.ndarray, k: float, levels: int,
+                    restore: tuple[float, float] | None = None) -> np.ndarray:
     """Non-negative garrote shrinkage of ``chan``'s starlet detail levels.
 
     Garrote rather than the soft threshold it replaces: soft thresholding
@@ -400,6 +408,15 @@ def _shrink_starlet(chan: np.ndarray, k: float, levels: int) -> np.ndarray:
     unprocessed frame had 47. That flatness is the classical method's ceiling,
     not a bug to tune away — capping the threshold to leave grain was tried and
     made every speck metric worse, because the grain it leaves *is* noise.
+
+    ``restore`` is ``(fraction, limit_in_sigmas)`` and puts part of the finest
+    level back after shrinking it, clamped. That is the finest level only
+    because it is the analogue of what Sony's own RAW denoiser re-injects: it
+    smooths a lowpassed plane and then adds the original 3x3 high-pass back as
+    ``clamp(d * gain/256, ±limit)``. With the gain its bodies actually carry —
+    just under 1.0 — that stage ends up removing about a tenth of the fine
+    detail where this one removed most of it, which is the gap the parameter
+    exists to close (sony/rawnr.py, notes/static-rawnr.md 7.1).
     """
     sigmas = _level_sigmas(levels)
     cur = chan
@@ -408,6 +425,7 @@ def _shrink_starlet(chan: np.ndarray, k: float, levels: int) -> np.ndarray:
     for j in range(levels):
         nxt = _smooth(cur, 1 << j)
         w = cur - nxt
+        finest = w if j == 0 and restore is not None else None
         if j == 0:
             # Calibrate the noise scale from the finest level's MAD instead of
             # trusting the VST to land exactly on unit variance. The fitted gain
@@ -428,6 +446,15 @@ def _shrink_starlet(chan: np.ndarray, k: float, levels: int) -> np.ndarray:
             gate = 1.0 - (thr * thr) / np.maximum(w * w, 1e-12)
             np.maximum(gate, 0.0, out=gate)
             w = w * gate
+        if finest is not None:
+            # Put back a share of exactly what shrinkage took, not a share of
+            # the original: at a real edge the coefficient survives shrinkage
+            # almost intact, so there is nothing to give back and the edge is
+            # not sharpened. The clamp is the halo limiter, in units of this
+            # level's own noise so it means the same thing at any exposure.
+            fraction, limit_sigmas = restore
+            bound = limit_sigmas * sigmas[0] * scale
+            w = w + np.clip((finest - w) * fraction, -bound, bound)
         acc += w
         cur = nxt
     return acc + cur
@@ -573,7 +600,7 @@ class WaveletDenoiser:
 
     def __call__(
         self, planes: np.ndarray, sigma: float | None = None, cfa: Sequence[str] | None = None,
-        noise: NoiseCurve | None = None,
+        noise: NoiseCurve | None = None, detail: DetailRestore | None = None,
     ) -> np.ndarray:
         planes = np.clip(planes.astype(np.float32, copy=False), 0.0, 1.0)
         levels = self._levels_for(planes.shape[:2])
@@ -606,7 +633,7 @@ class WaveletDenoiser:
         if order is None:
             # Unknown CFA: no luma/chroma basis, shrink each plane on its own.
             out = np.stack(
-                [_shrink_starlet(stabilised[..., c], k, levels)
+                [_shrink_starlet(stabilised[..., c], k, levels, detail)
                  for c in range(stabilised.shape[-1])],
                 axis=-1,
             )
@@ -614,8 +641,13 @@ class WaveletDenoiser:
 
         basis = stabilised[..., list(order)] @ _LUMA_CHROMA.T
         ks = (k, k * self.CHROMA_BOOST, k * self.CHROMA_BOOST, k)
+        # Detail restore is a luma decision: Sony re-injects the mosaic's own
+        # high-pass, and putting fine chroma back is exactly the colour speckle
+        # the chroma boost above exists to remove.
+        restores = (detail, None, None, None)
         shrunk = np.stack(
-            [_shrink_starlet(basis[..., i], ks[i], levels) for i in range(4)], axis=-1,
+            [_shrink_starlet(basis[..., i], ks[i], levels, restores[i]) for i in range(4)],
+            axis=-1,
         )
         out = np.empty_like(stabilised)
         # Orthonormal, so the inverse rotation is just the transpose.
@@ -641,6 +673,8 @@ class DenoiseStats:
     #: rather than per request, so a frame that denoises unlike its neighbours
     #: is usually explained here.
     noise_source: str
+    #: Fraction of the finest level put back, or None when nothing was.
+    detail_restored: float | None = None
 
 
 def denoise_raw_inplace(
@@ -649,6 +683,7 @@ def denoise_raw_inplace(
     *,
     sigma: float | None = None,
     noise: NoiseCurve | None = None,
+    detail: DetailRestore | None = None,
 ) -> DenoiseStats | None:
     """Denoise ``raw``'s visible Bayer mosaic in place.
 
@@ -679,7 +714,7 @@ def denoise_raw_inplace(
     norm = (planes - black) / scale
     np.clip(norm, 0.0, 1.0, out=norm)
 
-    denoised = denoiser(norm, sigma, cfa, noise)
+    denoised = denoiser(norm, sigma, cfa, noise, detail)
 
     denoised = denoised * scale + black
     np.clip(denoised, 0.0, white, out=denoised)
@@ -695,6 +730,7 @@ def denoise_raw_inplace(
         white_level=int(white),
         sigma=sigma,
         noise_source="camera" if noise is not None else "sigma" if sigma is not None else "fitted",
+        detail_restored=None if detail is None else detail[0],
     )
 
 
