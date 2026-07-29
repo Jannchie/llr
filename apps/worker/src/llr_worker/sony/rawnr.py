@@ -29,17 +29,22 @@ Scope, stated plainly:
 * The tag -> calibration mapping is read out of Edit.exe's parser at
   `+0x1611a5` and up, one tag per slot with no clamping. The `>256` branch that
   sits just past it belongs to Sharpness (`sharpness.py`), not to this group.
-* These tags feed `ZcTaskRawNRHalf`. The kernel that actually runs on the
-  execution path, `ZcTaskRawNRSIMD`, is a *different* implementation — float32
-  AVX2 with a wider footprint — and its `exec` reads only the `0x1018..0x1028`
-  group. Whether it reaches these thresholds by another route is unknown, so
-  this module claims to expose the camera's noise model, not to reproduce what
-  Edit.exe renders.
+* **The curve is the one the shipped kernel uses.** `ZcTaskRawNRSIMD` builds
+  its threshold tables somewhere other than its `exec`, so this was in doubt
+  until they were read out of the running process: on two frames the captured
+  tables match what this module computes from the tags entry for entry
+  (11/45/53 at ISO 1250, 3/16/16 at ISO 100). See `rawnr_probe.py`.
+* What is *not* reproduced is the filter that consumes the curve. Sony's runs
+  on the Bayer mosaic split into four half-resolution phase planes, and its
+  per-pixel maths is still undecoded (PIPELINE.md 7.13.2). So this exposes the
+  camera's measurement for our own denoiser to use, and claims nothing about
+  matching Edit.exe's output.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -94,14 +99,20 @@ class NoiseModel:
         raw = (((x - self.lo) * self.slope) >> _SLOPE_SHIFT) + self.base
         return np.clip(raw, 0, ENGINE_FULL_SCALE)
 
-    def threshold_normalised(self, level: np.ndarray | float) -> np.ndarray:
-        """As :meth:`threshold`, but with both sides in [0, 1].
+    def noise_shape_at(self, level: np.ndarray | float) -> np.ndarray:
+        """How the noise *grows* with the level, in [0, 1], shape only.
 
-        The caller's plane must be black-subtracted and scaled so that 1.0 is
-        the sensor's white level — the domain `denoise.denoise_raw_inplace`
-        normalises to. That is the same domain the engine's plane is in *if* no
-        gain has been applied before this stage; nothing here verifies that, so
-        treat the absolute scale as approximate and the shape as exact.
+        This is :meth:`threshold` rescaled, and the name says shape rather than
+        sigma on purpose: the engine's number is a sigma filter's inclusion
+        radius, so it is proportional to the noise but by an unknown constant
+        that mixes in how much smoothing Sony wanted. Consumers must take the
+        curve's *shape* — how much noisier a highlight is than a shadow — and
+        get the absolute scale from the frame, which is the easy half to
+        measure and the half this cannot supply.
+
+        The caller's plane must be black-subtracted and scaled so 1.0 is the
+        sensor's white level, which is what `denoise.denoise_raw_inplace`
+        normalises to.
         """
         scaled = np.asarray(level, dtype=np.float64) * ENGINE_FULL_SCALE
         return self.threshold(scaled).astype(np.float64) / ENGINE_FULL_SCALE
@@ -120,6 +131,18 @@ def noise_model(path: str | Path, plane: int = 0) -> NoiseModel | None:
     """
     if not 0 <= plane < len(STRENGTH_TAGS):
         raise ValueError(f"plane must be 0..{len(STRENGTH_TAGS) - 1}, got {plane}")
+    try:
+        st = Path(path).stat()
+    except OSError:
+        return None
+    return _cached_model(str(path), st.st_size, int(st.st_mtime_ns), plane)
+
+
+@lru_cache(maxsize=8)
+def _cached_model(path: str, size: int, mtime: int, plane: int) -> NoiseModel | None:
+    # Keyed on the file's identity like sharpness._cached_calibration: reaching
+    # the tags means decrypting the SR2 block, and every render of the same file
+    # asks for the same answer.
     try:
         tags = read_sr2_scalars(path, _MODEL_TAGS)
     except Exception:

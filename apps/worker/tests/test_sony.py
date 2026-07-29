@@ -1721,7 +1721,7 @@ def test_the_normalised_curve_is_the_same_shape_in_unit_scale() -> None:
     model = noise_model(SAMPLE_FL)
     assert model is not None
     levels = np.array([0, 512, 2048, 8192, ENGINE_FULL_SCALE])
-    unit = model.threshold_normalised(levels / ENGINE_FULL_SCALE)
+    unit = model.noise_shape_at(levels / ENGINE_FULL_SCALE)
     assert unit == pytest.approx(model.threshold(levels) / ENGINE_FULL_SCALE)
     assert np.all(unit > 0.0) and np.all(unit < 1.0)
 
