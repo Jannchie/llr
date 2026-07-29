@@ -243,12 +243,13 @@ def read_sr2_scalars(path: str | Path, tags: Sequence[int]) -> dict[int, int]:
     own TIFF type and byte order rather than assumed to be little-endian SHORTs.
     """
     dec, sub_pos, endian = _decrypted_sr2(path)
+    want = set(tags)
     out: dict[int, int] = {}
-    for tag in tags:
-        e = _find_tag(dec, sub_pos, endian, tag)
-        if e is None:
+    # One walk collecting the whole group, rather than _find_tag's linear rescan
+    # from the IFD start per tag.
+    for tag, typ, cnt, vpos, _ in _ifd_entries(dec, sub_pos, endian):
+        if tag not in want:
             continue
-        typ, cnt, vpos, _ = e
         fmt = _SCALAR_FMT.get(typ)
         if fmt is None or cnt < 1:
             continue

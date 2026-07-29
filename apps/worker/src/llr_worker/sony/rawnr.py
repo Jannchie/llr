@@ -52,7 +52,10 @@ import numpy as np
 from .sr2 import read_sr2_scalars
 
 #: Full scale of the engine's working domain, and the ceiling it clamps
-#: thresholds to. The plane is black-subtracted, so 0 is black and this is white.
+#: thresholds to. The plane is black-subtracted, so 0 is black and this is
+#: white. The table the engine builds is 32768 entries long, but its filters
+#: clamp the level to this before indexing (`rawnr_simd.py`), so the top half
+#: is never reached and this — not the table's length — is the domain.
 ENGINE_FULL_SCALE = 0x3FFF
 
 LEVEL_LO_TAG = 0x78C5      # below this level the threshold is constant
@@ -61,8 +64,10 @@ BASE_COEFF_TAG = 0x78C7    # threshold at `lo`, before the strength scaling
 SLOPE_COEFF_TAG = 0x78C8   # rise per level, in 1/4096ths
 
 #: One strength per plane of the engine's three. Every checked-in frame has all
-#: three equal, so nothing here has yet been able to tell them apart; they are
-#: kept separate rather than collapsed so a frame that differs would show it.
+#: three equal — `test_sony.py` asserts it — so the model below reads the first
+#: and speaks for the whole frame. All three are still required to be present,
+#: so a body that carries only some of them falls through to the fitted path
+#: rather than being read on a partial group.
 STRENGTH_TAGS = (0x78C9, 0x78CA, 0x78CB)
 
 _MODEL_TAGS = (LEVEL_LO_TAG, LEVEL_HI_TAG, BASE_COEFF_TAG, SLOPE_COEFF_TAG,
@@ -117,29 +122,23 @@ class NoiseModel:
         scaled = np.asarray(level, dtype=np.float64) * ENGINE_FULL_SCALE
         return self.threshold(scaled).astype(np.float64) / ENGINE_FULL_SCALE
 
-    def table(self) -> np.ndarray:
-        """The engine's own 32768-entry lookup, for comparing against a dump."""
-        return self.threshold(np.arange(1 << 15, dtype=np.int64))
 
-
-def noise_model(path: str | Path, plane: int = 0) -> NoiseModel | None:
+def noise_model(path: str | Path) -> NoiseModel | None:
     """This shot's noise model, or None for anything that does not carry one.
 
     None covers every "not a Sony RAW with these tags" case — a JPEG, a DNG, a
     body that predates the group — because the caller's answer to all of them is
     the same: fall back to fitting the noise from the image.
     """
-    if not 0 <= plane < len(STRENGTH_TAGS):
-        raise ValueError(f"plane must be 0..{len(STRENGTH_TAGS) - 1}, got {plane}")
     try:
         st = Path(path).stat()
     except OSError:
         return None
-    return _cached_model(str(path), st.st_size, int(st.st_mtime_ns), plane)
+    return _cached_model(str(path), st.st_size, int(st.st_mtime_ns))
 
 
 @lru_cache(maxsize=8)
-def _cached_model(path: str, size: int, mtime: int, plane: int) -> NoiseModel | None:
+def _cached_model(path: str, size: int, mtime: int) -> NoiseModel | None:
     # Keyed on the file's identity like sharpness._cached_calibration: reaching
     # the tags means decrypting the SR2 block, and every render of the same file
     # asks for the same answer.
@@ -149,10 +148,10 @@ def _cached_model(path: str, size: int, mtime: int, plane: int) -> NoiseModel | 
         # The SR2 walk can fail at any step on a file that is not a Sony RAW,
         # not only at the missing-tag check.
         return None
-    if not all(t in tags for t in (*_MODEL_TAGS[:4], STRENGTH_TAGS[plane])):
+    if not all(t in tags for t in _MODEL_TAGS):
         return None
 
-    strength = tags[STRENGTH_TAGS[plane]]
+    strength = tags[STRENGTH_TAGS[0]]
     fold = strength * _COEFF_NUMERATOR
     return NoiseModel(
         lo=tags[LEVEL_LO_TAG],

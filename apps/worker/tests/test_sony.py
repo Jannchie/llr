@@ -21,6 +21,7 @@ from llr_worker.cli import (
     prepare_linear,
     read_exiftool_metadata,
 )
+from llr_worker.denoise import _CurveVST
 from llr_worker.sony import (
     LookTweaks,
     apply_look_overrides,
@@ -107,6 +108,7 @@ from llr_worker.sony.sr2 import (
     dro_curve,
     dro_strength,
     look_calibrations,
+    read_sr2_scalars,
     read_sr2_tag,
     unpack_param_block,
 )
@@ -1706,13 +1708,9 @@ def test_the_threshold_stops_climbing_in_the_highlights() -> None:
     assert len(set(above.tolist())) == 1
     assert above[0] > below[0]
 
-    # Monotone in between, and the table the engine builds is the same curve.
+    # Monotone in between.
     ramp = model.threshold(np.arange(model.lo, model.hi + 1))
     assert np.all(np.diff(ramp) >= 0)
-    table = model.table()
-    assert table.shape == (1 << 15,)
-    assert np.array_equal(table[: ENGINE_FULL_SCALE + 1],
-                          model.threshold(np.arange(ENGINE_FULL_SCALE + 1)))
 
 
 @requires_sample
@@ -1739,15 +1737,36 @@ def test_a_file_without_the_tags_has_no_noise_model() -> None:
 
 
 @requires_sample
-def test_asking_for_a_plane_that_does_not_exist_is_an_error() -> None:
-    """Three planes, and a fourth is a bug in the caller rather than a default.
+def test_the_three_plane_strengths_agree() -> None:
+    """The assumption `noise_model` rests on: one curve speaks for the frame.
 
-    Returning None here would be indistinguishable from "this file has no noise
-    model", which is exactly the case callers silently fall back on.
+    The engine keeps a strength per plane and this reads the first. That is only
+    honest while all three match, which they do on every frame checked in — so
+    assert it rather than leave it as a comment, and a body that ever splits
+    them fails here instead of being silently read on plane 0 alone.
     """
-    for plane in range(len(STRENGTH_TAGS)):
-        assert noise_model(SAMPLE_FL, plane) is not None
-    with pytest.raises(ValueError):
-        noise_model(SAMPLE_FL, len(STRENGTH_TAGS))
-    with pytest.raises(ValueError):
-        noise_model(SAMPLE_FL, -1)
+    for path in (SAMPLE_FL, SAMPLE_HIGH_ISO):
+        tags = read_sr2_scalars(path, STRENGTH_TAGS)
+        assert set(tags) == set(STRENGTH_TAGS)
+        assert len(set(tags.values())) == 1, f"{path.name}: strengths differ, {tags}"
+
+
+@requires_sample
+def test_the_camera_curve_stabilises_through_the_denoiser_it_feeds() -> None:
+    """The two halves only meet in cli.py, so bind them somewhere tested.
+
+    `NoiseModel` promises a `NoiseCurve`; this is the assertion that the real
+    one — integer thresholds off a real frame, flat top and all — actually
+    drives `_CurveVST` to equal noise at every brightness, which is the whole
+    point of reading it.
+    """
+    model = noise_model(SAMPLE_HIGH_ISO)
+    assert model is not None
+    vst = _CurveVST(model)
+    rng = np.random.default_rng(7)
+    stds = []
+    for level in (0.02, 0.1, 0.5, 0.95):
+        sigma = float(model.noise_shape_at(np.array(level)))
+        s = (level + rng.normal(0.0, sigma, 40000)).astype(np.float32)
+        stds.append(float(vst.forward(s).std()))
+    assert max(stds) / min(stds) < 1.15
