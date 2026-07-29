@@ -13,7 +13,7 @@ r"""抓 `ZcTaskRawNRSIMD` 的六张阈值表和它的参数块。
 
     python rawnr_probe.py <ARW> [--secs 40]
 
-输出 rawnr_tables.npz: tbl0..tbl5 (int32[32768]) / params (int32[64]) / source
+输出 rawnr_tables_<stem>.npz: tbl0..tbl5 (int32[32768]) / params (int32[64]) / source
 """
 import os
 import subprocess

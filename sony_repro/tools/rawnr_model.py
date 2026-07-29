@@ -15,28 +15,42 @@ import os
 import subprocess
 import sys
 
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_ROOT, "apps", "worker", "src"))
 
+from llr_worker.sony.rawnr import (  # noqa: E402
+    BASE_COEFF_TAG,
+    SLOPE_COEFF_TAG,
+    STRENGTH_TAGS,
+    noise_model,
+)
 from rawnr_ref import threshold_table  # noqa: E402
 from sony_repro.sr2 import _decrypted_sr2, read_ifd  # noqa: E402
 
-LO, HI, BASE_K, SLOPE_K = 0x78C5, 0x78C6, 0x78C7, 0x78C8
-STRENGTH = (0x78C9, 0x78CA, 0x78CB)
+# 出厂模块只建阈值曲线,不碰 GAIN / LIMIT —— 那是滤波器的参数,不是噪声模型的,
+# 所以这两组标签留在这里读。
 GAIN = (0x78CC, 0x78CD, 0x78CE)
 LIMIT = (0x78CF, 0x78D0, 0x78D1)
 PROBES = (0, 256, 1024, 2048, 8192)
 
 
 def model(path, plane=0):
+    """lo/hi/base/slope **由 `llr_worker.sony.rawnr` 算**,这里只补它不管的项。
+
+    这样这张 ISO 横扫就不是另一份平行实现,而是对出货那份的实测检查 ——
+    改坏了 `rawnr.py`,这里会跟着变。
+    """
+    nm = noise_model(path)
+    if nm is None:
+        raise SystemExit(f"{path}:读不到噪声模型标签")
     dec, sub, endian = _decrypted_sr2(path)
     f = read_ifd(dec, sub, endian)
-    strength = f[STRENGTH[plane]]
     return {
-        "lo": f[LO], "hi": f[HI],
-        "base": strength * f[BASE_K] * 3 >> 8,
-        "slope": strength * f[SLOPE_K] * 3 >> 8,
-        "strength": strength, "base_k": f[BASE_K], "slope_k": f[SLOPE_K],
+        "lo": nm.lo, "hi": nm.hi, "base": nm.base, "slope": nm.slope,
+        "strength": f[STRENGTH_TAGS[plane]],
+        "base_k": f[BASE_COEFF_TAG], "slope_k": f[SLOPE_COEFF_TAG],
         "gain": f[GAIN[plane]], "limit": f[LIMIT[plane]],
     }
 

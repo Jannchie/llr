@@ -1,30 +1,37 @@
-r"""拿 `tile_dump.py` 抓的 RawNRSIMD 入口/出口,反推它到底在算什么。
+r"""拿 `tile_dump.py` 抓的 RawNRSIMD 入口/出口,量它的**支撑集有多大**。
 
 前提(已确认,见 notes/static-rawnr.md):它的阈值表就是 ARW 噪声模型那张
 (`rawnr_probe.py` 抓的 tbl0 与 `rawnr_model.py` 算的逐项一致),细节增益 256(=1.0),
-限幅 1023。剩下要定的是**算子形状**:参考值是什么、支撑集多大、哪些抽头参与。
+限幅 1023。
+
+范围只到「线性核能看出什么」为止。**算子形状本身已经不用猜了** ——
+`rawnr_simd.py` 逐位复刻了 R/B 那条路(99.97%),见 notes/static-rawnr.md 5.3;
+早先在这里按 RawNRHalf 的形状穷举候选,最好的也只解释掉 12.8%,那批扫描连同
+结论都已被取代,不再保留。
 
 用法::
 
-    python rawnr_fit.py tiles_NR_fl1250.npz rawnr_tables.npz [--tile 12]
+    python rawnr_fit.py tiles_NR_fl1250.npz rawnr_tables_fl_test.npz [--tile=12]
 """
 import os
 import sys
 
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from rawnr_ref import shifted  # noqa: E402
+
 SCR = os.path.dirname(os.path.abspath(__file__))
+
+#: 拟合时的行抽样步长。168 个未知数不需要一百多万条方程,而稠密设计矩阵在
+#: r=6 时是 1.6 GB(加上 lstsq 自己的副本能到 5 GB);抽样后结果看不出差别。
+ROW_STRIDE = 8
 
 
 def opt(name, default):
     return next((a.split("=", 1)[1] for a in sys.argv if a.startswith(f"--{name}=")),
                 default)
-
-
-def shifted(a, dy, dx, r):
-    """a 平移 (dy,dx) 后的内部区域;r 是四周留出的边距。"""
-    h, w = a.shape
-    return a[r + dy:h - r + dy, r + dx:w - r + dx]
 
 
 def linear_fit(src, delta, radius):
@@ -35,15 +42,11 @@ def linear_fit(src, delta, radius):
     """
     r = radius
     c = shifted(src, 0, 0, r)
-    cols, keys = [], []
-    for dy in range(-r, r + 1):
-        for dx in range(-r, r + 1):
-            if dy == 0 and dx == 0:
-                continue
-            cols.append((shifted(src, dy, dx, r) - c).ravel())
-            keys.append((dy, dx))
-    a = np.stack(cols, axis=1).astype(np.float64)
-    y = shifted(delta, 0, 0, r).ravel().astype(np.float64)
+    keys = [(dy, dx) for dy in range(-r, r + 1) for dx in range(-r, r + 1) if dy or dx]
+    a = np.empty((c[::ROW_STRIDE].size, len(keys)), np.float64)
+    for i, (dy, dx) in enumerate(keys):
+        a[:, i] = (shifted(src, dy, dx, r) - c)[::ROW_STRIDE].ravel()
+    y = shifted(delta, 0, 0, r)[::ROW_STRIDE].ravel().astype(np.float64)
     coef, *_ = np.linalg.lstsq(a, y, rcond=None)
     resid = y - a @ coef
     ker = np.zeros((2 * r + 1, 2 * r + 1))
@@ -52,49 +55,11 @@ def linear_fit(src, delta, radius):
     return ker, float(resid.std())
 
 
-def candidate(src, thr, radius, gain, limit, skip_cross, ref_mode):
-    """按 RawNRHalf 那套形状算一遍,支撑半径/是否跳过中心行列/参考值可换。
-
-    要定的就是这几个自由度 —— 阈值表、增益、限幅都已经从进程里抓到了。
-    """
-    r = radius
-    a = src
-    c = shifted(a, 0, 0, r)
-    if ref_mode == "binomial":
-        n4 = (shifted(a, -1, 0, r) + shifted(a, 1, 0, r)
-              + shifted(a, 0, -1, r) + shifted(a, 0, 1, r))
-        diag = (shifted(a, -1, -1, r) + shifted(a, -1, 1, r)
-                + shifted(a, 1, -1, r) + shifted(a, 1, 1, r))
-        hp = 12 * c - 2 * n4 - diag
-        d = np.sign(hp) * (np.abs(hp) >> 4)
-        lo = c - d
-    else:                                    # 参考值就是中心像素
-        lo, d = c, np.zeros_like(c)
-
-    ref = np.clip(lo, 0, (1 << 15) - 1)
-    t = thr[ref]
-    total = np.zeros_like(ref)
-    count = np.zeros_like(ref)
-    for dy in range(-r, r + 1):
-        for dx in range(-r, r + 1):
-            if dy == 0 and dx == 0:
-                continue
-            if skip_cross and (dy == 0 or dx == 0):
-                continue
-            v = shifted(a, dy, dx, r)
-            ok = np.abs(v - ref) < t
-            total += np.where(ok, v, 0)
-            count += ok
-    mean = (ref + total) // (count + 1)
-    boost = np.clip((d * gain) >> 8, -limit, limit)
-    return np.clip(mean + boost, 0, 0x3FFF), r
-
-
 def main():
     tiles = np.load(sys.argv[1] if len(sys.argv) > 1
                     else os.path.join(SCR, "tiles_NR_fl1250.npz"))
     tables = np.load(sys.argv[2] if len(sys.argv) > 2
-                     else os.path.join(SCR, "rawnr_tables.npz"))
+                     else os.path.join(SCR, "rawnr_tables_fl_test.npz"))
     tile = opt("tile", "12")
     src = tiles[f"t{tile}_in"][..., 0].astype(np.int64)
     dst = tiles[f"t{tile}_out"][..., 0].astype(np.int64)
@@ -118,16 +83,14 @@ def main():
 
     # 支撑集:逐半径拟合,残差不再下降的地方就是它的实际边界
     print("\n线性核拟合(残差 std,越低说明该半径解释得越多):")
-    kers = {}
     for r in (1, 2, 3, 4, 5, 6):
-        ker, resid = linear_fit(src, delta, r)
-        kers[r] = ker
+        _, resid = linear_fit(src, delta, r)
         print(f"  {2 * r + 1}x{2 * r + 1}  残差 {resid:7.3f}   "
               f"(delta std {delta.std():.3f})")
 
-    # 奇偶结构:CFA 上同相位的抽头才有权重
-    ker = kers[3]
+    # 奇偶结构:CFA 上同相位的抽头才有权重。7x7 够看出这一点,单独再算一次。
     r = 3
+    ker, _ = linear_fit(src, delta, r)
     even = [(dy, dx) for dy in range(-r, r + 1) for dx in range(-r, r + 1)
             if (dy or dx) and dy % 2 == 0 and dx % 2 == 0]
     odd = [(dy, dx) for dy in range(-r, r + 1) for dx in range(-r, r + 1)
@@ -138,28 +101,8 @@ def main():
           f"比值 {ew / max(ow, 1e-12):.1f}")
     np.set_printoptions(precision=4, suppress=True, linewidth=200)
     print(ker)
-
-    # 这一层是 **CFA 马赛克**(奇数间隔的差是偶数间隔的四倍),所以算子必须逐相位。
-    # 跨相位的抽头拿去比阈值只会全被拒,把它们算进来的候选一律不成立。
-    print("\n候选算子 vs 真值(逐相位,残差越小越像):")
-    print(f"  {'参考值':10} {'半径':>4} {'跳中心行列':>10} {'残差 std':>9} {'解释掉':>7}")
-    best = None
-    for ref_mode in ("binomial", "centre"):
-        for r in (1, 2, 3, 4):
-            for skip in (True, False):
-                out = dst.copy()
-                for py in (0, 1):
-                    for px in (0, 1):
-                        got, rr = candidate(src[py::2, px::2], thr, r, 256, 1023,
-                                            skip, ref_mode)
-                        out[py::2, px::2][rr:-rr or None, rr:-rr or None] = got
-                keep = 2 * max((1, 2, 3, 4))
-                resid = float((out - dst)[keep:-keep, keep:-keep].std())
-                frac = 1 - (resid / delta[keep:-keep, keep:-keep].std()) ** 2
-                print(f"  {ref_mode:10} {r:>4} {str(skip):>10} {resid:>9.3f} {frac:>6.1%}")
-                if best is None or resid < best[0]:
-                    best = (resid, ref_mode, r, skip)
-    print(f"  最佳:{best[1]} 半径{best[2]} 跳中心行列={best[3]}  残差 {best[0]:.3f}")
+    # 这一层是 **CFA 马赛克**(奇数间隔的差是偶数间隔的四倍),所以算子必须逐相位;
+    # 跨相位的抽头拿去比阈值只会全被拒。逐相位的逐位复刻见 rawnr_simd.py。
 
 
 if __name__ == "__main__":

@@ -22,9 +22,14 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "apps", "worker", "src"))
 
-LEVEL_MAX = 0x7FFF      # 阈值表的下标域
-OUT_MAX = 0x3FFF        # 输出钳位,也是引擎的满刻度
+from llr_worker.sony.rawnr import ENGINE_FULL_SCALE, NoiseModel  # noqa: E402
+
+LEVEL_MAX = 0x7FFF          # 阈值表的下标域
+OUT_MAX = ENGINE_FULL_SCALE  # 输出钳位,也是引擎的满刻度
 
 # 逐平面的参数,来自 calib(标签见 sony/rawnr.py 的注释)
 #   OFFSET  plane0 = c[0x1018]-c[0x1020]   plane1 = c[0x1018]-c[0x1028]-c[0x101c]
@@ -33,10 +38,13 @@ OUT_MAX = 0x3FFF        # 输出钳位,也是引擎的满刻度
 #   LIMIT   c[0x1054] / c[0x1058] / c[0x105c]      细节限幅
 
 
-def _neighbours(a, dy, dx):
-    """把 a 平移 (dy, dx) —— 只在内部区域取值,所以不补边。"""
+def shifted(a, dy, dx, r=2):
+    """把 a 平移 (dy, dx) —— 只在内部区域取值,所以不补边。r 是四周留出的边距。
+
+    这一族工具都要它,所以放在这里一份,`rawnr_fit` / `rawnr_simd` 直接导入。
+    """
     h, w = a.shape
-    return a[2 + dy:h - 2 + dy, 2 + dx:w - 2 + dx]
+    return a[r + dy:h - r + dy, r + dx:w - r + dx]
 
 
 def impulse_clamp(src):
@@ -47,11 +55,11 @@ def impulse_clamp(src):
     最细尺度上的孤立点,而不是噪声。
     """
     a = src.astype(np.int64)
-    stack = np.stack([_neighbours(a, -1, 0), _neighbours(a, 1, 0),
-                      _neighbours(a, 0, -1), _neighbours(a, 0, 1)])
+    stack = np.stack([shifted(a, -1, 0), shifted(a, 1, 0),
+                      shifted(a, 0, -1), shifted(a, 0, 1)])
     stack.sort(axis=0)
     out = a.copy()
-    core = _neighbours(a, 0, 0)
+    core = shifted(a, 0, 0)
     out[2:-2, 2:-2] = np.clip(core, stack[1], stack[2])
     return out
 
@@ -63,11 +71,11 @@ def _detail(a):
     (`cdq; and edx,0xf; add; sar` 就是这个惯用法,不是向下取整)。于是
     ``lo = c - hp/16`` 恰好是 3x3 二项式核 ``[[1,2,1],[2,4,2],[1,2,1]]/16``。
     """
-    c = _neighbours(a, 0, 0)
-    n4 = (_neighbours(a, -1, 0) + _neighbours(a, 1, 0)
-          + _neighbours(a, 0, -1) + _neighbours(a, 0, 1))
-    diag = (_neighbours(a, -1, -1) + _neighbours(a, -1, 1)
-            + _neighbours(a, 1, -1) + _neighbours(a, 1, 1))
+    c = shifted(a, 0, 0)
+    n4 = (shifted(a, -1, 0) + shifted(a, 1, 0)
+          + shifted(a, 0, -1) + shifted(a, 0, 1))
+    diag = (shifted(a, -1, -1) + shifted(a, -1, 1)
+            + shifted(a, 1, -1) + shifted(a, 1, 1))
     hp = 12 * c - 2 * n4 - diag
     d = np.sign(hp) * (np.abs(hp) >> 4)     # 向零取整,不能用 >> 4
     return d, c - d
@@ -91,7 +99,7 @@ def sigma_filter(src, thr_table, offset, gain, limit):
     count = np.zeros_like(ref)
     for dy in (-2, -1, 1, 2):
         for dx in (-2, -1, 1, 2):
-            v = _neighbours(a, dy, dx)
+            v = shifted(a, dy, dx)
             ok = np.abs(v - ref) < thr
             total += np.where(ok, v, 0)
             count += ok
@@ -105,10 +113,13 @@ def sigma_filter(src, thr_table, offset, gain, limit):
 
 
 def threshold_table(lo, hi, base, slope):
-    """引擎那张 32768 项表。base/slope 已经把平面强度折进去了。"""
-    v = np.arange(1 << 15, dtype=np.int64)
-    x = np.clip(v, lo, hi)
-    return np.clip((((x - lo) * slope) >> 12) + base, 0, OUT_MAX)
+    """引擎那张 32768 项表。base/slope 已经把平面强度折进去了。
+
+    公式**走出厂的 `llr_worker.sony.rawnr`**,不在这里另写一份 —— 理由同
+    `tone_verify.py`:这个工具的价值就在于验的是出货代码,验本地副本等于没验。
+    """
+    return NoiseModel(lo=lo, hi=hi, base=base, slope=slope).threshold(
+        np.arange(1 << 15, dtype=np.int64))
 
 
 def denoise_plane(src, table, offset=0, gain=256, limit=1023):

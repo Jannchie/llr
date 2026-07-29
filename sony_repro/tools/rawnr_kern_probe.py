@@ -26,7 +26,7 @@ r"""把 `0x3a1b00`(RawNRSIMD 的 R/B 滤波核)的**全部输入与输出**整�
     python rawnr_kern_probe.py <ARW> [--skip 0] [--which 0] [--secs 60]
 
 `--skip` 跳过前几次滤波调用;`--which` 选一个 exec 里的第几路(0/1 是两路 R/B)。
-输出 rawnr_kern_<stem>_s<skip>w<which>.npz:
+输出 rawnr_kern_<stem>_<rb|g>_s<skip>w<which>.npz(`rawnr_simd.CAPTURE` 是默认那个):
 mosaic / detail / ref / out, tbl0 / tbl3, 标量参数
 """
 import os
