@@ -1742,6 +1742,11 @@ def _read_exiftool_metadata_cached(path: str, size: int, mtime_ns: int) -> dict[
                 # unqualified request returns that one instead of the ladder.
                 "-Sony:Sharpness",
                 "-Sony:SharpnessRange",
+                # Spica's detail gain rolls off with sensitivity (spica.py), and
+                # without this it never saw an ISO at all — so the roll-off never
+                # happened and high-ISO frames got the full fine-detail boost
+                # applied straight to their noise.
+                "-ISO",
                 # DRO is a whole stage (ZcTaskVatr) that this pipeline does not
                 # reproduce, and it runs only when the shot asked for it.
                 # Knowing which shots those are is the difference between a
@@ -1781,6 +1786,7 @@ def _read_exiftool_metadata_cached(path: str, size: int, mtime_ns: int) -> dict[
         "Clarity",
         "Sharpness",
         "SharpnessRange",
+        "ISO",
         "DynamicRangeOptimizer",
     ]:
         out[key] = record.get(key)

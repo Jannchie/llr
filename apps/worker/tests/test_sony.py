@@ -20,6 +20,7 @@ from llr_worker.cli import (
     dro_from_exif,
     prepare_linear,
     read_exiftool_metadata,
+    spica_from_exif,
 )
 from llr_worker.denoise import _CurveVST
 from llr_worker.sony import (
@@ -1638,6 +1639,22 @@ def test_spica_is_weighted_against_sharpening_rather_than_beside_it() -> None:
     assert spica_amount(SHARPNESS_DEFAULT, -1) > spica_amount(SHARPNESS_DEFAULT,
                                                               SHARPNESS_RANGE_DEFAULT)
     assert spica_off()["amount"] == 0.0
+
+
+@requires_sample
+def test_the_iso_actually_reaches_spica() -> None:
+    """The gain curve was right and nothing ever fed it an ISO.
+
+    `spica_iso_gain` had tests; the wiring did not, so the exiftool call simply
+    never asked for -ISO and every frame got the un-attenuated fine-detail
+    boost. Reading the tag is what this asserts — testing the pure function
+    again would not have caught it.
+    """
+    exif = read_exiftool_metadata(SAMPLE_FL)
+    assert exif.get("ISO"), "ISO missing from the exif read"
+    block = spica_from_exif(exif)
+    assert block is not None
+    assert block["isoGain"] == pytest.approx(spica_iso_gain(int(exif["ISO"])))
 
 
 def test_spica_iso_gain_bends_only_above_the_knee() -> None:

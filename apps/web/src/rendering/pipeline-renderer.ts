@@ -173,6 +173,11 @@ type SonyPostTargets = {
   // this and `scene`, so whichever it wrote last is the one the compose reads.
   // Null when Spica is off, which is when nothing needs an intermediate.
   mid: RenderTarget | null;
+  // Render texels per source pixel, capped at 1. Sharpening and Spica step in
+  // scene texels, so at a reduced preview scale their kernel reaches across
+  // several sensor pixels instead of three and they hit far harder than the
+  // camera does; `detailScale` is what corrects for that. See runSonyPost.
+  detailScale: number;
 };
 export type ProfileCurve =
   | {
@@ -993,6 +998,8 @@ export class PipelineRenderer {
     const float = this.sceneNeedsFloat();
     const scene = this.cachedSceneTarget(w, h, float);
     if (!scene) return null;
+    const zoom = Math.hypot(xform[0], xform[1]) || 1;
+    const detailScale = Math.min(1, w / Math.max(1, this.texWidth * zoom));
     // Spica needs its programs, its tables and the intermediate all present; if
     // any of them will not build, the rest of the chain still runs without it
     // rather than the whole post pass disappearing.
@@ -1001,16 +1008,15 @@ export class PipelineRenderer {
       mid = this.cachedMidTarget(w, h, float);
     }
     if (this.sonySpica && !mid) this.sonySpica = null;
-    if (!this.sonyClarity) return { scene, base: null, mid };
+    if (!this.sonyClarity) return { scene, base: null, mid, detailScale };
     if (!this.postProgram("down") || !this.postProgram("edge") || !this.postProgram("blur")) return null;
 
-    const zoom = Math.hypot(xform[0], xform[1]) || 1;
     const down = this.sonyClarity.downsample;
     const bw = Math.max(1, Math.min(w, Math.round((this.texWidth * zoom) / down)));
     const bh = Math.max(1, Math.min(h, Math.round((this.texHeight * zoom) / down)));
     const pair = this.cachedBasePair(bw, bh);
     if (!pair) return null;
-    return { scene, base: { pair, w: bw, h: bh }, mid };
+    return { scene, base: { pair, w: bw, h: bh }, mid, detailScale };
   }
 
   /**
@@ -1221,7 +1227,18 @@ export class PipelineRenderer {
     // Which buffer the compose finally reads. Without Spica it is the scene
     // itself and nothing below runs.
     let src = scene;
-    const sharpenAmount = this.sonySharpen?.amount ?? 0;
+    // Both kernels step in scene texels, so a preview rendered at a fraction of
+    // the source reaches across that many more sensor pixels — and the camera's
+    // deadzone, an absolute threshold on the high-pass, stops holding flat areas
+    // back. Measured against the engine's own tiles (sharpen at full resolution
+    // then downsample, versus downsample then sharpen) the preview came out
+    // 2.9-3.5x too strong at 1/2, 8-13x at 1/4 and 24-49x at 1/8 — i.e. roughly
+    // (1/scale)^1.75, which is what the exponent undoes. It is a fit, not a
+    // derivation: the true ratio depends on how much fine structure the frame
+    // holds, and it spans that 8-13 at a single scale. Exports render at source
+    // resolution, where the scale is 1 and none of this applies.
+    const detail = Math.pow(t.detailScale, 1.75);
+    const sharpenAmount = (this.sonySharpen?.amount ?? 0) * detail;
     if (mid) {
       if (sharpenAmount > 0) {
         // Sharpening alone into `mid`: u_gain is already 0 unless Clarity is
@@ -1237,6 +1254,12 @@ export class PipelineRenderer {
       const dst = src === scene ? mid : scene;
       this.blitQuad(spica.prog, src.tex, dst.fbo, () => {
         gl.uniform2f(spica.u["u_sceneTexel"]!, 1 / w, 1 / h);
+        // Same correction, and Spica needs it more: its range threshold and the
+        // three curve breakpoints are all calibrated against the amplitude of a
+        // sensor-pixel neighbourhood, so a stretched kernel lands them on the
+        // wrong segment as well as overshooting. Set here rather than with the
+        // other uniforms because only this scope knows the render scale.
+        gl.uniform1f(spica.u["u_amount"]!, (this.sonySpica?.amount ?? 0) * detail);
         gl.activeTexture(gl.TEXTURE1);
         gl.bindTexture(gl.TEXTURE_2D, this.spicaWeightTex);
         gl.activeTexture(gl.TEXTURE2);
