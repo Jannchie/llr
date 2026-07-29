@@ -260,6 +260,25 @@ class _VST:
         return (np.square(g * t * 0.5) - 0.125 * g * g - self.read_var) / g
 
 
+def _lerp_uniform(x: np.ndarray, table: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """``table`` sampled at ``x``, where it covers [lo, hi] at an even spacing.
+
+    ``np.interp`` does the same job for an arbitrary table, but it has to search
+    for each sample's interval and it computes in float64 — on a full frame that
+    is both several times slower and twice the memory. An even grid needs no
+    search. Out-of-range input clamps to the end values, as ``np.interp`` does.
+    """
+    n = table.shape[0] - 1
+    u = np.clip((np.asarray(x, dtype=np.float32) - lo) * np.float32(n / (hi - lo)),
+                0.0, np.float32(n))
+    i = u.astype(np.int32)
+    np.minimum(i, n - 1, out=i)
+    # Back through float32 rather than subtracting the int array directly, which
+    # numpy would promote to float64 and double the memory for no accuracy.
+    f = u - i.astype(np.float32)
+    return table[i] * (np.float32(1.0) - f) + table[i + 1] * f
+
+
 class _CurveVST:
     """Variance-stabilising transform for an arbitrary measured noise shape.
 
@@ -280,8 +299,9 @@ class _CurveVST:
     :class:`NoiseCurve` promise shape alone.
     """
 
-    #: Samples across [0, 1]. The curve is piecewise linear with two knees, so
-    #: this only has to be fine enough not to round the knees off.
+    #: Samples across each direction's domain. The curve is piecewise linear
+    #: with two knees, so this only has to be fine enough not to round the knees
+    #: off.
     GRID = 4096
 
     def __init__(self, curve: NoiseCurve) -> None:
@@ -293,16 +313,23 @@ class _CurveVST:
         sigma = np.maximum(sigma, 1e-9)
         step = y[1] - y[0]
         t = np.concatenate(([0.0], np.cumsum((1.0 / sigma[:-1] + 1.0 / sigma[1:]) * 0.5 * step)))
-        self._y = y
-        self._t = t
+
+        # T is strictly increasing (sigma > 0), so it inverts by resampling y
+        # onto an even grid in T. Doing that here rather than interpolating
+        # against the uneven table at call time makes *both* directions a lookup
+        # on a uniform grid, which is a multiply and a lerp instead of a binary
+        # search per pixel — on a 24 MP frame, tenths of a second rather than
+        # seconds, and it keeps the whole thing in float32.
+        self._t_max = float(t[-1])
+        self._forward = t.astype(np.float32)
+        self._backward = np.interp(
+            np.linspace(0.0, self._t_max, self.GRID), t, y).astype(np.float32)
 
     def forward(self, y: np.ndarray) -> np.ndarray:
-        return np.interp(y, self._y, self._t).astype(np.float32, copy=False)
+        return _lerp_uniform(y, self._forward, 0.0, 1.0)
 
     def inverse(self, t: np.ndarray) -> np.ndarray:
-        # T is strictly increasing (sigma > 0), so interpolating it backwards is
-        # a genuine inverse rather than an approximation.
-        return np.interp(t, self._t, self._y).astype(np.float32, copy=False)
+        return _lerp_uniform(t, self._backward, 0.0, self._t_max)
 
 
 # ── Starlet (undecimated isotropic wavelet) shrinkage ──────────────────────
@@ -482,10 +509,11 @@ class WaveletDenoiser:
 
     Three things drive the quality:
 
-    1. *The VST matches the sensor.* Noise is fitted per frame as
-       ``var = gain*mean + read_var`` and stabilised with the generalised
-       Anscombe transform, which stays valid in the shadows where the read floor
-       dominates and a pure-Poisson ``sqrt`` does not.
+    1. *The VST matches the sensor.* Given a measured :class:`NoiseCurve` the
+       stabilising integral is taken over that shape directly; otherwise noise
+       is fitted per frame as ``var = gain*mean + read_var`` and stabilised with
+       the generalised Anscombe transform, which stays valid in the shadows
+       where the read floor dominates and a pure-Poisson ``sqrt`` does not.
 
     2. *Shrinkage is undecimated and garrote.* The à trous transform has no
        critical sampling, so no ringing or checkerboarding; garrote keeps large
@@ -522,7 +550,6 @@ class WaveletDenoiser:
     #: amplified by a 2.4x white-balance gain and the camera matrix.
     CHROMA_BOOST = 2.0
 
-
     #: Detail levels to shrink. Measured on real frames, sensor noise is close to
     #: white (its std halves per 2x downsample), so there is nothing to gain past
     #: the ~16 px scale that 4 levels reach — only detail to lose.
@@ -533,7 +560,6 @@ class WaveletDenoiser:
     #: local min/max, so this only has to catch what garrote would otherwise
     #: preserve perfectly.
     IMPULSE_SIGMAS = 3.0
-
 
     def __init__(self, strength: float = 1.0, levels: int | None = None) -> None:
         self.strength = strength
@@ -569,12 +595,11 @@ class WaveletDenoiser:
         # the transform spreads them over several levels. Keep the *input* noise
         # scale — after shrinkage the local spread is far smaller, and measuring
         # it there would produce a threshold that eats real detail.
-        noise = np.array([_neighbour_sigma(stabilised[..., c])
-                          for c in range(stabilised.shape[-1])], dtype=np.float32)
         if self.IMPULSE_SIGMAS > 0:
             for c in range(stabilised.shape[-1]):
+                plane = stabilised[..., c]
                 stabilised[..., c] = _clamp_impulses(
-                    stabilised[..., c], float(noise[c]), self.IMPULSE_SIGMAS)
+                    plane, _neighbour_sigma(plane), self.IMPULSE_SIGMAS)
 
         k = self.K * self.strength
         order = canonical_plane_order(cfa)
@@ -610,10 +635,11 @@ class DenoiseStats:
     black_levels: list[float]
     white_level: int
     sigma: float | None
-    #: Where the noise model came from: the camera's own curve, an explicit
-    #: sigma, or a fit of the frame. Worth recording because it is the one
-    #: input that varies per *file* rather than per request, so a frame that
-    #: denoises unlike its neighbours is usually explained here.
+    #: Which noise input was supplied: the camera's own curve, an explicit
+    #: sigma, or neither (leaving the denoiser to fit one from the frame).
+    #: Worth recording because it is the one input that varies per *file*
+    #: rather than per request, so a frame that denoises unlike its neighbours
+    #: is usually explained here.
     noise_source: str
 
 
@@ -668,8 +694,7 @@ def denoise_raw_inplace(
         black_levels=[float(b) for b in black],
         white_level=int(white),
         sigma=sigma,
-        noise_source="camera" if noise is not None else
-                     ("sigma" if sigma is not None else "fitted"),
+        noise_source="camera" if noise is not None else "sigma" if sigma is not None else "fitted",
     )
 
 

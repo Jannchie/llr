@@ -268,12 +268,10 @@ class _FlatThenRamp:
     exists.
     """
 
-    def __init__(self, floor: float = 2e-4, top: float = 1e-3, knee: float = 0.125) -> None:
-        self.floor, self.top, self.knee = floor, top, knee
+    FLOOR, TOP, KNEE = 2e-4, 1e-3, 0.125
 
     def noise_shape_at(self, level: np.ndarray) -> np.ndarray:
-        ramp = self.floor + (self.top - self.floor) * np.clip(level / self.knee, 0.0, 1.0)
-        return ramp
+        return self.FLOOR + (self.TOP - self.FLOOR) * np.clip(level / self.KNEE, 0.0, 1.0)
 
 
 def test_curve_vst_flattens_a_shape_no_poisson_fit_could_hold() -> None:
@@ -319,25 +317,21 @@ def test_a_zero_noise_curve_does_not_blow_the_transform_up() -> None:
     assert np.allclose(vst.inverse(out), y, atol=1e-3)
 
 
-def test_a_measured_curve_reaches_the_denoiser_and_changes_the_result() -> None:
-    """Wiring test: the curve must actually steer the output, not ride along.
+def test_a_measured_curve_reaches_the_denoiser_and_denoises() -> None:
+    """The curve path has to be a working denoiser, not merely a different one.
 
-    A parameter that is accepted and ignored is the failure this asserts
-    against — same frame, same seed, one with the curve and one without, and
-    the two results have to differ.
+    Separate from the "beats the fit" test below because it needs the opposite
+    frame: noise well above the texture, where shrinkage is unambiguously a win.
+    That test's frame is deliberately quiet, so it cannot assert this.
     """
     rng = np.random.default_rng(5)
     clean = np.linspace(0.05, 0.95, 64 * 64).reshape(64, 64).astype(np.float32)
     planes = np.stack([clean + rng.normal(0, 0.004, clean.shape) for _ in range(4)], axis=-1)
     planes = np.clip(planes.astype(np.float32), 0.0, 1.0)
 
-    dn = WaveletDenoiser()
-    fitted = dn(planes.copy(), None, ["R", "G", "G", "B"], None)
-    measured = dn(planes.copy(), None, ["R", "G", "G", "B"], _FlatThenRamp())
-    assert not np.allclose(fitted, measured)
-    # Both still have to be denoisers, not just different.
-    for out in (fitted, measured):
-        assert np.abs(out - clean[..., None]).mean() < np.abs(planes - clean[..., None]).mean()
+    measured = WaveletDenoiser()(planes.copy(), None, ["R", "G", "G", "B"], _FlatThenRamp())
+    truth = clean[..., None]
+    assert np.abs(measured - truth).mean() < np.abs(planes - truth).mean()
 
 
 def test_denoise_stats_say_where_the_noise_model_came_from() -> None:
@@ -364,6 +358,11 @@ def test_the_measured_curve_beats_a_fit_where_the_fit_cannot_reach() -> None:
     noisy. Measured against the truth, the camera's curve has to come out ahead
     there; elsewhere the two should be close, which is why this compares the
     bright end rather than the whole frame.
+
+    The frame is deliberately quiet, so it cannot also carry the "still a
+    denoiser" claim — with noise this far below the texture, shrinkage costs
+    more than it removes. That claim needs a noisy frame, which is what
+    `test_a_measured_curve_reaches_the_denoiser_and_denoises` uses.
     """
     rng = np.random.default_rng(101)
     curve = _FlatThenRamp()
