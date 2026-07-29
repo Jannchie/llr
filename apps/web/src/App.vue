@@ -721,6 +721,14 @@ const embeddedTransform = computed(() => {
 
 // Denoise params for the render-linear request. amount is normalised to 0..1;
 // disabled (or amount 0) tells the worker to skip inference entirely.
+//
+// `amount` therefore means two different things depending on where it is read.
+// This payload is 0..1 (render-linear, clamped again in protocol.ts). The
+// `denoise` state itself, and the Snapshot that persists it, are 0..100 — and
+// XMP export reads *that* one, not this, so it writes 0..100 too (cli.py's
+// daemon_export). Both ends are consistent today only because export passes
+// `settings.denoise` rather than this function's output. Swapping one for the
+// other silently changes the number by 100x, so keep them apart.
 function denoisePayload(d: typeof denoise = denoise): { enabled: boolean; model: string; amount: number } {
   return { enabled: d.enabled, model: d.model, amount: d.amount / 100 };
 }
@@ -1942,7 +1950,7 @@ const vWheelAdjust = {
           <span v-if="denoiseBusy" class="panel-hint">{{ t('detail.denoising') }}</span>
         </header>
         <div class="control-row">
-          <label class="control-label" for="denoise-on">{{ t('detail.aiDenoise') }}</label>
+          <label class="control-label" for="denoise-on">{{ t('detail.denoise') }}</label>
           <label class="switch">
             <input id="denoise-on" type="checkbox" v-model="denoise.enabled" />
             <span class="switch-track"><span class="switch-thumb" /></span>

@@ -812,6 +812,10 @@ def build_llr_attrs(settings: dict[str, Any]) -> OrderedDict[str, str]:
         attrs["llr:Dcp"] = str(dcp)
     denoise = settings.get("denoise") or {}
     if denoise.get("enabled"):
+        # `settings` is the browser's own state, so amount here is 0..100 — not
+        # the 0..1 that render-linear receives (see denoisePayload in App.vue).
+        # Same field name, two scales; the export path must keep reading the
+        # UI state rather than the request payload or this drifts by 100x.
         attrs["llr:DenoiseModel"] = str(denoise.get("model", ""))
         attrs["llr:DenoiseAmount"] = f"{round(_num(denoise, 'amount', 100))}"
 
@@ -1217,8 +1221,17 @@ def prepare_linear(
             # A Sony RAW carries the body's own measurement of how its noise
             # grows with the signal; anything else returns None and the
             # denoiser fits that shape from the pixels as before.
-            denoise_raw_inplace(raw, get_denoiser(denoise_model),
-                                noise=sony_noise_model(input_path))
+            stats = denoise_raw_inplace(raw, get_denoiser(denoise_model),
+                                        noise=sony_noise_model(input_path))
+            # Which of those two happened is invisible from the result, and it
+            # is the one input that varies per *file* rather than per request —
+            # so a frame that denoises unlike its neighbours is explained here
+            # and nowhere else. The API forwards our stderr to its console.
+            note = (f"{stats.model} {stats.width}x{stats.height} "
+                    f"noise={stats.noise_source}" if stats is not None
+                    else "skipped, sensor CFA is not 2x2 Bayer")
+            sys.stderr.write(f"denoise {input_path.name}: {note}\n")
+            sys.stderr.flush()
         renderer = resolve_color_renderer(root, dcp_arg, disable_dcp, recipe, metadata, input_path)
         if not renderer.active:
             # Scene-referred fallback: deliver linear ProPhoto (D50) so the browser

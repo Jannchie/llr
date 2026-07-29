@@ -131,7 +131,10 @@ const en = {
   // Detail panel
   "panel.detail": "Detail",
   "detail.denoising": "Denoising…",
-  "detail.aiDenoise": "AI Denoise",
+  // Classical wavelet shrinkage, not a neural model — see denoise.py. Named
+  // "AI Denoise" until the backend was checked; if a neural one ever ships it
+  // gets its own control rather than quietly taking over this one.
+  "detail.denoise": "Denoise",
   "detail.amount": "Amount",
 
   // HSL panel
@@ -298,7 +301,7 @@ const zh: Record<MessageKey, string> = {
 
   "panel.detail": "细节",
   "detail.denoising": "降噪中…",
-  "detail.aiDenoise": "AI 降噪",
+  "detail.denoise": "降噪",
   "detail.amount": "数量",
 
   "panel.hsl": "HSL / 颜色",
