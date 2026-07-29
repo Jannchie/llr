@@ -340,6 +340,7 @@ def _linear_cache_key(
     dcp_code: str | None,
     denoise_model: str | None,
     denoise_amount: float,
+    denoise_tweaks: tuple[float, float] = (50.0, 50.0),
 ) -> tuple[Any, ...]:
     """Everything that changes a decoded pixel, and nothing that does not.
 
@@ -353,7 +354,7 @@ def _linear_cache_key(
         base = (str(input_path), st.st_size, int(st.st_mtime_ns))
     except OSError:
         base = (str(input_path),)
-    return (*base, profile_id, bool(half_size), int(max_size or 0), dcp_code or "", denoise_model or "", round(float(denoise_amount), 3))
+    return (*base, profile_id, bool(half_size), int(max_size or 0), dcp_code or "", denoise_model or "", round(float(denoise_amount), 3), tuple(round(float(v), 3) for v in denoise_tweaks))
 
 
 _LINEAR_CACHE: OrderedDict[tuple[Any, ...], tuple[np.ndarray, dict[str, Any]]] = OrderedDict()
@@ -453,6 +454,12 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     # blend below from decoding an identical image twice.
     if bool(denoise_req.get("enabled", False)) and dn_amount > 0.0 and is_raw(input_path):
         dn_model = str(denoise_req.get("model") or DEFAULT_MODEL)
+    # Edge and colour ride Edit.exe's own 0..100 scale with 50 neutral, so a
+    # recipe that names them means the same thing in both applications. Unlike
+    # `amount` they are not a blend of two decodes — they change the denoised
+    # result itself — so they belong in the cache key rather than in the lerp.
+    dn_edge = max(0.0, min(100.0, float(denoise_req.get("edge", 50.0))))
+    dn_chroma = max(0.0, min(100.0, float(denoise_req.get("chroma", 50.0))))
 
     # Overrides for the shot's Creative Look tweaks, and for which look to render
     # at all. Both are deliberately absent from the cache key: neither the five
@@ -472,7 +479,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
                           else dro_level_from_request(request))
 
     # Check processed sRGB cache first
-    cache_key = _linear_cache_key(input_path, profile_id, half_size, max_size, dcp_code, dn_model, dn_amount)
+    cache_key = _linear_cache_key(input_path, profile_id, half_size, max_size, dcp_code, dn_model, dn_amount, (dn_edge, dn_chroma))
     with _CACHE_LOCK:
         cached_linear = _LINEAR_CACHE.get(cache_key)
         if cached_linear is not None:
@@ -528,6 +535,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
                 dcp_arg=None, disable_dcp=False,
                 half_size=half_size, max_size=max_size,
                 denoise_model=dn_model,
+                denoise_tweaks=(dn_edge, dn_chroma),
                 raw_provider=open_raw,
                 store_cache=store_cache,
             )
@@ -549,6 +557,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
                     dcp_arg=None, disable_dcp=False,
                     half_size=half_size, max_size=max_size,
                     denoise_model=dn_model,
+                    denoise_tweaks=(dn_edge, dn_chroma),
                     raw_provider=open_raw,
                     store_cache=store_cache,
                 )
@@ -1068,14 +1077,17 @@ def extract_preview_image(input_path: Path) -> Image.Image:
 
 
 def _raw_cache_key(
-    input_path: Path, half_size: bool, max_size: int | None, denoise_model: str | None
+    input_path: Path, half_size: bool, max_size: int | None, denoise_model: str | None,
+    denoise_tweaks: tuple[float, float] = (50.0, 50.0),
 ) -> tuple[Any, ...]:
     try:
         stat = input_path.stat()
         base = (str(input_path), bool(half_size), int(max_size or 0), stat.st_size, int(stat.st_mtime_ns))
     except OSError:
         base = (str(input_path), bool(half_size), int(max_size or 0))
-    return (*base, denoise_model or "")
+    # `amount` is deliberately absent (it blends this entry with the noisy one),
+    # but edge and colour change the denoised pixels themselves.
+    return (*base, denoise_model or "", tuple(round(float(v), 3) for v in denoise_tweaks))
 
 
 @dataclass(frozen=True)
@@ -1164,6 +1176,7 @@ def prepare_linear(
     half_size: bool = False,
     max_size: int | None = None,
     denoise_model: str | None = None,
+    denoise_tweaks: tuple[float, float] = (50.0, 50.0),
     raw_provider: Callable[[], rawpy.RawPy] | None = None,
     store_cache: bool = True,
 ) -> PreparedLinear:
@@ -1182,7 +1195,7 @@ def prepare_linear(
     if not is_raw(input_path):
         return prepare_rendered_image(input_path, half_size=half_size, max_size=max_size)
 
-    cache_key = _raw_cache_key(input_path, half_size, max_size, denoise_model)
+    cache_key = _raw_cache_key(input_path, half_size, max_size, denoise_model, denoise_tweaks)
 
     # Cache hit: re-apply DCP on cached camera RGB without re-decoding RAW
     with _CACHE_LOCK:
@@ -1229,10 +1242,14 @@ def prepare_linear(
             # where ours cost most of it. Only usable alongside the curve,
             # since the halo clamp is expressed in units of its threshold.
             restore = sony_detail_restore(input_path) if curve is not None else None
+            edge, chroma = denoise_tweaks
+            if restore is not None:
+                restore = restore.for_edge_slider(edge)
             stats = denoise_raw_inplace(
                 raw, get_denoiser(denoise_model), noise=curve,
-                detail=None if restore is None
-                else (restore.fraction, restore.limit_in_thresholds(curve)))
+                detail=None if restore is None or curve is None
+                else (restore.fraction, restore.limit_in_thresholds(curve)),
+                chroma_scale=chroma / 50.0)
             # Which of those two happened is invisible from the result, and it
             # is the one input that varies per *file* rather than per request —
             # so a frame that denoises unlike its neighbours is explained here

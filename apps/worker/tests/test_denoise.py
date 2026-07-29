@@ -209,19 +209,19 @@ def test_denoise_passes_the_cfa_and_the_noise_curve_through() -> None:
     class Spy:
         name = "spy"
 
-        def __call__(self, planes, sigma=None, cfa=None, noise=None, detail=None):
-            seen["cfa"] = cfa
-            seen["noise"] = noise
-            seen["detail"] = detail
+        def __call__(self, planes, sigma=None, cfa=None, noise=None, detail=None,
+                     *, chroma_scale=1.0):
+            seen.update(cfa=cfa, noise=noise, detail=detail, chroma=chroma_scale)
             return planes
 
     raw = make_raw(random_mosaic(np.random.default_rng(31), 16, 16))
     raw.color_desc = b"RGBG"
     curve = _FlatThenRamp()
-    denoise_raw_inplace(raw, Spy(), noise=curve, detail=(0.97, 16.8))
+    denoise_raw_inplace(raw, Spy(), noise=curve, detail=(0.97, 16.8), chroma_scale=1.4)
     assert seen["cfa"] == ["R", "G", "G", "B"]
     assert seen["noise"] is curve
     assert seen["detail"] == (0.97, 16.8)
+    assert seen["chroma"] == 1.4
 
 
 # ── End to end on synthetic sensor noise ──
@@ -373,6 +373,34 @@ def test_detail_restore_is_bounded_by_its_limit() -> None:
     plain = dn(noisy.copy(), None, ["R", "G", "G", "B"], None, None)
     clamped = dn(noisy.copy(), None, ["R", "G", "G", "B"], None, (1.0, 0.0))
     assert np.allclose(plain, clamped, atol=1e-6)
+
+
+def test_the_chroma_control_moves_colour_noise_and_leaves_luma_alone() -> None:
+    """Colour NR has to act on colour only, or it is just a second strength knob."""
+    rng = np.random.default_rng(91)
+    # Real colour structure, not a flat patch: on pure noise BayesShrink's
+    # signal_var hits its floor, the threshold runs away and every setting above
+    # zero zeroes the chroma levels outright, so the control looks inert.
+    yy, xx = np.mgrid[0:96, 0:96].astype(np.float32)
+    base = 0.3 + 0.04 * np.sin(xx / 11.0)
+    tint = 0.03 * np.cos(yy / 9.0)
+    planes = np.stack([base + tint, base, base, base - tint], axis=-1).astype(np.float32)
+    planes = np.clip(planes + rng.normal(0, 0.01, planes.shape).astype(np.float32), 0, 1)
+
+    dn = WaveletDenoiser()
+    out = {c: dn(planes.copy(), None, ["R", "G", "G", "B"], None, None, chroma_scale=c)
+           for c in (0.0, 1.0, 2.0)}
+
+    def chroma(a: np.ndarray) -> float:
+        return float((a[..., 0] - a[..., 3]).std())
+
+    def luma(a: np.ndarray) -> float:
+        return float(a.mean(axis=-1).std())
+
+    assert chroma(out[0.0]) > chroma(out[1.0]) > chroma(out[2.0])
+    # Luma must barely notice: the basis is orthonormal, so the chroma rows it
+    # scales do not carry Y.
+    assert luma(out[0.0]) == pytest.approx(luma(out[2.0]), rel=0.05)
 
 
 def test_denoise_stats_say_where_the_noise_model_came_from() -> None:

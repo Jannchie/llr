@@ -32,10 +32,19 @@ describe("clampRenderParams", () => {
       halfSize: true,
       maxSize: 1600,
       dcpCode: undefined,
-      denoise: { enabled: false, model: undefined, amount: 1 },
+      denoise: { enabled: false, model: undefined, amount: 1, edge: 50, chroma: 50 },
       look: {},
       purpose: "preview",
     });
+  });
+
+  it("lands edge and colour on neutral when absent, and clamps them to 0..100", () => {
+    // 50 is neutral for both, so an absent field must not fall to 0 — that would
+    // silently mean "restore no detail" and "no colour noise reduction".
+    expect(clampRenderParams({ denoise: {} }).denoise.edge).toBe(50);
+    expect(clampRenderParams({ denoise: { edge: -20, chroma: 300 } }).denoise)
+      .toMatchObject({ edge: 0, chroma: 100 });
+    expect(clampRenderParams({ denoise: { edge: Number.NaN } }).denoise.edge).toBe(50);
   });
 
   it("treats anything but an explicit export as a cacheable preview decode", () => {

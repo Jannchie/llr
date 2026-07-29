@@ -136,6 +136,10 @@ const en = {
   // gets its own control rather than quietly taking over this one.
   "detail.denoise": "Denoise",
   "detail.amount": "Amount",
+  // Named after the controls Imaging Edge exposes, and on its 0..100 scale with
+  // 50 neutral, so a value carries the same meaning across both applications.
+  "detail.chromaNr": "Color NR",
+  "detail.edgeNr": "Edge NR",
 
   // HSL panel
   "panel.hsl": "HSL / Color",
@@ -303,6 +307,8 @@ const zh: Record<MessageKey, string> = {
   "detail.denoising": "降噪中…",
   "detail.denoise": "降噪",
   "detail.amount": "数量",
+  "detail.chromaNr": "色彩降噪",
+  "detail.edgeNr": "边缘降噪",
 
   "panel.hsl": "HSL / 颜色",
   "hsl.red": "红色",

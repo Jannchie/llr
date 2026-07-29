@@ -283,7 +283,12 @@ const hasCameraMatch = ref(false);
 // AI RAW denoise. Applied in the worker on the Bayer mosaic before demosaic, so
 // changing it re-decodes linear.bin (like dcpCode) rather than re-running the
 // WebGL shader. amount is 0..100 (normalised to 0..1 for the API).
-const defaultDenoise = () => ({ enabled: false, model: "wavelet", amount: 100 });
+// edge and chroma ride Edit.exe's own 0..100 scale with 50 neutral, and go to
+// the API unscaled — unlike amount. Edge sets how much fine detail survives
+// (the camera's own value at 50); chroma scales the colour-noise threshold.
+const defaultDenoise = () => ({
+  enabled: false, model: "wavelet", amount: 100, edge: 50, chroma: 50,
+});
 const denoise = reactive(defaultDenoise());
 const denoiseBusy = ref(false);
 // Hold-to-compare: while true we draw the unedited original (baseline params +
@@ -729,8 +734,14 @@ const embeddedTransform = computed(() => {
 // daemon_export). Both ends are consistent today only because export passes
 // `settings.denoise` rather than this function's output. Swapping one for the
 // other silently changes the number by 100x, so keep them apart.
-function denoisePayload(d: typeof denoise = denoise): { enabled: boolean; model: string; amount: number } {
-  return { enabled: d.enabled, model: d.model, amount: d.amount / 100 };
+// edge and chroma are *not* rescaled: 0..100 is the wire scale for those.
+function denoisePayload(d: typeof denoise = denoise): {
+  enabled: boolean; model: string; amount: number; edge: number; chroma: number;
+} {
+  return {
+    enabled: d.enabled, model: d.model, amount: d.amount / 100,
+    edge: d.edge, chroma: d.chroma,
+  };
 }
 
 // Decode `id`'s linear data and render it into the (reused) WebGL pipeline.
@@ -1958,6 +1969,12 @@ const vWheelAdjust = {
         </div>
         <SliderRow v-show="denoise.enabled" v-model="denoise.amount" style="margin-top: 6px;"
           :label="t('detail.amount')" input-id="denoise-amount" :min="0" :max="100" :reset-value="100" />
+        <!-- 50 is neutral for both: the camera's own detail-restore value, and
+             the tuned chroma threshold. Reset therefore goes to 50, not 100. -->
+        <SliderRow v-show="denoise.enabled" v-model="denoise.chroma" style="margin-top: 6px;"
+          :label="t('detail.chromaNr')" input-id="denoise-chroma" :min="0" :max="100" :reset-value="50" />
+        <SliderRow v-show="denoise.enabled" v-model="denoise.edge" style="margin-top: 6px;"
+          :label="t('detail.edgeNr')" input-id="denoise-edge" :min="0" :max="100" :reset-value="50" />
       </section>
 
       <section class="panel" v-if="activeSource && !cropMode">

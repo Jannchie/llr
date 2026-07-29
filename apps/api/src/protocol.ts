@@ -30,7 +30,15 @@ export interface RenderLinearBody {
   halfSize?: boolean;
   maxSize?: number;
   dcpCode?: string;
-  denoise?: { enabled?: boolean; model?: string; amount?: number };
+  denoise?: {
+    enabled?: boolean;
+    model?: string;
+    amount?: number;
+    // Edge and colour ride Edit.exe's own 0..100 scale with 50 neutral, so the
+    // same number means the same thing in both applications.
+    edge?: number;
+    chroma?: number;
+  };
   look?: LookTweaks;
   style?: string;
   dro?: number;
@@ -48,7 +56,13 @@ export interface RenderParams {
   // change must not re-decode the RAW), a one-off export must not be.
   purpose: "preview" | "export";
   dcpCode: string | undefined;
-  denoise: { enabled: boolean; model: string | undefined; amount: number };
+  denoise: {
+    enabled: boolean;
+    model: string | undefined;
+    amount: number;
+    edge: number;
+    chroma: number;
+  };
   look: LookTweaks;
   style: string | undefined;
   dro: number | undefined;
@@ -109,6 +123,11 @@ export function clampLookTweaks(look: unknown): LookTweaks {
 export function clampRenderParams(body: RenderLinearBody): RenderParams {
   const maxSizeRaw = Number(body.maxSize ?? 1600);
   const denoiseAmount = Number(body.denoise?.amount ?? 1);
+  // 50 is neutral for both, so an absent field must land there rather than at 0.
+  const clamp100 = (v: unknown) => {
+    const n = Number(v ?? 50);
+    return Number.isFinite(n) ? Math.min(100, Math.max(0, n)) : 50;
+  };
   return {
     profile: typeof body.profileId === "string" && body.profileId ? body.profileId : "standard",
     halfSize: typeof body.halfSize === "boolean" ? body.halfSize : true,
@@ -121,6 +140,8 @@ export function clampRenderParams(body: RenderLinearBody): RenderParams {
       enabled: body.denoise?.enabled === true,
       model: typeof body.denoise?.model === "string" ? body.denoise.model : undefined,
       amount: Number.isFinite(denoiseAmount) ? Math.min(1, Math.max(0, denoiseAmount)) : 1,
+      edge: clamp100(body.denoise?.edge),
+      chroma: clamp100(body.denoise?.chroma),
     },
     look: clampLookTweaks(body.look),
     style: clampLookStyle(body.style),

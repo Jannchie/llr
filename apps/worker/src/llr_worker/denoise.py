@@ -161,6 +161,7 @@ class Denoiser(Protocol):
     def __call__(
         self, planes: np.ndarray, sigma: float | None = None, cfa: Sequence[str] | None = None,
         noise: NoiseCurve | None = None, detail: DetailRestore | None = None,
+        *, chroma_scale: float = 1.0,
     ) -> np.ndarray: ...
 
     name: str
@@ -175,6 +176,7 @@ class PassthroughDenoiser:
     def __call__(
         self, planes: np.ndarray, sigma: float | None = None, cfa: Sequence[str] | None = None,
         noise: NoiseCurve | None = None, detail: DetailRestore | None = None,
+        *, chroma_scale: float = 1.0,
     ) -> np.ndarray:
         return planes
 
@@ -601,6 +603,7 @@ class WaveletDenoiser:
     def __call__(
         self, planes: np.ndarray, sigma: float | None = None, cfa: Sequence[str] | None = None,
         noise: NoiseCurve | None = None, detail: DetailRestore | None = None,
+        *, chroma_scale: float = 1.0,
     ) -> np.ndarray:
         planes = np.clip(planes.astype(np.float32, copy=False), 0.0, 1.0)
         levels = self._levels_for(planes.shape[:2])
@@ -640,7 +643,11 @@ class WaveletDenoiser:
             return np.clip(vst.inverse(out), 0.0, 1.0)
 
         basis = stabilised[..., list(order)] @ _LUMA_CHROMA.T
-        ks = (k, k * self.CHROMA_BOOST, k * self.CHROMA_BOOST, k)
+        # chroma_scale is the request's colour-noise control: 0 shrinks the two
+        # chroma channels no harder than luma's own threshold would (in fact not
+        # at all), 1 is the tuned default.
+        boost = self.CHROMA_BOOST * max(float(chroma_scale), 0.0)
+        ks = (k, k * boost, k * boost, k)
         # Detail restore is a luma decision: Sony re-injects the mosaic's own
         # high-pass, and putting fine chroma back is exactly the colour speckle
         # the chroma boost above exists to remove.
@@ -675,6 +682,8 @@ class DenoiseStats:
     noise_source: str
     #: Fraction of the finest level put back, or None when nothing was.
     detail_restored: float | None = None
+    #: Multiplier the request put on the chroma threshold (1.0 = the default).
+    chroma_scale: float = 1.0
 
 
 def denoise_raw_inplace(
@@ -684,6 +693,7 @@ def denoise_raw_inplace(
     sigma: float | None = None,
     noise: NoiseCurve | None = None,
     detail: DetailRestore | None = None,
+    chroma_scale: float = 1.0,
 ) -> DenoiseStats | None:
     """Denoise ``raw``'s visible Bayer mosaic in place.
 
@@ -714,7 +724,7 @@ def denoise_raw_inplace(
     norm = (planes - black) / scale
     np.clip(norm, 0.0, 1.0, out=norm)
 
-    denoised = denoiser(norm, sigma, cfa, noise, detail)
+    denoised = denoiser(norm, sigma, cfa, noise, detail, chroma_scale=chroma_scale)
 
     denoised = denoised * scale + black
     np.clip(denoised, 0.0, white, out=denoised)
@@ -731,6 +741,7 @@ def denoise_raw_inplace(
         sigma=sigma,
         noise_source="camera" if noise is not None else "sigma" if sigma is not None else "fitted",
         detail_restored=None if detail is None else detail[0],
+        chroma_scale=float(chroma_scale),
     )
 
 
