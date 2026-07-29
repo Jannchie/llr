@@ -85,6 +85,7 @@ from llr_worker.sony.profile import (
     sepia_toning,
     tone_curve_points,
 )
+from llr_worker.sony.rawnr import ENGINE_FULL_SCALE, STRENGTH_TAGS, noise_model
 from llr_worker.sony.sharpness import (
     SHARPNESS_CALIB_DEFAULT,
     SHARPNESS_DEFAULT,
@@ -122,6 +123,9 @@ SAMPLES = Path(__file__).resolve().parents[3] / "samples"
 # Both shot on an ILCE-7CM2, Creative Look FL and IN respectively.
 SAMPLE_FL = SAMPLES / "DSC01157.ARW"
 SAMPLE_IN = SAMPLES / "DSC04568.ARW"
+# ISO 1250 against SAMPLE_IN's 100 — the only pair here far enough apart in ISO
+# to show the noise model moving.
+SAMPLE_HIGH_ISO = SAMPLES / "fl_test.ARW"
 
 requires_sample = pytest.mark.skipif(not SAMPLE_FL.exists(), reason="sample ARW not checked out")
 requires_exiftool = pytest.mark.skipif(detect_exiftool() is None, reason="exiftool not installed")
@@ -1657,3 +1661,93 @@ def test_spica_iso_gain_bends_only_above_the_knee() -> None:
     # An unreadable ISO renders at what most frames get, not at a neutral
     # invented for the occasion.
     assert spica_iso_gain(None) == 1.0
+
+
+# ── The camera's own noise model ───────────────────────────────────────────
+
+
+@requires_sample
+def test_the_noise_threshold_rises_with_iso() -> None:
+    """The tags are a real per-shot measurement, not a constant riding along.
+
+    ISO 100 against ISO 1250 on the same body: every level has to be allowed a
+    larger deviation on the noisier frame. A model read out of the wrong tags,
+    or one that ignored the strength scaling, would tie rather than separate.
+    """
+    if not SAMPLE_HIGH_ISO.exists():
+        pytest.skip("high-ISO sample not checked out")
+    base = noise_model(SAMPLE_IN)
+    high = noise_model(SAMPLE_HIGH_ISO)
+    assert base is not None and high is not None
+
+    levels = np.arange(0, ENGINE_FULL_SCALE, 64)
+    assert np.all(high.threshold(levels) > base.threshold(levels))
+    # And it is a threshold, not a fraction: single digits at base ISO on a
+    # 14-bit scale, which is why the stage is nearly a no-op there.
+    assert base.threshold(0) < 8
+
+
+@requires_sample
+def test_the_threshold_stops_climbing_in_the_highlights() -> None:
+    """Flat, then a ramp, then flat again — not a shot-noise square root.
+
+    The upper knee is the load-bearing part: it sits at an eighth of full scale,
+    so across almost the whole tonal range Sony holds the threshold constant
+    rather than letting it grow with the signal. A denoiser that assumed
+    sqrt(level) would smooth highlights this model deliberately leaves alone.
+    """
+    model = noise_model(SAMPLE_FL)
+    assert model is not None
+    assert model.lo < model.hi < ENGINE_FULL_SCALE
+
+    below = model.threshold(np.array([0, model.lo // 2, model.lo]))
+    assert len(set(below.tolist())) == 1
+    above = model.threshold(np.array([model.hi, model.hi + 1, ENGINE_FULL_SCALE]))
+    assert len(set(above.tolist())) == 1
+    assert above[0] > below[0]
+
+    # Monotone in between, and the table the engine builds is the same curve.
+    ramp = model.threshold(np.arange(model.lo, model.hi + 1))
+    assert np.all(np.diff(ramp) >= 0)
+    table = model.table()
+    assert table.shape == (1 << 15,)
+    assert np.array_equal(table[: ENGINE_FULL_SCALE + 1],
+                          model.threshold(np.arange(ENGINE_FULL_SCALE + 1)))
+
+
+@requires_sample
+def test_the_normalised_curve_is_the_same_shape_in_unit_scale() -> None:
+    """denoise works in [0, 1]; the conversion must not reshape the curve."""
+    model = noise_model(SAMPLE_FL)
+    assert model is not None
+    levels = np.array([0, 512, 2048, 8192, ENGINE_FULL_SCALE])
+    unit = model.threshold_normalised(levels / ENGINE_FULL_SCALE)
+    assert unit == pytest.approx(model.threshold(levels) / ENGINE_FULL_SCALE)
+    assert np.all(unit > 0.0) and np.all(unit < 1.0)
+
+
+def test_a_file_without_the_tags_has_no_noise_model() -> None:
+    """None rather than an exception: every caller's answer is the same fallback.
+
+    The SR2 walk can fail at any step on a non-Sony file, not only at the
+    missing-tag check, so this goes through a file that is not even a TIFF.
+    """
+    path = SAMPLES / "test.svg"
+    if not path.exists():
+        pytest.skip("sample not checked out")
+    assert noise_model(path) is None
+
+
+@requires_sample
+def test_asking_for_a_plane_that_does_not_exist_is_an_error() -> None:
+    """Three planes, and a fourth is a bug in the caller rather than a default.
+
+    Returning None here would be indistinguishable from "this file has no noise
+    model", which is exactly the case callers silently fall back on.
+    """
+    for plane in range(len(STRENGTH_TAGS)):
+        assert noise_model(SAMPLE_FL, plane) is not None
+    with pytest.raises(ValueError):
+        noise_model(SAMPLE_FL, len(STRENGTH_TAGS))
+    with pytest.raises(ValueError):
+        noise_model(SAMPLE_FL, -1)

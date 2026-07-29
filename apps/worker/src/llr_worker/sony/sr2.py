@@ -20,6 +20,7 @@ suite verifies this decode against frida dumps of the engine's own memory, all
 from __future__ import annotations
 
 import struct
+from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache, partial
 from pathlib import Path
@@ -223,6 +224,36 @@ def read_sr2_tag(path: str | Path, tag: int = SR2_PARAM_TAG) -> bytes:
         raise KeyError(f"SR2SubIFD has no tag 0x{tag:04x}")
     _, _, vpos, size = e
     return dec[vpos:vpos + size]
+
+
+#: TIFF type code -> struct format, for the types Sony uses for scalar tags.
+_SCALAR_FMT = {1: "B", 3: "H", 4: "I", 6: "b", 8: "h", 9: "i"}
+
+
+def read_sr2_scalars(path: str | Path, tags: Sequence[int]) -> dict[int, int]:
+    """Several single-value SR2SubIFD tags, decrypting the block once.
+
+    read_sr2_tag decrypts the whole SR2 block to reach one tag, so a caller
+    wanting a group of them (a noise model, a calibration set) would pay for
+    that decryption once per tag. This walks the decrypted IFD instead.
+
+    Unlike read_sr2_tag this reports absence by omission rather than by raising:
+    a group is normally read to be used together, and a caller that needs every
+    member checks the keys it asked for. Values are decoded through the entry's
+    own TIFF type and byte order rather than assumed to be little-endian SHORTs.
+    """
+    dec, sub_pos, endian = _decrypted_sr2(path)
+    out: dict[int, int] = {}
+    for tag in tags:
+        e = _find_tag(dec, sub_pos, endian, tag)
+        if e is None:
+            continue
+        typ, cnt, vpos, _ = e
+        fmt = _SCALAR_FMT.get(typ)
+        if fmt is None or cnt < 1:
+            continue
+        out[tag] = int(struct.unpack_from(endian + fmt, dec, vpos)[0])
+    return out
 
 
 @lru_cache(maxsize=8)
