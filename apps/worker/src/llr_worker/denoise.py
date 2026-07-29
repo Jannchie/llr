@@ -123,6 +123,23 @@ def _plane_colors(raw: Any, row_phase: int = 0, col_phase: int = 0) -> list[str]
 # ── Denoiser backends ──────────────────────────────────────────────────────
 
 
+class NoiseCurve(Protocol):
+    """How much noisier a highlight is than a shadow, on this sensor.
+
+    ``noise_shape_at`` takes normalised levels in [0, 1] and returns a value
+    proportional to the noise there. Only the *shape* is promised: the constant
+    of proportionality is the caller's problem, because the source that
+    motivates this protocol — a camera that writes its own noise
+    characterisation into the RAW — states the shape exactly and the scale only
+    up to a tuning factor. That split is the useful one anyway: measuring the
+    overall noise level from a frame is easy, while measuring how it varies
+    across the tonal range means separating noise from texture at every
+    brightness, which is the part that goes wrong.
+    """
+
+    def noise_shape_at(self, level: np.ndarray) -> np.ndarray: ...
+
+
 class Denoiser(Protocol):
     """A denoiser maps normalised Bayer planes -> denoised planes, same shape.
 
@@ -130,10 +147,13 @@ class Denoiser(Protocol):
     ``sigma`` is an optional noise-level hint in the same [0, 1] scale (None =
     blind / self-estimated). ``cfa`` names each plane's colour ("R"/"G"/"B"),
     which a denoiser needs to tell luma from chroma; None means "assume RGGB".
+    ``noise`` is an optional measured noise shape (see :class:`NoiseCurve`)
+    that stands in for fitting one from the pixels.
     """
 
     def __call__(
         self, planes: np.ndarray, sigma: float | None = None, cfa: Sequence[str] | None = None,
+        noise: NoiseCurve | None = None,
     ) -> np.ndarray: ...
 
     name: str
@@ -147,6 +167,7 @@ class PassthroughDenoiser:
 
     def __call__(
         self, planes: np.ndarray, sigma: float | None = None, cfa: Sequence[str] | None = None,
+        noise: NoiseCurve | None = None,
     ) -> np.ndarray:
         return planes
 
@@ -239,17 +260,62 @@ class _VST:
         return (np.square(g * t * 0.5) - 0.125 * g * g - self.read_var) / g
 
 
+class _CurveVST:
+    """Variance-stabilising transform for an arbitrary measured noise shape.
+
+    For any noise model the stabilising map is ``T(y) = integral dy / sigma(y)``
+    — after it, a fixed step in ``T`` is a fixed number of noise sigmas
+    whatever the brightness, which is exactly what one threshold across the
+    whole tonal range needs. :class:`_VST` solves that integral in closed form
+    for the Poisson-Gaussian case; this integrates numerically instead, so it
+    accepts whatever shape the sensor actually has.
+
+    That generality is the point rather than a convenience. Sony's own curve is
+    linear in the level and then *flat* above an eighth of full scale, which no
+    ``gain*mean + read_var`` fit can represent: forcing it into that form would
+    put back the highlight over-smoothing the flat section exists to prevent.
+
+    Only the curve's shape is used; ``_shrink_starlet`` recalibrates the
+    absolute scale from the finest level's MAD, which is what lets a
+    :class:`NoiseCurve` promise shape alone.
+    """
+
+    #: Samples across [0, 1]. The curve is piecewise linear with two knees, so
+    #: this only has to be fine enough not to round the knees off.
+    GRID = 4096
+
+    def __init__(self, curve: NoiseCurve) -> None:
+        y = np.linspace(0.0, 1.0, self.GRID, dtype=np.float64)
+        sigma = np.asarray(curve.noise_shape_at(y), dtype=np.float64)
+        # A curve that reports zero noise anywhere would divide by zero and send
+        # the transform to infinity; floor it at a value far below any real
+        # sensor's read noise rather than trusting the source.
+        sigma = np.maximum(sigma, 1e-9)
+        step = y[1] - y[0]
+        t = np.concatenate(([0.0], np.cumsum((1.0 / sigma[:-1] + 1.0 / sigma[1:]) * 0.5 * step)))
+        self._y = y
+        self._t = t
+
+    def forward(self, y: np.ndarray) -> np.ndarray:
+        return np.interp(y, self._y, self._t).astype(np.float32, copy=False)
+
+    def inverse(self, t: np.ndarray) -> np.ndarray:
+        # T is strictly increasing (sigma > 0), so interpolating it backwards is
+        # a genuine inverse rather than an approximation.
+        return np.interp(t, self._t, self._y).astype(np.float32, copy=False)
+
+
 # ── Starlet (undecimated isotropic wavelet) shrinkage ──────────────────────
 
 _B3_SPLINE = (1 / 16, 4 / 16, 6 / 16, 4 / 16, 1 / 16)
 
 
-def _atrous_smooth(a: np.ndarray, step: int) -> np.ndarray:
+def _smooth(a: np.ndarray, step: int) -> np.ndarray:
     """Separable B3-spline blur with holes (à trous), i.e. dilated by ``step``.
 
     Written as five shifted adds per axis rather than a convolution: the kernel
-    is 4*step+1 wide but only five taps are non-zero, and at step 32 a dense
-    convolution would do 25x the arithmetic.
+    is 4*step+1 wide but only five taps are non-zero, and at step 8 a dense
+    convolution would do several times the arithmetic.
     """
     out = a
     for axis in (0, 1):
@@ -283,7 +349,7 @@ def _level_sigmas(levels: int) -> tuple[float, ...]:
     cur = rng.standard_normal((384, 384)).astype(np.float32)
     sigmas: list[float] = []
     for j in range(levels):
-        nxt = _atrous_smooth(cur, 1 << j)
+        nxt = _smooth(cur, 1 << j)
         sigmas.append(float((cur - nxt)[96:-96, 96:-96].std()))
         cur = nxt
     return tuple(sigmas)
@@ -301,13 +367,19 @@ def _shrink_starlet(chan: np.ndarray, k: float, levels: int) -> np.ndarray:
     The coarsest approximation is never touched — for chroma it carries the
     actual colour of the scene, and `levels` is chosen so that everything finer
     than it (where blotches live) is shrunk.
+
+    Note what this costs in a deep shadow: measured on a real ISO 2000 frame,
+    the result there holds 0.7 of an 8-bit level of local variation where the
+    unprocessed frame had 47. That flatness is the classical method's ceiling,
+    not a bug to tune away — capping the threshold to leave grain was tried and
+    made every speck metric worse, because the grain it leaves *is* noise.
     """
     sigmas = _level_sigmas(levels)
     cur = chan
     acc = np.zeros_like(chan)
     scale = 1.0
     for j in range(levels):
-        nxt = _atrous_smooth(cur, 1 << j)
+        nxt = _smooth(cur, 1 << j)
         w = cur - nxt
         if j == 0:
             # Calibrate the noise scale from the finest level's MAD instead of
@@ -332,6 +404,38 @@ def _shrink_starlet(chan: np.ndarray, k: float, levels: int) -> np.ndarray:
         acc += w
         cur = nxt
     return acc + cur
+
+
+# ── Impulse pixels ─────────────────────────────────────────────────────────
+
+
+def _neighbour_sigma(x: np.ndarray) -> float:
+    """Robust noise sigma from horizontal pixel differences."""
+    d = x[:, 1:] - x[:, :-1]
+    return float(np.median(np.abs(d - np.median(d)))) / 0.6745 / np.sqrt(2.0)
+
+
+def _clamp_impulses(x: np.ndarray, sigma: float, k: float) -> np.ndarray:
+    """Pull pixels that lie outside their whole 4-neighbourhood back towards it.
+
+    Hot pixels, dead pixels and cosmic-ray hits are large isolated wavelet
+    coefficients, so garrote shrinkage — which is built to keep large
+    coefficients — preserves them perfectly while cleaning everything around
+    them. They go from invisible in the grain to obvious specks on a smooth
+    background: measured on a real frame, pixels sitting more than 6 sigma off
+    their neighbourhood went from 0.005% before denoising to 0.52% after.
+
+    Clamping against the neighbourhood's own min/max (rather than a fixed
+    threshold) is what keeps edges and fine lines: a pixel on a real edge always
+    has a neighbour close to it, so it never exceeds the bound.
+    """
+    # One padded copy, then four strided views — np.roll would copy the whole
+    # plane four times over, which on a 24 MP frame is most of the cost.
+    p = np.pad(x, 1, mode="edge")
+    up, dn, lf, rt = p[:-2, 1:-1], p[2:, 1:-1], p[1:-1, :-2], p[1:-1, 2:]
+    hi = np.maximum(np.maximum(up, dn), np.maximum(lf, rt))
+    lo = np.minimum(np.minimum(up, dn), np.minimum(lf, rt))
+    return np.clip(x, lo - k * sigma, hi + k * sigma)
 
 
 # ── Luma / chroma decorrelation ────────────────────────────────────────────
@@ -393,12 +497,11 @@ class WaveletDenoiser:
        signal each channel holds — the green-difference channel is nearly pure
        noise and gets cleaned hard without touching luma detail.
 
-    Two things it deliberately does *not* do, both because measurement rejected
-    them on this sensor: smooth chroma over a large radius, and threshold chroma
-    harder than luma. Real sensor noise turned out to be close to white (its std
-    halves per 2x downsample), so the low-frequency colour blotch those target
-    holds a small share of the error, and both cost more real colour detail than
-    they removed noise.
+    What it deliberately does *not* do is smooth chroma over a large radius.
+    Real sensor noise measured close to white (its std halves per 2x downsample),
+    so the low-frequency colour blotch a big radius targets holds a small share
+    of the error, while the edge-preserving filters that would remove it bled
+    colour across strong edges.
 
     Calibration-free and sensor-agnostic, so it generalises to any camera. Runs
     on CPU (numpy only); a one-time cost per source, then cached.
@@ -406,19 +509,31 @@ class WaveletDenoiser:
 
     name = "wavelet"
 
-    #: Multiplier on the per-level BayesShrink threshold. One value for all four
-    #: basis channels: leaning on chroma the way converters traditionally do
-    #: measured strictly worse here — on this sensor the low-frequency chroma
-    #: noise a heavier threshold removes is a fraction of the colour detail it
-    #: destroys. The decorrelation still pays for itself, because the adaptive
-    #: threshold then sees a green-difference channel that is nearly pure noise
-    #: and shrinks it hard on its own.
-    K = 1.2
+    #: Multiplier on the per-level BayesShrink threshold.
+    K = 0.9
+
+    #: Extra threshold on the two chroma channels, as a multiple of ``K``.
+    #:
+    #: Tuned on a real ISO 2000 frame rather than on the RMSE of synthetic noise,
+    #: which prefers 1.0 — because what the eye objects to is isolated colour
+    #: specks, and those are *high*-frequency chroma. A 16 px chroma error metric
+    #: cannot see them at all, and they survive white-noise benchmarks because
+    #: synthetic noise has no hot pixels and no per-channel read noise to be
+    #: amplified by a 2.4x white-balance gain and the camera matrix.
+    CHROMA_BOOST = 2.0
+
 
     #: Detail levels to shrink. Measured on real frames, sensor noise is close to
     #: white (its std halves per 2x downsample), so there is nothing to gain past
     #: the ~16 px scale that 4 levels reach — only detail to lose.
     LEVELS = 4
+
+    #: How far outside its own neighbourhood a pixel may sit before it is treated
+    #: as an impulse rather than as detail. The bound is already relative to the
+    #: local min/max, so this only has to catch what garrote would otherwise
+    #: preserve perfectly.
+    IMPULSE_SIGMAS = 3.0
+
 
     def __init__(self, strength: float = 1.0, levels: int | None = None) -> None:
         self.strength = strength
@@ -432,16 +547,34 @@ class WaveletDenoiser:
 
     def __call__(
         self, planes: np.ndarray, sigma: float | None = None, cfa: Sequence[str] | None = None,
+        noise: NoiseCurve | None = None,
     ) -> np.ndarray:
         planes = np.clip(planes.astype(np.float32, copy=False), 0.0, 1.0)
         levels = self._levels_for(planes.shape[:2])
 
-        if sigma is None:
-            gain, read_var = estimate_noise_model(planes)
+        vst: _VST | _CurveVST
+        if noise is not None:
+            # A measured shape beats a fitted one: estimate_noise_model has to
+            # tell noise from texture to work at all, and it gives up (returns a
+            # pure-Gaussian fallback) on frames that are very clean or very
+            # busy. A curve the camera wrote is right on both.
+            vst = _CurveVST(noise)
+        elif sigma is None:
+            vst = _VST(*estimate_noise_model(planes))
         else:
-            gain, read_var = 0.0, float(sigma) ** 2
-        vst = _VST(gain, read_var)
+            vst = _VST(0.0, float(sigma) ** 2)
         stabilised = vst.forward(planes)
+
+        # Impulses first: they are single-pixel outliers, so they must go before
+        # the transform spreads them over several levels. Keep the *input* noise
+        # scale — after shrinkage the local spread is far smaller, and measuring
+        # it there would produce a threshold that eats real detail.
+        noise = np.array([_neighbour_sigma(stabilised[..., c])
+                          for c in range(stabilised.shape[-1])], dtype=np.float32)
+        if self.IMPULSE_SIGMAS > 0:
+            for c in range(stabilised.shape[-1]):
+                stabilised[..., c] = _clamp_impulses(
+                    stabilised[..., c], float(noise[c]), self.IMPULSE_SIGMAS)
 
         k = self.K * self.strength
         order = canonical_plane_order(cfa)
@@ -455,12 +588,14 @@ class WaveletDenoiser:
             return np.clip(vst.inverse(out), 0.0, 1.0)
 
         basis = stabilised[..., list(order)] @ _LUMA_CHROMA.T
+        ks = (k, k * self.CHROMA_BOOST, k * self.CHROMA_BOOST, k)
         shrunk = np.stack(
-            [_shrink_starlet(basis[..., i], k, levels) for i in range(4)], axis=-1,
+            [_shrink_starlet(basis[..., i], ks[i], levels) for i in range(4)], axis=-1,
         )
         out = np.empty_like(stabilised)
         # Orthonormal, so the inverse rotation is just the transpose.
         out[..., list(order)] = shrunk @ _LUMA_CHROMA
+
         return np.clip(vst.inverse(out), 0.0, 1.0)
 
 
@@ -475,6 +610,11 @@ class DenoiseStats:
     black_levels: list[float]
     white_level: int
     sigma: float | None
+    #: Where the noise model came from: the camera's own curve, an explicit
+    #: sigma, or a fit of the frame. Worth recording because it is the one
+    #: input that varies per *file* rather than per request, so a frame that
+    #: denoises unlike its neighbours is usually explained here.
+    noise_source: str
 
 
 def denoise_raw_inplace(
@@ -482,6 +622,7 @@ def denoise_raw_inplace(
     denoiser: Denoiser,
     *,
     sigma: float | None = None,
+    noise: NoiseCurve | None = None,
 ) -> DenoiseStats | None:
     """Denoise ``raw``'s visible Bayer mosaic in place.
 
@@ -512,7 +653,7 @@ def denoise_raw_inplace(
     norm = (planes - black) / scale
     np.clip(norm, 0.0, 1.0, out=norm)
 
-    denoised = denoiser(norm, sigma, cfa)
+    denoised = denoiser(norm, sigma, cfa, noise)
 
     denoised = denoised * scale + black
     np.clip(denoised, 0.0, white, out=denoised)
@@ -527,6 +668,8 @@ def denoise_raw_inplace(
         black_levels=[float(b) for b in black],
         white_level=int(white),
         sigma=sigma,
+        noise_source="camera" if noise is not None else
+                     ("sigma" if sigma is not None else "fitted"),
     )
 
 

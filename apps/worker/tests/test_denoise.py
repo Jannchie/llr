@@ -10,6 +10,7 @@ from llr_worker.denoise import (
     _VST,
     PassthroughDenoiser,
     WaveletDenoiser,
+    _CurveVST,
     _plane_black_levels,
     _plane_colors,
     canonical_plane_order,
@@ -202,20 +203,23 @@ def test_plane_colors_gather_through_pattern_and_margins() -> None:
     assert _plane_colors(SimpleNamespace()) is None
 
 
-def test_denoise_passes_the_cfa_through() -> None:
+def test_denoise_passes_the_cfa_and_the_noise_curve_through() -> None:
     seen: dict[str, object] = {}
 
     class Spy:
         name = "spy"
 
-        def __call__(self, planes, sigma=None, cfa=None):
+        def __call__(self, planes, sigma=None, cfa=None, noise=None):
             seen["cfa"] = cfa
+            seen["noise"] = noise
             return planes
 
     raw = make_raw(random_mosaic(np.random.default_rng(31), 16, 16))
     raw.color_desc = b"RGBG"
-    denoise_raw_inplace(raw, Spy())
+    curve = _FlatThenRamp()
+    denoise_raw_inplace(raw, Spy(), noise=curve)
     assert seen["cfa"] == ["R", "G", "G", "B"]
+    assert seen["noise"] is curve
 
 
 # ── End to end on synthetic sensor noise ──
@@ -251,3 +255,134 @@ def test_get_denoiser_rejects_unknown_model() -> None:
     with pytest.raises(ValueError, match="unknown denoise model"):
         get_denoiser("does-not-exist")
     assert get_denoiser("passthrough") is get_denoiser("passthrough")
+
+
+# ── A measured noise curve instead of a fitted one ──
+
+
+class _FlatThenRamp:
+    """A stand-in for the shape a Sony body writes: flat, ramp, flat again.
+
+    Deliberately not a `gain*mean + read_var` curve — the upper plateau is the
+    part `_VST` structurally cannot represent, and the reason `_CurveVST`
+    exists.
+    """
+
+    def __init__(self, floor: float = 2e-4, top: float = 1e-3, knee: float = 0.125) -> None:
+        self.floor, self.top, self.knee = floor, top, knee
+
+    def noise_shape_at(self, level: np.ndarray) -> np.ndarray:
+        ramp = self.floor + (self.top - self.floor) * np.clip(level / self.knee, 0.0, 1.0)
+        return ramp
+
+
+def test_curve_vst_flattens_a_shape_no_poisson_fit_could_hold() -> None:
+    """The transform has to equalise noise across the plateau, not just the ramp.
+
+    Above the knee the curve is *flat*, so a Poisson-Gaussian model — whose
+    sigma keeps growing as sqrt(level) — would over-stabilise there and leave
+    the highlights looking quieter than they are, which is how highlights end
+    up over-smoothed. Sampling either side of the knee is what catches that.
+    """
+    curve = _FlatThenRamp()
+    vst = _CurveVST(curve)
+    rng = np.random.default_rng(31)
+    stds = []
+    for level in (0.01, 0.1, 0.4, 0.95):
+        s = np.full(40000, level, dtype=np.float32)
+        s = s + rng.normal(0.0, float(curve.noise_shape_at(np.array(level))), s.shape)
+        stds.append(float(vst.forward(s.astype(np.float32)).std()))
+    assert max(stds) / min(stds) < 1.15
+
+
+def test_curve_vst_roundtrips() -> None:
+    vst = _CurveVST(_FlatThenRamp())
+    y = np.linspace(0.0, 1.0, 512, dtype=np.float32)
+    assert np.allclose(vst.inverse(vst.forward(y)), y, atol=1e-3)
+
+
+def test_a_zero_noise_curve_does_not_blow_the_transform_up() -> None:
+    """A curve reporting no noise would divide by zero; the floor must hold.
+
+    Not hypothetical: the threshold a camera writes is an integer, and it
+    reaches 0 wherever the body decided to do nothing at all.
+    """
+
+    class Zero:
+        def noise_shape_at(self, level: np.ndarray) -> np.ndarray:
+            return np.zeros_like(level)
+
+    vst = _CurveVST(Zero())
+    y = np.linspace(0.0, 1.0, 64, dtype=np.float32)
+    out = vst.forward(y)
+    assert np.all(np.isfinite(out))
+    assert np.allclose(vst.inverse(out), y, atol=1e-3)
+
+
+def test_a_measured_curve_reaches_the_denoiser_and_changes_the_result() -> None:
+    """Wiring test: the curve must actually steer the output, not ride along.
+
+    A parameter that is accepted and ignored is the failure this asserts
+    against — same frame, same seed, one with the curve and one without, and
+    the two results have to differ.
+    """
+    rng = np.random.default_rng(5)
+    clean = np.linspace(0.05, 0.95, 64 * 64).reshape(64, 64).astype(np.float32)
+    planes = np.stack([clean + rng.normal(0, 0.004, clean.shape) for _ in range(4)], axis=-1)
+    planes = np.clip(planes.astype(np.float32), 0.0, 1.0)
+
+    dn = WaveletDenoiser()
+    fitted = dn(planes.copy(), None, ["R", "G", "G", "B"], None)
+    measured = dn(planes.copy(), None, ["R", "G", "G", "B"], _FlatThenRamp())
+    assert not np.allclose(fitted, measured)
+    # Both still have to be denoisers, not just different.
+    for out in (fitted, measured):
+        assert np.abs(out - clean[..., None]).mean() < np.abs(planes - clean[..., None]).mean()
+
+
+def test_denoise_stats_say_where_the_noise_model_came_from() -> None:
+    rng = np.random.default_rng(11)
+    raw = make_raw(random_mosaic(rng, 32, 32))
+    stats = denoise_raw_inplace(raw, PassthroughDenoiser())
+    assert stats is not None and stats.noise_source == "fitted"
+
+    raw = make_raw(random_mosaic(rng, 32, 32))
+    stats = denoise_raw_inplace(raw, PassthroughDenoiser(), noise=_FlatThenRamp())
+    assert stats is not None and stats.noise_source == "camera"
+
+    raw = make_raw(random_mosaic(rng, 32, 32))
+    stats = denoise_raw_inplace(raw, PassthroughDenoiser(), sigma=0.01)
+    assert stats is not None and stats.noise_source == "sigma"
+
+
+def test_the_measured_curve_beats_a_fit_where_the_fit_cannot_reach() -> None:
+    """The justification for the wiring: it has to win, not merely differ.
+
+    The frame carries noise with a flat-topped shape — the one `estimate_noise_model`
+    structurally cannot represent, since it only fits `gain*mean + read_var`. So the
+    fit over-estimates noise in the highlights and smooths detail that was never
+    noisy. Measured against the truth, the camera's curve has to come out ahead
+    there; elsewhere the two should be close, which is why this compares the
+    bright end rather than the whole frame.
+    """
+    rng = np.random.default_rng(101)
+    curve = _FlatThenRamp()
+    # A gradient that spans the knee, plus texture so there is detail to lose.
+    ramp = np.linspace(0.02, 0.98, 256, dtype=np.float32)
+    clean = np.repeat(ramp[None, :], 256, axis=0)
+    clean = clean + 0.02 * np.sin(np.arange(256, dtype=np.float32) / 2.0)[:, None]
+    clean = np.clip(clean, 0.0, 1.0)
+    sigma = np.asarray(curve.noise_shape_at(clean), dtype=np.float32)
+    planes = np.stack(
+        [np.clip(clean + rng.normal(0, 1, clean.shape).astype(np.float32) * sigma, 0, 1)
+         for _ in range(4)], axis=-1)
+
+    dn = WaveletDenoiser()
+    fitted = dn(planes.copy(), None, ["R", "G", "G", "B"], None)
+    measured = dn(planes.copy(), None, ["R", "G", "G", "B"], curve)
+
+    truth = clean[..., None]
+    bright = clean > 0.5
+    err_fit = float(np.abs(fitted - truth)[bright].mean())
+    err_mea = float(np.abs(measured - truth)[bright].mean())
+    assert err_mea < err_fit, f"measured {err_mea:.3g} did not beat fitted {err_fit:.3g}"

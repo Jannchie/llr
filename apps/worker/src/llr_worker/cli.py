@@ -34,6 +34,7 @@ from .sony import is_borrowed as sony_is_borrowed
 from .sony.dro import dro_gain_table, dro_grid, dro_grid_json
 from .sony.dro_presets import DRO_LEVEL_AUTO, DRO_LEVEL_MAX
 from .sony.profile import look_render_info
+from .sony.rawnr import noise_model as sony_noise_model
 from .sony.sharpness import (
     SHARPNESS_DEFAULT,
     SHARPNESS_RANGE_DEFAULT,
@@ -1213,7 +1214,11 @@ def prepare_linear(
         # cache_key (which includes denoise_model) like any other camera RGB.
         # Returns None (mosaic untouched) on non-2x2 CFAs such as Fuji X-Trans.
         if denoise_model:
-            denoise_raw_inplace(raw, get_denoiser(denoise_model))
+            # A Sony RAW carries the body's own measurement of how its noise
+            # grows with the signal; anything else returns None and the
+            # denoiser fits that shape from the pixels as before.
+            denoise_raw_inplace(raw, get_denoiser(denoise_model),
+                                noise=sony_noise_model(input_path))
         renderer = resolve_color_renderer(root, dcp_arg, disable_dcp, recipe, metadata, input_path)
         if not renderer.active:
             # Scene-referred fallback: deliver linear ProPhoto (D50) so the browser
