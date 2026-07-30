@@ -575,17 +575,24 @@ Marble 同时在做一个大幅色彩变换(Clarity 那一支),那部分量级 ~
 > compose/spica 五个,序列在 `pipeline-renderer.ts` 的 `runSonyPost`)。位置也对 ——
 > Marble 就排在 Sharpness / Spica 之后。
 >
-> ✅ **已接进管线(默认关),开启是一行。** `apps/web/src/rendering/passes.ts` 三个
-> shader、`pipeline-renderer.ts` 的 `runChromaNr` 三个 pass,门控在 profile 的
-> `chromaNr` 字段(0..1)。字段缺省即 0,此时 `chroma` 为 null,整条链**与今天逐字节相同**。
+> ✅ **已接进管线并且已开启。** `apps/web/src/rendering/passes.ts` 三个 shader、
+> `pipeline-renderer.ts` 的 `runChromaNr` 三个 pass,门控在 profile 的 `chromaNr`
+> 字段;`App.vue` 在 `profileSpica || profileSharpness` 存在时给 1 ——
+> 即「这是不是一张索尼渲染」,与其它几级同一个判据。Edit 里 Marble 恒开,
+> 所以忠实复刻就是恒开;要开关的话字段已经在那里。
 >
-> **要打开:** `apps/web/src/App.vue` 组装 profile curve 的地方(`spica:` 那一行旁边)
-> 加 `chromaNr: 1`。Edit 里 Marble 是恒开的,所以忠实复刻就是 1 ——
-> 但这会改变**每一张**索尼片的输出,所以默认留空,由人来定。
+> **验证到什么程度:** `vue-tsc` 干净、web 219 测试、worker 229 测试、
+> 11 个 program 全部在真实 WebGL2 编译链接(`shader-check`)、
+> shader 链在合成图案上四条性质全对(`chroma-check`),
+> 以及 **在一块真实照片裁块上与 `chromanr.py` 逐像素对拍**:
+> 平均差 **1.88e-4**、最大 **3.51e-3**,而算子自身的改动幅度是 **0.164** ——
+> 最差的像素只差算子效果的 2%。
 >
-> 已验证:`vue-tsc` 干净、web 219 测试、11 个 program 全部在真实 WebGL2 编译链接
-> (`shader-check`)、shader 链的计算逐位对上 `chromanr.py`(`chroma-check`)。
-> **未验证:没有人拿真照片渲过** —— 那要先把上面那行加上。
+> ⚠️ **那次对拍抓到过一个真分歧,值得记:** 头一版参考用 `_bilinear_to` 做降采样
+> (只读 4 邻域,中间的内容全混叠进矩),而 shader 做的是 8×8 盒平均。
+> 合成图案上两者看不出差别,**真实数据上最大差 3.4e-2**(算子幅度 0.164)。
+> 盒平均既更对也是会上线的那个,所以改的是参考。改完差距降了一个数量级。
+> **合成图案只能证明算子没被写反;要证明「上线的就是被定标的那个」,必须用真实数据。**
 
 > ✅ **像素级验证是有的,而且已经跑通。** ~~那边没有像素级的验证手段~~ ——
 > **这条我又说错了**:`__tests__/passes.spec.ts` 确实只是文本级的(正则核对 uniform
