@@ -985,11 +985,12 @@ function buildProfileLUT(cp: ColorProfileMeta | null | undefined): ProfileCurve 
     // render has no Marble to reproduce.
     //
     // The largest single correction in the chain: llr's colour-difference noise
-    // measured 6.59x Edit's without it and 1.31x with, on three frames, with
-    // luma untouched (sony_repro/notes/measured-chroma-gap.md 2.8, 2.9). 1.31 is
-    // the fast form this actually runs; the exact reference is 1.35, so the
-    // approximation costs nothing here — box-averaging the moments happens to
-    // land slightly closer than the reference's own wider box.
+    // measured 6.59x Edit's without it, and between 0.11x and 1.64x with it over
+    // all sixteen engine captures, median 0.75 (measured-chroma-gap.md 2.10). So
+    // it closes most of a 6.6x gap, and its own error still spans 15x -- it
+    // over-cleans at low ISO and lands near Edit above ISO 800, because the
+    // filter has no ISO term where the engine's neighbouring stages do.
+    // Worth shipping over the 6.59x it replaces, not yet worth calling faithful.
     chromaNr: cp?.profileSpica || cp?.profileSharpness ? 1 : 0,
   };
 }

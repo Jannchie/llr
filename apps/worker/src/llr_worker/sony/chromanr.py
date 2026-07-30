@@ -52,6 +52,25 @@ _LUMA = np.array([0.299, 0.587, 0.114], dtype=np.float32)
 
 #: Sets the band this works over; the guided radius is ``2**levels // 2``.
 #:
+#: ⚠️ **Calibrated on three frames and it does not generalise.** Over all sixteen
+#: engine captures the ratio to Edit runs 0.11x to 1.64x -- a 15x spread, median
+#: 0.75, geometric mean 0.57 -- so on most frames this removes *more* chroma
+#: noise than Edit does, not less. The three it was swept on gave 0.94, 0.96 and
+#: 1.64, which is the high end of that range.
+#:
+#: The spread tracks ISO (log-log r = +0.506): roughly 0.11-0.80 at ISO 100,
+#: 0.25-0.96 through ISO 640, and 0.94-1.64 from ISO 800 up. That is the missing
+#: piece -- GUIDE_EPS is an absolute threshold on luma variance and the engine's
+#: neighbours both scale with ISO (RawNR's strength is 0.4 below ISO 400, Spica
+#: interpolates over three ISO breakpoints), while this has no ISO term at all.
+#:
+#: Do not re-tune off that table yet: the metric is a ratio measured in flat
+#: tiles, and at low ISO both terms are small, so it may be reading residual
+#: structure rather than noise. Edit's own ratio is *higher* at ISO 100 than at
+#: 4000, which looks more like the denominator collapsing than like Edit leaving
+#: chroma noise behind. Settle the metric first. See
+#: sony_repro/notes/measured-chroma-gap.md 2.10.
+#:
 #: Calibrated against Edit's output on three frames (`tools/tone_axis.py`). The
 #: guided filter converges rather than overshooting -- 1.95x, 1.35x, 1.22x, 1.18x
 #: of Edit's chroma-to-luma ratio for levels 3 through 6 -- because preserving
