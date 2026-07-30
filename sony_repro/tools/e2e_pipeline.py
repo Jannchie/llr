@@ -65,6 +65,20 @@ def render(path, profile_id, with_chroma=True, half_size=True, denoise_model=Non
     量**噪声**时必须 `half_size=False`:半尺寸是 LibRaw 的 Bayer 合并,一个四元组
     出一个像素,根本没走插值 demosaic —— 而 demosaic 恰好是色度噪声的来源。
     同理 `denoise_model` 不给就是**完全不降噪**,拿它去比降噪效果会得出空结论。
+
+    ⚠️ **这条链路不做镜头畸变校正,而 Edit 做。** 上线的 llr 是做的(web 端
+    lens.ts,`lensDistortion` 默认 100),但这里从 `prepare_linear` 直接接色调链,
+    绕过了它。实测 DSC02995 的位移场:纯径向、中心≈0、四角 47.5px、切向 RMS
+    只有 0.62px —— 就是 ARW 里那张 `DistortionCorrParams` 表。
+
+    后果按测法分:
+      * **平坦区的 MAD 幅度**(色差标定、噪声比值)对错位不敏感,基本不受影响;
+      * **任何逐像素/相关性的比较全部作废** —— 不补几何的话,最细带的相关会被
+        打到 0.00,读起来像"llr 全是噪声",其实是那一带压根没对上。
+      * 顺带,连幅度也会被夸大:未补几何时量到 llr 的亮度细带是 Edit 的
+        1.6~1.9 倍,补上之后只有 1.2~1.3 倍。
+    要做结构性对比,用 `luma_gap.py` 的位移场补偿(它两侧各 warp 一半,免得
+    双线性插值的低通只算在一边)。见 measured-chroma-gap.md §2.12。
     """
     r = prepare_linear(path, {"profileId": profile_id}, ROOT, None, False,
                        half_size=half_size, denoise_model=denoise_model,

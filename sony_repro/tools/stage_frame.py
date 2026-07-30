@@ -4,8 +4,17 @@ tile 在整幅里的位置在 task 的 `+0x48..0x54`,平面对应的是外扩过
 两者之差就是平面内的偏移 —— 所有 ZcTask 共用这套基类字段,所以任一阶段都能拼。
 有了它就能拿引擎的中间结果逐像素对我们的复刻,不用再靠整幅统计量猜。
 
-用法: python stage_frame.py <ARW> <任务名>:<in|out> [任务名:when ...] -- [秒数]
+用法: python stage_frame.py <ARW> <任务名>:<in|out> [任务名:when ...]
+                            [--step N] [--out 名字] [-- 秒数]
 例:   python stage_frame.py x.ARW ZcTaskMainGamma:out ZcTaskYCC2RGB:out
+
+⚠️ `--step` 抽的是**裸样本**(`row[ox + i*STEP]`),抽样前不低通。默认的 STEP=4
+把原图 Nyquist 以上的东西整个折进最细的一带:实测 llr 侧「裸抽样 / 4×4 块平均」
+的最细带 σ 差 2.1~2.3 倍,也就是过半的能量是混叠。后果是**最细带上做不了
+相关性分解** —— 混叠形态对输入高频极敏感,llr 与 Edit 的高频本就不同,于是
+band0 的相关被打到 0.00~0.02,看着像"llr 全是噪声",其实是这一带压根没对上。
+而且它对幅度也不是中性的:高频多的一侧折回来得多,比值被系统性放大。
+要在最细尺度上比 llr 和 Edit,就得 `--step 1`。见 measured-chroma-gap.md §2.12。
 """
 import json
 import os
@@ -18,11 +27,23 @@ import numpy as np
 
 EXE = r"C:\Program Files\Sony\Imaging Edge\Edit.exe"
 SCR = os.path.dirname(os.path.abspath(__file__))
-STEP = 4
 W, H = 7008, 4672
 
 args = [a for a in sys.argv[2:] if a != "--"]
 arw = sys.argv[1]
+
+
+def take_opt(name, default):
+    if name in args:
+        i = args.index(name)
+        v = args[i + 1]
+        del args[i:i + 2]
+        return v
+    return default
+
+
+STEP = int(take_opt("--step", "4"))
+OUT_NAME = take_opt("--out", "stage_frames")
 secs = 30.0
 if args and args[-1].replace(".", "").isdigit():
     secs = float(args.pop())
@@ -103,7 +124,7 @@ time.sleep(secs)
 
 print("\n拼上的块数:", hits)
 out = {k.replace(":", "_"): v for k, v in frames.items()}
-path = os.path.join(SCR, "stage_frames.npz")
+path = os.path.join(SCR, f"{OUT_NAME}.npz")
 np.savez_compressed(path, step=np.array([STEP, W, H]), **out)
 print("SAVED", path)
 try:
