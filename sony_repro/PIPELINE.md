@@ -53,6 +53,24 @@ Preprocess(2) → TileDivRough(1) → DemosaicRough(1)
 → SIMDSharpness(35) → SIMDSpica(35) → SIMDMarble(35)
 ```
 
+> ⚠️ **上面这份顺序是按次数分组誊写的,不是数据流顺序。** 阶段抓取实测
+> (`notes/measured-chroma-gap.md` §2.4):`SSCS:out` 还是 RGB(均值 532/405/312),
+> 而 `AreaCompSIMD:out` 已经是 YCC(plane1/2 均值在 32768 附近)且亮度电平涨了 11 倍
+> —— 所以 36 次那一组(`SIMDLinearMatrix16` / `MainGamma` / `RGB2YCC` /
+> `ChromaSuppres` / `YGamma`)跑在 **`SSCS` 与 `AreaCompSIMD` 之间**,
+> `YCC2RGB` 在 `Spica` 之后。真实数据流:
+>
+> ```
+> Preprocess → TileDivRough → DemosaicRough                    (粗预览)
+> → TileDiv → RawNRSIMD → SIMDITP → SSCS                       (马赛克域 → demosaic)
+> → [GTC → SIMDLinearMatrix16 → MainGamma → RGB2YCC → ChromaSuppres → YGamma]
+> → AreaCompSIMD → SIMDSharpness → SIMDSpica → YCC2RGB → SIMDMarble
+> ```
+>
+> `ZcTaskSIMDITP` 吃的是**马赛克**(入口 tile 的四相位里两个绿位点均值逐位相同,
+> 间距 1 的差是间距 2 的 7~14 倍),**它就是真正的 demosaic**;
+> 开头那个 `DemosaicRough` 只服务粗预览。
+
 **一次都没跑的(38 个)**,其中和颜色有关的:`ZcTask3DLut`、`ZcTaskLinearMatrix`、
 `ZcTaskLinearMatrix16`(非 SIMD)、`ZcTaskToneCurve`、`ZcTaskEffect`、`ZcTaskDither`、
 **`ZcTaskSIMDHueSaturation`**、`ZcTaskITP`、`ZcTaskAreaComp`、`ZcTaskMarble`、
