@@ -48,7 +48,10 @@ function emit(task, tag) {
   const o = new Uint16Array(buf);
   for (let k = 0; k < 3; k++) {
     const p = set.add(8 + k * 8).readPointer();
-    if (p.isNull()) return;
+    // planar set 的平面数不是恒为 3:ZcTaskRawNRSIMD 和 ZcTaskSIMDITP 的**入口**
+    // 只有 1 个。这里原先是 return,于是这两级抓出来一片空白,看着像钩子没生效
+    // —— 而执行普查明明数得到次数。跳过缺的平面,对应通道留 0。
+    if (p.isNull()) continue;
     const stride = p.add(0x14).readS32(), data = p.add(0x20).readPointer();
     const ph = p.add(12).readS32();
     for (let j = 0; j < nh; j++) {
