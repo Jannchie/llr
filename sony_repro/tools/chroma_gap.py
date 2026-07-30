@@ -11,8 +11,10 @@ Edit。两份都在手上(`final_DSC*.npz` 是 `ZcTaskSIMDMarble:out` 的整幅�
   「Edit 的色度是不是从一个共享基底重建出来的」—— ITP 的输出写成
   `plane0 = base + d0, plane1 = base, plane2 = base + d2`,若 d0/d2 被单独滤过,
   就该看到高相关 + 极小色差。
+* `--ours [片名...]`:把 llr 自己的成品放到 `--base` 那两根轴上,凑成三方对照。
+  慢(整幅 + 降噪),默认只跑前三张。
 
-不给参数两项都跑。
+不给参数跑前两项。
 
 引擎帧是**抽点**(`stage_frame.py` 里 `row[ox + i*STEP]`),所以 JPEG 也必须
 `[::step, ::step]` 抽点 —— 用 resize 会把 JPEG 的噪声平均掉,比较立刻失真,
@@ -147,52 +149,106 @@ def run_scale(data):
     print("\n引擎帧是 1/4 抽点,所以这里的 1px 对应原图 4px 间距。")
 
 
+def fingerprint(img):
+    """(G 细节 MAD, (R−G) 的, (B−G) 的, 色差/G, 三通道细节相关) 或 None。"""
+    g, rg, bg, cor = [], [], [], []
+    for y, x in flat_tiles(img[..., 1]):
+        p = img[y:y + TILE, x:x + TILE]
+        dR, dG, dB = (detail(p[..., k]) for k in range(3))
+        g.append(mad(dG))
+        rg.append(mad(dR - dG))
+        bg.append(mad(dB - dG))
+        a, b, c = dR.ravel(), dG.ravel(), dB.ravel()
+        if min(a.std(), b.std(), c.std()) > 1e-6:
+            cor.append(np.mean([np.corrcoef(a, b)[0, 1],
+                                np.corrcoef(b, c)[0, 1],
+                                np.corrcoef(a, c)[0, 1]]))
+    if not g:
+        return None
+    mg, mrg, mbg = np.median(g), np.median(rg), np.median(bg)
+    return (mg, mrg, mbg, (mrg + mbg) / 2 / max(mg, 1e-6),
+            np.median(cor) if cor else np.nan)
+
+
+BASE_HDR = (f"{'片':>9}  {'来源':>5}  {'G 细节':>7} {'(R-G)':>7} {'(B-G)':>7}"
+            f"  {'色差/G':>7}  {'通道相关':>8}")
+
+
+def base_row(stem, tag, f):
+    print(f"{stem:>9}  {tag:>5}  {f[0]:7.3f} {f[1]:7.3f} {f[2]:7.3f}"
+          f"  {f[3]:7.2f}  {f[4]:8.3f}")
+
+
+def base_median(tag, rows):
+    m = np.nanmedian(np.asarray(rows), axis=0)
+    print(f"{tag:>5} 中位: G={m[0]:.3f}  (R-G)={m[1]:.3f}  (B-G)={m[2]:.3f}"
+          f"  色差/G={m[3]:.2f}  通道相关={m[4]:.3f}")
+
+
 def run_base(data):
     print("\n## 色度是否由共享基底重建\n")
-    print(f"{'片':>9}  {'来源':>5}  {'G 细节':>7} {'(R-G)':>7} {'(B-G)':>7}"
-          f"  {'色差/G':>7}  {'通道相关':>8}")
+    print(BASE_HDR)
     print("-" * 68)
     agg = {"Edit": [], "JPEG": []}
     for stem, eng, jpg in data:
         for tag, img in (("Edit", eng), ("JPEG", jpg)):
-            g, rg, bg, cor = [], [], [], []
-            for y, x in flat_tiles(img[..., 1]):
-                p = img[y:y + TILE, x:x + TILE]
-                dR, dG, dB = (detail(p[..., k]) for k in range(3))
-                g.append(mad(dG))
-                rg.append(mad(dR - dG))
-                bg.append(mad(dB - dG))
-                a, b, c = dR.ravel(), dG.ravel(), dB.ravel()
-                if min(a.std(), b.std(), c.std()) > 1e-6:
-                    cor.append(np.mean([np.corrcoef(a, b)[0, 1],
-                                        np.corrcoef(b, c)[0, 1],
-                                        np.corrcoef(a, c)[0, 1]]))
-            if not g:
+            f = fingerprint(img)
+            if f is None:
                 continue
-            mg, mrg, mbg = np.median(g), np.median(rg), np.median(bg)
-            mc = np.median(cor) if cor else np.nan
-            ratio = (mrg + mbg) / 2 / max(mg, 1e-6)
-            agg[tag].append((mg, mrg, mbg, ratio, mc))
-            print(f"{stem:>9}  {tag:>5}  {mg:7.3f} {mrg:7.3f} {mbg:7.3f}"
-                  f"  {ratio:7.2f}  {mc:8.3f}")
+            agg[tag].append(f)
+            base_row(stem, tag, f)
     print()
-    for tag, rs in agg.items():
-        if rs:
-            m = np.nanmedian(np.asarray(rs), axis=0)
-            print(f"{tag:>5} 中位: G={m[0]:.3f}  (R-G)={m[1]:.3f}  (B-G)={m[2]:.3f}"
-                  f"  色差/G={m[3]:.2f}  通道相关={m[4]:.3f}")
+    for tag, rows in agg.items():
+        if rows:
+            base_median(tag, rows)
     print("\nEdit 的色差/G 远小于 JPEG、通道相关远高于 JPEG,即色度由共享基底重建。")
+
+
+def run_ours(data, stems):
+    """把 llr 的成品放到同两根轴上。三方对照才看得出差距归谁。"""
+    sys.path.insert(0, str(Path(__file__).parent))
+    import e2e_pipeline as E
+    from engine_final_check import align, to_grid
+
+    print("\n## 三方对照(llr 走生产路径:整幅 + wavelet 降噪)\n")
+    print(BASE_HDR)
+    print("-" * 68)
+    agg = {"Edit": [], "llr": [], "JPEG": []}
+    for stem, eng, jpg in data:
+        if stem not in stems:
+            continue
+        # 整幅 + 降噪。半尺寸会绕过 demosaic,而 demosaic 正是要判的那一步。
+        ours, _ = E.render(SRC / f"{stem}.ARW", "sony", half_size=False,
+                           denoise_model="wavelet")
+        ours = align(ours, eng, eng.shape[:2])[0]
+        # to_grid 是最近邻取点,整数倍时就是抽点 —— 不会把噪声平均掉,
+        # 这一条是这里唯一不能让步的地方。
+        ours = to_grid(ours, eng.shape[:2]) * 255.0
+        for tag, img in (("Edit", eng), ("llr", ours), ("JPEG", jpg)):
+            f = fingerprint(img)
+            if f is None:
+                continue
+            agg[tag].append(f)
+            base_row(stem, tag, f)
+        print()
+    for tag, rows in agg.items():
+        if rows:
+            base_median(tag, rows)
 
 
 def main():
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    want = set(a for a in sys.argv[1:] if a.startswith("--")) or {"--scale", "--base"}
+    flags = set(a for a in sys.argv[1:] if a.startswith("--"))
+    named = [a for a in sys.argv[1:] if not a.startswith("--")]
+    want = flags or {"--scale", "--base"}
     data = list(frames())
     print(f"{len(data)} 张引擎成品")
     if "--scale" in want:
         run_scale(data)
     if "--base" in want:
         run_base(data)
+    if "--ours" in want:
+        run_ours(data, set(named or [s for s, _, _ in data[:3]]))
     return 0
 
 

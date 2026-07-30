@@ -58,8 +58,17 @@ def sony_chroma(s, cross, gain, pivot=0.0, contrast=1.0, sat=1.0):
         y + 1.4020 * cr, y - 0.7141 * cr - 0.3441 * cb, y + 1.7720 * cb], -1))
 
 
-def render(path, profile_id, with_chroma=True):
-    r = prepare_linear(path, {"profileId": profile_id}, ROOT, None, False, half_size=True)
+def render(path, profile_id, with_chroma=True, half_size=True, denoise_model=None,
+           denoise_tweaks=(50.0, 50.0)):
+    """半尺寸是默认,因为色彩对比不在乎分辨率,而它快一倍。
+
+    量**噪声**时必须 `half_size=False`:半尺寸是 LibRaw 的 Bayer 合并,一个四元组
+    出一个像素,根本没走插值 demosaic —— 而 demosaic 恰好是色度噪声的来源。
+    同理 `denoise_model` 不给就是**完全不降噪**,拿它去比降噪效果会得出空结论。
+    """
+    r = prepare_linear(path, {"profileId": profile_id}, ROOT, None, False,
+                       half_size=half_size, denoise_model=denoise_model,
+                       denoise_tweaks=denoise_tweaks)
     cp = r.color_profile
     c = r.linear.astype(np.float32)
     pts = cp.get("profileToneCurve")
