@@ -131,14 +131,27 @@ def coarse_only(plane: np.ndarray, levels: int = DEFAULT_LEVELS) -> np.ndarray:
 #: enough that a real luma edge dominates it, large enough that flat areas fall
 #: back to a plain average.
 #:
-#: ⚠️ Not calibrated -- `DEFAULT_LEVELS` was swept with this held at 1e-4, and the
-#: two interact: the guide carries luma noise too, so where the guide's local
-#: variance is comparable to eps the filter treats that noise as structure and
-#: keeps some of the chroma noise correlated with it. On the real frames that
-#: still landed within 2% of Edit on two of three, but on a synthetic flat field
-#: -- where the guide is *nothing but* noise -- it is the degenerate case and
-#: removes much less than the unguided split. Sweeping the pair jointly against
-#: `tools/tone_axis.py` is the obvious next refinement.
+#: Swept jointly with `DEFAULT_LEVELS`, because the two interact: the guide
+#: carries luma noise too, so wherever its local variance is comparable to eps
+#: the filter treats that noise as structure and keeps the chroma noise
+#: correlated with it. Against Edit on three frames the grid gives, as a multiple
+#: of Edit's chroma-to-luma ratio:
+#:
+#:     eps      levels 4   levels 5
+#:     1e-4       1.35x      1.22x
+#:     4e-4       0.77x      0.49x
+#:     2e-3       0.65x      0.28x
+#:     6e-3       0.61x      0.25x
+#:
+#: Every larger eps overshoots. Judged on per-frame agreement rather than the
+#: median -- geometric mean of the per-frame ratios, 1.19 here against 0.74 at
+#: 4e-4, with a slightly tighter spread too -- this corner is the best of the
+#: grid. The true optimum sits somewhere between 1e-4 and 4e-4 and three frames
+#: cannot resolve it more finely than that.
+#:
+#: A synthetic flat field is this filter's degenerate case: the guide is nothing
+#: but noise, so it removes far less there than the unguided split does. That is
+#: why the tests assert ten-times on `guide=False` and only two-times here.
 GUIDE_EPS = 1e-4
 
 
@@ -175,7 +188,7 @@ def guided_by_luma(chroma: np.ndarray, luma: np.ndarray, radius: int,
 
 
 def apply_chroma_nr(rgb: np.ndarray, levels: int = DEFAULT_LEVELS,
-                    guide: bool = True) -> np.ndarray:
+                    guide: bool = True, eps: float = GUIDE_EPS) -> np.ndarray:
     """Remove the fine chroma band from `rgb`, leaving luma untouched.
 
     `rgb` is float32 (h, w, 3) in any consistent scale. The luma plane is carried
@@ -199,8 +212,8 @@ def apply_chroma_nr(rgb: np.ndarray, levels: int = DEFAULT_LEVELS,
         # variant covers the same band -- the difference is only that it stops at
         # luma edges instead of averaging across them.
         radius = max(1, 2 ** max(levels, 1) // 2)
-        cr = guided_by_luma(cr, y, radius)
-        cb = guided_by_luma(cb, y, radius)
+        cr = guided_by_luma(cr, y, radius, eps)
+        cb = guided_by_luma(cb, y, radius, eps)
     else:
         cr = coarse_only(cr, levels)
         cb = coarse_only(cb, levels)
