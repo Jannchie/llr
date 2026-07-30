@@ -34,11 +34,17 @@ Scope, stated plainly:
   until they were read out of the running process: on two frames the captured
   tables match what this module computes from the tags entry for entry
   (11/45/53 at ISO 1250, 3/16/16 at ISO 100). See `rawnr_probe.py`.
-* What is *not* reproduced is the filter that consumes the curve. Sony's runs
-  on the Bayer mosaic split into four half-resolution phase planes, and its
-  per-pixel maths is still undecoded (PIPELINE.md 7.13.2). So this exposes the
-  camera's measurement for our own denoiser to use, and claims nothing about
-  matching Edit.exe's output.
+* The filter that consumes the curve is `rawnr_simd.py`, transcribed from the
+  AVX2 kernels: it runs on the Bayer mosaic split into four half-resolution
+  phase planes (PIPELINE.md 7.13.3). Its analysis step is bit-identical to the
+  engine's and end to end it explains 100.00% of what the engine did on a
+  captured tile. What is still missing there is green's *filter* kernel
+  (`0x3a0c30`), decoded only as far as its analysis.
+* This module on its own only exposes the camera's measurement, for llr's
+  wavelet denoiser to use, and claims nothing about matching Edit.exe.
+  Reproducing Edit means using `rawnr_simd.py` as well -- the two halves are
+  not separable, and adopting a parameter from one into the other has twice
+  made the result worse (see DETAIL_GAIN_UNIT below).
 """
 
 from __future__ import annotations
