@@ -60,13 +60,24 @@ def bands(y, n=NBANDS):
     return out
 
 
-def tile_masks(y, frac=0.25):
-    """(平坦 mask, 结构 mask),都按 tile 的标准差分位数切,再摊回像素。"""
+def tile_masks(y, frac=0.25, valid=None):
+    """(平坦 mask, 结构 mask),都按 tile 的标准差分位数切,再摊回像素。
+
+    `valid` 是逐像素的可用掩码 —— 引擎的 dump 偶尔有没拼上的块,那里是 0,
+    会在边界上造出一圈假的强边,既能把 tile 误判成"结构",又会污染统计。
+    整块含无效像素的 tile 直接弃掉,不做部分采纳。
+    """
     h, w = y.shape[0] // TILE * TILE, y.shape[1] // TILE * TILE
     v = y[:h, :w].reshape(h // TILE, TILE, w // TILE, TILE).std(axis=(1, 3))
-    lo, hi = np.quantile(v, frac), np.quantile(v, 1 - frac)
+    ok = np.ones(v.shape, bool)
+    if valid is not None:
+        ok = valid[:h, :w].reshape(h // TILE, TILE, w // TILE, TILE).all(axis=(1, 3))
+    vv = v[ok]
+    if vv.size == 0:
+        vv = v.ravel()
+    lo, hi = np.quantile(vv, frac), np.quantile(vv, 1 - frac)
     out = []
-    for m in (v <= lo, v >= hi):
+    for m in ((v <= lo) & ok, (v >= hi) & ok):
         full = np.zeros(y.shape, bool)
         full[:h, :w] = np.repeat(np.repeat(m, TILE, 0), TILE, 1)
         out.append(full)
@@ -294,17 +305,21 @@ def load_pair(stem):
         # σ_llr 从 0.721 掉到 0.458,看着像"几何一修差距就没了",其实一半是插值
         # 的功劳。各走一半,两侧受同一个算子,损失才对消。
         raw_e = y_e
+        # dump 偶有没拼上的块(那里全 0),跟着 Edit 一起 warp,再当掩码用。
+        ok = warp_by_field((eng.sum(axis=2) > 0).astype(np.float32),
+                           ys, xs, -dyg * 0.5, -dxg * 0.5) > 0.999
         y_e = warp_by_field(y_e, ys, xs, -dyg * 0.5, -dxg * 0.5)
         y_l_full = warp_by_field(y_l_full, ys, xs, dyg * 0.5, dxg * 0.5)
         h, w = y_e.shape
         m = 64  # warp 后边界不可靠,裁掉
         cost = mad(bands(y_e, 1)[0]) / max(mad(bands(raw_e, 1)[0]), 1e-9)
-        y_e, y_l = y_e[m:h - m, m:w - m], y_l_full[m:h - m, m:w - m]
+        sl = (slice(m, h - m), slice(m, w - m))
+        y_e, y_l, ok = y_e[sl], y_l_full[sl], ok[sl]
         rms = float(np.sqrt((dyg ** 2 + dxg ** 2).mean()))
-        return y_e, y_l, (f"全分辨率 step=1  几何各校正一半"
-                          f"(RMS {rms:.1f}px, 峰 {np.hypot(dyg, dxg).max():.1f}px,"
-                          f" 信噪比中位 {q:.0f}; 重采样让 Edit 的 band0 变成"
-                          f" {cost:.2f}×,两侧同代价)")
+        return y_e, y_l, ok, (f"全分辨率 step=1  几何各校正一半"
+                              f"(RMS {rms:.1f}px, 峰 {np.hypot(dyg, dxg).max():.1f}px,"
+                              f" 信噪比中位 {q:.0f}; 重采样让 Edit 的 band0 变成"
+                              f" {cost:.2f}×,两侧同代价; 可用 {ok.mean():.1%})")
 
     z = np.load(TMP / f"final_{stem}.npz")
     step, W, H = (int(v) for v in z["step"])
@@ -314,14 +329,15 @@ def load_pair(stem):
     rot = align(ours, eng, eng.shape[:2])[0]
     c, dy, dx = align_full(rot @ W601 * 255.0, y_e, y_e.shape)
     y_l = subsample(rot * 255.0, dy, dx, y_e.shape) @ W601
-    return y_e, y_l, f"⚠️ step=4 裸抽样(最细带是混叠)  相位 ({dy},{dx})  corr {c:.3f}"
+    return (y_e, y_l, eng.sum(axis=2) > 0,
+            f"⚠️ step=4 裸抽样(最细带是混叠)  相位 ({dy},{dx})  corr {c:.3f}")
 
 
 def main():
     stems = sys.argv[1:] or ["DSC02995"]
     for stem in stems:
-        y_e, y_l, how = load_pair(stem)
-        flat, edge = tile_masks(y_e)
+        y_e, y_l, ok, how = load_pair(stem)
+        flat, edge = tile_masks(y_e, valid=ok)
         be, bl = bands(y_e), bands(y_l)
 
         print(f"\n=== {stem}  ISO {iso_of(stem)}   平坦 {flat.sum() / flat.size:.0%}"
@@ -344,6 +360,10 @@ def main():
             share = sr ** 2 / excess if excess > 1e-12 else float("nan")
             print(f"  band{i} {2 ** i:>2}px {se:8.3f} {sl:8.3f} {sl / max(se, 1e-9):6.2f} │"
                   f" {k:7.2f} {sr:9.3f} {share:9.2f} {c:6.2f} │ {ce:11.2f}")
+            # 机器可读,供 luma_gap_agg.py 汇总 —— 分批跑时逐行追加进文件,
+            # 中途被杀也只丢当前一帧。
+            print(f"SUMMARY {stem} {iso_of(stem)} {i} {se:.4f} {sl:.4f} {k:.4f}"
+                  f" {sr:.4f} {c:.4f} {ce:.4f}")
     print("\n  放大 a>1 = llr 把同样的结构放得更大(锐化);σ_r 大 = llr 有 Edit 里"
           "没有的东西(噪声)。\n  「独有/超出」接近 1 说明超出量几乎全是独有成分。"
           "\n  ⚠️ 结构区 corr 若不接近 1,说明两张图没对齐,平坦区的分解不可信。")
