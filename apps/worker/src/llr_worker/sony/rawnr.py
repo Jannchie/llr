@@ -68,6 +68,13 @@ SLOPE_COEFF_TAG = 0x78C8   # rise per level, in 1/4096ths
 #: and speaks for the whole frame. All three are still required to be present,
 #: so a body that carries only some of them falls through to the fitted path
 #: rather than being read on a partial group.
+#:
+#: The same holds for the gain and limit triples below, checked over 65 frames
+#: spanning ISO 100 to 8000: all three planes carry identical values in every
+#: one, so reading index 0 for those is equally safe. Worth knowing because a
+#: per-plane difference would land squarely on the colour differences, which is
+#: where the remaining gap to Edit lives — it was a natural suspect and it is
+#: not the cause.
 STRENGTH_TAGS = (0x78C9, 0x78CA, 0x78CB)
 
 #: Detail re-injection, one per plane. Sony's filter smooths a *lowpassed*
@@ -81,6 +88,23 @@ DETAIL_GAIN_TAGS = (0x78CC, 0x78CD, 0x78CE)
 DETAIL_LIMIT_TAGS = (0x78CF, 0x78D0, 0x78D1)
 
 #: `gain` is 8.8 fixed point, so this is "restore all of it".
+#:
+#: The engine caps it there. The tag runs 216..433 over the frames here, and
+#: probing RawNRSIMD's parameter block gives 256 for tags of 480 and 268 but the
+#: tag itself for 249 and 216 — so what it loads is ``min(tag, 256)``, which
+#: resolves the "constant or clamped?" question left open in
+#: notes/static-rawnr.md 5.1 (both frames sampled there had tags above 256, so
+#: they could not tell the two apart).
+#:
+#: ⚠️ **Do not apply that clamp here.** It was tried and measured: llr's luma
+#: detail on DSC02995 went 1.685 -> 1.528 against Edit's 1.872, i.e. further
+#: *below* Edit rather than closer, and the colour differences did not move
+#: (1.211/1.049 -> 1.188/1.066). The reason is that this gain feeds a wavelet,
+#: not Sony's sigma filter, and the two do not remove the same amount of detail
+#: to begin with — Edit's RAW stage costs about a tenth of the fine detail where
+#: ours costs most of it. Above 256 the tag is therefore doing useful work as
+#: compensation. Faithful to the engine's *parameter* is not the same as
+#: faithful to its *result*, and the result is what is being reproduced.
 DETAIL_GAIN_UNIT = 256
 
 _MODEL_TAGS = (LEVEL_LO_TAG, LEVEL_HI_TAG, BASE_COEFF_TAG, SLOPE_COEFF_TAG,
@@ -240,5 +264,7 @@ def _cached_read(path: str, size: int,
 
     detail = None
     if all(t in tags for t in _DETAIL_TAGS):
+        # Deliberately the raw tag, not min(tag, DETAIL_GAIN_UNIT) — see that
+        # constant's note for why the engine's own clamp does not belong here.
         detail = DetailRestore(gain=tags[_DETAIL_TAGS[0]], limit=tags[_DETAIL_TAGS[1]])
     return model, detail

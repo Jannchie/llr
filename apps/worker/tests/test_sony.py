@@ -87,7 +87,15 @@ from llr_worker.sony.profile import (
     sepia_toning,
     tone_curve_points,
 )
-from llr_worker.sony.rawnr import ENGINE_FULL_SCALE, STRENGTH_TAGS, noise_model
+from llr_worker.sony.rawnr import (
+    DETAIL_GAIN_TAGS,
+    DETAIL_GAIN_UNIT,
+    DETAIL_LIMIT_TAGS,
+    ENGINE_FULL_SCALE,
+    STRENGTH_TAGS,
+    detail_restore,
+    noise_model,
+)
 from llr_worker.sony.sharpness import (
     SHARPNESS_CALIB_DEFAULT,
     SHARPNESS_DEFAULT,
@@ -1766,6 +1774,42 @@ def test_the_three_plane_strengths_agree() -> None:
         tags = read_sr2_scalars(path, STRENGTH_TAGS)
         assert set(tags) == set(STRENGTH_TAGS)
         assert len(set(tags.values())) == 1, f"{path.name}: strengths differ, {tags}"
+
+
+@requires_sample
+def test_the_three_plane_detail_pairs_agree() -> None:
+    """`detail_restore` reads plane 0's gain and limit and speaks for the frame.
+
+    Same contract as the strengths above, and worth its own assertion because a
+    per-plane split would land on the colour differences specifically, which is
+    where the remaining gap to Edit lives. Checked over 65 frames when this was
+    written; the two samples here are the regression.
+    """
+    for path in (SAMPLE_FL, SAMPLE_HIGH_ISO):
+        for group in (DETAIL_GAIN_TAGS, DETAIL_LIMIT_TAGS):
+            tags = read_sr2_scalars(path, group)
+            assert set(tags) == set(group)
+            assert len(set(tags.values())) == 1, f"{path.name}: {group} differ, {tags}"
+
+
+@requires_sample
+def test_the_detail_gain_is_the_raw_tag_and_may_exceed_restore_everything() -> None:
+    """Pins that the engine's own ``min(tag, 256)`` clamp is *not* applied.
+
+    The clamp is real — probing RawNRSIMD's parameter block gives 256 for tags
+    of 480 and 268 and the tag itself for 249 and 216. Applying it here was
+    tried and measured worse: luma detail moved further below Edit's while the
+    colour differences stayed put, because this gain drives a wavelet rather
+    than Sony's sigma filter and above 256 it is compensating for the wavelet
+    costing more detail. Asserting the raw value keeps a future reader from
+    "fixing" it back on the strength of the engine parameter alone.
+    """
+    for path in (SAMPLE_FL, SAMPLE_HIGH_ISO):
+        raw = read_sr2_scalars(path, (DETAIL_GAIN_TAGS[0],))[DETAIL_GAIN_TAGS[0]]
+        restore = detail_restore(path)
+        assert restore is not None
+        assert restore.gain == raw
+        assert restore.fraction == raw / DETAIL_GAIN_UNIT
 
 
 @requires_sample
