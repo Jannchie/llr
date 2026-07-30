@@ -575,6 +575,24 @@ Marble 同时在做一个大幅色彩变换(Clarity 那一支),那部分量级 ~
 > compose/spica 五个,序列在 `pipeline-renderer.ts` 的 `runSonyPost`)。位置也对 ——
 > Marble 就排在 Sharpness / Spica 之后。
 >
+### 上线版的最终数字:**1.31× Edit**
+
+`levels=4` 的三种形态,三张片的「色差/亮度」中位:
+
+| | 中位 | 逐张 | 对 Edit |
+|---|---|---|---|
+| **Edit** | **0.102** | 0.102 / 0.179 / 0.081 | 1.0× |
+| llr 现状(无此级) | 0.671 | 0.671 / 0.563 / 0.774 | 6.59× |
+| chromanr 精确 | 0.138 | 0.103 / 0.176 / 0.138 | 1.35× |
+| **chromanr fast s8(实际上线)** | **0.133** | 0.098 / 0.169 / 0.133 | **1.31×** |
+
+**fast 版比精确版还略接近 Edit**,逐张与精确版差在 5% 以内 —— 所以 GPU 上的这个
+近似在这里不但没有代价,盒平均的矩比精确版自己那个更宽的盒还稍好一点。
+(修盒平均之前 fast s8 是 1.34×;那次修复顺带把它推近了。)
+
+> ⚠️ 精确版仍是**定标的锚**:参数是在它上面扫的(§2.9.1),fast 版的职责是
+> **跟得住它**。两者若哪天分开了,先怀疑 fast 版,别直接改参数。
+
 > ✅ **已接进管线并且已开启。** `apps/web/src/rendering/passes.ts` 三个 shader、
 > `pipeline-renderer.ts` 的 `runChromaNr` 三个 pass,门控在 profile 的 `chromaNr`
 > 字段;`App.vue` 在 `profileSpica || profileSharpness` 存在时给 1 ——

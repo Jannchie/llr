@@ -985,8 +985,11 @@ function buildProfileLUT(cp: ColorProfileMeta | null | undefined): ProfileCurve 
     // render has no Marble to reproduce.
     //
     // The largest single correction in the chain: llr's colour-difference noise
-    // measured 6.59x Edit's without it and 1.35x with, on three frames, with
-    // luma untouched (sony_repro/notes/measured-chroma-gap.md 2.8, 2.9).
+    // measured 6.59x Edit's without it and 1.31x with, on three frames, with
+    // luma untouched (sony_repro/notes/measured-chroma-gap.md 2.8, 2.9). 1.31 is
+    // the fast form this actually runs; the exact reference is 1.35, so the
+    // approximation costs nothing here — box-averaging the moments happens to
+    // land slightly closer than the reference's own wider box.
     chromaNr: cp?.profileSpica || cp?.profileSharpness ? 1 : 0,
   };
 }
