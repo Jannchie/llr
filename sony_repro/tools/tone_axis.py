@@ -87,10 +87,16 @@ def render_two(path):
     y2 = np.interp(np.clip(y, 0, 1), grid, lut).astype(np.float32)
     out["只作用在亮度"] = s0 + (y2 - y)[..., None]
 
+    # 第三个变体:亮度色调 + **跳过** sony_chroma。两条色差改善得不对称
+    # (B 到位、R 还差 3.8 倍),而 sony_chroma 是这之后唯一还动色度的一步 ——
+    # 跳掉它就能判断那 3.8 倍是不是它造成的。
+    SKIP = "只作用在亮度 + 跳过 sony_chroma"
+    out[SKIP] = out["只作用在亮度"]
+
     cross, gain = cp.get("profileChromaCross"), cp.get("profileChromaGain")
     res = {}
     for k, s in out.items():
-        if cross and gain:
+        if cross and gain and k != SKIP:
             s = E.sony_chroma(s, np.asarray(cross), np.asarray(gain),
                               cp.get("profileLumaPivot", 0.0),
                               cp.get("profileLumaContrast", 1.0),
