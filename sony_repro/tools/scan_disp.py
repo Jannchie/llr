@@ -6,6 +6,11 @@ Ghidra 装没了,但要回答「谁写 calib+0xe44」这类问题,全量反汇�
 **必须用 Windows 的 Python 跑**(capstone/pefile 装在那边):
     python sony_repro/tools/scan_disp.py 0xe44 0xe46 0xe48 0xe4a
     python sony_repro/tools/scan_disp.py --write 0xe44      # 只看写入
+    python sony_repro/tools/scan_disp.py --range 0xc0000 0xc0200   # 整段的位移词汇表
+
+`--range` 是为「这一带到底有哪些字段被访问过」这类问题准备的。逐个猜位移时,
+猜错了看不出区别 —— 没命中和「这个偏移不存在」是同一个输出。列出整段实际出现过
+的位移就能分开这两种情况:色彩降噪那三个字段就是这么确认「只有写、没有读」的。
 """
 import sys
 
@@ -42,9 +47,16 @@ def sweep(md, data, start):
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     only_write = '--write' in sys.argv
-    wanted = {int(a, 0) for a in args}
-    if not wanted:
-        raise SystemExit(__doc__)
+    if '--range' in sys.argv:
+        if len(args) != 2:
+            raise SystemExit('--range 要两个参数:下界 上界(半开)')
+        lo, hi = (int(a, 0) for a in args)
+        wanted = None
+    else:
+        lo = hi = None
+        wanted = {int(a, 0) for a in args}
+        if not wanted:
+            raise SystemExit(__doc__)
 
     pe = pefile.PE(BIN, fast_load=True)
     base = pe.OPTIONAL_HEADER.ImageBase
@@ -59,7 +71,10 @@ def main():
         for op in ins.operands:
             if op.type != capstone.x86.X86_OP_MEM:
                 continue
-            if op.mem.disp not in wanted:
+            if wanted is None:
+                if not lo <= op.mem.disp < hi:
+                    continue
+            elif op.mem.disp not in wanted:
                 continue
             # 写入 = 内存操作数在第一位(Intel 语法的目的操作数)
             is_write = ins.operands[0].type == capstone.x86.X86_OP_MEM
