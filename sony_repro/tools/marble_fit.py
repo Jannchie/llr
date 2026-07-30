@@ -48,6 +48,39 @@ def flat_tiles(y, frac=0.25, cap=200):
              slice(int(xs[k]) * TILE, int(xs[k]) * TILE + TILE)) for k in idx]
 
 
+def gauss(a, sigma):
+    """可分离高斯。盒低通滚降太慢,会连 20px 以上的结构一起伤 —— 而 Marble 保得住,
+    所以候选里必须有截止更锐利的那一类。"""
+    r = max(1, int(3 * sigma))
+    x = np.arange(-r, r + 1, dtype=np.float64)
+    k = np.exp(-0.5 * (x / sigma) ** 2)
+    k /= k.sum()
+    p = np.pad(a, ((0, 0), (r, r)), mode="edge")
+    out = np.apply_along_axis(lambda v: np.convolve(v, k, "valid"), 1, p)
+    p = np.pad(out, ((r, r), (0, 0)), mode="edge")
+    return np.apply_along_axis(lambda v: np.convolve(v, k, "valid"), 0, p)
+
+
+def pyramid(a, levels):
+    """逐级 2x2 盒平均下采样,再双线性上采样回原尺寸 —— 锐利的尺度分割。"""
+    cur, shapes = a, []
+    for _ in range(levels):
+        shapes.append(cur.shape)
+        h, w = cur.shape[0] & ~1, cur.shape[1] & ~1
+        c = cur[:h, :w]
+        cur = (c[0::2, 0::2] + c[1::2, 0::2] + c[0::2, 1::2] + c[1::2, 1::2]) * 0.25
+    for shape in reversed(shapes):
+        up = np.repeat(np.repeat(cur, 2, axis=0), 2, axis=1)
+        # 双线性:上采样后再过一次 3 抽头,免得留下块状
+        up = (up + np.roll(up, 1, 0) + np.roll(up, 1, 1)
+              + np.roll(np.roll(up, 1, 0), 1, 1)) * 0.25
+        pad_h, pad_w = shape[0] - up.shape[0], shape[1] - up.shape[1]
+        if pad_h > 0 or pad_w > 0:
+            up = np.pad(up, ((0, max(pad_h, 0)), (0, max(pad_w, 0))), mode="edge")
+        cur = up[:shape[0], :shape[1]]
+    return cur
+
+
 def explained(target, cand):
     """cand 解释掉 target 的多少 —— 1 − var(残差)/var(target)。"""
     t, c = target.ravel(), cand.ravel()
@@ -97,6 +130,30 @@ def main():
             # 线性混合的最小二乘:out ≈ a·in + b·box9 + c·box21 + d。
             # 若 a 明显非零,说明是「部分混回原图」而不是纯替换;若 b/c 之和明显
             # 偏离 1,就有增益。
+            # ⚠️ 整信号的拟合在这里是**没意义的**:Marble 同时在做一个大幅色彩变换
+            # (Clarity 那一支),in→out 的差异被它主导 —— 实测所有平滑候选的残差都和
+            # 「原样」相差不到 2%。真正该问的只在**细节带**上:细节从 70.6 掉到 3.3,
+            # 是「按系数衰减」还是「被整个换掉」?前者的复刻就只是乘一个系数。
+            dd_i = np.concatenate([detail(di[s]).ravel() for s in tiles])
+            dd_o = np.concatenate([detail(do[s]).ravel() for s in tiles])
+            slope = float((dd_o * dd_i).sum() / max((dd_i * dd_i).sum(), 1e-12))
+            corr = float(np.corrcoef(dd_i, dd_o)[0, 1])
+            keep = 1.0 - float(np.var(dd_o - slope * dd_i) / max(np.var(dd_o), 1e-12))
+            print(f"        细节带: 斜率 {slope:+6.4f}  相关 {corr:+6.3f}  "
+                  f"线性解释 {keep * 100:6.2f}%")
+
+            # 判据统一成「残差 RMS / 输出自身的噪声底」,接近 1 才算解释到噪声底。
+            floor = float(np.median([mad(detail(do[s])) for s in tiles]))
+            print("        单候选残差(RMS / 噪声底):")
+            singles = {"原样": di, "盒 k=21": box(di, 21)}
+            singles.update({f"高斯 σ={s}": gauss(di, s) for s in (2, 4, 8)})
+            singles.update({f"金字塔 {n} 级": pyramid(di, n) for n in (2, 3, 4)})
+            for cname, c in singles.items():
+                res = np.concatenate([(do[s] - c[s]).ravel() for s in tiles])
+                rms = float(np.sqrt(np.mean(res ** 2)))
+                print(f"          {cname:<12} {rms:8.2f} / {floor:5.2f} = "
+                      f"{rms / max(floor, 1e-9):7.1f}×")
+
             cols = [di, box(di, 9), box(di, 21), np.ones_like(di)]
             A = np.stack([np.concatenate([c[s].ravel() for s in tiles]) for c in cols], 1)
             coef, *_ = np.linalg.lstsq(A, flat_t, rcond=None)
