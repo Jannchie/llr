@@ -6,6 +6,7 @@
  */
 
 import {
+  CHROMA_SUBSAMPLE,
   SONY_POST_PROGRAMS, type SonyPostProgramName,
   MASK_BLUR_SHADER, MASK_DOWNSAMPLE_SHADER, MASK_VERTEX_SHADER, PASSES, VERTEX_SHADER,
 } from "./passes";
@@ -173,6 +174,20 @@ type SonyPostTargets = {
   // this and `scene`, so whichever it wrote last is the one the compose reads.
   // Null when Spica is off, which is when nothing needs an intermediate.
   mid: RenderTarget | null;
+  // Marble's other half, the chroma cleanup (passes.ts; reference and
+  // calibration in worker sony/chromanr.py). `m1`/`m2` hold the moments at
+  // CHROMA_SUBSAMPLE, `coef` the guided filter's a and b, and `out` is a
+  // full-resolution buffer for the compose to write into — the compose otherwise
+  // writes straight to the destination and nothing can run after it.
+  //
+  // Null whenever the stage is off *or* any of the four will not allocate, and
+  // then every line below behaves exactly as it did before this existed. That is
+  // deliberate: the stage defaults to off, so the path this shares with Clarity
+  // and Spica is untouched until someone turns it on.
+  chroma: {
+    m1: RenderTarget; m2: RenderTarget; coef: RenderTarget; out: RenderTarget;
+    w: number; h: number;
+  } | null;
   // Render texels per source pixel, capped at 1. Sharpening and Spica step in
   // scene texels, so at a reduced preview scale their kernel reaches across
   // several sensor pixels instead of three and they hit far harder than the
@@ -184,6 +199,12 @@ export type ProfileCurve =
     lut: Float32Array; srgbBasis: boolean; chroma?: ProfileChroma | null;
     dro?: ProfileDro | null; clarity?: ProfileClarity | null;
     sharpen?: ProfileSharpen | null; spica?: ProfileSpica | null;
+    // How much of Marble's chroma cleanup to apply, 0..1. Absent or 0 leaves the
+    // post chain byte-for-byte as it was before the stage existed — the profile
+    // has to ask for it. Edit runs it unconditionally, so faithful reproduction
+    // is 1; whether that should be the default here is a product call, and
+    // omitting the field is what defers it.
+    chromaNr?: number | null;
   }
   | null;
 
@@ -403,6 +424,15 @@ export class PipelineRenderer {
   private sonyClarity: ProfileClarity | null = null;
   private sonySharpen: ProfileSharpen | null = null;
   private sonySpica: ProfileSpica | null = null;
+  //: Marble's chroma cleanup, 0 = off. Zero unless the profile asks, so the
+  //: chain below is unchanged until it does.
+  private sonyChromaNr = 0;
+  // Its four buffers, cached together under one size key as [m1, m2, coef, out].
+  // One entry rather than four maps because they are allocated and dropped as a
+  // unit, and stored as an array so evictOldest frees them without a special
+  // case. Not cachedMidTarget: that hands back the *same* target for the same
+  // size, and the compose would end up reading the texture it is writing.
+  private sonyChromaTargets = new Map<string, RenderTarget[]>();
   // Spica's two constant tables, uploaded once and shared by every draw. They
   // are the operator's shape rather than anything per-shot, so unlike the other
   // stages' numbers they are textures instead of uniforms — 2500 weights will
@@ -744,6 +774,7 @@ export class PipelineRenderer {
     this.sonySharpen = sharpen && sharpen.amount > 0 ? sharpen : null;
     const spica = curve?.spica ?? null;
     this.sonySpica = spica && spica.amount > 0 ? spica : null;
+    this.sonyChromaNr = Math.max(0, Math.min(1, curve?.chromaNr ?? 0));
     this.uploadSonyPostUniforms();
   }
 
@@ -992,7 +1023,7 @@ export class PipelineRenderer {
    */
   private prepareSonyPost(w: number, h: number, xform: Float32Array): SonyPostTargets | null {
     if (!this.sonyPostSupported) return null;
-    if (!this.sonyClarity && !this.sonySharpen && !this.sonySpica) return null;
+    if (!this.sonyClarity && !this.sonySharpen && !this.sonySpica && this.sonyChromaNr <= 0) return null;
     if (!this.postProgram("compose")) return null;
 
     const float = this.sceneNeedsFloat();
@@ -1008,7 +1039,15 @@ export class PipelineRenderer {
       mid = this.cachedMidTarget(w, h, float);
     }
     if (this.sonySpica && !mid) this.sonySpica = null;
-    if (!this.sonyClarity) return { scene, base: null, mid, detailScale };
+    // Same all-or-nothing rule as Spica's: if the stage's programs or buffers
+    // will not build, it drops out and the rest of the chain still runs.
+    let chroma: SonyPostTargets["chroma"] = null;
+    if (this.sonyChromaNr > 0
+      && this.postProgram("chromaMoment") && this.postProgram("chromaCoef")
+      && this.postProgram("chromaCompose")) {
+      chroma = this.cachedChromaTargets(w, h);
+    }
+    if (!this.sonyClarity) return { scene, base: null, mid, chroma, detailScale };
     if (!this.postProgram("down") || !this.postProgram("edge") || !this.postProgram("blur")) return null;
 
     const down = this.sonyClarity.downsample;
@@ -1016,7 +1055,7 @@ export class PipelineRenderer {
     const bh = Math.max(1, Math.min(h, Math.round((this.texHeight * zoom) / down)));
     const pair = this.cachedBasePair(bw, bh);
     if (!pair) return null;
-    return { scene, base: { pair, w: bw, h: bh }, mid, detailScale };
+    return { scene, base: { pair, w: bw, h: bh }, mid, chroma, detailScale };
   }
 
   /**
@@ -1080,6 +1119,52 @@ export class PipelineRenderer {
    * every other pass. Kept in its own cache rather than as a third scene entry
    * so that a preview and a histogram at different sizes cannot evict it.
    */
+  /**
+   * The chroma stage's four buffers, or null if any of them will not build.
+   *
+   * All-or-nothing on purpose: a half-allocated set would leave the compose
+   * writing into a buffer nothing reads, i.e. a black frame. Returning null
+   * instead drops the stage and the rest of the chain runs as before, the same
+   * contract Spica's intermediate has.
+   *
+   * The moments need float storage — they carry Y*Y and Y*Cr, and an 8-bit
+   * target would quantise the variance to nothing — and `coef` is sampled at
+   * full resolution, which is where the guided filter's bilinear upsample comes
+   * from. makeRenderTarget already sets LINEAR on both axes.
+   */
+  private cachedChromaTargets(w: number, h: number): SonyPostTargets["chroma"] {
+    const gl = this.gl;
+    const lo = Math.max(1, Math.floor(w / CHROMA_SUBSAMPLE));
+    const loH = Math.max(1, Math.floor(h / CHROMA_SUBSAMPLE));
+    const key = `${w}x${h}`;
+    const shape = (set: RenderTarget[]): SonyPostTargets["chroma"] =>
+      ({ m1: set[0], m2: set[1], coef: set[2], out: set[3], w: lo, h: loH });
+    const hit = this.sonyChromaTargets.get(key);
+    if (hit) {
+      this.sonyChromaTargets.delete(key);
+      this.sonyChromaTargets.set(key, hit);
+      return shape(hit);
+    }
+    const set = [
+      this.makeRenderTarget(lo, loH, gl.RGBA16F, gl.RGBA, gl.FLOAT),
+      this.makeRenderTarget(lo, loH, gl.RGBA16F, gl.RGBA, gl.FLOAT),
+      this.makeRenderTarget(lo, loH, gl.RGBA16F, gl.RGBA, gl.FLOAT),
+      this.makeRenderTarget(w, h, gl.RGBA16F, gl.RGBA, gl.FLOAT),
+    ];
+    if (set.some(t => !t)) {
+      for (const t of set) {
+        if (!t) continue;
+        gl.deleteTexture(t.tex);
+        gl.deleteFramebuffer(t.fbo);
+      }
+      return null;
+    }
+    const made = set as RenderTarget[];
+    this.sonyChromaTargets.set(key, made);
+    this.evictOldest(this.sonyChromaTargets, 2);
+    return shape(made);
+  }
+
   private cachedMidTarget(w: number, h: number, float: boolean): RenderTarget | null {
     const gl = this.gl;
     const key = `${w}x${h}:${float ? "f" : "b"}`;
@@ -1269,7 +1354,11 @@ export class PipelineRenderer {
       src = dst;
     }
 
-    this.blitQuad(compose.prog, src.tex, fbo, () => {
+    // With the chroma stage on, the compose lands in its own buffer so there is
+    // something for it to read; with it off this is `fbo` and the line below is
+    // the same draw it always was.
+    const composeDst = t.chroma ? t.chroma.out.fbo : fbo;
+    this.blitQuad(compose.prog, src.tex, composeDst, () => {
       // The sharpen kernel steps in scene texels — three of them either way,
       // which is what the engine's three sensor pixels become here.
       gl.uniform2f(compose.u["u_sceneTexel"]!, 1 / w, 1 / h);
@@ -1285,6 +1374,58 @@ export class PipelineRenderer {
       gl.bindTexture(gl.TEXTURE_2D, base ? base.pair[0].tex : scene.tex);
       if (base) gl.uniform2f(compose.u["u_baseTexel"]!, 1 / base.w, 1 / base.h);
       gl.activeTexture(gl.TEXTURE0);
+    });
+
+    if (t.chroma) this.runChromaNr(t.chroma, fbo, w, h);
+  }
+
+  /**
+   * Marble's chroma cleanup: the fast guided filter, three passes.
+   *
+   * Moments at CHROMA_SUBSAMPLE (run twice, six quantities across two RGBA
+   * targets), then a and b from a 3x3 box over them, then a full-resolution
+   * rebuild that samples the coefficients bilinearly — which is what stands in
+   * for the exact filter's second box, and what makes this three passes instead
+   * of 17x17 taps over four moments per pixel.
+   *
+   * Verified against worker/sony/chromanr.py in `scripts/chroma-check.ts`: on a
+   * colour step riding a luma step both keep 66.9% at +-8px and 100.0% at
+   * +-16px, and chroma noise on a flat field falls 13x while luma moves 1.3e-7.
+   */
+  private runChromaNr(
+    c: NonNullable<SonyPostTargets["chroma"]>, fbo: WebGLFramebuffer | null,
+    w: number, h: number,
+  ): void {
+    const gl = this.gl;
+    const moment = this.sonyPostProgs.get("chromaMoment")!;
+    const coef = this.sonyPostProgs.get("chromaCoef")!;
+    const compose = this.sonyPostProgs.get("chromaCompose")!;
+
+    gl.viewport(0, 0, c.w, c.h);
+    for (const [dst, second] of [[c.m1, 0], [c.m2, 1]] as [RenderTarget, number][]) {
+      this.blitQuad(moment.prog, c.out.tex, dst.fbo, () => {
+        gl.uniform2f(moment.u["u_sceneTexel"]!, 1 / w, 1 / h);
+        gl.uniform1f(moment.u["u_second"]!, second);
+      });
+    }
+    this.blitQuad(coef.prog, c.m1.tex, c.coef.fbo, () => {
+      // blitQuad binds the first sampler on unit 0; the second needs saying.
+      gl.uniform1i(coef.u["u_m1"]!, 0);
+      gl.uniform1i(coef.u["u_m2"]!, 1);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, c.m2.tex);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.uniform2f(coef.u["u_texel"]!, 1 / c.w, 1 / c.h);
+    });
+
+    gl.viewport(0, 0, w, h);
+    this.blitQuad(compose.prog, c.out.tex, fbo, () => {
+      gl.uniform1i(compose.u["u_scene"]!, 0);
+      gl.uniform1i(compose.u["u_coef"]!, 1);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, c.coef.tex);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.uniform1f(compose.u["u_amount"]!, this.sonyChromaNr);
     });
   }
 
@@ -1370,6 +1511,7 @@ export class PipelineRenderer {
     this.evictOldest(this.sonySceneTargets, 0);
     this.evictOldest(this.sonyBaseTargets, 0);
     this.evictOldest(this.sonyMidTargets, 0);
+    this.evictOldest(this.sonyChromaTargets, 0);
   }
 
   /**
