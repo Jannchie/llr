@@ -201,9 +201,10 @@ export type ProfileCurve =
     sharpen?: ProfileSharpen | null; spica?: ProfileSpica | null;
     // How much of Marble's chroma cleanup to apply, 0..1. Absent or 0 leaves the
     // post chain byte-for-byte as it was before the stage existed — the profile
-    // has to ask for it. Edit runs it unconditionally, so faithful reproduction
-    // is 1; whether that should be the default here is a product call, and
-    // omitting the field is what defers it.
+    // has to ask for it. Edit runs the stage unconditionally, but reproducing it
+    // is not 1: CHROMA_AMOUNT (0.9) is what matches Edit's output over the
+    // corpus, and 1 over-cleans. Callers should pass that constant rather than
+    // a literal.
     chromaNr?: number | null;
   }
   | null;

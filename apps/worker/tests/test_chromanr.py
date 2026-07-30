@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 
 from llr_worker.sony.chromanr import (
+    DEFAULT_AMOUNT,
     DEFAULT_LEVELS,
     apply_chroma_nr,
     coarse_only,
@@ -87,7 +88,9 @@ def test_the_scale_split_removes_the_fine_band_rather_than_shrinking_it() -> Non
     flat-area numbers could not.
     """
     img = _noisy_grey(size=256)
-    out = apply_chroma_nr(img, guide=False)
+    # amount=1.0 explicitly: this pins the *operator's* shape, so it must not
+    # move when the shipped blend is retuned. DEFAULT_AMOUNT is 0.90.
+    out = apply_chroma_nr(img, guide=False, amount=1.0)
     d_in = _detail(img[..., 0] - img[..., 1]).ravel()
     d_out = _detail(out[..., 0] - out[..., 1]).ravel()
     assert _mad(d_out) < 0.1 * _mad(d_in)
@@ -97,7 +100,7 @@ def test_the_scale_split_removes_the_fine_band_rather_than_shrinking_it() -> Non
 def test_the_scale_split_shrinks_the_band_by_at_least_ten_times() -> None:
     """Measured range on the engine was 11x to 21x; assert the order, not a value."""
     img = _noisy_grey(size=256)
-    out = apply_chroma_nr(img, guide=False)
+    out = apply_chroma_nr(img, guide=False, amount=1.0)
     for i, j in ((0, 1), (2, 1)):
         before = _mad(_detail(img[..., i] - img[..., j]))
         after = _mad(_detail(out[..., i] - out[..., j]))
@@ -232,3 +235,116 @@ def test_a_hard_colour_edge_bleeds_and_this_records_how_much() -> None:
     # Width of the transition, counted where the profile sits between 10% and 90%.
     inside = np.abs(profile - (lo + 0.5 * span)) < 0.4 * abs(span)
     assert 4 <= int(inside.sum()) <= 64, int(inside.sum())
+
+
+def test_amount_zero_leaves_the_image_alone() -> None:
+    """The off switch has to be exact, not merely close.
+
+    It is the same guarantee `levels <= 0` gives, and it matters because the
+    renderer decides per shot whether to run this at all; a near-miss at
+    amount 0 would show up as a shot changing when it was supposed to be off.
+    """
+    img = _noisy_grey()
+    out = apply_chroma_nr(img, amount=0.0, subsample=8)
+    assert np.array_equal(out, img)
+
+
+def test_the_default_amount_is_the_calibrated_one() -> None:
+    """The default has to *be* the shipped setting, not merely resemble it.
+
+    Pinned against DEFAULT_AMOUNT rather than against 1.0 because the reference
+    and the renderer are calibrated together: CHROMA_AMOUNT in passes.ts carries
+    the same number, and a silent drift between them would show up only as
+    llr and the reference disagreeing on a photograph.
+    """
+    img = _noisy_grey()
+    assert np.array_equal(apply_chroma_nr(img, subsample=8),
+                          apply_chroma_nr(img, amount=DEFAULT_AMOUNT, subsample=8))
+    # And it is a partial blend, i.e. genuinely weaker than the raw filter.
+    assert not np.array_equal(apply_chroma_nr(img, subsample=8),
+                              apply_chroma_nr(img, amount=1.0, subsample=8))
+
+
+def test_amount_is_a_midpoint_in_the_difference_domain() -> None:
+    """Half of the way is half of the way -- the blend the shader does.
+
+    Checked against the two endpoints rather than against a hand-computed
+    value, so it pins the blend's *position* (before the rebuild, in Cr/Cb)
+    rather than restating the arithmetic.
+    """
+    img = _noisy_grey()
+    off = apply_chroma_nr(img, amount=0.0, subsample=8)
+    full = apply_chroma_nr(img, amount=1.0, subsample=8)
+    half = apply_chroma_nr(img, amount=0.5, subsample=8)
+    assert np.allclose(half, (off + full) * 0.5, atol=2e-6)
+
+
+@pytest.mark.parametrize("amount", [0.0, 0.25, 0.5, 0.75, 1.0])
+def test_luma_survives_every_amount(amount: float) -> None:
+    """The blend sits in the difference domain, so luma is exact throughout.
+
+    If it were done on RGB after the rebuild this would drift with `amount`,
+    which is precisely the mistake the placement is there to avoid.
+    """
+    img = _noisy_grey()
+    out = apply_chroma_nr(img, amount=amount, subsample=8)
+    assert np.allclose(_luma(out), _luma(img), atol=2e-6)
+
+
+def test_levels_below_the_subsample_are_one_setting() -> None:
+    """At the shipped subsample the guided radius saturates.
+
+    `levels` reaches the fast path as ``max(1, radius // subsample)`` with
+    ``radius = 2**levels // 2``, so at subsample 8 everything up to levels 4 is
+    the same 3x3 coefficient box -- and the GLSL port, a fixed 8x8 moment box
+    plus a 3x3 coefficient box, *is* that setting. A sweep over levels 2..4
+    therefore measures nothing, which is exactly what one of them did before
+    this was noticed (§2.11).
+    """
+    img = _noisy_grey()
+    for lv in (2, 3):
+        assert np.array_equal(apply_chroma_nr(img, levels=lv, subsample=8),
+                              apply_chroma_nr(img, levels=4, subsample=8))
+    # levels 5 crosses the subsample and is a genuinely different setting.
+    assert not np.array_equal(apply_chroma_nr(img, levels=5, subsample=8),
+                              apply_chroma_nr(img, levels=4, subsample=8))
+
+
+def test_eps_loses_its_grip_once_the_guide_has_structure() -> None:
+    """Why `eps` could not carry the calibration, and `amount` has to.
+
+    `a = cov / (var_I + eps)`, so `eps` only matters while it is comparable to
+    the guide's own variance. On a flat field -- the synthetic case, and the
+    degenerate one -- `var_I` is nearly zero and `eps` swings the result over a
+    wide range. Put luma detail in the guide and `var_I` dominates the sum, so
+    the same decade of `eps` barely moves anything. That is the mechanism
+    behind the measured behaviour on photographs, where 13x of `eps` bought
+    1.6-3.4x of output.
+
+    `amount` has no such dependence -- it is a blend, so it spans the full
+    range on any content. This test is what stops a future sweep from being run
+    on an axis that cannot answer it.
+    """
+    rng = np.random.default_rng(11)
+    flat = _noisy_grey()
+    # The same chroma noise, but the guide now carries luma detail of its own.
+    textured = flat + rng.normal(0.0, 0.05, flat.shape[:2]).astype(np.float32)[..., None]
+
+    def residual(img: np.ndarray, **kw: float) -> float:
+        # amount=1.0 unless overridden: this is about `eps`'s reach, and the
+        # shipped blend would dilute exactly the effect being measured.
+        out = apply_chroma_nr(img, subsample=8, **{"amount": 1.0, **kw})
+        return _mad(_detail(out[..., 0] - out[..., 1]))
+
+    flat_span = residual(flat, eps=1e-4) / max(residual(flat, eps=4e-3), 1e-9)
+    text_span = residual(textured, eps=1e-4) / max(residual(textured, eps=4e-3), 1e-9)
+    # Structure in the guide costs `eps` most of its authority.
+    assert flat_span > 4.0 * text_span, (flat_span, text_span)
+    # And what is left lands where the photographs did: a decade of `eps` buys
+    # a factor of about two. That range is measured, not chosen -- 1.6-3.4 over
+    # DSC02975 and DSC03025 -- so it is the bound worth pinning.
+    assert 1.5 < text_span < 3.5, text_span
+
+    # `amount` reaches the whole range regardless of what the guide contains.
+    for img in (flat, textured):
+        assert residual(img, amount=1.0) < 0.5 * residual(img, amount=0.1)

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { PipelineRenderer, parseDcpTables, type EditParams, type ProfileCurve, type ViewWindow } from "./rendering/pipeline-renderer";
+import { CHROMA_AMOUNT } from "./rendering/passes";
 import {
   curveToLUT, buildToneCurveLUT, defaultToneCurve, normalizeToneCurve,
   DEFAULT_BASIC, sameBasic,
@@ -985,13 +986,11 @@ function buildProfileLUT(cp: ColorProfileMeta | null | undefined): ProfileCurve 
     // render has no Marble to reproduce.
     //
     // The largest single correction in the chain: llr's colour-difference noise
-    // measured 6.59x Edit's without it, and between 0.11x and 1.64x with it over
-    // all sixteen engine captures, median 0.75 (measured-chroma-gap.md 2.10). So
-    // it closes most of a 6.6x gap, and its own error still spans 15x -- it
-    // over-cleans at low ISO and lands near Edit above ISO 800, because the
-    // filter has no ISO term where the engine's neighbouring stages do.
-    // Worth shipping over the 6.59x it replaces, not yet worth calling faithful.
-    chromaNr: cp?.profileSpica || cp?.profileSharpness ? 1 : 0,
+    // measured 6.59x Edit's without it. At CHROMA_AMOUNT it lands at a geometric
+    // mean of 0.98 and a median of 1.01 over all sixteen engine captures, so the
+    // centre is right; the per-frame spread is still 0.36x-2.44x, and that part
+    // is neither ISO-driven nor yet explained (measured-chroma-gap.md 2.11).
+    chromaNr: cp?.profileSpica || cp?.profileSharpness ? CHROMA_AMOUNT : 0,
   };
 }
 

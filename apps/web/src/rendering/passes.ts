@@ -1061,6 +1061,24 @@ export const CHROMA_SUBSAMPLE = 8;
 export const CHROMA_COEF_RADIUS = 1;   // at the decimated scale, so 8 full-res
 export const CHROMA_EPS = 1e-4;
 
+/**
+ * How much of the filtered chroma survives — `u_amount` in the compose pass,
+ * and the same number as DEFAULT_AMOUNT in the worker's chromanr.py.
+ *
+ * It is the only axis here with real range. CHROMA_COEF_RADIUS is what a
+ * levels setting collapses to at this subsample — every band up to 8 full-res
+ * pixels is this one 3x3 box — and CHROMA_EPS only bites while it is
+ * comparable to the guide's own variance, which on a photograph is dominated
+ * by luma detail.
+ *
+ * 0.90 minimises mean |log(llr/Edit)| of absolute colour difference over all
+ * sixteen engine captures: geometric mean 0.98, median 1.01. It replaced 1.0,
+ * which scored 0.543 to this one's 0.351 and over-cleaned at a geometric mean
+ * of 0.67. Deliberately ISO-independent, unlike Spica and RawNR: fitting an
+ * ISO term moves the score by one percent. See measured-chroma-gap.md 2.11.
+ */
+export const CHROMA_AMOUNT = 0.9;
+
 // Rec.601, matching the engine's own inverse: ZcTaskYCC2RGB (RVA 0x3713e0) holds
 // 14020, 3441, 7141 and 17720 over a Y coefficient of 10000, and its midpoint
 // offset 0x14ab0000 is exactly (3441 + 7141) * 32768. Not Rec.709 — the engine's

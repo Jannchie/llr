@@ -111,11 +111,16 @@ def render_two(path):
     # levels 与 GUIDE_EPS 会互相作用(引导量里也带亮度噪声),所以联合扫,
     # 不能只扫一个。
     base = res["逐通道 (现状)"]
-    # 只跑**会上线的那一个**(fast s8)及其邻域。参数是在 3 张片上扫出来的,
-    # 而那 3 张对最优点的偏好本就不一致 —— 所以要看的是**全语料的离散度**,
-    # 不是某一档的中位好不好看。
-    for n, e in ((4, 1e-4), (4, 4e-4), (5, 1e-4), (5, 4e-4)):
-        res[f"L{n} e{e:.0e}"] = apply_chroma_nr(base, levels=n, eps=e, subsample=8)
+    # 扫 **amount**,不扫 levels/eps —— 那两个轴在上线配置上都动不了多少(§2.11):
+    #   levels 以 max(1, radius // subsample) 进入 fast 路径,subsample=8 时
+    #     2/3/4 三档折叠成同一个 3x3 系数 box(逐位相同),而上线的 GLSL 正是这一档;
+    #   eps 只在 var_I 可比时说了算,真实照片里 var_I 由亮度细节主导,13 倍的 eps
+    #     只买到 1.6~3.4 倍的输出 —— 而低 ISO 上缺的是 6~9 倍。
+    # amount 是个混合系数,量程天然覆盖全程,且正对应 shader 里已有的 u_amount。
+    # amount=1.0 就是旧的 L4 e1e-04,留作跟前一轮数据对齐的锚点。
+    for amt in (0.15, 0.3, 0.45, 0.6, 0.8, 1.0):
+        res[f"a{amt:.2f}"] = apply_chroma_nr(base, levels=4, eps=1e-4,
+                                             subsample=8, amount=amt)
     return res
 
 

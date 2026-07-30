@@ -39,6 +39,7 @@ import { writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import {
+  CHROMA_AMOUNT,
   CHROMA_COEF_SHADER,
   CHROMA_COMPOSE_SHADER,
   CHROMA_MOMENT_SHADER,
@@ -63,6 +64,7 @@ const FS_MOMENT = ${JSON.stringify(CHROMA_MOMENT_SHADER)};
 const FS_COEF = ${JSON.stringify(CHROMA_COEF_SHADER)};
 const FS_COMPOSE = ${JSON.stringify(CHROMA_COMPOSE_SHADER)};
 const N = ${N}, MARGIN = ${MARGIN}, S = ${CHROMA_SUBSAMPLE};
+const AMT = ${CHROMA_AMOUNT};
 const FIX = ${JSON.stringify(FIXTURE)};
 
 const out = document.getElementById("out");
@@ -274,16 +276,26 @@ if (!gl || !gl.getExtension("EXT_color_buffer_float") || !gl.getExtension("OES_t
       px[i * 4 + 2] = FIX.src[i * 3 + 2];
       px[i * 4 + 3] = 1;
     }
-    const got = run(px, 1);
+    // Both ends of the blend. amount 1 pins the filter itself; AMT pins what
+    // actually ships, and is the only thing that would catch the two sides
+    // disagreeing about *where* the blend happens — the shader mixes in Cr/Cb
+    // before rebuilding RGB, and a port that mixed afterwards would match at
+    // amount 1 and drift everywhere else.
+    for (const [label, amount, want] of [
+      ["the filter itself (amount = 1)", 1, FIX.ref],
+      ["the shipped blend (amount = " + AMT + ")", AMT, FIX.ref_shipped],
+    ]) {
+    if (!want) { check("fixture carries " + label, false, "regenerate it"); continue; }
+    const got = run(px, amount);
     let worst = 0, sum = 0, n = 0, moved = 0;
     for (let y = MARGIN; y < N - MARGIN; y++) {
       for (let x = MARGIN; x < N - MARGIN; x++) {
         const c = at(got, x, y);
         for (let k = 0; k < 3; k++) {
-          const want = FIX.ref[(y * N + x) * 3 + k];
-          const d = Math.abs(c[k] - want);
+          const w = want[(y * N + x) * 3 + k];
+          const d = Math.abs(c[k] - w);
           worst = Math.max(worst, d); sum += d; n++;
-          moved = Math.max(moved, Math.abs(want - px[(y * N + x) * 4 + k]));
+          moved = Math.max(moved, Math.abs(w - px[(y * N + x) * 4 + k]));
         }
       }
     }
@@ -296,11 +308,12 @@ if (!gl || !gl.getExtension("EXT_color_buffer_float") || !gl.getExtension("OES_t
     // a regression has somewhere to show. The loose version this replaced passed
     // while the two sides were box-averaging and bilinear-resampling the moments
     // respectively — a real divergence it was too slack to catch.
-    check("matches the worker's reference on a real crop",
+    check("matches the worker's reference on a real crop: " + label,
           worst < 6e-3 && sum / n < 4e-4,
           "mean |delta| = " + (sum / n).toExponential(2) +
           ", max = " + worst.toExponential(2) +
           " (the filter itself moves up to " + moved.toFixed(3) + ")");
+    }
   } else {
     check("chroma-fixture.json matches this patch size", false,
           "regenerate it — N is " + N);

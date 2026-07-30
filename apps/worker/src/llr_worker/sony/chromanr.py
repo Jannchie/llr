@@ -52,38 +52,46 @@ _LUMA = np.array([0.299, 0.587, 0.114], dtype=np.float32)
 
 #: Sets the band this works over; the guided radius is ``2**levels // 2``.
 #:
-#: ⚠️ **Calibrated on three frames and it does not generalise.** Over all sixteen
-#: engine captures the ratio to Edit runs 0.11x to 1.64x -- a 15x spread, median
-#: 0.75, geometric mean 0.57 -- so on most frames this removes *more* chroma
-#: noise than Edit does, not less. The three it was swept on gave 0.94, 0.96 and
-#: 1.64, which is the high end of that range.
+#: ⚠️ **Not a calibration axis at the shipped subsample.** `levels` reaches the
+#: fast path as ``max(1, radius // subsample)``, so with subsample 8 the values
+#: 1 through 4 are one and the same 3x3 coefficient box, bit for bit -- and the
+#: GLSL port, a fixed 8x8 moment box plus a 3x3 coefficient box, *is* that
+#: setting. Only 5 and up are distinguishable. A sweep over levels 3..6 was run
+#: before this was noticed and half of it measured nothing; see
+#: sony_repro/notes/measured-chroma-gap.md 2.11 and the test named
+#: `test_levels_below_the_subsample_are_one_setting`.
 #:
-#: The spread tracks ISO (log-log r = +0.506): roughly 0.11-0.80 at ISO 100,
-#: 0.25-0.96 through ISO 640, and 0.94-1.64 from ISO 800 up. That is the missing
-#: piece -- GUIDE_EPS is an absolute threshold on luma variance and the engine's
-#: neighbours both scale with ISO (RawNR's strength is 0.4 below ISO 400, Spica
-#: interpolates over three ISO breakpoints), while this has no ISO term at all.
-#:
-#: Do not re-tune off that table yet: the metric is a ratio measured in flat
-#: tiles, and at low ISO both terms are small, so it may be reading residual
-#: structure rather than noise. Edit's own ratio is *higher* at ISO 100 than at
-#: 4000, which looks more like the denominator collapsing than like Edit leaving
-#: chroma noise behind. Settle the metric first. See
-#: sony_repro/notes/measured-chroma-gap.md 2.10.
-#:
-#: Calibrated against Edit's output on three frames (`tools/tone_axis.py`). The
-#: guided filter converges rather than overshooting -- 1.95x, 1.35x, 1.22x, 1.18x
-#: of Edit's chroma-to-luma ratio for levels 3 through 6 -- because preserving
-#: edges bounds how much it can take out. Level 4 is chosen on per-frame
-#: agreement rather than on the median: it gives 0.103 / 0.176 / 0.138 against
-#: Edit's 0.102 / 0.179 / 0.081, so two frames land within 2% and the third is
-#: the outlier at any level.
-#:
-#: That per-frame tracking is the point. The unguided scale split reached 1.08x
-#: at the median but its per-frame values were 0.040 / 0.045 / 0.048 -- flat,
-#: while Edit's vary nearly threefold. Matching a median while ignoring the
-#: variation means the mechanism is wrong even when the summary number is right.
+#: 4 is kept because it is what the GLSL implements and because the exact form
+#: (subsample < 2), where the radius does bite, agrees with it there.
 DEFAULT_LEVELS = 4
+
+#: How much of the filtered chroma survives, matching CHROMA_COMPOSE_SHADER's
+#: `u_amount` and CHROMA_AMOUNT in passes.ts.
+#:
+#: This is the axis that carries the calibration, because it is the only one
+#: that can. `levels` collapses at the shipped subsample (above), and `eps` only
+#: has authority while it is comparable to the guide's own variance -- on a
+#: photograph luma detail dominates ``var_I``, and 13x of eps buys 1.6-3.4x of
+#: output where low-ISO frames needed 6-9x.
+#:
+#: 0.90 is the value that minimises mean |log(llr/Edit)| of the absolute colour
+#: difference over all sixteen engine captures: geometric mean 0.98, median
+#: 1.01. The previous setting of 1.0 scored 0.543 against this one's 0.351, and
+#: sat at a geometric mean of 0.67 -- it over-cleaned.
+#:
+#: **No ISO term**, and that is a measured decision rather than an omission.
+#: Fitting ``amount = k*log2(ISO/100) + b`` gives k = +0.019 per stop, a residual
+#: RMS of 0.097 against the constant model's 0.101, and a score of 0.347 against
+#: 0.351 -- one percent, for a term the engine's neighbours do carry. The +0.506
+#: ISO correlation reported earlier was an artefact of sweeping `eps`: eps'
+#: effectiveness depends on ``var_I``, which rises with noise, which rises with
+#: ISO. On this axis the correlation is +0.284 and buys nothing.
+#:
+#: What remains is not ISO and not yet explained: at 0.90 the per-frame ratio
+#: still spans 0.36 to 2.44. The optimum *parameter* varies only 0.65-1.00, but
+#: the ratio is steep in `amount` near 0.9, so a narrow parameter band still
+#: leaves a wide spread in the result. That spread is the honest open item.
+DEFAULT_AMOUNT = 0.90
 
 
 def _halve(plane: np.ndarray) -> np.ndarray:
@@ -269,7 +277,8 @@ def guided_by_luma(chroma: np.ndarray, luma: np.ndarray, radius: int,
 
 def apply_chroma_nr(rgb: np.ndarray, levels: int = DEFAULT_LEVELS,
                     guide: bool = True, eps: float = GUIDE_EPS,
-                    subsample: int = 0) -> np.ndarray:
+                    subsample: int = 0,
+                    amount: float = DEFAULT_AMOUNT) -> np.ndarray:
     """Remove the fine chroma band from `rgb`, leaving luma untouched.
 
     `rgb` is float32 (h, w, 3) in any consistent scale. The luma plane is carried
@@ -277,10 +286,19 @@ def apply_chroma_nr(rgb: np.ndarray, levels: int = DEFAULT_LEVELS,
     to chroma differences rather than smoothing the channels: the engine moves
     luma by about 0.3% and every bit of that belongs to its Clarity branch, not to
     the chroma cleanup.
+
+    `amount` blends the filtered differences back over the originals, matching
+    CHROMA_COMPOSE_SHADER's `u_amount` (same domain, same clamp). It is the only
+    axis that actually varies the strength of the shipped configuration: `levels`
+    reaches the fast path as ``max(1, radius // subsample)``, so at the shipped
+    subsample of 8 every value up to 4 collapses onto the same 3x3 coefficient
+    box, and `eps` moves the output by far less than its own range -- 13x of eps
+    bought 1.6-3.4x of output on the two frames it was probed on. See §2.11.
     """
     if rgb.ndim != 3 or rgb.shape[-1] != 3:
         raise ValueError(f"expected an (h, w, 3) image, got {rgb.shape}")
-    if levels <= 0:
+    amount = float(np.clip(amount, 0.0, 1.0))
+    if levels <= 0 or amount == 0.0:
         return rgb.astype(np.float32, copy=True)
     a = rgb.astype(np.float32, copy=False)
     y = a @ _LUMA
@@ -302,6 +320,12 @@ def apply_chroma_nr(rgb: np.ndarray, levels: int = DEFAULT_LEVELS,
     else:
         cr = coarse_only(cr, levels)
         cb = coarse_only(cb, levels)
+    if amount < 1.0:
+        # In the difference domain and before the rebuild, so luma stays exact
+        # for every amount -- the same place CHROMA_COMPOSE_SHADER blends.
+        w = np.float32(amount)
+        cr = cr * w + ((a[..., 0] - y) / np.float32(_CR_TO_R)) * (1 - w)
+        cb = cb * w + ((a[..., 2] - y) / np.float32(_CB_TO_B)) * (1 - w)
     out = np.empty_like(a)
     out[..., 0] = y + np.float32(_CR_TO_R) * cr
     out[..., 1] = y - np.float32(_CB_TO_G) * cb - np.float32(_CR_TO_G) * cr
