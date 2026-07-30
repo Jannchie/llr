@@ -111,10 +111,11 @@ def render_two(path):
     # levels 与 GUIDE_EPS 会互相作用(引导量里也带亮度噪声),所以联合扫,
     # 不能只扫一个。
     base = res["逐通道 (现状)"]
-    res["chromanr 精确"] = apply_chroma_nr(base)
-    # fast 版是**会上线的那一个**(精确版在 GPU 上跑不动),所以定标必须落在它身上。
-    for s in (4, 8, 16):
-        res[f"chromanr fast s{s}"] = apply_chroma_nr(base, subsample=s)
+    # 只跑**会上线的那一个**(fast s8)及其邻域。参数是在 3 张片上扫出来的,
+    # 而那 3 张对最优点的偏好本就不一致 —— 所以要看的是**全语料的离散度**,
+    # 不是某一档的中位好不好看。
+    for n, e in ((4, 1e-4), (4, 4e-4), (5, 1e-4), (5, 4e-4)):
+        res[f"L{n} e{e:.0e}"] = apply_chroma_nr(base, levels=n, eps=e, subsample=8)
     return res
 
 
@@ -128,7 +129,17 @@ def main():
         z = np.load(TMP / f"final_{stem}.npz")
         step, W, H = (int(v) for v in z["step"])
         eng = z["ZcTaskSIMDMarble_out"][:H // step, :W // step]
-        print(f"\n=== {stem}  引擎成品 {eng.shape}")
+        # ISO 一并打出来:引擎里相邻的两级(RawNR、Spica)都带 ISO 依赖,而这一级
+        # 一个都没有。若残差跟着 ISO 走,缺的就是那一项,不是参数没调好。
+        iso = ""
+        try:
+            import subprocess
+            r = subprocess.run(["exiftool", "-ISO", "-T", str(SRC / f"{stem}.ARW")],
+                               capture_output=True, text=True, timeout=30)
+            iso = f"ISO {r.stdout.strip()}"
+        except Exception:  # noqa: BLE001
+            pass
+        print(f"\n=== {stem}  {iso}")
         rows = {"Edit": stats("Edit", eng.astype(np.float32) * (255.0 / FULL))}
         for name, img in render_two(SRC / f"{stem}.ARW").items():
             a = align(img, eng, eng.shape[:2])[0]

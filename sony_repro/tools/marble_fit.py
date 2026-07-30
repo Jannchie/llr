@@ -14,7 +14,11 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import numpy as np
 
-Z = Path("/home/jannchie/llr/sony_repro/tools/tiles_marble.npz")
+#: 默认是 DSC02995(ISO 320)。**算子的形状是从这一张的两块 tile 上读出来的**,
+#: 所以换张片再跑一次是必要的,不是锦上添花 —— 给个名字即可:
+#:     marble_fit.py marble2961
+Z = Path("/home/jannchie/llr/sony_repro/tools") / (
+    f"tiles_{sys.argv[1] if len(sys.argv) > 1 else 'marble'}.npz")
 W601 = np.array([0.299, 0.587, 0.114])
 
 
