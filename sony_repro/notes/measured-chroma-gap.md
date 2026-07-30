@@ -575,6 +575,18 @@ Marble 同时在做一个大幅色彩变换(Clarity 那一支),那部分量级 ~
 > compose/spica 五个,序列在 `pipeline-renderer.ts` 的 `runSonyPost`)。位置也对 ——
 > Marble 就排在 Sharpness / Spica 之后。
 >
+> ✅ **已接进管线(默认关),开启是一行。** `apps/web/src/rendering/passes.ts` 三个
+> shader、`pipeline-renderer.ts` 的 `runChromaNr` 三个 pass,门控在 profile 的
+> `chromaNr` 字段(0..1)。字段缺省即 0,此时 `chroma` 为 null,整条链**与今天逐字节相同**。
+>
+> **要打开:** `apps/web/src/App.vue` 组装 profile curve 的地方(`spica:` 那一行旁边)
+> 加 `chromaNr: 1`。Edit 里 Marble 是恒开的,所以忠实复刻就是 1 ——
+> 但这会改变**每一张**索尼片的输出,所以默认留空,由人来定。
+>
+> 已验证:`vue-tsc` 干净、web 219 测试、11 个 program 全部在真实 WebGL2 编译链接
+> (`shader-check`)、shader 链的计算逐位对上 `chromanr.py`(`chroma-check`)。
+> **未验证:没有人拿真照片渲过** —— 那要先把上面那行加上。
+
 > ✅ **像素级验证是有的,而且已经跑通。** ~~那边没有像素级的验证手段~~ ——
 > **这条我又说错了**:`__tests__/passes.spec.ts` 确实只是文本级的(正则核对 uniform
 > 注册表),但 `apps/web/scripts/` 下另有两个脚本,而且脚本头上把用法写得很清楚:
