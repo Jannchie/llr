@@ -75,7 +75,21 @@ def main():
             print(f"  {name}: 细节 MAD in {fi:8.3f} → out {fo:8.3f}   "
                   f"×{fo / max(fi, 1e-9):5.3f}      "
                   f"整块 std {di.std():8.1f} → {do.std():8.1f}")
-            # H2:各半径盒低通
+            # 只在**平坦区**上问一次「是不是低通类」。保边算子在没有边的地方退化为
+            # 低通,所以平坦区的解释力才是算子类别的判据 —— 整块的数字被边缘和
+            # Clarity 的局部对比度分量拖着(t12 的整块 std 反而涨了),分不出类别。
+            cands = {"原样": di}
+            cands.update({f"盒 k={k}": box(di, k) for k in (3, 5, 9, 13, 21, 31)})
+            flat_t = np.concatenate([do[s].ravel() for s in tiles])
+            scores = {}
+            for cname, c in cands.items():
+                p = np.concatenate([c[s].ravel() for s in tiles])
+                scores[cname] = 1.0 - float(np.var(flat_t - p) / max(np.var(flat_t), 1e-12))
+            top = sorted(scores.items(), key=lambda kv: -kv[1])[:3]
+            print("        平坦区解释力: "
+                  + "   ".join(f"{n} {v * 100:6.2f}%" for n, v in top))
+
+            # H2:各半径盒低通(整块)
             best = max(((k, explained(do, box(di, k))) for k in (3, 5, 7, 9, 13, 17, 25)),
                        key=lambda t: t[1])
             print(f"        盒低通最佳 k={best[0]:2d} 解释 {best[1] * 100:6.2f}%   "
