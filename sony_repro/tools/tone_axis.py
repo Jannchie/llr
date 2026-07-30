@@ -107,20 +107,32 @@ def render_two(path):
 
 
 def main():
-    stem = sys.argv[1] if len(sys.argv) > 1 else "DSC02995"
-    z = np.load(TMP / f"final_{stem}.npz")
-    step, W, H = (int(v) for v in z["step"])
-    eng = z["ZcTaskSIMDMarble_out"][:H // step, :W // step]
-    print(f"{stem}  引擎成品 {eng.shape}")
-    print("\n参照:")
-    stats("Edit", eng.astype(np.float32) * (255.0 / FULL))
+    """默认跑三张。**别拿一张片下结论** —— 头一版只测了 DSC02995,得出「色调那一改
+    收益 2.9 倍」,换两张之后中位只有 1.5 倍,其中一张几乎没有收益。
+    `dump_finals.py` 的开头早就写着「两三张的样本量不足以为一个全局改动背书」。"""
+    stems = sys.argv[1:] or ["DSC02995", "DSC02961", "DSC03025"]
+    ratios = {}
+    for stem in stems:
+        z = np.load(TMP / f"final_{stem}.npz")
+        step, W, H = (int(v) for v in z["step"])
+        eng = z["ZcTaskSIMDMarble_out"][:H // step, :W // step]
+        print(f"\n=== {stem}  引擎成品 {eng.shape}")
+        rows = {"Edit": stats("Edit", eng.astype(np.float32) * (255.0 / FULL))}
+        for name, img in render_two(SRC / f"{stem}.ARW").items():
+            a = align(img, eng, eng.shape[:2])[0]
+            rows[name] = stats(name, to_grid(a, eng.shape[:2]) * 255.0)
+        for name, (my, ma, mb) in rows.items():
+            ratios.setdefault(name, []).append((ma + mb) / 2 / max(my, 1e-9))
 
-    print("\nllr 两种色调作用方式:")
-    for name, img in render_two(SRC / f"{stem}.ARW").items():
-        a = align(img, eng, eng.shape[:2])[0]
-        stats(name, to_grid(a, eng.shape[:2]) * 255.0)
-    print("\n注:「只作用在亮度」会让暗部欠饱和 —— Edit 靠 ChromaSuppres 与色度增益补,"
-          "\n   这里只量噪声,不是可交付的实现。")
+    print(f"\n{len(stems)} 张的「色差/亮度」中位:")
+    edit = float(np.median(ratios["Edit"]))
+    for name, rs in ratios.items():
+        med = float(np.median(rs))
+        tail = "" if name == "Edit" else f"   对 Edit {med / max(edit, 1e-9):5.2f}×"
+        print(f"  {name:<32} {med:6.3f}   逐张 "
+              + " ".join(f"{r:.3f}" for r in rs) + tail)
+    print("\n注:「只作用在亮度」会让暗部欠饱和,「跳过 sony_chroma」会让颜色不对 ——"
+          "\n   两个都是**定位用的变体**,不是可交付的实现。")
     return 0
 
 
