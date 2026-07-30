@@ -20,6 +20,7 @@ sys.path.insert(0, "/home/jannchie/llr/apps/worker/src")
 import e2e_pipeline as E  # noqa: E402
 from engine_final_check import align, to_grid  # noqa: E402
 from llr_worker.cli import prepare_linear  # noqa: E402
+from llr_worker.sony.chromanr import apply_chroma_nr  # noqa: E402
 
 SRC = Path("/mnt/e/10960725")
 TMP = Path("/home/jannchie/llr/tmp")
@@ -103,6 +104,12 @@ def render_two(path):
                               cp.get("profileChromaSaturation", 1.0)).astype(np.float32)
         cc = s @ E.SRGB_TO_PROPHOTO.T if srgb_basis else s
         res[k] = E.srgb_encode(np.clip(cc, 0, 1) @ E.PROPHOTO_TO_SRGB.T).astype(np.float32)
+
+    # 接在**最末端**,因为 Marble 就在那个位置 —— 提前接等于白接:逐通道的非线性
+    # 曲线会把亮度噪声重新变成色度噪声。levels 逐档都出,因为「约 20px」那个尺度
+    # 只有个括号,没有定标(见 notes/measured-chroma-gap.md §2.7.2)。
+    for n in (1, 2, 3, 4):
+        res[f"现状 + chromanr L{n}"] = apply_chroma_nr(res["逐通道 (现状)"], levels=n)
     return res
 
 
