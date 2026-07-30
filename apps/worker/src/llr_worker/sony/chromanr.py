@@ -164,6 +164,53 @@ def _box(plane: np.ndarray, radius: int) -> np.ndarray:
     return (total / (k * k)).astype(np.float32)
 
 
+def _bilinear_to(plane: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    """Bilinear resample onto `shape`, sampling at pixel centres."""
+    h, w = plane.shape
+    ys = (np.arange(shape[0], dtype=np.float32) + 0.5) * (h / shape[0]) - 0.5
+    xs = (np.arange(shape[1], dtype=np.float32) + 0.5) * (w / shape[1]) - 0.5
+    y0 = np.clip(np.floor(ys), 0, h - 1).astype(np.int32)
+    x0 = np.clip(np.floor(xs), 0, w - 1).astype(np.int32)
+    y1 = np.clip(y0 + 1, 0, h - 1)
+    x1 = np.clip(x0 + 1, 0, w - 1)
+    fy = np.clip(ys - y0, 0.0, 1.0).astype(np.float32)[:, None]
+    fx = np.clip(xs - x0, 0.0, 1.0).astype(np.float32)[None, :]
+    top = plane[np.ix_(y0, x0)] * (1 - fx) + plane[np.ix_(y0, x1)] * fx
+    bot = plane[np.ix_(y1, x0)] * (1 - fx) + plane[np.ix_(y1, x1)] * fx
+    return (top * (1 - fy) + bot * fy).astype(np.float32)
+
+
+def guided_by_luma_fast(chroma: np.ndarray, luma: np.ndarray, radius: int,
+                        eps: float = GUIDE_EPS, subsample: int = 8) -> np.ndarray:
+    """The guided filter with its coefficients computed at reduced resolution.
+
+    Exists because the exact form cannot be a GPU pass: a radius-8 box is 17x17
+    taps per pixel and there are four moments to gather. The standard fast form
+    computes the moments on a decimated pair and bilinearly upsamples ``a`` and
+    ``b``, which is cheap enough to be three or four passes -- and, importantly,
+    is the form that would actually ship, so it is the one that has to carry the
+    calibration rather than the exact one.
+
+    The second box over ``a`` and ``b`` in the exact form is dropped here; the
+    bilinear upsample stands in for it, as it does in the literature.
+    """
+    if subsample < 2:
+        return guided_by_luma(chroma, luma, radius, eps)
+    small = (max(1, luma.shape[0] // subsample), max(1, luma.shape[1] // subsample))
+    i_s = _bilinear_to(luma, small)
+    p_s = _bilinear_to(chroma, small)
+    ii_s = _bilinear_to(luma * luma, small)
+    ip_s = _bilinear_to(luma * chroma, small)
+    r = max(1, radius // subsample)
+    mean_i = _box(i_s, r)
+    mean_p = _box(p_s, r)
+    cov = _box(ip_s, r) - mean_i * mean_p
+    var_i = _box(ii_s, r) - mean_i * mean_i
+    a = cov / (var_i + np.float32(eps))
+    b = mean_p - a * mean_i
+    return _bilinear_to(a, luma.shape) * luma + _bilinear_to(b, luma.shape)
+
+
 def guided_by_luma(chroma: np.ndarray, luma: np.ndarray, radius: int,
                    eps: float = GUIDE_EPS) -> np.ndarray:
     """Smooth `chroma` but stop at edges that exist in `luma`.
@@ -188,7 +235,8 @@ def guided_by_luma(chroma: np.ndarray, luma: np.ndarray, radius: int,
 
 
 def apply_chroma_nr(rgb: np.ndarray, levels: int = DEFAULT_LEVELS,
-                    guide: bool = True, eps: float = GUIDE_EPS) -> np.ndarray:
+                    guide: bool = True, eps: float = GUIDE_EPS,
+                    subsample: int = 0) -> np.ndarray:
     """Remove the fine chroma band from `rgb`, leaving luma untouched.
 
     `rgb` is float32 (h, w, 3) in any consistent scale. The luma plane is carried
@@ -212,8 +260,12 @@ def apply_chroma_nr(rgb: np.ndarray, levels: int = DEFAULT_LEVELS,
         # variant covers the same band -- the difference is only that it stops at
         # luma edges instead of averaging across them.
         radius = max(1, 2 ** max(levels, 1) // 2)
-        cr = guided_by_luma(cr, y, radius, eps)
-        cb = guided_by_luma(cb, y, radius, eps)
+        if subsample >= 2:
+            cr = guided_by_luma_fast(cr, y, radius, eps, subsample)
+            cb = guided_by_luma_fast(cb, y, radius, eps, subsample)
+        else:
+            cr = guided_by_luma(cr, y, radius, eps)
+            cb = guided_by_luma(cb, y, radius, eps)
     else:
         cr = coarse_only(cr, levels)
         cb = coarse_only(cb, levels)

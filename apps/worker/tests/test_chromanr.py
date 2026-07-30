@@ -193,6 +193,27 @@ def test_a_colour_edge_on_a_luma_edge_survives() -> None:
     assert kept.mean() > lost.mean(), (kept.mean(), lost.mean())
 
 
+def test_the_fast_form_tracks_the_exact_one() -> None:
+    """The fast form is what can ship, so it has to behave like the calibrated one.
+
+    Coefficients computed on a decimated pair and bilinearly upsampled is the
+    only form that fits in three or four GPU passes; the exact filter is 17x17
+    taps over four moments. If the two diverge, the calibration belongs to
+    something that will never run.
+    """
+    rng = np.random.default_rng(17)
+    img = _noisy_grey(size=256)
+    img[:, 128:] += rng.normal(0.0, 0.0, (256, 128, 3)).astype(np.float32)
+    img[64:192, 64:192, 0] += 0.15  # some structure for the guide to hold on to
+    exact = apply_chroma_nr(img)
+    fast = apply_chroma_nr(img, subsample=8)
+    for i, j in ((0, 1), (2, 1)):
+        de = _mad(_detail(exact[..., i] - exact[..., j]))
+        df = _mad(_detail(fast[..., i] - fast[..., j]))
+        assert df < 2.0 * max(de, 1e-6), (i, j, de, df)
+    assert np.allclose(_luma(fast), _luma(img), atol=1e-5)
+
+
 def test_a_hard_colour_edge_bleeds_and_this_records_how_much() -> None:
     """Characterisation, not a match: the engine's edge behaviour is unmeasured.
 

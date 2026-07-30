@@ -1057,6 +1057,114 @@ void main() {
  * Clarity and is built whenever either is on; `spica` runs between the two and
  * only when it is on.
  */
+export const CHROMA_SUBSAMPLE = 8;
+export const CHROMA_COEF_RADIUS = 1;   // at the decimated scale, so 8 full-res
+export const CHROMA_EPS = 1e-4;
+
+// Rec.601, matching the engine's own inverse: ZcTaskYCC2RGB (RVA 0x3713e0) holds
+// 14020, 3441, 7141 and 17720 over a Y coefficient of 10000, and its midpoint
+// offset 0x14ab0000 is exactly (3441 + 7141) * 32768. Not Rec.709 — the engine's
+// chroma axes are 601 and the round trip has to use the pair it uses.
+const CHROMA_GLSL_COMMON = `
+const vec3 CY = vec3(0.299, 0.587, 0.114);
+const float CR2R = 1.4020, CB2G = 0.3441, CR2G = 0.7141, CB2B = 1.7720;`;
+
+// ===== Sony in-camera chroma cleanup — the other half of ZcTaskSIMDMarble =====
+// The notes only ever recorded Clarity. Hooked on Marble's own input and output
+// at full resolution, the fine-scale colour differences also fall 11x to 21x
+// while the whole-tile standard deviation stays put and luma moves 0.3%, and the
+// output's fine chroma band is *uncorrelated* with the input's (|r| <= 0.032) —
+// so the band is removed, not shrunk. sony_repro/notes/measured-chroma-gap.md
+// 2.7; the reference and its calibration are in worker sony/chromanr.py.
+//
+// A plain scale split reproduced the flat-area numbers and still washed small
+// saturated marks out on hard boundaries: a flat area has no edges, so the metric
+// that drove the calibration could not see it. Guiding by luma fixes that and
+// follows from the measurement — Marble leaves luma alone, so luma still carries
+// every edge.
+//
+// Three passes, the standard fast guided filter. The exact filter is 17x17 taps
+// over four moments per pixel, which is no GPU pass; computing the coefficients
+// on an 8x decimated pair and upsampling them bilinearly is, and it is the form
+// the worker calibrates, so what ships is what was measured.
+export const CHROMA_MOMENT_SHADER = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 outColor;
+uniform sampler2D u_scene;
+uniform vec2 u_sceneTexel;   // one full-res texel
+uniform float u_second;      // 0 = (Y, Cr, Cb, Y*Y), 1 = (Y*Cr, Y*Cb, 0, 0)
+${CHROMA_GLSL_COMMON}
+const int S = ${CHROMA_SUBSAMPLE};
+void main() {
+  // Sixteen bilinear reads cover the 8x8 box: each lands on a texel corner so
+  // the hardware averages a 2x2 for free. Sampling all 64 costs four times as
+  // much for the same mean.
+  vec4 acc = vec4(0.0);
+  for (int j = 0; j < S / 2; j++) {
+    for (int i = 0; i < S / 2; i++) {
+      vec2 off = (vec2(float(i), float(j)) * 2.0 - float(S) * 0.5 + 1.0) * u_sceneTexel;
+      vec3 c = max(texture(u_scene, v_uv + off).rgb, 0.0);
+      float y = dot(c, CY);
+      vec3 ycc = vec3(y, (c.r - y) / CR2R, (c.b - y) / CB2B);
+      acc += (u_second > 0.5)
+        ? vec4(ycc.x * ycc.y, ycc.x * ycc.z, 0.0, 0.0)
+        : vec4(ycc, ycc.x * ycc.x);
+    }
+  }
+  outColor = acc / float((S / 2) * (S / 2));
+}`;
+
+export const CHROMA_COEF_SHADER = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 outColor;
+uniform sampler2D u_m1;      // (meanY, meanCr, meanCb, meanYY)
+uniform sampler2D u_m2;      // (meanYCr, meanYCb, -, -)
+uniform vec2 u_texel;        // one decimated texel
+const int R = ${CHROMA_COEF_RADIUS};
+const float EPS = ${CHROMA_EPS};
+void main() {
+  vec4 s1 = vec4(0.0);
+  vec2 s2 = vec2(0.0);
+  for (int j = -R; j <= R; j++) {
+    for (int i = -R; i <= R; i++) {
+      vec2 off = vec2(float(i), float(j)) * u_texel;
+      s1 += texture(u_m1, v_uv + off);
+      s2 += texture(u_m2, v_uv + off).rg;
+    }
+  }
+  float n = float((2 * R + 1) * (2 * R + 1));
+  s1 /= n; s2 /= n;
+  float varY = max(s1.a - s1.r * s1.r, 0.0);
+  vec2 cov = s2 - s1.r * s1.gb;
+  vec2 a = cov / (varY + EPS);
+  vec2 b = s1.gb - a * s1.r;
+  outColor = vec4(a, b);
+}`;
+
+export const CHROMA_COMPOSE_SHADER = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 outColor;
+uniform sampler2D u_scene;
+uniform sampler2D u_coef;    // (a_cr, a_cb, b_cr, b_cb), sampled LINEAR
+uniform float u_amount;      // 0 = off, 1 = fully cleaned
+${CHROMA_GLSL_COMMON}
+void main() {
+  vec3 c = texture(u_scene, v_uv).rgb;
+  float y = dot(c, CY);
+  vec4 ab = texture(u_coef, v_uv);
+  // Luma is carried through untouched; only the two differences are rebuilt.
+  vec2 cc = ab.xy * y + ab.zw;
+  vec2 orig = vec2((c.r - y) / CR2R, (c.b - y) / CB2B);
+  cc = mix(orig, cc, clamp(u_amount, 0.0, 1.0));
+  outColor = vec4(y + CR2R * cc.x,
+                  y - CB2G * cc.y - CR2G * cc.x,
+                  y + CB2B * cc.y,
+                  1.0);
+}`;
+
 export const SONY_POST_PROGRAMS = {
   down: { fsSource: CLARITY_DOWN_SHADER, uniforms: ["u_input", "u_cell", "u_taps"] },
   edge: { fsSource: CLARITY_EDGE_SHADER, uniforms: ["u_input", "u_texel", "u_threshold"] },
@@ -1068,6 +1176,18 @@ export const SONY_POST_PROGRAMS = {
   spica: {
     fsSource: SPICA_SHADER,
     uniforms: ["u_scene", "u_weights", "u_lut", "u_sceneTexel", "u_amount", "u_isoGain"],
+  },
+  chromaMoment: {
+    fsSource: CHROMA_MOMENT_SHADER,
+    uniforms: ["u_scene", "u_sceneTexel", "u_second"],
+  },
+  chromaCoef: {
+    fsSource: CHROMA_COEF_SHADER,
+    uniforms: ["u_m1", "u_m2", "u_texel"],
+  },
+  chromaCompose: {
+    fsSource: CHROMA_COMPOSE_SHADER,
+    uniforms: ["u_scene", "u_coef", "u_amount"],
   },
 } as const;
 

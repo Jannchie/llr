@@ -111,9 +111,10 @@ def render_two(path):
     # levels 与 GUIDE_EPS 会互相作用(引导量里也带亮度噪声),所以联合扫,
     # 不能只扫一个。
     base = res["逐通道 (现状)"]
-    for n in (4, 5):
-        for e in (1e-4, 4e-4, 1.6e-3, 6.4e-3):
-            res[f"chromanr L{n} e{e:.0e}"] = apply_chroma_nr(base, levels=n, eps=e)
+    res["chromanr 精确"] = apply_chroma_nr(base)
+    # fast 版是**会上线的那一个**(精确版在 GPU 上跑不动),所以定标必须落在它身上。
+    for s in (4, 8, 16):
+        res[f"chromanr fast s{s}"] = apply_chroma_nr(base, subsample=s)
     return res
 
 

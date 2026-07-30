@@ -575,11 +575,32 @@ Marble 同时在做一个大幅色彩变换(Clarity 那一支),那部分量级 ~
 > compose/spica 五个,序列在 `pipeline-renderer.ts` 的 `runSonyPost`)。位置也对 ——
 > Marble 就排在 Sharpness / Spica 之后。
 >
-> ⚠️ **但那边没有像素级的验证手段**:`__tests__/passes.spec.ts` 是**文本级**的
-> (正则核对 uniform 注册表与 shader 声明是否同步),既不编译 GLSL 也不比像素。
-> 所以 shader 写完只能靠人眼在真机上看。另外半径 8 的 guided filter 在 GPU 上
-> 不能硬算 17×17,得走 fast guided filter(降采样算 a/b 再上采样)——
-> 现有的 `down` / `blur` 两个 program 正好是这个形状,可以复用。
+> ✅ **像素级验证是有的,而且已经跑通。** ~~那边没有像素级的验证手段~~ ——
+> **这条我又说错了**:`__tests__/passes.spec.ts` 确实只是文本级的(正则核对 uniform
+> 注册表),但 `apps/web/scripts/` 下另有两个脚本,而且脚本头上把用法写得很清楚:
+>
+> * `shader-check.ts` —— 在**真实 WebGL2 上下文**里编译+链接每个 program
+> * `spica-check.ts` —— 在合成图案上**实际跑 shader**,校验行为性质(flat / edge /
+>   symmetry),并打印 `DONE failures=N`
+>
+> 实测跑通(`check:spica` → `DONE failures=0`)。Windows 上的调用方式:
+>
+> ```
+> chrome --headless=new --enable-unsafe-swiftshader --use-angle=swiftshader \
+>        --user-data-dir=<tmp> --screenshot=out.png <file URL>
+> ```
+> ⚠️ **不要加 `--virtual-time-budget`** —— 加了截图不会落盘(脚本头里的示例带着它);
+> 去掉再 `Start-Sleep` 几秒就正常。Windows 上 `--dump-dom` 也拿不到输出,
+> 只能读截图。
+>
+> **所以「shader 无法验证」不是理由**,照 `spica-check.ts` 的模式写一个
+> `chroma-check.ts` 就能自证。
+
+> ⚠️ 真正的成本在算子形状:半径 8 的 guided filter 在 GPU 上不能硬算 17×17,
+> 得走 fast guided filter(低分辨率上算 a/b 再上采样),而逐通道要 4 个矩
+> (mean_Y / mean_p / mean_Yp / mean_YY),打包下来是 3~4 个 pass。
+> **若为此换成更省的算子(例如以亮度为权的联合双边),必须先在 Python 侧换掉并
+> 重新定标** —— 否则上线的 shader 不是被定标过的那个东西。
 
 ## 3. 那个基底重建就是 ITP,而且它就是真正的 demosaic
 
