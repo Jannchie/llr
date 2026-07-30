@@ -108,7 +108,7 @@ def render_two(path):
     # 接在**最末端**,因为 Marble 就在那个位置 —— 提前接等于白接:逐通道的非线性
     # 曲线会把亮度噪声重新变成色度噪声。levels 逐档都出,因为「约 20px」那个尺度
     # 只有个括号,没有定标(见 notes/measured-chroma-gap.md §2.7.2)。
-    for n in (1, 2, 3, 4):
+    for n in (3, 4, 5, 6):
         res[f"现状 + chromanr L{n}"] = apply_chroma_nr(res["逐通道 (现状)"], levels=n)
     return res
 

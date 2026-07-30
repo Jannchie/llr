@@ -50,20 +50,21 @@ _CB_TO_B = 17720 / 10000
 #: Luma weights implied by the inverse above, i.e. the forward transform's rows.
 _LUMA = np.array([0.299, 0.587, 0.114], dtype=np.float32)
 
-#: Halvings before the chroma planes are sent back up; each level doubles the
-#: cutoff, so this puts it at 8px.
+#: Sets the band this works over; the guided radius is ``2**levels // 2``.
 #:
-#: Calibrated, not guessed. Against Edit's own output on three frames
-#: (`sony_repro/tools/tone_axis.py`), the chroma-to-luma detail ratio comes out
-#: 4.45x, 2.33x, 1.08x and 0.44x of Edit's for levels 1 through 4, so 3 lands
-#: within 8% at the median while 4 overshoots by more than two. Per-frame spread
-#: at 3 is 0.111 / 0.096 / 0.109 against Edit's 0.102 / 0.179 / 0.081.
+#: Calibrated against Edit's output on three frames (`tools/tone_axis.py`). The
+#: guided filter converges rather than overshooting -- 1.95x, 1.35x, 1.22x, 1.18x
+#: of Edit's chroma-to-luma ratio for levels 3 through 6 -- because preserving
+#: edges bounds how much it can take out. Level 4 is chosen on per-frame
+#: agreement rather than on the median: it gives 0.103 / 0.176 / 0.138 against
+#: Edit's 0.102 / 0.179 / 0.081, so two frames land within 2% and the third is
+#: the outlier at any level.
 #:
-#: Worth noting because the first estimate was wrong: reading the operator's
-#: extent off box radii 9 through 31 scoring identically suggested a cutoff near
-#: 20px, which would have been level 4 or 5. The bracket was too loose, and only
-#: sweeping against the engine's output settled it.
-DEFAULT_LEVELS = 3
+#: That per-frame tracking is the point. The unguided scale split reached 1.08x
+#: at the median but its per-frame values were 0.040 / 0.045 / 0.048 -- flat,
+#: while Edit's vary nearly threefold. Matching a median while ignoring the
+#: variation means the mechanism is wrong even when the summary number is right.
+DEFAULT_LEVELS = 4
 
 
 def _halve(plane: np.ndarray) -> np.ndarray:
@@ -126,7 +127,55 @@ def coarse_only(plane: np.ndarray, levels: int = DEFAULT_LEVELS) -> np.ndarray:
     return cur
 
 
-def apply_chroma_nr(rgb: np.ndarray, levels: int = DEFAULT_LEVELS) -> np.ndarray:
+#: Regularisation for the luma-guided variant, in units of the luma range. Small
+#: enough that a real luma edge dominates it, large enough that flat areas fall
+#: back to a plain average.
+#:
+#: ⚠️ Not calibrated -- `DEFAULT_LEVELS` was swept with this held at 1e-4, and the
+#: two interact: the guide carries luma noise too, so where the guide's local
+#: variance is comparable to eps the filter treats that noise as structure and
+#: keeps some of the chroma noise correlated with it. On the real frames that
+#: still landed within 2% of Edit on two of three, but on a synthetic flat field
+#: -- where the guide is *nothing but* noise -- it is the degenerate case and
+#: removes much less than the unguided split. Sweeping the pair jointly against
+#: `tools/tone_axis.py` is the obvious next refinement.
+GUIDE_EPS = 1e-4
+
+
+def _box(plane: np.ndarray, radius: int) -> np.ndarray:
+    """Box mean with edge padding, via a summed-area table."""
+    k = 2 * radius + 1
+    p = np.pad(plane.astype(np.float64), radius, mode="edge")
+    cs = np.pad(p.cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+    total = cs[k:, k:] - cs[:-k, k:] - cs[k:, :-k] + cs[:-k, :-k]
+    return (total / (k * k)).astype(np.float32)
+
+
+def guided_by_luma(chroma: np.ndarray, luma: np.ndarray, radius: int,
+                   eps: float = GUIDE_EPS) -> np.ndarray:
+    """Smooth `chroma` but stop at edges that exist in `luma`.
+
+    A plain scale split matches Edit's *flat-area* numbers and still fails the
+    picture: on a poster with hard colour boundaries it washes small saturated
+    marks out and mushes colour edges, while Edit keeps them crisp. The flat-area
+    metric cannot see that -- there are no edges in a flat area -- so matching it
+    is necessary and not sufficient.
+
+    Luma guidance is the mechanism that fits everything measured: Edit leaves luma
+    untouched, so luma still carries every edge, and colour boundaries in real
+    images almost always coincide with one.
+    """
+    mean_i = _box(luma, radius)
+    mean_p = _box(chroma, radius)
+    cov = _box(luma * chroma, radius) - mean_i * mean_p
+    var_i = _box(luma * luma, radius) - mean_i * mean_i
+    a = cov / (var_i + np.float32(eps))
+    b = mean_p - a * mean_i
+    return _box(a, radius) * luma + _box(b, radius)
+
+
+def apply_chroma_nr(rgb: np.ndarray, levels: int = DEFAULT_LEVELS,
+                    guide: bool = True) -> np.ndarray:
     """Remove the fine chroma band from `rgb`, leaving luma untouched.
 
     `rgb` is float32 (h, w, 3) in any consistent scale. The luma plane is carried
@@ -137,14 +186,24 @@ def apply_chroma_nr(rgb: np.ndarray, levels: int = DEFAULT_LEVELS) -> np.ndarray
     """
     if rgb.ndim != 3 or rgb.shape[-1] != 3:
         raise ValueError(f"expected an (h, w, 3) image, got {rgb.shape}")
+    if levels <= 0:
+        return rgb.astype(np.float32, copy=True)
     a = rgb.astype(np.float32, copy=False)
     y = a @ _LUMA
     # Chroma as the two colour differences the measurement was made on, scaled to
     # Cb/Cr so the inverse below is the engine's own.
     cr = (a[..., 0] - y) / np.float32(_CR_TO_R)
     cb = (a[..., 2] - y) / np.float32(_CB_TO_B)
-    cr = coarse_only(cr, levels)
-    cb = coarse_only(cb, levels)
+    if guide:
+        # 2**levels is the cutoff the scale split would have had, so the guided
+        # variant covers the same band -- the difference is only that it stops at
+        # luma edges instead of averaging across them.
+        radius = max(1, 2 ** max(levels, 1) // 2)
+        cr = guided_by_luma(cr, y, radius)
+        cb = guided_by_luma(cb, y, radius)
+    else:
+        cr = coarse_only(cr, levels)
+        cb = coarse_only(cb, levels)
     out = np.empty_like(a)
     out[..., 0] = y + np.float32(_CR_TO_R) * cr
     out[..., 1] = y - np.float32(_CB_TO_G) * cb - np.float32(_CR_TO_G) * cr

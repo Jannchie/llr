@@ -76,29 +76,48 @@ def test_luma_is_preserved_exactly() -> None:
     assert np.allclose(_luma(out), _luma(img), atol=1e-5)
 
 
-def test_the_fine_chroma_band_is_removed_not_shrunk() -> None:
+def test_the_scale_split_removes_the_fine_band_rather_than_shrinking_it() -> None:
     """The load-bearing measurement: |r| <= 0.032 between input and output bands.
 
     A shrinkage would leave the output's fine band a scaled copy of the input's,
     so correlation would stay near 1 whatever the factor. The engine's is
-    essentially zero, and so must this be, or it is reproducing the wrong shape.
+    essentially zero. Asserted on the unguided split because that is the shape
+    the engine measurement describes; the guided default trades some of this for
+    the edge behaviour the split gets wrong, which the picture showed and the
+    flat-area numbers could not.
     """
     img = _noisy_grey(size=256)
-    out = apply_chroma_nr(img)
+    out = apply_chroma_nr(img, guide=False)
     d_in = _detail(img[..., 0] - img[..., 1]).ravel()
     d_out = _detail(out[..., 0] - out[..., 1]).ravel()
     assert _mad(d_out) < 0.1 * _mad(d_in)
     assert abs(float(np.corrcoef(d_in, d_out)[0, 1])) < 0.2
 
 
-def test_the_fine_chroma_band_shrinks_by_at_least_ten_times() -> None:
+def test_the_scale_split_shrinks_the_band_by_at_least_ten_times() -> None:
     """Measured range on the engine was 11x to 21x; assert the order, not a value."""
+    img = _noisy_grey(size=256)
+    out = apply_chroma_nr(img, guide=False)
+    for i, j in ((0, 1), (2, 1)):
+        before = _mad(_detail(img[..., i] - img[..., j]))
+        after = _mad(_detail(out[..., i] - out[..., j]))
+        assert before / max(after, 1e-9) > 10.0, (i, j, before, after)
+
+
+def test_the_guided_default_still_removes_most_of_the_band() -> None:
+    """A flat field is the guided filter's degenerate case, so this is a floor.
+
+    With nothing but noise in the guide, some chroma noise correlates with it and
+    survives -- on real frames, where the guide carries real structure, the same
+    settings land within 2% of Edit on two of three. So assert only that it is
+    clearly working here, and leave the fidelity claim to the frames.
+    """
     img = _noisy_grey(size=256)
     out = apply_chroma_nr(img)
     for i, j in ((0, 1), (2, 1)):
         before = _mad(_detail(img[..., i] - img[..., j]))
         after = _mad(_detail(out[..., i] - out[..., j]))
-        assert before / max(after, 1e-9) > 10.0, (i, j, before, after)
+        assert before / max(after, 1e-9) > 2.0, (i, j, before, after)
 
 
 def test_coarse_colour_structure_survives() -> None:
@@ -118,11 +137,10 @@ def test_coarse_colour_structure_survives() -> None:
 
 def test_more_levels_remove_more() -> None:
     img = _noisy_grey(size=256)
-    mads = [
-        _mad(_detail(apply_chroma_nr(img, levels=n)[..., 0]
-                     - apply_chroma_nr(img, levels=n)[..., 1]))
-        for n in (1, 2, 4)
-    ]
+    mads = []
+    for n in (1, 2, 4):
+        out = apply_chroma_nr(img, levels=n, guide=False)
+        mads.append(_mad(_detail(out[..., 0] - out[..., 1])))
     assert mads[0] > mads[1] > mads[2]
 
 
@@ -148,25 +166,44 @@ def test_odd_sizes_keep_their_shape(levels: int) -> None:
 def test_the_default_level_count_is_the_calibrated_one() -> None:
     """Pins the sweep's answer so a "rounder" default cannot drift in silently.
 
-    Against Edit's output on three frames the chroma-to-luma ratio came out
-    4.45x, 2.33x, 1.08x and 0.44x of Edit's for levels 1..4. Level 3 is the match;
-    level 4 overshoots by more than two, which would make llr visibly smoother
-    than the thing it is reproducing.
+    Levels 3..6 give 1.95x, 1.35x, 1.22x and 1.18x of Edit's chroma-to-luma
+    ratio. 4 is chosen on per-frame agreement, 0.103 / 0.176 / 0.138 against
+    Edit's 0.102 / 0.179 / 0.081, not on the median.
     """
-    assert DEFAULT_LEVELS == 3
+    assert DEFAULT_LEVELS == 4
+
+
+def test_a_colour_edge_on_a_luma_edge_survives() -> None:
+    """The property the picture caught and the flat-area numbers could not.
+
+    An unguided scale split matched Edit's flat-area statistics and still washed
+    small saturated marks out on a poster with hard boundaries, because a flat
+    area has no edges for the metric to judge. Guidance is what fixes it, so the
+    thing worth asserting is that a colour step riding on a luma step comes
+    through, and that turning guidance off is visibly worse.
+    """
+    img = np.full((128, 128, 3), 0.45, dtype=np.float32)
+    img[:, 64:] = np.array([0.75, 0.30, 0.20], dtype=np.float32)  # colour + luma step
+    guided = apply_chroma_nr(img, guide=True)
+    split = apply_chroma_nr(img, guide=False)
+    want = img[:, 80][..., 0] - img[:, 80][..., 1]
+    assert np.allclose(guided[:, 80][..., 0] - guided[:, 80][..., 1], want, atol=0.02)
+    kept = np.abs(guided[:, 66][..., 0] - guided[:, 66][..., 1])
+    lost = np.abs(split[:, 66][..., 0] - split[:, 66][..., 1])
+    assert kept.mean() > lost.mean(), (kept.mean(), lost.mean())
 
 
 def test_a_hard_colour_edge_bleeds_and_this_records_how_much() -> None:
     """Characterisation, not a match: the engine's edge behaviour is unmeasured.
 
-    A step contains every scale, so a scale split necessarily softens it. The
-    number below is this module's, not Edit's — if a real frame shows colour
-    bleeding across hard edges, this is the knob that moved and the measurement
-    that has to be made against the engine.
+    A step contains every scale, so a scale split necessarily softens it. This
+    records how much, on the *unguided* path and on a colour step with no luma
+    step under it — the case guidance cannot help, because there is nothing in
+    the guide to stop at. Equal-luma colour boundaries are the known blind spot.
     """
     img = np.full((128, 128, 3), 0.4, dtype=np.float32)
     img[:, 64:, 0] = 0.7
-    out = apply_chroma_nr(img, levels=DEFAULT_LEVELS)
+    out = apply_chroma_nr(img, levels=DEFAULT_LEVELS, guide=False)
     d = out[..., 0] - out[..., 1]
     profile = d.mean(axis=0)
     lo, hi = profile[8], profile[-8]
