@@ -88,7 +88,7 @@ def all_settings(frames):
 
     a = np.asarray(best_of, float)
     print("\n  每档在全语料上的表现(越接近 1 越像):")
-    for j, s in enumerate(SETTINGS):
+    for s in SETTINGS:
         v = np.array([np.sqrt((d[s][1] / max(d["Edit"][1], 1e-9))
                               * (d[s][2] / max(d["Edit"][2], 1e-9)))
                       for _, _, d in frames if s in d and "Edit" in d])

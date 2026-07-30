@@ -34,7 +34,7 @@ import numpy as np
 sys.path.insert(0, "/home/jannchie/llr/sony_repro/tools")
 sys.path.insert(0, "/home/jannchie/llr/apps/worker/src")
 import e2e_pipeline as E  # noqa: E402
-from engine_final_check import align, to_grid  # noqa: E402
+from engine_final_check import align  # noqa: E402
 from llr_worker.cli import prepare_linear  # noqa: E402
 from llr_worker.sony.chromanr import _box, apply_chroma_nr  # noqa: E402
 
@@ -75,13 +75,13 @@ def tile_masks(y, frac=0.25):
 
 def decompose(d_edit, d_llr, mask):
     """d_llr = a·d_edit + r,返回 (σ_e, σ_l, a, σ_r, corr)。"""
-    e, l = d_edit[mask].astype(np.float64), d_llr[mask].astype(np.float64)
-    e, l = e - e.mean(), l - l.mean()
+    e, q = d_edit[mask].astype(np.float64), d_llr[mask].astype(np.float64)
+    e, q = e - e.mean(), q - q.mean()
     ee = float(e @ e)
-    a = float(e @ l) / ee if ee > 0 else 0.0
-    r = l - a * e
-    c = float(np.corrcoef(e, l)[0, 1]) if ee > 0 and float(l @ l) > 0 else 0.0
-    return mad(e), mad(l), a, mad(r), c
+    a = float(e @ q) / ee if ee > 0 else 0.0
+    r = q - a * e
+    c = float(np.corrcoef(e, q)[0, 1]) if ee > 0 and float(q @ q) > 0 else 0.0
+    return mad(e), mad(q), a, mad(r), c
 
 
 def subsample(full, dy, dx, shape):
@@ -264,7 +264,7 @@ def iso_of(stem):
         r = subprocess.run(["exiftool", "-ISO", "-T", str(SRC / f"{stem}.ARW")],
                            capture_output=True, text=True, timeout=30)
         return int(r.stdout.strip())
-    except Exception:  # noqa: BLE001
+    except Exception:
         return 0
 
 
@@ -336,7 +336,7 @@ def main():
         print(f"  {'带':<6} {'σ_Edit':>8} {'σ_llr':>8} {'比':>6} │"
               f" {'放大 a':>7} {'σ_r 独有':>9} {'独有/超出':>9} {'corr':>6} │"
               f" {'结构区 corr':>11}")
-        for i, (de, dl) in enumerate(zip(be, bl)):
+        for i, (de, dl) in enumerate(zip(be, bl, strict=True)):
             se, sl, k, sr, c = decompose(de, dl, flat)
             ce = decompose(de, dl, edge)[4]
             # llr 比 Edit 多出来的量,有多少是「Edit 里没有的」而不是「放大的」。
