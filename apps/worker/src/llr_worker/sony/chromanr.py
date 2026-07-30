@@ -164,6 +164,14 @@ def _box(plane: np.ndarray, radius: int) -> np.ndarray:
     return (total / (k * k)).astype(np.float32)
 
 
+def _box_downsample(plane: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    """Mean of each block, matching the shader's 8x8 box in CHROMA_MOMENT_SHADER."""
+    h = shape[0] * (plane.shape[0] // shape[0])
+    w = shape[1] * (plane.shape[1] // shape[1])
+    p = plane[:h, :w]
+    return p.reshape(shape[0], h // shape[0], shape[1], w // shape[1]).mean(axis=(1, 3))
+
+
 def _bilinear_to(plane: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     """Bilinear resample onto `shape`, sampling at pixel centres."""
     h, w = plane.shape
@@ -197,10 +205,16 @@ def guided_by_luma_fast(chroma: np.ndarray, luma: np.ndarray, radius: int,
     if subsample < 2:
         return guided_by_luma(chroma, luma, radius, eps)
     small = (max(1, luma.shape[0] // subsample), max(1, luma.shape[1] // subsample))
-    i_s = _bilinear_to(luma, small)
-    p_s = _bilinear_to(chroma, small)
-    ii_s = _bilinear_to(luma * luma, small)
-    ip_s = _bilinear_to(luma * chroma, small)
+    # Box-average the blocks, not bilinear-resample them. Resampling reads four
+    # neighbours and lets everything between them alias into the moments, which
+    # is visible: against the GLSL port, which box-averages, the worst pixel
+    # disagreed by 3.4e-2 where the operator's own excursion was 0.164. The box
+    # is both the better choice and the one that ships, so the reference follows
+    # it rather than the other way round.
+    i_s = _box_downsample(luma, small)
+    p_s = _box_downsample(chroma, small)
+    ii_s = _box_downsample(luma * luma, small)
+    ip_s = _box_downsample(luma * chroma, small)
     r = max(1, radius // subsample)
     mean_i = _box(i_s, r)
     mean_p = _box(p_s, r)

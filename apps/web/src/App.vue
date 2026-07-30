@@ -977,6 +977,17 @@ function buildProfileLUT(cp: ColorProfileMeta | null | undefined): ProfileCurve 
     // with complementary weights, so a shot can have this on with sharpening
     // barely doing anything, or the reverse — each is gated on its own amount.
     spica: cp?.profileSpica?.amount ? cp.profileSpica : null,
+    // Marble's other half, the chroma cleanup — on for the same reason the three
+    // above are, that the engine runs it and reproducing the engine means
+    // running it. Unlike them it has no per-shot amount to gate on: Marble runs
+    // unconditionally, so the gate is just "is this a Sony render at all", which
+    // profileSpica/profileSharpness being present is what says. A JPEG or a DCP
+    // render has no Marble to reproduce.
+    //
+    // The largest single correction in the chain: llr's colour-difference noise
+    // measured 6.59x Edit's without it and 1.35x with, on three frames, with
+    // luma untouched (sony_repro/notes/measured-chroma-gap.md 2.8, 2.9).
+    chromaNr: cp?.profileSpica || cp?.profileSharpness ? 1 : 0,
   };
 }
 

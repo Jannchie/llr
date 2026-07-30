@@ -45,6 +45,12 @@ import {
   CHROMA_SUBSAMPLE,
   MASK_VERTEX_SHADER,
 } from "../src/rendering/passes";
+// A real 128x128 crop of DSC02995 and what worker/sony/chromanr.py makes of it.
+// Synthetic patterns only prove nothing is inverted; real data carries noise, a
+// hard colour edge, saturated blocks and luma texture at once, and agreeing on
+// that is what makes the shipped shader the operator that was calibrated.
+// Regenerate with the script in the same directory as this fixture's note.
+import FIXTURE from "./chroma-fixture.json" with { type: "json" };
 
 const N = 128;      // full-res patch; 16 decimated texels at 8x, enough for a 3x3 box
 const MARGIN = 12;  // the border reads outside the patch — ignore it
@@ -57,6 +63,7 @@ const FS_MOMENT = ${JSON.stringify(CHROMA_MOMENT_SHADER)};
 const FS_COEF = ${JSON.stringify(CHROMA_COEF_SHADER)};
 const FS_COMPOSE = ${JSON.stringify(CHROMA_COMPOSE_SHADER)};
 const N = ${N}, MARGIN = ${MARGIN}, S = ${CHROMA_SUBSAMPLE};
+const FIX = ${JSON.stringify(FIXTURE)};
 
 const out = document.getElementById("out");
 let bad = 0;
@@ -256,6 +263,47 @@ if (!gl || !gl.getExtension("EXT_color_buffer_float") || !gl.getExtension("OES_t
     });
     check("amount = 0 leaves the frame alone", worst < 2e-3,
           "max |delta| = " + worst.toExponential(2));
+  }
+
+  // ---- parity with the worker's reference, on a real photographic crop ----
+  if (FIX && FIX.n === N) {
+    const px = new Float32Array(N * N * 4);
+    for (let i = 0; i < N * N; i++) {
+      px[i * 4] = FIX.src[i * 3];
+      px[i * 4 + 1] = FIX.src[i * 3 + 1];
+      px[i * 4 + 2] = FIX.src[i * 3 + 2];
+      px[i * 4 + 3] = 1;
+    }
+    const got = run(px, 1);
+    let worst = 0, sum = 0, n = 0, moved = 0;
+    for (let y = MARGIN; y < N - MARGIN; y++) {
+      for (let x = MARGIN; x < N - MARGIN; x++) {
+        const c = at(got, x, y);
+        for (let k = 0; k < 3; k++) {
+          const want = FIX.ref[(y * N + x) * 3 + k];
+          const d = Math.abs(c[k] - want);
+          worst = Math.max(worst, d); sum += d; n++;
+          moved = Math.max(moved, Math.abs(want - px[(y * N + x) * 4 + k]));
+        }
+      }
+    }
+    // Loose against the reference's own excursion: this is float32 on
+    // SwiftShader against float64 in numpy, over a chain with a division by a
+    // variance, so bit-parity is not the bar. Agreeing to a few thousandths
+    // while the operator itself moves pixels far further than that is.
+    // (No backticks in here: this block lives inside a template literal.)
+    // Tightened to just above what was measured (1.88e-4 mean, 3.51e-3 max), so
+    // a regression has somewhere to show. The loose version this replaced passed
+    // while the two sides were box-averaging and bilinear-resampling the moments
+    // respectively — a real divergence it was too slack to catch.
+    check("matches the worker's reference on a real crop",
+          worst < 6e-3 && sum / n < 4e-4,
+          "mean |delta| = " + (sum / n).toExponential(2) +
+          ", max = " + worst.toExponential(2) +
+          " (the filter itself moves up to " + moved.toFixed(3) + ")");
+  } else {
+    check("chroma-fixture.json matches this patch size", false,
+          "regenerate it — N is " + N);
   }
 }
 report("DONE failures=" + bad);
