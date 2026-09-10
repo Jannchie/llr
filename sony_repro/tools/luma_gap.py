@@ -244,10 +244,16 @@ def align_shift(a, b, span=8, patch=1024):
     return best
 
 
-def render_llr(path):
-    """上线配置:逐通道色调 + sony_chroma + 色度降噪(默认 amount)。"""
+def render_llr(path, denoise_model):
+    """上线配置:逐通道色调 + sony_chroma + 色度降噪(默认 amount)。
+
+    `denoise_model=None` 就是**完全不在马赛克域降噪**,用来判断成品里那份
+    「Edit 没有的独立成分」是不是 llr 自己的降噪器留下的 —— §2.6 量到 llr 的
+    马赛克比 Edit 干净一个数量级(0.296 对 1.38),而 §2.13 又量到成品在 8px 上
+    多出与 Edit 无关的成分,8px 不是传感器噪声的尺度,是降噪斑块的尺度。
+    """
     r = prepare_linear(path, {"profileId": "sony"}, E.ROOT, None, False,
-                       half_size=False, denoise_model="wavelet")
+                       half_size=False, denoise_model=denoise_model)
     cp = r.color_profile
     c = r.linear.astype(np.float32)
     pts = cp.get("profileToneCurve")
@@ -279,14 +285,14 @@ def iso_of(stem):
         return 0
 
 
-def load_pair(stem):
+def load_pair(stem, denoise_model):
     """(Edit 亮度, llr 亮度, 说明) —— 有全分辨率 dump 就用它,否则退回 step=4。
 
     step=4 的那一支保留只为了跟旧结果对照:它的最细带过半是混叠(§2.12),
     别拿它下"噪声还是结构"的结论。
     """
     full = TMP / f"full_{stem}.npz"
-    ours = render_llr(SRC / f"{stem}.ARW")
+    ours = render_llr(SRC / f"{stem}.ARW", denoise_model)
     if full.exists():
         z = np.load(full)
         step, W, H = (int(v) for v in z["step"])
@@ -334,9 +340,12 @@ def load_pair(stem):
 
 
 def main():
-    stems = sys.argv[1:] or ["DSC02995"]
+    args = sys.argv[1:]
+    denoise_model = None if "--no-denoise" in args else "wavelet"
+    stems = [a for a in args if a != "--no-denoise"] or ["DSC02995"]
+    print(f"llr 马赛克域降噪: {denoise_model or '关'}")
     for stem in stems:
-        y_e, y_l, ok, how = load_pair(stem)
+        y_e, y_l, ok, how = load_pair(stem, denoise_model)
         flat, edge = tile_masks(y_e, valid=ok)
         be, bl = bands(y_e), bands(y_l)
 

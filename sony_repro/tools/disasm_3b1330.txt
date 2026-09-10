@@ -1,0 +1,101 @@
+  3b1330  push           rdi
+  3b1332  push           r13
+  3b1334  push           r15
+  3b1336  sub            rsp, 0x20
+  3b133a  mov            rax, qword ptr [rip + 0x1a80ff]
+  3b1341  xor            rax, rsp
+  3b1344  mov            qword ptr [rsp + 8], rax
+  3b1349  mov            qword ptr [rsp], r9
+  3b134d  mov            rdi, r9
+  3b1350  mov            r11d, dword ptr [r9 + 0xc]
+  3b1354  mov            r15, r8
+  3b1357  mov            eax, dword ptr [r9 + 0x14]
+  3b135b  add            r11d, 2
+  3b135f  vbroadcastss   ymm3, dword ptr [rip + 0x12d7c0]
+  3b1368  sub            eax, 2
+  3b136b  mov            dword ptr [rsp], 0x3f000000
+  3b1372  mov            r13, rdx
+  3b1375  cmp            r11d, eax
+  3b1378  jae            0x7ff619c01472
+  3b137e  mov            r8d, dword ptr [r9 + 8]
+  3b1382  mov            r10d, dword ptr [r9 + 0x10]
+  3b1386  mov            qword ptr [rsp + 0x40], rbx
+  3b138b  mov            rbx, qword ptr [r15 + 0x10]
+  3b138f  mov            qword ptr [rsp + 0x10], r14
+  3b1394  lea            r14d, [r11 + 1]
+  3b1398  mov            qword ptr [rsp + 0x18], rsi
+  3b139d  nop            dword ptr [rax]
+  3b13a0  mov            rcx, qword ptr [r13 + 0x10]
+  3b13a4  test           rcx, rcx
+  3b13a7  jne            0x7ff619c013ae
+  3b13a9  xor            r9d, r9d
+  3b13ac  jmp            0x7ff619c013c4
+  3b13ae  cmp            r11d, dword ptr [r13 + 4]
+  3b13b2  jb             0x7ff619c013b9
+  3b13b4  xor            r9d, r9d
+  3b13b7  jmp            0x7ff619c013c4
+  3b13b9  mov            r9d, r11d
+  3b13bc  imul           r9d, dword ptr [r13 + 8]
+  3b13c1  add            r9, rcx
+  3b13c4  movsxd         rcx, r8d
+  3b13c7  lea            eax, [r11 - 1]
+  3b13cb  shl            rcx, 2
+  3b13cf  test           rbx, rbx
+  3b13d2  jne            0x7ff619c013da
+  3b13d4  xor            esi, esi
+  3b13d6  xor            edx, edx
+  3b13d8  jmp            0x7ff619c01406
+  3b13da  cmp            eax, dword ptr [r15 + 4]
+  3b13de  jb             0x7ff619c013e4
+  3b13e0  xor            esi, esi
+  3b13e2  jmp            0x7ff619c013f1
+  3b13e4  imul           eax, dword ptr [r15 + 8]
+  3b13e9  mov            esi, eax
+  3b13eb  add            rsi, rbx
+  3b13ee  add            rcx, rsi
+  3b13f1  cmp            r14d, dword ptr [r15 + 4]
+  3b13f5  jb             0x7ff619c013fb
+  3b13f7  xor            edx, edx
+  3b13f9  jmp            0x7ff619c01406
+  3b13fb  mov            edx, r14d
+  3b13fe  imul           edx, dword ptr [r15 + 8]
+  3b1403  add            rdx, rbx
+  3b1406  cmp            r8d, r10d
+  3b1409  jae            0x7ff619c0144e
+  3b140b  mov            rax, r9
+  3b140e  sub            rax, rsi
+  3b1411  add            rax, rcx
+  3b1414  sub            rdx, r9
+  3b1417  nop            word ptr [rax + rax]
+  3b1420  vmovups        ymm1, ymmword ptr [rdx + rax]
+  3b1425  vaddps         ymm1, ymm1, ymmword ptr [rcx]
+  3b1429  vmulps         ymm2, ymm1, ymm3
+  3b142d  vmovups        ymmword ptr [rax], ymm2
+  3b1431  mov            r10d, dword ptr [rdi + 0x10]
+  3b1435  lea            rcx, [rcx + 0x20]
+  3b1439  add            r8d, 8
+  3b143d  lea            rax, [rax + 0x20]
+  3b1441  cmp            r8d, r10d
+  3b1444  jb             0x7ff619c01420
+  3b1446  mov            r8d, dword ptr [rdi + 8]
+  3b144a  mov            rbx, qword ptr [r15 + 0x10]
+  3b144e  mov            eax, dword ptr [rdi + 0x14]
+  3b1451  inc            r11d
+  3b1454  sub            eax, 2
+  3b1457  inc            r14d
+  3b145a  cmp            r11d, eax
+  3b145d  jb             0x7ff619c013a0
+  3b1463  mov            r14, qword ptr [rsp + 0x10]
+  3b1468  mov            rsi, qword ptr [rsp + 0x18]
+  3b146d  mov            rbx, qword ptr [rsp + 0x40]
+  3b1472  lea            rax, [rip + 0xb51ff]
+  3b1479  mov            qword ptr [rdi], rax
+  3b147c  vzeroupper     
+  3b147f  mov            rcx, qword ptr [rsp + 8]
+  3b1484  xor            rcx, rsp
+  3b1487  call           0x7ff619ba5630
+  3b148c  add            rsp, 0x20
+  3b1490  pop            r15
+  3b1492  pop            r13
+  3b1494  pop            rdi
+  3b1495  ret            
