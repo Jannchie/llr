@@ -1,0 +1,795 @@
+  3a0c30  mov          rax, rsp
+  3a0c33  push         rbp
+  3a0c34  push         rbx
+  3a0c35  push         rsi
+  3a0c36  push         rdi
+  3a0c37  push         r12
+  3a0c39  push         r13
+  3a0c3b  push         r14
+  3a0c3d  push         r15
+  3a0c3f  sub          rsp, 0x2a8
+  3a0c46  vmovaps      xmmword ptr [rax - 0x58], xmm6
+  3a0c4b  vmovaps      xmmword ptr [rax - 0x68], xmm7
+  3a0c50  vmovaps      xmmword ptr [rax - 0x78], xmm8
+  3a0c55  vmovaps      xmmword ptr [rax - 0x88], xmm9
+  3a0c5d  vmovaps      xmmword ptr [rax - 0x98], xmm10
+  3a0c65  vmovaps      xmmword ptr [rax - 0xa8], xmm11
+  3a0c6d  vmovaps      xmmword ptr [rax - 0xb8], xmm12
+  3a0c75  vmovaps      xmmword ptr [rax - 0xc8], xmm13
+  3a0c7d  vmovaps      xmmword ptr [rax - 0xd8], xmm14
+  3a0c85  vmovaps      xmmword ptr [rax - 0xe8], xmm15
+  3a0c8d  lea          rbp, [rsp + 0x20]
+  3a0c92  and          rbp, 0xffffffffffffffe0
+  3a0c96  mov          rax, qword ptr [rip + 0x1b87a3]
+  3a0c9d  xor          rax, rsp
+  3a0ca0  mov          qword ptr [rbp + 0x1d8], rax
+  3a0ca7  vmovss       xmm0, dword ptr [rip + 0xc8b45]
+  3a0caf  mov          eax, dword ptr [rsp + 0x340]
+  3a0cb6  mov          r13, rdx
+  3a0cb9  vbroadcastss ymm11, dword ptr [rip + 0xc8b32]
+  3a0cc2  vbroadcastss ymm13, dword ptr [rip + 0x13e595]
+  3a0ccb  vbroadcastss ymm14, dword ptr [rip + 0x13dda8]
+  3a0cd4  vbroadcastss ymm8, dword ptr [rip + 0xc8b1f]
+  3a0cdd  vbroadcastss ymm12, dword ptr [rip + 0xc8b1a]
+  3a0ce6  vmovss       dword ptr [rbp + 0x1c0], xmm0
+  3a0cee  vmovss       xmm0, dword ptr [rip + 0x13e56a]
+  3a0cf6  vmovss       dword ptr [rbp + 0x1c0], xmm0
+  3a0cfe  vmovss       xmm0, dword ptr [rip + 0x13dd76]
+  3a0d06  vmovss       dword ptr [rbp + 0x1c0], xmm0
+  3a0d0e  vxorps       xmm0, xmm0, xmm0
+  3a0d12  vcvtsi2ss    xmm0, xmm0, dword ptr [rsp + 0x328]
+  3a0d1b  vmulss       xmm0, xmm0, dword ptr [rip + 0x13dd69]
+  3a0d23  vmovss       dword ptr [rbp + 0x1c4], xmm0
+  3a0d2b  vxorps       xmm0, xmm0, xmm0
+  3a0d2f  vcvtsi2ss    xmm0, xmm0, dword ptr [rsp + 0x320]
+  3a0d38  vmovss       dword ptr [rbp + 0x1c8], xmm0
+  3a0d40  vmulss       xmm0, xmm0, dword ptr [rip + 0x13e584]
+  3a0d48  vmovss       dword ptr [rbp + 0x1d0], xmm0
+  3a0d50  vxorps       xmm0, xmm0, xmm0
+  3a0d54  vcvtsi2ss    xmm0, xmm0, dword ptr [rsp + 0x330]
+  3a0d5d  vmovss       dword ptr [rbp + 0x1cc], xmm0
+  3a0d65  vxorps       xmm0, xmm0, xmm0
+  3a0d69  mov          qword ptr [rbp + 0x178], rdx
+  3a0d70  mov          r15, rcx
+  3a0d73  mov          edx, dword ptr [rcx + 4]
+  3a0d76  mov          rsi, r8
+  3a0d79  vmovss       dword ptr [rbp + 0x1c0], xmm0
+  3a0d81  vmovss       xmm0, dword ptr [rip + 0xc8a73]
+  3a0d89  sub          edx, 5
+  3a0d8c  mov          qword ptr [rbp + 0x80], r9
+  3a0d93  mov          r9d, dword ptr [rcx]
+  3a0d96  mov          qword ptr [rbp + 0x170], rcx
+  3a0d9d  mov          ecx, 5
+  3a0da2  mov          qword ptr [rbp + 0x168], r8
+  3a0da9  movsxd       r8, dword ptr [rsp + 0x338]
+  3a0db1  mov          dword ptr [rbp + 0x18], r8d
+  3a0db5  mov          dword ptr [rbp + 0xc], eax
+  3a0db8  mov          dword ptr [rbp + 0x1c], r9d
+  3a0dbc  mov          dword ptr [rbp + 8], ecx
+  3a0dbf  vmovss       dword ptr [rbp + 0x1c0], xmm0
+  3a0dc7  mov          dword ptr [rbp + 0x1c0], 0x80000000
+  3a0dd1  mov          dword ptr [rbp + 0x1c0], edx
+  3a0dd7  vxorps       xmm5, xmm5, xmm5
+  3a0ddb  cmp          edx, ecx
+  3a0ddd  jbe          0x7ff608361a8e
+  3a0de3  add          eax, -2
+  3a0de6  lea          rdx, [r8*4]
+  3a0dee  mov          qword ptr [rbp + 0x40], rdx
+  3a0df2  xor          r12d, r12d
+  3a0df5  mov          dword ptr [rbp + 0x38], eax
+  3a0df8  nop          dword ptr [rax + rax]
+  3a0e00  mov          rdi, qword ptr [rsi + 0x10]
+  3a0e04  lea          edx, [rcx - 4]
+  3a0e07  lea          rbx, [rsi + 4]
+  3a0e0b  test         rdi, rdi
+  3a0e0e  jne          0x7ff608360e29
+  3a0e10  mov          r11, r12
+  3a0e13  mov          qword ptr [rbp + 0x28], r12
+  3a0e17  mov          r14, r12
+  3a0e1a  lea          edx, [rcx + 2]
+  3a0e1d  mov          r8, r12
+  3a0e20  lea          r9, [rsi + 8]
+  3a0e24  mov          r10, r12
+  3a0e27  jmp          0x7ff608360e99
+  3a0e29  lea          eax, [rcx - 2]
+  3a0e2c  cmp          edx, dword ptr [rbx]
+  3a0e2e  jb           0x7ff608360e35
+  3a0e30  mov          r11, r12
+  3a0e33  jmp          0x7ff608360e3f
+  3a0e35  imul         edx, dword ptr [rsi + 8]
+  3a0e39  mov          r11d, edx
+  3a0e3c  add          r11, rdi
+  3a0e3f  mov          edx, dword ptr [rbx]
+  3a0e41  lea          r9, [rsi + 8]
+  3a0e45  cmp          eax, edx
+  3a0e47  jb           0x7ff608360e4e
+  3a0e49  mov          r14, r12
+  3a0e4c  jmp          0x7ff608360e58
+  3a0e4e  imul         eax, dword ptr [r9]
+  3a0e52  mov          r14d, eax
+  3a0e55  add          r14, rdi
+  3a0e58  cmp          ecx, edx
+  3a0e5a  jb           0x7ff608360e61
+  3a0e5c  mov          r8, r12
+  3a0e5f  jmp          0x7ff608360e6b
+  3a0e61  mov          r8d, ecx
+  3a0e64  imul         r8d, dword ptr [r9]
+  3a0e68  add          r8, rdi
+  3a0e6b  lea          edx, [rcx + 2]
+  3a0e6e  cmp          edx, dword ptr [rbx]
+  3a0e70  jb           0x7ff608360e77
+  3a0e72  mov          r10, r12
+  3a0e75  jmp          0x7ff608360e81
+  3a0e77  mov          r10d, edx
+  3a0e7a  imul         r10d, dword ptr [r9]
+  3a0e7e  add          r10, rdi
+  3a0e81  lea          eax, [rdx + 2]
+  3a0e84  cmp          eax, dword ptr [rbx]
+  3a0e86  jb           0x7ff608360e8e
+  3a0e88  mov          qword ptr [rbp + 0x28], r12
+  3a0e8c  jmp          0x7ff608360e99
+  3a0e8e  imul         eax, dword ptr [r9]
+  3a0e92  add          rax, rdi
+  3a0e95  mov          qword ptr [rbp + 0x28], rax
+  3a0e99  mov          rsi, qword ptr [r13 + 0x10]
+  3a0e9d  test         rsi, rsi
+  3a0ea0  jne          0x7ff608360ea8
+  3a0ea2  mov          qword ptr [rbp + 0x20], r12
+  3a0ea6  jmp          0x7ff608360ec2
+  3a0ea8  cmp          ecx, dword ptr [r13 + 4]
+  3a0eac  jb           0x7ff608360eb4
+  3a0eae  mov          qword ptr [rbp + 0x20], r12
+  3a0eb2  jmp          0x7ff608360ec2
+  3a0eb4  mov          eax, ecx
+  3a0eb6  imul         eax, dword ptr [r13 + 8]
+  3a0ebb  add          rax, rsi
+  3a0ebe  mov          qword ptr [rbp + 0x20], rax
+  3a0ec2  mov          rsi, qword ptr [r15 + 0x10]
+  3a0ec6  test         rsi, rsi
+  3a0ec9  jne          0x7ff608360ed1
+  3a0ecb  mov          qword ptr [rbp + 0x30], r12
+  3a0ecf  jmp          0x7ff608360eeb
+  3a0ed1  cmp          ecx, dword ptr [r15 + 4]
+  3a0ed5  jb           0x7ff608360edd
+  3a0ed7  mov          qword ptr [rbp + 0x30], r12
+  3a0edb  jmp          0x7ff608360eeb
+  3a0edd  mov          eax, ecx
+  3a0edf  imul         eax, dword ptr [r15 + 8]
+  3a0ee4  add          rax, rsi
+  3a0ee7  mov          qword ptr [rbp + 0x30], rax
+  3a0eeb  lea          eax, [rcx - 1]
+  3a0eee  test         rdi, rdi
+  3a0ef1  jne          0x7ff608360ef8
+  3a0ef3  mov          rsi, r12
+  3a0ef6  jmp          0x7ff608360f1b
+  3a0ef8  cmp          eax, dword ptr [rbx]
+  3a0efa  jb           0x7ff608360f01
+  3a0efc  mov          rsi, r12
+  3a0eff  jmp          0x7ff608360f0a
+  3a0f01  imul         eax, dword ptr [r9]
+  3a0f05  mov          esi, eax
+  3a0f07  add          rsi, rdi
+  3a0f0a  lea          eax, [rdx - 1]
+  3a0f0d  cmp          eax, dword ptr [rbx]
+  3a0f0f  jae          0x7ff608360f1b
+  3a0f11  imul         eax, dword ptr [r9]
+  3a0f15  mov          r12d, eax
+  3a0f18  add          r12, rdi
+  3a0f1b  mov          rdi, qword ptr [rbp + 0x80]
+  3a0f22  mov          eax, dword ptr [rbp + 0x38]
+  3a0f25  add          eax, edx
+  3a0f27  mov          r15, qword ptr [rdi + 0x10]
+  3a0f2b  lea          r9d, [rax - 1]
+  3a0f2f  test         r15, r15
+  3a0f32  jne          0x7ff608360f4f
+  3a0f34  mov          rax, qword ptr [rbp + 0x40]
+  3a0f38  xor          r13d, r13d
+  3a0f3b  xor          r9d, r9d
+  3a0f3e  xor          edi, edi
+  3a0f40  xor          ebx, ebx
+  3a0f42  add          rax, 0x14
+  3a0f46  mov          qword ptr [rbp + 0x10], rax
+  3a0f4a  jmp          0x7ff608360fcf
+  3a0f4f  cmp          r9d, dword ptr [rdi + 4]
+  3a0f53  lea          rbx, [rdi + 4]
+  3a0f57  jb           0x7ff608360f5e
+  3a0f59  xor          r13d, r13d
+  3a0f5c  jmp          0x7ff608360f69
+  3a0f5e  imul         r9d, dword ptr [rdi + 8]
+  3a0f63  mov          r13d, r9d
+  3a0f66  add          r13, r15
+  3a0f69  cmp          eax, dword ptr [rbx]
+  3a0f6b  jb           0x7ff608360f72
+  3a0f6d  xor          r9d, r9d
+  3a0f70  jmp          0x7ff608360f7c
+  3a0f72  imul         eax, dword ptr [rdi + 8]
+  3a0f76  mov          r9d, eax
+  3a0f79  add          r9, r15
+  3a0f7c  mov          eax, ecx
+  3a0f7e  mov          ecx, dword ptr [rbp + 8]
+  3a0f81  sub          eax, dword ptr [rbp + 0xc]
+  3a0f84  inc          eax
+  3a0f86  cmp          eax, dword ptr [rbx]
+  3a0f88  jb           0x7ff608360f96
+  3a0f8a  mov          rax, qword ptr [rbp + 0x40]
+  3a0f8e  xor          edi, edi
+  3a0f90  add          rax, 0x14
+  3a0f94  jmp          0x7ff608360faa
+  3a0f96  imul         eax, dword ptr [rdi + 8]
+  3a0f9a  mov          edi, eax
+  3a0f9c  mov          rax, qword ptr [rbp + 0x40]
+  3a0fa0  add          rdi, r15
+  3a0fa3  add          rax, 0x14
+  3a0fa7  add          rax, rdi
+  3a0faa  mov          qword ptr [rbp + 0x10], rax
+  3a0fae  mov          eax, dword ptr [rbp + 0xc]
+  3a0fb1  add          eax, edx
+  3a0fb3  cmp          eax, dword ptr [rbx]
+  3a0fb5  jb           0x7ff608360fbb
+  3a0fb7  xor          ebx, ebx
+  3a0fb9  jmp          0x7ff608360fcb
+  3a0fbb  mov          rbx, qword ptr [rbp + 0x80]
+  3a0fc2  imul         eax, dword ptr [rbx + 8]
+  3a0fc6  mov          ebx, eax
+  3a0fc8  add          rbx, r15
+  3a0fcb  mov          rax, qword ptr [rbp + 0x10]
+  3a0fcf  mov          edx, dword ptr [rbp + 0x1c]
+  3a0fd2  add          edx, -5
+  3a0fd5  cmp          edx, 5
+  3a0fd8  jbe          0x7ff608361a62
+  3a0fde  movsxd       rdx, dword ptr [rbp + 0x18]
+  3a0fe2  mov          r15d, 2
+  3a0fe8  movsxd       rcx, dword ptr [rbp + 0x18]
+  3a0fec  sub          r15, rdx
+  3a0fef  sub          qword ptr [rbp + 0x28], r8
+  3a0ff3  sub          rsi, r8
+  3a0ff6  sub          qword ptr [rbp + 0x20], r8
+  3a0ffa  sub          r12, r8
+  3a0ffd  sub          qword ptr [rbp + 0x30], r8
+  3a1001  lea          rdx, [rdx*4]
+  3a1009  shl          r15, 2
+  3a100d  sub          rdx, r8
+  3a1010  sub          r15, rdi
+  3a1013  mov          qword ptr [rbp + 0x138], rsi
+  3a101a  add          r15, r8
+  3a101d  mov          qword ptr [rbp + 0x140], r12
+  3a1024  add          r15, rax
+  3a1027  sub          r11, r8
+  3a102a  lea          rax, [rdx + r13]
+  3a102e  mov          qword ptr [rbp], r15
+  3a1032  mov          qword ptr [rbp + 0x100], rax
+  3a1039  sub          r14, r8
+  3a103c  lea          rax, [rcx*4 - 8]
+  3a1044  mov          qword ptr [rbp + 0x50], r11
+  3a1048  lea          rcx, [rcx*4 - 0xc]
+  3a1050  mov          qword ptr [rbp + 0x78], r14
+  3a1054  sub          rcx, r8
+  3a1057  sub          rax, r8
+  3a105a  add          r13, rax
+  3a105d  sub          r10, r8
+  3a1060  mov          qword ptr [rbp + 0x150], r13
+  3a1067  mov          qword ptr [rbp + 0x48], r10
+  3a106b  lea          r15, [rcx + r9]
+  3a106f  add          rcx, rdi
+  3a1072  mov          qword ptr [rbp + 0x118], rcx
+  3a1079  mov          ecx, dword ptr [rbp + 0x1c]
+  3a107c  add          ecx, -5
+  3a107f  mov          qword ptr [rbp + 0x108], r15
+  3a1086  lea          r15, [r9 + rdx]
+  3a108a  add          ecx, -6
+  3a108d  mov          qword ptr [rbp + 0x110], r15
+  3a1094  add          r9, rax
+  3a1097  lea          r15, [rbx + rdx]
+  3a109b  shr          ecx, 3
+  3a109e  add          rdx, rdi
+  3a10a1  mov          qword ptr [rbp + 0x120], r15
+  3a10a8  mov          r15, qword ptr [rbp]
+  3a10ac  add          rbx, rax
+  3a10af  inc          ecx
+  3a10b1  mov          qword ptr [rbp + 0x158], r9
+  3a10b8  mov          qword ptr [rbp + 0x70], rcx
+  3a10bc  mov          qword ptr [rbp + 0x148], rdx
+  3a10c3  mov          qword ptr [rbp + 0x160], rbx
+  3a10ca  nop          word ptr [rax + rax]
+  3a10d0  mov          r8, qword ptr [rsp + 0x310]
+  3a10d8  vmovups      ymm2, ymmword ptr [r15 - 8]
+  3a10de  mov          rax, qword ptr [rbp + 0x100]
+  3a10e5  vmovups      ymm7, ymmword ptr [r15 - 0x10]
+  3a10eb  vmovups      ymm9, ymmword ptr [r15]
+  3a10f0  vmovups      ymm10, ymmword ptr [r10 + r15 - 8]
+  3a10f7  vmaxps       ymm0, ymm2, ymm5
+  3a10fb  vminps       ymm4, ymm0, ymm8
+  3a1100  vxorps       xmm0, xmm0, xmm0
+  3a1104  vshufps      xmm1, xmm4, xmm4, 0x55
+  3a1109  vcvttss2si   rcx, xmm4
+  3a110e  mov          ecx, ecx
+  3a1110  vmovups      ymmword ptr [rbp + 0x1a0], ymm4
+  3a1118  vcvtsi2ss    xmm0, xmm0, dword ptr [r8 + rcx*4]
+  3a111e  vmovss       dword ptr [rbp + 0xe0], xmm0
+  3a1126  vxorps       xmm0, xmm0, xmm0
+  3a112a  vcvttss2si   rcx, xmm1
+  3a112f  mov          ecx, ecx
+  3a1131  vshufps      xmm1, xmm4, xmm4, 0xaa
+  3a1136  vcvtsi2ss    xmm0, xmm0, dword ptr [r8 + rcx*4]
+  3a113c  vmovss       dword ptr [rbp + 0xe4], xmm0
+  3a1144  vxorps       xmm0, xmm0, xmm0
+  3a1148  vcvttss2si   rcx, xmm1
+  3a114d  mov          ecx, ecx
+  3a114f  vshufps      xmm1, xmm4, xmm4, 0xff
+  3a1154  vcvtsi2ss    xmm0, xmm0, dword ptr [r8 + rcx*4]
+  3a115a  vmovss       dword ptr [rbp + 0xe8], xmm0
+  3a1162  vxorps       xmm0, xmm0, xmm0
+  3a1166  vcvttss2si   rcx, xmm1
+  3a116b  mov          ecx, ecx
+  3a116d  vextractf128 xmm1, ymm4, 1
+  3a1173  vcvtsi2ss    xmm0, xmm0, dword ptr [r8 + rcx*4]
+  3a1179  vmovss       dword ptr [rbp + 0xec], xmm0
+  3a1181  vcvttss2si   rcx, xmm1
+  3a1186  vxorps       xmm0, xmm0, xmm0
+  3a118a  mov          ecx, ecx
+  3a118c  vextractf128 xmm1, ymm4, 1
+  3a1192  vshufps      xmm1, xmm1, xmm1, 0x55
+  3a1197  vcvtsi2ss    xmm0, xmm0, dword ptr [r8 + rcx*4]
+  3a119d  vmovss       dword ptr [rbp + 0xf0], xmm0
+  3a11a5  vcvttss2si   rcx, xmm1
+  3a11aa  vxorps       xmm0, xmm0, xmm0
+  3a11ae  mov          ecx, ecx
+  3a11b0  vextractf128 xmm1, ymm4, 1
+  3a11b6  vshufps      xmm1, xmm1, xmm1, 0xaa
+  3a11bb  vcvtsi2ss    xmm0, xmm0, dword ptr [r8 + rcx*4]
+  3a11c1  vmovss       dword ptr [rbp + 0xf4], xmm0
+  3a11c9  vcvttss2si   rcx, xmm1
+  3a11ce  vxorps       xmm0, xmm0, xmm0
+  3a11d2  mov          ecx, ecx
+  3a11d4  vextractf128 xmm1, ymm4, 1
+  3a11da  vshufps      xmm1, xmm1, xmm1, 0xff
+  3a11df  vcvtsi2ss    xmm0, xmm0, dword ptr [r8 + rcx*4]
+  3a11e5  vmovss       dword ptr [rbp + 0xf8], xmm0
+  3a11ed  vcvttss2si   rcx, xmm1
+  3a11f2  vxorps       xmm0, xmm0, xmm0
+  3a11f6  mov          ecx, ecx
+  3a11f8  vcvtsi2ss    xmm0, xmm0, dword ptr [r8 + rcx*4]
+  3a11fe  vmovss       dword ptr [rbp + 0xfc], xmm0
+  3a1206  vaddps       ymm0, ymm7, ymmword ptr [r14 + r15 - 8]
+  3a120d  vaddps       ymm1, ymm0, ymm2
+  3a1211  vaddps       ymm2, ymm1, ymm9
+  3a1216  vaddps       ymm3, ymm2, ymm10
+  3a121b  vaddps       ymm0, ymm3, ymmword ptr [r10 + r15 - 0xc]
+  3a1222  vaddps       ymm1, ymm0, ymmword ptr [r10 + r15 - 4]
+  3a1229  vaddps       ymm2, ymm1, ymmword ptr [rsi + r15 - 0xc]
+  3a1230  vaddps       ymm3, ymm2, ymmword ptr [rsi + r15 - 8]
+  3a1237  vaddps       ymm0, ymm3, ymmword ptr [rsi + r15 - 4]
+  3a123e  vaddps       ymm1, ymm0, ymmword ptr [r12 + r15 - 0xc]
+  3a1245  vaddps       ymm2, ymm1, ymmword ptr [r12 + r15 - 8]
+  3a124c  vaddps       ymm3, ymm2, ymmword ptr [r12 + r15 - 4]
+  3a1253  vaddps       ymm0, ymm3, ymmword ptr [r15 + r13]
+  3a1259  vaddps       ymm1, ymm0, ymmword ptr [rax + r15 - 4]
+  3a1260  mov          rax, qword ptr [rbp + 0x108]
+  3a1267  vaddps       ymm2, ymm1, ymmword ptr [rax + r15]
+  3a126d  mov          rax, qword ptr [rbp + 0x110]
+  3a1274  vaddps       ymm3, ymm2, ymmword ptr [r9 + r15]
+  3a127a  vaddps       ymm0, ymm3, ymmword ptr [rax + r15 - 4]
+  3a1281  vaddps       ymm1, ymm0, ymmword ptr [rax + r15]
+  3a1287  mov          rax, qword ptr [rbp + 0x118]
+  3a128e  vaddps       ymm2, ymm1, ymmword ptr [rax + r15]
+  3a1294  mov          rax, qword ptr [rbp + 0x10]
+  3a1298  vaddps       ymm3, ymm2, ymmword ptr [rax]
+  3a129c  vaddps       ymm0, ymm3, ymmword ptr [rdx + r15 - 4]
+  3a12a3  vaddps       ymm1, ymm0, ymmword ptr [rdx + r15]
+  3a12a9  vaddps       ymm2, ymm1, ymmword ptr [rbx + r15]
+  3a12af  mov          rdx, qword ptr [rsp + 0x318]
+  3a12b7  mov          rax, qword ptr [rbp + 0x120]
+  3a12be  vaddps       ymm3, ymm2, ymmword ptr [rax + r15 - 4]
+  3a12c5  vmulps       ymm0, ymm3, ymm11
+  3a12ca  vmovups      ymm3, ymmword ptr [r11 + r15 - 8]
+  3a12d1  vmaxps       ymm1, ymm0, ymm5
+  3a12d5  vxorps       xmm0, xmm0, xmm0
+  3a12d9  vminps       ymm2, ymm1, ymm8
+  3a12de  vmovups      ymm8, ymmword ptr [rbp + 0xe0]
+  3a12e6  vshufps      xmm1, xmm2, xmm2, 0x55
+  3a12eb  vcvttss2si   rcx, xmm2
+  3a12f0  mov          ecx, ecx
+  3a12f2  vcvtsi2ss    xmm0, xmm0, dword ptr [rdx + rcx*4]
+  3a12f7  vmovss       dword ptr [rbp + 0xc0], xmm0
+  3a12ff  vxorps       xmm0, xmm0, xmm0
+  3a1303  vcvttss2si   rcx, xmm1
+  3a1308  mov          ecx, ecx
+  3a130a  vshufps      xmm1, xmm2, xmm2, 0xaa
+  3a130f  vcvtsi2ss    xmm0, xmm0, dword ptr [rdx + rcx*4]
+  3a1314  vmovss       dword ptr [rbp + 0xc4], xmm0
+  3a131c  vxorps       xmm0, xmm0, xmm0
+  3a1320  vcvttss2si   rcx, xmm1
+  3a1325  mov          ecx, ecx
+  3a1327  vshufps      xmm1, xmm2, xmm2, 0xff
+  3a132c  vcvtsi2ss    xmm0, xmm0, dword ptr [rdx + rcx*4]
+  3a1331  vmovss       dword ptr [rbp + 0xc8], xmm0
+  3a1339  vcvttss2si   rcx, xmm1
+  3a133e  vxorps       xmm0, xmm0, xmm0
+  3a1342  mov          ecx, ecx
+  3a1344  vextractf128 xmm1, ymm2, 1
+  3a134a  vcvtsi2ss    xmm0, xmm0, dword ptr [rdx + rcx*4]
+  3a134f  vmovss       dword ptr [rbp + 0xcc], xmm0
+  3a1357  vcvttss2si   rcx, xmm1
+  3a135c  vxorps       xmm0, xmm0, xmm0
+  3a1360  mov          ecx, ecx
+  3a1362  vextractf128 xmm1, ymm2, 1
+  3a1368  vshufps      xmm1, xmm1, xmm1, 0x55
+  3a136d  vcvtsi2ss    xmm0, xmm0, dword ptr [rdx + rcx*4]
+  3a1372  vmovss       dword ptr [rbp + 0xd0], xmm0
+  3a137a  vcvttss2si   rcx, xmm1
+  3a137f  vxorps       xmm0, xmm0, xmm0
+  3a1383  mov          ecx, ecx
+  3a1385  vextractf128 xmm1, ymm2, 1
+  3a138b  vshufps      xmm1, xmm1, xmm1, 0xaa
+  3a1390  vcvtsi2ss    xmm0, xmm0, dword ptr [rdx + rcx*4]
+  3a1395  vmovss       dword ptr [rbp + 0xd4], xmm0
+  3a139d  vcvttss2si   rcx, xmm1
+  3a13a2  vxorps       xmm0, xmm0, xmm0
+  3a13a6  mov          ecx, ecx
+  3a13a8  vextractf128 xmm1, ymm2, 1
+  3a13ae  vshufps      xmm1, xmm1, xmm1, 0xff
+  3a13b3  vcvtsi2ss    xmm0, xmm0, dword ptr [rdx + rcx*4]
+  3a13b8  vmovss       dword ptr [rbp + 0xd8], xmm0
+  3a13c0  vcvttss2si   rcx, xmm1
+  3a13c5  vxorps       xmm0, xmm0, xmm0
+  3a13c9  mov          ecx, ecx
+  3a13cb  vcvtsi2ss    xmm0, xmm0, dword ptr [rdx + rcx*4]
+  3a13d0  vmovss       dword ptr [rbp + 0xdc], xmm0
+  3a13d8  vsubps       ymm1, ymm13, ymmword ptr [rbp + 0xc0]
+  3a13e0  vmulps       ymm0, ymm4, ymmword ptr [rbp + 0xc0]
+  3a13e8  vmulps       ymm2, ymm1, ymm2
+  3a13ec  vaddps       ymm2, ymm2, ymm0
+  3a13f0  vmulps       ymm5, ymm2, ymm14
+  3a13f5  vsubps       ymm0, ymm5, ymmword ptr [r11 + r15 - 0x18]
+  3a13fc  vandnps      ymm1, ymm12, ymm0
+  3a1400  vsubps       ymm0, ymm5, ymmword ptr [r11 + r15 - 0x10]
+  3a1407  vsubps       ymm1, ymm1, ymm8
+  3a140c  vmovmskps    ecx, ymm1
+  3a1410  shl          rcx, 5
+  3a1414  vandnps      ymm1, ymm12, ymm0
+  3a1418  vsubps       ymm2, ymm1, ymm8
+  3a141d  vmovmskps    edx, ymm2
+  3a1421  shl          rdx, 5
+  3a1425  mov          qword ptr [rbp + 0x88], rdx
+  3a142c  vmovups      ymmword ptr [rbp + 0x180], ymm5
+  3a1434  mov          qword ptr [rbp + 0x90], rcx
+  3a143b  vmovups      ymm4, ymmword ptr [r11 + r15]
+  3a1441  mov          rax, qword ptr [rbp]
+  3a1445  lea          rdx, [rip + 0x208784]
+  3a144c  mov          rcx, qword ptr [rbp + 0x48]
+  3a1450  vsubps       ymm0, ymm5, ymm3
+  3a1454  vandnps      ymm1, ymm12, ymm0
+  3a1458  vsubps       ymm2, ymm1, ymm8
+  3a145d  vmovmskps    r8d, ymm2
+  3a1461  vsubps       ymm0, ymm5, ymm4
+  3a1465  vandnps      ymm1, ymm12, ymm0
+  3a1469  vsubps       ymm0, ymm5, ymmword ptr [r11 + r15 + 8]
+  3a1470  vsubps       ymm2, ymm1, ymm8
+  3a1475  vandnps      ymm1, ymm12, ymm0
+  3a1479  vsubps       ymm0, ymm5, ymmword ptr [r14 + r15 - 0x18]
+  3a1480  vmovmskps    r9d, ymm2
+  3a1484  vsubps       ymm2, ymm1, ymm8
+  3a1489  vandnps      ymm1, ymm12, ymm0
+  3a148d  vsubps       ymm0, ymm5, ymmword ptr [r14 + r15 - 0x10]
+  3a1494  vmovmskps    r10d, ymm2
+  3a1498  vsubps       ymm2, ymm1, ymm8
+  3a149d  vandnps      ymm1, ymm12, ymm0
+  3a14a1  vsubps       ymm0, ymm5, ymmword ptr [r14 + r15 - 8]
+  3a14a8  vmovmskps    r11d, ymm2
+  3a14ac  vsubps       ymm2, ymm1, ymm8
+  3a14b1  vandnps      ymm1, ymm12, ymm0
+  3a14b5  vsubps       ymm0, ymm5, ymmword ptr [r14 + r15]
+  3a14bb  vmovmskps    ebx, ymm2
+  3a14bf  vsubps       ymm2, ymm1, ymm8
+  3a14c4  vandnps      ymm1, ymm12, ymm0
+  3a14c8  vsubps       ymm0, ymm5, ymmword ptr [r14 + r15 + 8]
+  3a14cf  vmovmskps    edi, ymm2
+  3a14d3  vsubps       ymm2, ymm1, ymm8
+  3a14d8  vandnps      ymm1, ymm12, ymm0
+  3a14dc  vsubps       ymm0, ymm5, ymmword ptr [r15 - 0x18]
+  3a14e2  vmovmskps    esi, ymm2
+  3a14e6  vsubps       ymm2, ymm1, ymm8
+  3a14eb  vandnps      ymm1, ymm12, ymm0
+  3a14ef  vmovmskps    r14d, ymm2
+  3a14f3  vsubps       ymm2, ymm1, ymm8
+  3a14f8  vmovmskps    r15d, ymm2
+  3a14fc  vsubps       ymm0, ymm5, ymm7
+  3a1500  vandnps      ymm1, ymm12, ymm0
+  3a1504  vsubps       ymm2, ymm1, ymm8
+  3a1509  vmovmskps    r12d, ymm2
+  3a150d  vsubps       ymm0, ymm5, ymm9
+  3a1512  vandnps      ymm1, ymm12, ymm0
+  3a1516  vsubps       ymm0, ymm5, ymmword ptr [rax + 8]
+  3a151b  vsubps       ymm2, ymm1, ymm8
+  3a1520  vandnps      ymm1, ymm12, ymm0
+  3a1524  vmovmskps    r13d, ymm2
+  3a1528  vsubps       ymm2, ymm1, ymm8
+  3a152d  vmovmskps    eax, ymm2
+  3a1531  shl          rax, 5
+  3a1535  mov          qword ptr [rbp + 0xa0], rax
+  3a153c  mov          rax, qword ptr [rbp]
+  3a1540  shl          r8, 5
+  3a1544  shl          r9, 5
+  3a1548  shl          r10, 5
+  3a154c  vsubps       ymm0, ymm5, ymmword ptr [rcx + rax - 0x18]
+  3a1552  vandnps      ymm1, ymm12, ymm0
+  3a1556  vsubps       ymm2, ymm1, ymm8
+  3a155b  vmovmskps    eax, ymm2
+  3a155f  shl          rax, 5
+  3a1563  mov          qword ptr [rbp + 0xa8], rax
+  3a156a  mov          rax, qword ptr [rbp]
+  3a156e  shl          r11, 5
+  3a1572  shl          rbx, 5
+  3a1576  shl          rdi, 5
+  3a157a  vsubps       ymm0, ymm5, ymmword ptr [rcx + rax - 0x10]
+  3a1580  vandnps      ymm1, ymm12, ymm0
+  3a1584  vsubps       ymm2, ymm1, ymm8
+  3a1589  vmovmskps    eax, ymm2
+  3a158d  shl          rsi, 5
+  3a1591  shl          r14, 5
+  3a1595  shl          r15, 5
+  3a1599  shl          r12, 5
+  3a159d  shl          r13, 5
+  3a15a1  shl          rax, 5
+  3a15a5  mov          qword ptr [rbp + 0x58], rax
+  3a15a9  mov          qword ptr [rbp + 0x98], r8
+  3a15b0  vsubps       ymm0, ymm5, ymm10
+  3a15b5  vandnps      ymm1, ymm12, ymm0
+  3a15b9  vsubps       ymm2, ymm1, ymm8
+  3a15be  vmovmskps    eax, ymm2
+  3a15c2  shl          rax, 5
+  3a15c6  lea          r8, [rip + 0x208603]
+  3a15cd  mov          qword ptr [rbp + 0x60], rax
+  3a15d1  mov          rax, qword ptr [rbp]
+  3a15d5  vmovups      ymm15, ymmword ptr [rcx + rax]
+  3a15da  vsubps       ymm0, ymm5, ymm15
+  3a15df  vandnps      ymm1, ymm12, ymm0
+  3a15e3  vsubps       ymm2, ymm1, ymm8
+  3a15e8  vmovmskps    eax, ymm2
+  3a15ec  shl          rax, 5
+  3a15f0  mov          qword ptr [rbp + 0x68], rax
+  3a15f4  mov          rax, qword ptr [rbp]
+  3a15f8  vmovups      ymm13, ymmword ptr [rcx + rax + 8]
+  3a15fe  mov          rcx, qword ptr [rbp + 0x28]
+  3a1602  vsubps       ymm0, ymm5, ymm13
+  3a1607  vandnps      ymm1, ymm12, ymm0
+  3a160b  vsubps       ymm2, ymm1, ymm8
+  3a1610  vmovmskps    eax, ymm2
+  3a1614  shl          rax, 5
+  3a1618  mov          qword ptr [rbp + 0x128], rax
+  3a161f  mov          rax, qword ptr [rbp]
+  3a1623  vmovups      ymm11, ymmword ptr [rcx + rax - 0x18]
+  3a1629  vsubps       ymm0, ymm5, ymm11
+  3a162e  vandnps      ymm1, ymm12, ymm0
+  3a1632  vsubps       ymm2, ymm1, ymm8
+  3a1637  vmovmskps    eax, ymm2
+  3a163b  shl          rax, 5
+  3a163f  mov          qword ptr [rbp + 0x130], rax
+  3a1646  mov          rax, qword ptr [rbp]
+  3a164a  vmovups      ymm9, ymmword ptr [rcx + rax - 0x10]
+  3a1650  vsubps       ymm0, ymm5, ymm9
+  3a1655  vandnps      ymm1, ymm12, ymm0
+  3a1659  vsubps       ymm2, ymm1, ymm8
+  3a165e  vmovmskps    eax, ymm2
+  3a1662  shl          rax, 5
+  3a1666  vmovups      ymm14, ymmword ptr [rax + rdx]
+  3a166b  mov          rax, qword ptr [rbp]
+  3a166f  vmovups      ymm7, ymmword ptr [rcx + rax - 8]
+  3a1675  vsubps       ymm0, ymm5, ymm7
+  3a1679  vandnps      ymm1, ymm12, ymm0
+  3a167d  vsubps       ymm2, ymm1, ymm8
+  3a1682  vbroadcastss ymm1, dword ptr [rip + 0xc8175]
+  3a168b  vmovmskps    eax, ymm2
+  3a168f  shl          rax, 5
+  3a1693  vmovups      ymm12, ymmword ptr [rax + rdx]
+  3a1698  mov          rax, qword ptr [rbp]
+  3a169c  vmovups      ymm6, ymmword ptr [rcx + rax]
+  3a16a1  vsubps       ymm0, ymm5, ymm6
+  3a16a5  vandnps      ymm1, ymm1, ymm0
+  3a16a9  vmovups      ymm0, ymmword ptr [rbp + 0x180]
+  3a16b1  vsubps       ymm2, ymm1, ymm8
+  3a16b6  vbroadcastss ymm1, dword ptr [rip + 0xc8141]
+  3a16bf  vmovmskps    eax, ymm2
+  3a16c3  shl          rax, 5
+  3a16c7  vmovups      ymm10, ymmword ptr [rax + rdx]
+  3a16cc  mov          rax, qword ptr [rbp]
+  3a16d0  vmovups      ymm5, ymmword ptr [rcx + rax + 8]
+  3a16d6  mov          rcx, qword ptr [rbp + 0x90]
+  3a16dd  vsubps       ymm0, ymm0, ymm5
+  3a16e1  vandnps      ymm1, ymm1, ymm0
+  3a16e5  vsubps       ymm2, ymm1, ymm8
+  3a16ea  vmovmskps    eax, ymm2
+  3a16ee  shl          rax, 5
+  3a16f2  vmovups      ymm8, ymmword ptr [rax + rdx]
+  3a16f7  mov          rdx, qword ptr [rbp + 0x50]
+  3a16fb  mov          rax, qword ptr [rbp]
+  3a16ff  vmovups      ymm0, ymmword ptr [rdx + rax - 0x18]
+  3a1705  vmulps       ymm1, ymm0, ymmword ptr [rcx + r8]
+  3a170b  vmovups      ymm0, ymmword ptr [rdx + rax - 0x10]
+  3a1711  mov          rcx, rdx
+  3a1714  mov          rdx, qword ptr [rbp + 0x88]
+  3a171b  vmulps       ymm0, ymm0, ymmword ptr [rdx + r8]
+  3a1721  mov          r8, qword ptr [rbp + 0x98]
+  3a1728  lea          rdx, [rip + 0x2084a1]
+  3a172f  vaddps       ymm2, ymm1, ymm0
+  3a1733  vmulps       ymm0, ymm4, ymmword ptr [r9 + rdx]
+  3a1739  vmulps       ymm1, ymm3, ymmword ptr [r8 + rdx]
+  3a173f  vaddps       ymm3, ymm2, ymm1
+  3a1743  vmovups      ymm1, ymmword ptr [rcx + rax + 8]
+  3a1749  vmulps       ymm1, ymm1, ymmword ptr [r10 + rdx]
+  3a174f  mov          rcx, qword ptr [rbp + 0x78]
+  3a1753  lea          r8, [rip + 0x208476]
+  3a175a  vaddps       ymm4, ymm3, ymm0
+  3a175e  vaddps       ymm2, ymm4, ymm1
+  3a1762  vmovups      ymm0, ymmword ptr [rcx + rax - 0x18]
+  3a1768  vmulps       ymm0, ymm0, ymmword ptr [r11 + rdx]
+  3a176e  vmovups      ymm1, ymmword ptr [rcx + rax - 0x10]
+  3a1774  vmulps       ymm1, ymm1, ymmword ptr [rbx + rdx]
+  3a1779  vaddps       ymm3, ymm2, ymm0
+  3a177d  vmovups      ymm0, ymmword ptr [rdi + rdx]
+  3a1782  vmulps       ymm0, ymm0, ymmword ptr [rcx + rax - 8]
+  3a1788  vaddps       ymm4, ymm3, ymm1
+  3a178c  vmovups      ymm1, ymmword ptr [rcx + rax]
+  3a1791  vmulps       ymm1, ymm1, ymmword ptr [rsi + rdx]
+  3a1796  vaddps       ymm2, ymm4, ymm0
+  3a179a  vmovups      ymm0, ymmword ptr [rcx + rax + 8]
+  3a17a0  vmulps       ymm0, ymm0, ymmword ptr [r14 + rdx]
+  3a17a6  vaddps       ymm3, ymm2, ymm1
+  3a17aa  vmovups      ymm1, ymmword ptr [rax - 0x18]
+  3a17af  vmulps       ymm1, ymm1, ymmword ptr [r15 + rdx]
+  3a17b5  vaddps       ymm4, ymm3, ymm0
+  3a17b9  vmovups      ymm0, ymmword ptr [r12 + rdx]
+  3a17bf  vmulps       ymm0, ymm0, ymmword ptr [rax - 0x10]
+  3a17c4  vaddps       ymm2, ymm4, ymm1
+  3a17c8  vmovups      ymm1, ymmword ptr [rdx + r13]
+  3a17ce  vmulps       ymm1, ymm1, ymmword ptr [rax]
+  3a17d2  vaddps       ymm2, ymm2, ymm0
+  3a17d6  vmovups      ymm0, ymmword ptr [rax + 8]
+  3a17db  vaddps       ymm3, ymm2, ymmword ptr [rbp + 0x1a0]
+  3a17e3  vaddps       ymm4, ymm3, ymm1
+  3a17e7  mov          rcx, rax
+  3a17ea  mov          rax, qword ptr [rbp + 0xa0]
+  3a17f1  vmulps       ymm0, ymm0, ymmword ptr [rax + rdx]
+  3a17f6  mov          rdx, qword ptr [rbp + 0x48]
+  3a17fa  mov          rax, qword ptr [rbp + 0xa8]
+  3a1801  vaddps       ymm2, ymm4, ymm0
+  3a1805  vmovups      ymm1, ymmword ptr [rdx + rcx - 0x18]
+  3a180b  vmulps       ymm1, ymm1, ymmword ptr [rax + r8]
+  3a1811  vmovups      ymm0, ymmword ptr [rdx + rcx - 0x10]
+  3a1817  mov          rax, qword ptr [rbp + 0x58]
+  3a181b  vaddps       ymm3, ymm2, ymm1
+  3a181f  vmulps       ymm0, ymm0, ymmword ptr [rax + r8]
+  3a1825  mov          rax, qword ptr [rbp + 0x60]
+  3a1829  vaddps       ymm4, ymm3, ymm0
+  3a182d  vmovups      ymm1, ymmword ptr [rax + r8]
+  3a1833  vmulps       ymm1, ymm1, ymmword ptr [rdx + rcx - 8]
+  3a1839  mov          rax, qword ptr [rbp + 0x68]
+  3a183d  lea          rcx, [rip + 0x20838c]
+  3a1844  mov          rdx, qword ptr [rbp + 0x88]
+  3a184b  mov          r8, qword ptr [rbp + 0x98]
+  3a1852  vaddps       ymm2, ymm4, ymm1
+  3a1856  vmulps       ymm0, ymm15, ymmword ptr [rax + rcx]
+  3a185b  mov          rax, qword ptr [rbp + 0x128]
+  3a1862  vaddps       ymm3, ymm2, ymm0
+  3a1866  vmovups      ymm15, ymmword ptr [rax + rcx]
+  3a186b  mov          rax, qword ptr [rbp + 0x130]
+  3a1872  vmulps       ymm1, ymm15, ymm13
+  3a1877  vaddps       ymm4, ymm3, ymm1
+  3a187b  vmulps       ymm1, ymm14, ymm9
+  3a1880  vmovups      ymm13, ymmword ptr [rax + rcx]
+  3a1885  mov          rcx, qword ptr [rbp + 0x90]
+  3a188c  lea          rax, [rip + 0x20833d]
+  3a1893  vmulps       ymm0, ymm13, ymm11
+  3a1898  vaddps       ymm2, ymm4, ymm0
+  3a189c  vaddps       ymm3, ymm2, ymm1
+  3a18a0  vmulps       ymm0, ymm12, ymm7
+  3a18a4  vaddps       ymm4, ymm3, ymm0
+  3a18a8  vmulps       ymm1, ymm10, ymm6
+  3a18ac  vaddps       ymm2, ymm4, ymm1
+  3a18b0  vmulps       ymm0, ymm8, ymm5
+  3a18b4  vaddps       ymm5, ymm2, ymm0
+  3a18b8  vmovups      ymm0, ymmword ptr [rdx + rax]
+  3a18bd  vaddps       ymm1, ymm0, ymmword ptr [rcx + rax]
+  3a18c2  lea          rcx, [rip + 0x208307]
+  3a18c9  vaddps       ymm2, ymm1, ymmword ptr [r8 + rcx]
+  3a18cf  vaddps       ymm0, ymm2, ymmword ptr [r9 + rcx]
+  3a18d5  vaddps       ymm3, ymm0, ymmword ptr [r10 + rcx]
+  3a18db  vaddps       ymm1, ymm3, ymmword ptr [r11 + rcx]
+  3a18e1  vaddps       ymm2, ymm1, ymmword ptr [rbx + rcx]
+  3a18e6  vaddps       ymm0, ymm2, ymmword ptr [rdi + rcx]
+  3a18eb  vaddps       ymm3, ymm0, ymmword ptr [rsi + rcx]
+  3a18f0  vaddps       ymm1, ymm3, ymmword ptr [r14 + rcx]
+  3a18f6  vaddps       ymm2, ymm1, ymmword ptr [r15 + rcx]
+  3a18fc  vaddps       ymm0, ymm2, ymmword ptr [r12 + rcx]
+  3a1902  vaddps       ymm3, ymm0, ymmword ptr [rip + 0x20a2a6]
+  3a190a  vaddps       ymm1, ymm3, ymmword ptr [rcx + r13]
+  3a1910  mov          r15, qword ptr [rbp]
+  3a1914  mov          rax, qword ptr [rbp + 0xa0]
+  3a191b  add          qword ptr [rbp + 0x10], 0x20
+  3a1920  vbroadcastss ymm11, dword ptr [rip + 0xc7ecb]
+  3a1929  mov          r10, qword ptr [rbp + 0x48]
+  3a192d  vaddps       ymm2, ymm1, ymmword ptr [rax + rcx]
+  3a1932  mov          rax, qword ptr [rbp + 0xa8]
+  3a1939  mov          r14, qword ptr [rbp + 0x78]
+  3a193d  mov          r11, qword ptr [rbp + 0x50]
+  3a1941  mov          rsi, qword ptr [rbp + 0x138]
+  3a1948  vaddps       ymm0, ymm2, ymmword ptr [rax + rcx]
+  3a194d  mov          rax, qword ptr [rbp + 0x58]
+  3a1951  mov          r12, qword ptr [rbp + 0x140]
+  3a1958  mov          rdx, qword ptr [rbp + 0x148]
+  3a195f  mov          r13, qword ptr [rbp + 0x150]
+  3a1966  vaddps       ymm3, ymm0, ymmword ptr [rax + rcx]
+  3a196b  mov          rax, qword ptr [rbp + 0x60]
+  3a196f  mov          r9, qword ptr [rbp + 0x158]
+  3a1976  mov          rbx, qword ptr [rbp + 0x160]
+  3a197d  vaddps       ymm1, ymm3, ymmword ptr [rax + rcx]
+  3a1982  mov          rax, qword ptr [rbp + 0x68]
+  3a1986  vaddps       ymm2, ymm1, ymmword ptr [rax + rcx]
+  3a198b  mov          rax, qword ptr [rbp + 0x20]
+  3a198f  vaddps       ymm0, ymm2, ymm15
+  3a1994  vaddps       ymm3, ymm0, ymm13
+  3a1999  vbroadcastss ymm13, dword ptr [rip + 0x13d8be]
+  3a19a2  vaddps       ymm1, ymm3, ymm14
+  3a19a7  vbroadcastss ymm14, dword ptr [rip + 0x13d0cc]
+  3a19b0  vaddps       ymm2, ymm1, ymm12
+  3a19b5  vbroadcastss ymm1, dword ptr [rbp + 0x1d0]
+  3a19be  vbroadcastss ymm12, dword ptr [rip + 0xc7e39]
+  3a19c7  vaddps       ymm0, ymm2, ymm10
+  3a19cc  vaddps       ymm3, ymm0, ymm8
+  3a19d1  vbroadcastss ymm0, dword ptr [rbp + 0x1c4]
+  3a19da  vmulps       ymm0, ymm0, ymmword ptr [rax + r15 - 8]
+  3a19e1  mov          rax, qword ptr [rbp + 0x30]
+  3a19e5  vbroadcastss ymm8, dword ptr [rip + 0xc7e0e]
+  3a19ee  vmaxps       ymm1, ymm0, ymm1
+  3a19f2  vbroadcastss ymm0, dword ptr [rbp + 0x1c8]
+  3a19fb  vminps       ymm2, ymm1, ymm0
+  3a19ff  vbroadcastss ymm0, dword ptr [rbp + 0x1cc]
+  3a1a08  vdivps       ymm4, ymm5, ymm3
+  3a1a0c  vaddps       ymm3, ymm4, ymm2
+  3a1a10  vsubps       ymm0, ymm3, ymm0
+  3a1a14  vxorps       xmm5, xmm5, xmm5
+  3a1a18  vmaxps       ymm1, ymm0, ymm5
+  3a1a1c  vminps       ymm2, ymm1, ymm8
+  3a1a21  vmovups      ymmword ptr [rax + r15 - 8], ymm2
+  3a1a28  add          r15, 0x20
+  3a1a2c  sub          qword ptr [rbp + 0x70], 1
+  3a1a31  mov          qword ptr [rbp], r15
+  3a1a35  jne          0x7ff6083610d0
+  3a1a3b  vbroadcastss ymm12, dword ptr [rip + 0xc7dbc]
+  3a1a44  vbroadcastss ymm11, dword ptr [rip + 0xc7da7]
+  3a1a4d  vbroadcastss ymm13, dword ptr [rip + 0x13d80a]
+  3a1a56  vbroadcastss ymm14, dword ptr [rip + 0x13d01d]
+  3a1a5f  mov          ecx, dword ptr [rbp + 8]
+  3a1a62  mov          rsi, qword ptr [rbp + 0x168]
+  3a1a69  inc          ecx
+  3a1a6b  mov          r12d, 0
+  3a1a71  mov          r15, qword ptr [rbp + 0x170]
+  3a1a78  mov          r13, qword ptr [rbp + 0x178]
+  3a1a7f  mov          dword ptr [rbp + 8], ecx
+  3a1a82  cmp          ecx, dword ptr [rbp + 0x1c0]
+  3a1a88  jb           0x7ff608360e00
+  3a1a8e  vzeroupper   
+  3a1a91  mov          rcx, qword ptr [rbp + 0x1d8]
+  3a1a98  xor          rcx, rsp
+  3a1a9b  call         0x7ff608315630
+  3a1aa0  lea          r11, [rsp + 0x2a8]
+  3a1aa8  vmovaps      xmm6, xmmword ptr [r11 - 0x18]
+  3a1aae  vmovaps      xmm7, xmmword ptr [r11 - 0x28]
+  3a1ab4  vmovaps      xmm8, xmmword ptr [r11 - 0x38]
+  3a1aba  vmovaps      xmm9, xmmword ptr [r11 - 0x48]
+  3a1ac0  vmovaps      xmm10, xmmword ptr [r11 - 0x58]
+  3a1ac6  vmovaps      xmm11, xmmword ptr [r11 - 0x68]
+  3a1acc  vmovaps      xmm12, xmmword ptr [r11 - 0x78]
+  3a1ad2  vmovaps      xmm13, xmmword ptr [r11 - 0x88]
+  3a1adb  vmovaps      xmm14, xmmword ptr [r11 - 0x98]
+  3a1ae4  vmovaps      xmm15, xmmword ptr [r11 - 0xa8]
+  3a1aed  mov          rsp, r11
+  3a1af0  pop          r15
+  3a1af2  pop          r14
+  3a1af4  pop          r13
+  3a1af6  pop          r12
+  3a1af8  pop          rdi
+  3a1af9  pop          rsi
+  3a1afa  pop          rbx
+  3a1afb  pop          rbp
+  3a1afc  ret          
