@@ -45,11 +45,56 @@ differing pixels in ~920k came down to one tap each sitting within 2 ulp of it.
 That is why the base tables below are written in the engine's order rather than
 in scan order, and why rewriting the accumulation as `np.stack(...).sum(-1)` or
 an `einsum` breaks it.
+
+Two operators, one result. The numpy bodies here -- `_filt_rows` and the two
+`analysis_*` -- are the transcription that was scored against the engine, and
+they stay: they are the definition. `rawnr_numba` recomputes exactly them,
+pixel by pixel in compiled code, because expressing 25 taps as 25 whole-plane
+passes costs 1.5 s of a 33 MP frame's 2.5 s and the taps themselves cost almost
+nothing. `filt` and the analyses dispatch to it; `LLR_RAWNR_BACKEND=numpy`
+takes the reference instead, and so does a build with no numba. The two are
+`array_equal` on the engine's own planes and on random ones -- not "close", the
+same bits, which is the only claim worth making about a transcription.
 """
 
 from __future__ import annotations
 
+import os
+import sys
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
+
 import numpy as np
+
+#: Which operator runs: "numba" (the compiled kernels in `rawnr_numba`) or
+#: "numpy" (the reference operators in this file -- `_filt_rows` and the two
+#: `analysis_*` bodies). The two are checked bit-identical by
+#: `tests/test_rawnr_simd.py`; the numpy one is the transcription that was
+#: scored against the engine, so it stays, and stays reachable.
+#:
+#: Read once from LLR_RAWNR_BACKEND at import, like sony/itp.py's: a per-call
+#: getenv on a path that runs 33 M pixels is a cost for nothing, and a backend
+#: that can change mid-frame is not a backend. Tests set this attribute.
+BACKEND = (os.environ.get("LLR_RAWNR_BACKEND") or "numba").strip().lower()
+
+#: The compiled kernels, or None when numba will not import. Optional on
+#: purpose: numba is a speed dependency, not a correctness one, and a worker
+#: that cannot import it must still denoise -- so this degrades to the reference
+#: operator with one line on stderr rather than failing the render.
+_kernels: Any
+try:
+    from . import rawnr_numba as _kernels
+except Exception as exc:  # pragma: no cover - depends on the install
+    _kernels = None
+    print(f"llr: numba unavailable ({exc}); sony.rawnr_simd falls back to numpy",
+          file=sys.stderr)
+
+
+def _use_kernels() -> bool:
+    """Whether the compiled operator runs for this process."""
+    return _kernels is not None and BACKEND != "numpy"
+
 
 #: The engine's 14-bit working scale.
 LEVEL_MAX = 16383
@@ -160,8 +205,10 @@ BASE_GREEN_OTHER = (
      (2, -1), (2, 0)),
 )
 
-#: ISO interpolation on the strength, at `0x39fb4c..0x39fbbe`. This is why the
-#: stage does almost nothing at base ISO: at ISO 100 it runs at four tenths.
+#: ISO interpolation on the strength, at `0x39fb4c..0x39fbbe`, applied by
+#: `apply_strength` when the exec writes its result back. This is why the stage
+#: does almost nothing at base ISO: at ISO 100 only four tenths of the filter's
+#: change survives.
 ISO_STRENGTH_LO_ISO = 400.0
 ISO_STRENGTH_HI_ISO = 1600.0
 ISO_STRENGTH_LO = 0.4
@@ -183,6 +230,65 @@ def iso_strength(iso: float) -> float:
     return ISO_STRENGTH_LO + t * (ISO_STRENGTH_HI - ISO_STRENGTH_LO)
 
 
+#: Where Edit's manual Noise Reduction panel meets Auto. Measured at export on
+#: DSC03036 (ISO 2000): with the panel at its defaults -- 量 50 / 色彩降噪 5 /
+#: 边缘降噪 50 -- the stage's output is bit-identical to Auto's, so the manual
+#: default *is* Auto. 量 0 leaves 93% of the pixels within one LSB of the input
+#: (off, near enough). 25 and 75..100 are not a blend toward either end: the
+#: filter itself changes (its tile halo grows by 8 px from 75 up), which is not
+#: reproduced here. sony_repro/notes/measured-chroma-gap.md 2.24.2.
+MANUAL_AMOUNT_AUTO = 50.0
+
+
+def manual_strength(amount: float, iso: float) -> float:
+    """The write-back strength for a manual Noise Reduction amount (0..100).
+
+    Pinned at both ends the engine was measured at: 0 is off, 50 is exactly
+    Auto's `iso_strength`. Between them it is a straight line, which is the
+    honest shape for two measured points; above 50 the engine strengthens the
+    filter in a way this stage cannot express, so it holds Auto's value rather
+    than invent one.
+    """
+    a = max(0.0, min(float(amount), MANUAL_AMOUNT_AUTO)) / MANUAL_AMOUNT_AUTO
+    return iso_strength(iso) * a
+
+
+def apply_strength(filtered: np.ndarray, original: np.ndarray, strength: float) -> np.ndarray:
+    """What the exec (`0x39fab0`) writes back after the four kernels have run.
+
+    The ISO strength is not in the thresholds and not in the kernels -- both
+    reproduce the engine bit for bit at ISO 100 -- it is applied on the way
+    *out*: the filtered plane is blended with the plane the stage was given,
+    by `iso_strength(ISO)`, and truncated to integer levels (the output plane
+    is uint16). Measured on the engine's own input/output planes
+    (sony_repro/tools/rawnr_strength_probe.py): fl_test (ISO 1250, 0.825) and
+    a7v_donor (ISO 100, 0.4) both 100.0000% with this float32 order; the
+    `in + s*(f - in)` association loses a dozen pixels per frame.
+
+    So at base ISO the kernels do their full job and six tenths of it is thrown
+    away here -- which is why the stage was measured "doing almost nothing" at
+    ISO 100 (static-rawnr.md), and why `amount` in llr must not also carry it.
+    The truncation belongs to the engine even at full strength.
+    """
+    s = np.float32(strength)
+    f = filtered.astype(np.float32, copy=False)
+    o = original.astype(np.float32, copy=False)
+    if _use_kernels() and f.shape == o.shape and f.flags.c_contiguous and o.flags.c_contiguous:
+        # The same three operations, in one traversal and on threads. Worth it
+        # because this is not arithmetic-bound: as numpy it is five whole-array
+        # passes over 132 MB each on the 33 MP frame, which measured 0.12 s
+        # against this one's 0.025 s. Flat views, since the write-back is
+        # elementwise and its callers are not all the same rank.
+        out = np.empty(f.shape, dtype=np.float32)
+        args = (f.reshape(-1), o.reshape(-1), out.reshape(-1), s, np.float32(1) - s)
+        _run_rows(f.size, lambda i0, i1: _kernels.strength_rows(*args, i0, i1),
+                  ELEMENTWISE_STRIP, KERNEL_WORKERS)
+        return out
+    out = s * f
+    out += (np.float32(1) - s) * o
+    return np.trunc(out)
+
+
 def blend_table_value(ui: float) -> int:
     """`tbl3`'s constant for a Manual Noise Reduction slider position.
 
@@ -200,6 +306,73 @@ def _shifted(a: np.ndarray, dy: int, dx: int, r: int) -> np.ndarray:
     return a[r + dy:h - r + dy, r + dx:w - r + dx]
 
 
+#: How the compiled kernels are cut up for threads. Every output pixel is a
+#: function of its own neighbourhood and nothing else, so row strips change no
+#: bit -- a load-balance knob, not a result knob. Much smaller strips than the
+#: numpy operator's, and every core rather than twelve, because the kernel has
+#: no 25-temporary working set to keep resident: all that is left to buy is a
+#: tail short enough not to decide the wall clock. Measured on one 8 MP green
+#: plane: 32/24 0.024 s, 64/24 0.025 s, 128/24 0.026 s, 128/12 0.030 s,
+#: 256/12 0.033 s. Single-threaded it is 0.20 s, i.e. this schedule is worth 8x.
+KERNEL_STRIP_ROWS = 32
+KERNEL_WORKERS = max(1, os.cpu_count() or 1)
+
+#: The same schedule for the flat elementwise kernel (`apply_strength`), in
+#: elements rather than rows: 1 MB of float32 a piece, so a 33 MP frame's plane
+#: set is ~130 pieces over the workers and a test-sized plane is one.
+ELEMENTWISE_STRIP = 1 << 18
+
+#: How much of a row `filt_rows` carries through its 25 taps at once -- see its
+#: docstring for why it works a segment at a time at all. Its five working
+#: buffers are this many float32 each. Not a result knob: pixels are
+#: independent and the arithmetic inside one is untouched.
+#:
+#: What it buys is having *a* segment rather than a pixel; the segment's length
+#: barely matters. Measured on one 8 MP plane, single thread: 32 cols 0.177 s,
+#: 64 0.163 s, 128 0.160 s, 256 0.161 s, 512 0.157 s, 4096 (i.e. the whole row,
+#: 2344 px) 0.163 s -- against 0.52 s per pixel. So this is the middle of a
+#: plateau, not a tuned peak, and only the shortest segment is measurably worse:
+#: at 32 the per-chunk prologue starts to show. It is kept well inside L1 anyway
+#: rather than left at the row length, because the row length is the caller's
+#: image width and this should not become one.
+KERNEL_CHUNK_COLS = 256
+
+
+def _run_rows(height: int, work: Callable[[int, int], None],
+              strip_rows: int, workers: int) -> None:
+    """Call `work(y0, y1)` over row strips covering `0..height`, on threads.
+
+    The kernels hold the GIL for none of their run (`nogil=True`), so this is
+    real parallelism; a strip's inputs are read straight out of the whole plane,
+    so no strip has to invent an edge and the split cannot change a value.
+    """
+    starts = range(0, height, strip_rows)
+    n_workers = max(1, min(workers, len(starts)))
+    if n_workers == 1:
+        for a in starts:
+            work(a, min(height, a + strip_rows))
+        return
+
+    def run(a: int) -> None:
+        work(a, min(height, a + strip_rows))
+
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        list(pool.map(run, starts))
+
+
+def _kernel_input(a: np.ndarray) -> np.ndarray | None:
+    """`a` as the kernels want it, or None if handing it over would change it.
+
+    float32 and 2-D is the contract the whole transcription is written in -- the
+    numpy operator would compute a float64 plane in float64, so a silent cast
+    here would be a different result, not a faster one. `ascontiguousarray`
+    copies at most a layout.
+    """
+    if a.ndim != 2 or a.dtype != np.float32:
+        return None
+    return np.ascontiguousarray(a)
+
+
 def analysis_rb(plane: np.ndarray, offset: float) -> tuple[np.ndarray, np.ndarray]:
     """`0x3a2aa0`: the red/blue analysis. Loses one pixel on each side.
 
@@ -210,6 +383,16 @@ def analysis_rb(plane: np.ndarray, offset: float) -> tuple[np.ndarray, np.ndarra
     # copy=False: the frame path already hands these in as float32, and nothing
     # here writes through `a` -- `_shifted` only slices.
     a = plane.astype(np.float32, copy=False)
+    if _use_kernels():
+        src = _kernel_input(a)
+        if src is not None and src.shape[0] > 2 and src.shape[1] > 2:
+            d = np.empty((src.shape[0] - 2, src.shape[1] - 2), dtype=np.float32)
+            ref = np.empty_like(d)
+            off = np.float32(offset)
+            _run_rows(d.shape[0],
+                      lambda y0, y1: _kernels.analysis_rb_rows(src, off, d, ref, y0, y1),
+                      KERNEL_STRIP_ROWS, KERNEL_WORKERS)
+            return d, ref
     c = _shifted(a, 0, 0, 1)
     n4 = (_shifted(a, -1, 0, 1) + _shifted(a, 1, 0, 1)
           + _shifted(a, 0, -1, 1) + _shifted(a, 0, 1, 1))
@@ -252,6 +435,19 @@ def analysis_green(plane: np.ndarray, other: np.ndarray, offset: float,
     """
     a = plane.astype(np.float32, copy=False)
     b = other.astype(np.float32, copy=False)
+    if _use_kernels():
+        src, oth = _kernel_input(a), _kernel_input(b)
+        if src is not None and oth is not None and src.shape == oth.shape \
+                and src.shape[0] > 2 and src.shape[1] > 2:
+            d = np.empty((src.shape[0] - 2, src.shape[1] - 2), dtype=np.float32)
+            ref = np.empty_like(d)
+            cross = np.array(CROSS_GREEN[phase], dtype=np.int64)
+            off = np.float32(offset)
+            _run_rows(d.shape[0],
+                      lambda y0, y1: _kernels.analysis_green_rows(
+                          src, oth, cross, off, d, ref, y0, y1),
+                      KERNEL_STRIP_ROWS, KERNEL_WORKERS)
+            return d, ref
     c = _shifted(a, 0, 0, 1)
     n4 = (_shifted(a, -1, 0, 1) + _shifted(a, 1, 0, 1)
           + _shifted(a, 0, -1, 1) + _shifted(a, 0, 1, 1))
@@ -265,12 +461,196 @@ def analysis_green(plane: np.ndarray, other: np.ndarray, offset: float,
     return d, ref
 
 
+#: How the sigma filter is scheduled over a plane. Every output pixel is a
+#: function of its own 9x9 neighbourhood and nothing else, so cutting the plane
+#: into horizontal strips that overlap by FILT_MARGIN changes no bit -- and it
+#: is the only reason the frame path is not four times slower: at 128 rows a
+#: strip's ~25 float32 temporaries fit in cache instead of streaming through
+#: DRAM 25 taps deep, and numpy releases the GIL inside its ufuncs, so the
+#: strips overlap on real cores. Measured on one 8 MP phase plane: 1.41 s
+#: whole, 1.06 s in strips on one thread, 0.37 s on twelve, bit-identical.
+FILT_STRIP_ROWS = 128
+FILT_WORKERS = max(1, min(12, (os.cpu_count() or 1)))
+
+#: The 5x5 tap set in scan order, built from the same comprehension `_filt_rows`
+#: iterates. Handed to the kernel rather than hardcoded there so the two
+#: operators cannot end up scanning in different orders -- which would move the
+#: unconditional centre tap's place in the float32 accumulation, and with it the
+#: last bit of every output pixel.
+_FILT_TAPS = np.array([(dy, dx)
+                       for dy in (k * TAP_SPACING
+                                  for k in range(-TAPS_PER_SIDE, TAPS_PER_SIDE + 1))
+                       for dx in (k * TAP_SPACING
+                                  for k in range(-TAPS_PER_SIDE, TAPS_PER_SIDE + 1))],
+                      dtype=np.int64)
+
+#: Where the centre lands in that scan -- the one tap the engine never
+#: thresholds, and the reason its *position* matters rather than just its
+#: presence (see `_filt_rows`). Derived, not written down, so it follows
+#: TAPS_PER_SIDE.
+_FILT_CENTRE_TAP = int(np.flatnonzero((_FILT_TAPS == 0).all(axis=1))[0])
+
+
+def _member_offsets(members: tuple[tuple[int, int], ...], stride: int) -> np.ndarray:
+    """A neighbour table as flat element offsets, in the order it was written.
+
+    The order is the whole point -- these tables are the engine's `vaddps`
+    chain, not a set (see BASE_GREEN_OWN) -- so this only ever maps, never
+    sorts or deduplicates.
+    """
+    if not members:
+        return np.empty(0, dtype=np.int64)
+    a = np.asarray(members, dtype=np.int64).reshape(-1, 2)
+    return a[:, 0] * stride + a[:, 1]
+
+
 def filt(d: np.ndarray, ref: np.ndarray, thresholds: np.ndarray,
          blend: int = BLEND_NEUTRAL, gain: int = DETAIL_GAIN,
          limit: int = DETAIL_LIMIT, offset: float = OFFSET_RB, *,
          other: np.ndarray | None = None,
          base_own: tuple[tuple[int, int], ...] = BASE_RB,
-         base_other: tuple[tuple[int, int], ...] = ()) -> np.ndarray:
+         base_other: tuple[tuple[int, int], ...] = (),
+         strip_rows: int | None = None, workers: int | None = None) -> np.ndarray:
+    """`0x3a1b00` (red/blue) and `0x3a0c30` (green): the sigma filter, over
+    the whole plane. See _filt_rows for the operator; this is its schedule and
+    the one place the compiled kernel is chosen over it.
+
+    `strip_rows` / `workers` are cache and core knobs, not result knobs: the
+    output is bit-identical for any values (FILT_STRIP_ROWS above). Left unset
+    they take each backend's own defaults, which differ because the two
+    operators are bound by different things -- see KERNEL_STRIP_ROWS.
+    """
+    if base_other and other is None:
+        # Checked here as well as in `_filt_rows` because the kernel path never
+        # reaches that body, and falling back to own-plane-only would score
+        # 47.9% while looking almost right.
+        raise ValueError("base_other needs the other green phase's ref")
+    if _use_kernels():
+        out = _filt_numba(d, ref, thresholds, blend, gain, limit, offset,
+                          other, base_own, base_other,
+                          KERNEL_STRIP_ROWS if strip_rows is None else strip_rows,
+                          KERNEL_WORKERS if workers is None else workers)
+        if out is not None:
+            return out
+    if strip_rows is None:
+        strip_rows = FILT_STRIP_ROWS
+    if workers is None:
+        workers = FILT_WORKERS
+    r = FILT_MARGIN
+    height = d.shape[0] - 2 * r
+    kw: dict[str, Any] = {"blend": blend, "gain": gain, "limit": limit, "offset": offset,
+                          "base_own": base_own, "base_other": base_other}
+    if height <= strip_rows:
+        return _filt_rows(d, ref, thresholds, other=other, **kw)
+    out = np.empty((height, d.shape[1] - 2 * r), dtype=np.float32)
+
+    def run(a: int) -> None:
+        b = min(height, a + strip_rows)
+        # A strip's inputs carry the margin on both ends, so its interior is
+        # exactly the output rows a..b -- the same rows the whole-plane call
+        # would compute from the same neighbourhoods.
+        out[a:b] = _filt_rows(d[a:b + 2 * r], ref[a:b + 2 * r], thresholds,
+                              other=None if other is None else other[a:b + 2 * r], **kw)
+
+    starts = range(0, height, strip_rows)
+    n_workers = max(1, min(workers, len(starts)))
+    if n_workers == 1:
+        for a in starts:
+            run(a)
+    else:
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            list(pool.map(run, starts))
+    return out
+
+
+def _filt_numba(d: np.ndarray, ref: np.ndarray, thresholds: np.ndarray,
+                blend: int, gain: int, limit: int, offset: float,
+                other: np.ndarray | None,
+                base_own: tuple[tuple[int, int], ...],
+                base_other: tuple[tuple[int, int], ...],
+                strip_rows: int, workers: int) -> np.ndarray | None:
+    """`_filt_rows` through `rawnr_numba.filt_rows`, or None if it cannot run.
+
+    Everything float32 is computed here, once per plane, and handed over as
+    float32 scalars: a Python float reaching the kernel would be a float64
+    literal there and would promote the expression it lands in. The
+    normalisations are the engine's own -- `mean = members * (1/n)`, then
+    `[(1024-blend)*mean + blend*centre] * (1/1024)` -- rather than the
+    algebraically equal `w*centre + (1-w)*mean`, which differs in the last bit
+    and so in which taps clear the threshold.
+
+    Returns None (rather than casting) whenever the inputs are not the float32
+    2-D planes the transcription is written in, so the reference operator keeps
+    those cases and computes them in their own dtype.
+    """
+    src = _kernel_input(d)
+    centre = _kernel_input(ref)
+    if src is None or centre is None or src.shape != centre.shape:
+        return None
+    r = FILT_MARGIN
+    height, width = src.shape[0] - 2 * r, src.shape[1] - 2 * r
+    if height <= 0 or width <= 0 or thresholds.ndim != 1 or thresholds.shape[0] < 1:
+        return None
+    if base_other:
+        # `filt` has already refused a cross-plane base with no other plane.
+        cross = _kernel_input(other) if other is not None else None
+        if cross is None or cross.shape != centre.shape:
+            return None
+    else:
+        # Unused, but numba wants an array rather than an optional.
+        cross = centre
+
+    # Flat element offsets, so a tap costs an add rather than a multiply. The
+    # three planes are the same shape, so one stride serves all of them.
+    stride = centre.shape[1]
+    n = len(base_own) + len(base_other)
+    tap_off = _FILT_TAPS[:, 0] * stride + _FILT_TAPS[:, 1]
+    own_off = _member_offsets(base_own, stride)
+    other_off = _member_offsets(base_other, stride)
+    # The whole table up front rather than a gather per pixel: converting every
+    # entry gives the same float32 as converting the ones actually looked up.
+    table = np.ascontiguousarray(thresholds, dtype=np.float32)
+    out = np.empty((height, width), dtype=np.float32)
+    args = (np.float32(BLEND_UNIT - blend), np.float32(blend),
+            np.float32(1.0 / BLEND_UNIT), np.float32(1.0 / n),
+            np.float32(gain / 256.0), np.float32(limit), np.float32(-limit),
+            np.float32(offset), np.float32(table.shape[0] - 1),
+            np.float32(OUTPUT_CEILING))
+    _run_rows(height,
+              lambda y0, y1: _kernels.filt_rows(src, centre, cross, table, tap_off,
+                                                _FILT_CENTRE_TAP, own_off, other_off, out,
+                                                y0, y1, r, KERNEL_CHUNK_COLS, *args),
+              strip_rows, workers)
+    return out
+
+
+def warmup() -> None:
+    """Compile the kernels on a tiny plane, so the first frame does not.
+
+    Cold, with an empty numba cache, the three kernels take 0.9 s of LLVM; warm
+    they come back from the on-disk cache `cache=True` writes, in 0.08 s. It is
+    that second figure that matters here -- the cache is per machine, not per
+    process, so every run after the first pays it, and a worker started per
+    request would otherwise pay it inside its first frame. The daemon calls this
+    on a background thread at startup (cli.py `_warm_kernels`); the kernels are
+    nogil, so it does not block. A no-op on the numpy backend.
+    """
+    if not _use_kernels():
+        return
+    n = 2 * PHASE_MARGIN + 2
+    plane = np.full((n, n), 1000.0, dtype=np.float32)
+    table = np.full(TABLE_SIZE, 50.0, dtype=np.float32)
+    denoise_phase_rb(plane, table)
+    denoise_greens(plane, plane.copy(), table)
+    apply_strength(plane, plane, 1.0)
+
+
+def _filt_rows(d: np.ndarray, ref: np.ndarray, thresholds: np.ndarray,
+               blend: int = BLEND_NEUTRAL, gain: int = DETAIL_GAIN,
+               limit: int = DETAIL_LIMIT, offset: float = OFFSET_RB, *,
+               other: np.ndarray | None = None,
+               base_own: tuple[tuple[int, int], ...] = BASE_RB,
+               base_other: tuple[tuple[int, int], ...] = ()) -> np.ndarray:
     """`0x3a1b00` (red/blue) and `0x3a0c30` (green): the sigma filter.
 
     Loses `FILT_MARGIN` on each side. A sigma filter whose comparison reference

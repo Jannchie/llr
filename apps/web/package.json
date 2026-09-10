@@ -6,7 +6,7 @@
   "scripts": {
     "build": "vite build",
     "check": "vue-tsc -p tsconfig.json --noEmit",
-    "check:chroma": "tsx scripts/chroma-check.ts",
+    "check:marble": "tsx scripts/marble-check.ts",
     "check:shaders": "tsx scripts/shader-check.ts",
     "check:spica": "tsx scripts/spica-check.ts",
     "dev": "vite --host 0.0.0.0",

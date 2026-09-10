@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from llr_worker import denoise as denoise_module
 from llr_worker.denoise import (
     _LUMA_CHROMA,
     _VST,
@@ -26,6 +27,7 @@ from llr_worker.denoise import (
     pack_bayer,
     unpack_bayer,
 )
+from llr_worker.sony import rawnr_simd
 from llr_worker.sony.rawnr import NoiseModel
 
 RGGB_PATTERN = np.array([[0, 1], [3, 2]], dtype=np.uint8)  # Sony A7C II layout
@@ -216,7 +218,7 @@ def test_denoise_passes_the_cfa_and_the_noise_curve_through() -> None:
         name = "spy"
 
         def __call__(self, planes, sigma=None, cfa=None, noise=None, detail=None,
-                     *, chroma_scale=1.0, sensor_levels=None):
+                     *, chroma_scale=1.0, sensor_levels=None, strength=1.0):
             seen.update(cfa=cfa, noise=noise, detail=detail, chroma=chroma_scale,
                         levels=sensor_levels)
             return planes
@@ -625,3 +627,119 @@ def test_the_fallback_is_resolved_from_the_frame_not_assumed(
     assert effective_model(FALLBACK_MODEL, path) == FALLBACK_MODEL
     assert get_denoiser(DEFAULT_MODEL).requires_noise_model
     assert not get_denoiser(FALLBACK_MODEL).requires_noise_model
+
+
+def test_the_sony_denoiser_writes_back_by_the_iso_strength() -> None:
+    """Strength 0 hands the input straight back (the engine's truncated blend
+    of the input with itself), strength 1 is the full filter, and a strength
+    in between lands between them on every pixel the filter moved."""
+    raw, planes, kw = _sony_case(5)
+    black, white = kw["sensor_levels"]
+    d = get_denoiser("sony")
+    span = white - black
+    none = d(planes, **kw, strength=0.0) * span + black
+    full = d(planes, **kw, strength=1.0) * span + black
+    half = d(planes, **kw, strength=0.4) * span + black
+    np.testing.assert_allclose(none, np.trunc(np.clip(raw, 0, 16383)), atol=1e-2)
+    moved = np.abs(full - raw) > 2.0
+    assert moved.any()
+    between = (np.minimum(raw, full) - 1.0 <= half) & (half <= np.maximum(raw, full) + 1.0)
+    assert between[moved].all()
+    # and the result is integer-valued in raw levels: the engine truncates
+    assert np.allclose(full, np.trunc(full + 1e-3), atol=1e-2)
+
+
+# ── The compiled plane plumbing against the numpy chains ───────────────────
+#
+# `denoise_numba` fuses each normalisation chain into one traversal. That is a
+# performance change and nothing else, so what these check is that it is
+# nothing else: `array_equal` on the mosaic a whole `denoise_raw_inplace` writes
+# back, not a tolerance. The stage round-trips every pixel through [0, 1] and
+# back (and, for the Sony denoiser, through raw levels a second time), so a
+# single reassociated float32 would show up here as a shifted level.
+
+needs_numba = pytest.mark.skipif(denoise_module._kernels is None,
+                                 reason="numba is an optional dependency")
+
+
+def _mosaic_through(monkeypatch: pytest.MonkeyPatch, backend: str, mosaic: np.ndarray,
+                    model: str, **kw: object) -> np.ndarray:
+    """`denoise_raw_inplace` on a copy of `mosaic`, under one backend."""
+    monkeypatch.setattr(denoise_module, "BACKEND", backend)
+    monkeypatch.setattr(rawnr_simd, "BACKEND", backend)
+    work = mosaic.copy()
+    denoise_raw_inplace(make_raw(work), get_denoiser(model), **kw)  # type: ignore[arg-type]
+    return work
+
+
+@needs_numba
+@pytest.mark.parametrize("shape", [(64, 96), (34, 50), (128, 128)])
+def test_the_compiled_plumbing_writes_back_the_same_mosaic(
+        monkeypatch: pytest.MonkeyPatch, shape: tuple[int, int]) -> None:
+    """Every denoiser, since the plumbing is shared and only the middle differs.
+
+    Odd-ish sizes on purpose: the kernels walk the mosaic in row bands, so a
+    height that is not a multiple of the band is where a tail bug would live.
+    """
+    rng = np.random.default_rng(sum(shape))
+    mosaic = random_mosaic(rng, *shape)
+    cases: list[tuple[str, dict]] = [
+        ("passthrough", {}),
+        ("wavelet", {}),
+        ("sony", {"noise": _sony_model(), "strength": 0.825}),
+    ]
+    for model, kw in cases:
+        fast = _mosaic_through(monkeypatch, "numba", mosaic, model, **kw)
+        ref = _mosaic_through(monkeypatch, "numpy", mosaic, model, **kw)
+        assert np.array_equal(fast, ref), (
+            f"{model}: {int(np.count_nonzero(fast != ref))}/{fast.size} levels differ, "
+            f"max |d| {int(np.abs(fast.astype(np.int32) - ref.astype(np.int32)).max())}")
+
+
+@needs_numba
+def test_the_compiled_plumbing_keeps_the_passthrough_round_trip_exact() -> None:
+    """The strongest statement the round trip can make: normalise and
+    denormalise a real mosaic through the kernels and get it back unchanged.
+
+    This is `test_passthrough_denoise_reproduces_mosaic_bit_for_bit` with the
+    compiled path underneath it, which is where a fused clamp or a truncation
+    that should have been a round would show.
+    """
+    rng = np.random.default_rng(3)
+    mosaic = random_mosaic(rng, 96, 64)
+    work = mosaic.copy()
+    denoise_raw_inplace(make_raw(work), PassthroughDenoiser())
+    assert np.array_equal(work, mosaic)
+
+
+@needs_numba
+def test_the_denoise_backend_switch_selects_which_plumbing_runs(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """`LLR_DENOISE_BACKEND=numpy` has to reach the dispatch, not just a flag.
+
+    Checked by making the kernel module unusable: under the reference backend
+    nothing may touch it, and under the compiled one everything must.
+    """
+
+    class Forbidden:
+        def __getattr__(self, name: str) -> object:
+            raise RuntimeError(f"the numpy backend called the kernel ({name})")
+
+    mosaic = random_mosaic(np.random.default_rng(4), 16, 16)
+    monkeypatch.setattr(denoise_module, "_kernels", Forbidden())
+
+    monkeypatch.setattr(denoise_module, "BACKEND", "numpy")
+    assert denoise_module._use_kernels() is False
+    denoise_raw_inplace(make_raw(mosaic.copy()), PassthroughDenoiser())
+
+    monkeypatch.setattr(denoise_module, "BACKEND", "numba")
+    assert denoise_module._use_kernels() is True
+    with pytest.raises(RuntimeError, match="called the kernel"):
+        denoise_raw_inplace(make_raw(mosaic.copy()), PassthroughDenoiser())
+
+
+def test_denoise_warmup_compiles_the_plane_kernels() -> None:
+    """Safe with no numba (a no-op) and safe to call twice; cli.py calls it on
+    a background thread at startup."""
+    denoise_module.warmup()
+    denoise_module.warmup()

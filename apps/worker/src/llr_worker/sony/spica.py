@@ -126,6 +126,51 @@ def spica_iso_gain(iso: float | None) -> float:
     return 1.0 * (1.0 - t) + SPICA_ISO_FLOOR * t
 
 
+# Two more ISO ramps the engine builds into the same config block, read out of
+# five frames' `cfg` at 0x35a270 (ISO 100/320/1250/2000/4000, all Sharpness
+# Normal/+3; sony_repro/notes/measured-chroma-gap.md 2.23). Both are linear in
+# ISO between the same breakpoints RawNR's strength uses, and both are the
+# camera's defaults up to ISO 400 -- which is why the frame the shader's
+# constants were transcribed from never showed them:
+#
+#   cfg[0xc4]/4096   1.0 up to 400  ->  0.5 at 1600  ->  0.25 at 25600
+#   range-curve a,b  +0             ->  +128          ->  +384   (c, d fixed)
+#
+# Five frames land on these to float32 (2645.33 / 2030.93 / 1945.6 for the
+# gain, 90.667 / 132.267 / 153.6 for the shift). Without them Spica is a full
+# 2x too strong from ISO 1600 up.
+SPICA_ISO_LO = 400.0
+SPICA_ISO_MID = 1600.0
+SPICA_ISO_HI = 25600.0
+SPICA_GAIN_FRACTIONS = (1.0, 0.5, 0.25)
+SPICA_RANGE_SHIFTS = (0.0, 128.0, 384.0)
+
+
+def _iso_ramp(iso: float | None, values: tuple[float, float, float]) -> float:
+    """Piecewise-linear in ISO over (SPICA_ISO_LO, MID, HI), flat outside."""
+    v_lo, v_mid, v_hi = values
+    if iso is None or iso <= SPICA_ISO_LO:
+        return v_lo
+    if iso >= SPICA_ISO_HI:
+        return v_hi
+    if iso <= SPICA_ISO_MID:
+        t = (float(iso) - SPICA_ISO_LO) / (SPICA_ISO_MID - SPICA_ISO_LO)
+        return v_lo + t * (v_mid - v_lo)
+    t = (float(iso) - SPICA_ISO_MID) / (SPICA_ISO_HI - SPICA_ISO_MID)
+    return v_mid + t * (v_hi - v_mid)
+
+
+def spica_gain_scale(iso: float | None) -> float:
+    """`cfg[0xc4] / 2048` for a shot's ISO: SPICA_GAIN_SCALE at base ISO, half
+    of it at 1600, a quarter at 25600."""
+    return SPICA_GAIN_SCALE * _iso_ramp(iso, SPICA_GAIN_FRACTIONS)
+
+
+def spica_range_shift(iso: float | None) -> float:
+    """How far the range trapezoid's `a` and `b` move up for a shot's ISO."""
+    return _iso_ramp(iso, SPICA_RANGE_SHIFTS)
+
+
 def spica_amount(sharpness: int, sharpness_range: int) -> float:
     """How much of the filtered buffer survives the blend, 0 = the stage is off.
 
@@ -151,12 +196,15 @@ def spica_amount(sharpness: int, sharpness_range: int) -> float:
 
 
 def spica_block(sharpness: int, sharpness_range: int,
-                iso_gain: float = 1.0) -> dict[str, Any]:
+                iso_gain: float = 1.0, gain_scale: float = SPICA_GAIN_SCALE,
+                range_shift: float = 0.0) -> dict[str, Any]:
     """What the shader needs, as it travels on the profile.
 
-    Two numbers. Everything else — the weight tables, the classifier LUT, the
-    trapezoids — is the operator's own shape rather than anything per-shot, so
-    it lives in the shader beside sharpening's kernel for the same reason.
+    Four numbers, three of them the shot's ISO in different clothes (isoGain
+    scales the detail, gainScale the trapezoids' output, rangeShift moves the
+    range trapezoid). Everything else — the weight tables, the classifier LUT,
+    the trapezoids' shapes — is the operator's own and lives in the shader
+    beside sharpening's kernel for the same reason.
 
     Rides through a profile rebuild untouched, like sharpness_block: no Creative
     Look slider can move a camera setting.
@@ -164,6 +212,8 @@ def spica_block(sharpness: int, sharpness_range: int,
     return {
         "amount": spica_amount(sharpness, sharpness_range),
         "isoGain": float(iso_gain),
+        "gainScale": float(gain_scale),
+        "rangeShift": float(range_shift),
     }
 
 
@@ -175,4 +225,4 @@ def spica_off() -> dict[str, Any]:
     *doubles* this stage's weight (see spica_amount), so running the formula on
     a missing tag would sharpen a file harder than any real setting can.
     """
-    return {"amount": 0.0, "isoGain": 1.0}
+    return {"amount": 0.0, "isoGain": 1.0, "gainScale": SPICA_GAIN_SCALE, "rangeShift": 0.0}

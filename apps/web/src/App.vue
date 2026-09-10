@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { PipelineRenderer, parseDcpTables, type EditParams, type ProfileCurve, type ViewWindow } from "./rendering/pipeline-renderer";
-import { CHROMA_AMOUNT } from "./rendering/passes";
+import { sonyChromaNrSlider } from "./rendering/sony-denoise";
 import {
   curveToLUT, buildToneCurveLUT, defaultToneCurve, normalizeToneCurve,
   DEFAULT_BASIC, sameBasic,
@@ -41,7 +41,12 @@ type SliderSpec = { key: RecipeKey; min: number; max: number; step: number };
 // needsLensCorr: the group's controls do nothing but blend the shot's own
 // correction tables toward identity, so they only mean something when the file
 // carried a pair (see lensCorrAvailable).
-type SliderGroup = { title: "tone" | "presence" | "color" | "lens"; items: SliderSpec[]; needsLensCorr?: boolean };
+type SliderGroup = { title: "tone" | "presence" | "color" | "lens"; tab: EditTab; items: SliderSpec[]; needsLensCorr?: boolean };
+
+// The rail shows one group at a time, picked from the icon strip along its
+// outer edge. Nine always-open panels stacked to 2400px — reaching the curve
+// meant scrolling two and a half screens past controls nobody was using.
+type EditTab = "light" | "color" | "curve" | "detail" | "look" | "crop" | "settings";
 
 // Distortion correction defaults to fully applied (mirrorless glass is designed
 // around it — uncorrected geometry reads as broken). Vignetting stays off by
@@ -55,7 +60,7 @@ const defaultRecipe = (): Recipe => ({
 });
 
 const groups: SliderGroup[] = [
-  { title: "tone", items: [
+  { title: "tone", tab: "light", items: [
     { key: "exposure", min: -5, max: 5, step: 0.1 },
     { key: "contrast", min: -100, max: 100, step: 1 },
     { key: "highlights", min: -100, max: 100, step: 1 },
@@ -63,17 +68,17 @@ const groups: SliderGroup[] = [
     { key: "whites", min: -100, max: 100, step: 1 },
     { key: "blacks", min: -100, max: 100, step: 1 },
   ]},
-  { title: "presence", items: [
+  { title: "presence", tab: "light", items: [
     { key: "clarity", min: -100, max: 100, step: 1 },
     { key: "dehaze", min: -100, max: 100, step: 1 },
   ]},
-  { title: "color", items: [
+  { title: "color", tab: "color", items: [
     { key: "temperature", min: 2000, max: 12000, step: 50 },
     { key: "tint", min: -100, max: 100, step: 1 },
     { key: "vibrance", min: -100, max: 100, step: 1 },
     { key: "saturation", min: -100, max: 100, step: 1 },
   ]},
-  { title: "lens", needsLensCorr: true, items: [
+  { title: "lens", tab: "detail", needsLensCorr: true, items: [
     { key: "lensDistortion", min: 0, max: 100, step: 1 },
     { key: "lensVignetting", min: 0, max: 100, step: 1 },
   ]},
@@ -316,6 +321,19 @@ const hasCameraMatch = ref(false);
 // for frames without Sony's noise tags. How faithful the reproduction is
 // belongs to the worker and is recorded there -- sony/rawnr_simd.py's module
 // docstring -- not copied here, where it goes stale unnoticed.
+// Sony's "advanced colour reproduction" — Imaging Edge Edit's 色彩复制 radio.
+// Off by default because Edit's own default is 标准. One switch, two effects,
+// which is how Edit has it: YGamma swaps to its advanced table and contrast
+// (worker sony/chroma.py), and ZcTask3DLut then runs between it and the YCC
+// return trip (worker sony/lut3d.py). Together they bring bright saturated
+// pixels down in luma and chroma and pull the top of the Y range back to
+// neutral, which is most of what makes Edit's output look like the camera's
+// JPEG.
+//
+// Render-time, not a decode: the table is static, so this is a uniform and a
+// redraw. It still belongs in the snapshot — it is a per-image choice the way
+// the Creative Look tweaks are, and undo has to travel with it.
+const sonyAdvancedColour = ref(false);
 const defaultDenoise = () => ({
   enabled: true, auto: true, amount: 100, edge: 50, chroma: 50,
 });
@@ -442,14 +460,17 @@ function gradingColor(key: string): string {
   const s = g[key + "S"] ?? 0;
   return `hsl(${gradingHueDeg(h)}, ${s}%, 50%)`;
 }
-function resetHslGrading(): void {
+function resetHsl(): void {
   for (let i = 0; i < 8; i++) { hslHue[i] = 0; hslSat[i] = 0; hslLum[i] = 0; }
+}
+function resetGrading(): void {
   grading.shH = 0; grading.shS = 0;
   grading.mdH = 0; grading.mdS = 0;
   grading.hlH = 0; grading.hlS = 0;
   grading.blend = 50;
   grading.balance = 0;
 }
+function resetHslGrading(): void { resetHsl(); resetGrading(); }
 
 // ── Tone Curve (Lightroom-compatible: parametric + RGB/R/G/B point curves) ──
 
@@ -469,6 +490,9 @@ const {
 // or reading every panel.
 const isEdited = (key: RecipeKey): boolean => recipe[key] !== SLIDER_DEFAULTS[key];
 const groupEdited = (group: SliderGroup): boolean => group.items.some(s => isEdited(s.key));
+function resetGroup(group: SliderGroup): void {
+  for (const spec of group.items) recipe[spec.key] = SLIDER_DEFAULTS[spec.key];
+}
 const hslEdited = computed(() =>
   hslHue.some(v => v !== 0) || hslSat.some(v => v !== 0) || hslLum.some(v => v !== 0));
 const gradingEdited = computed(() => {
@@ -528,6 +552,9 @@ type Snapshot = {
   dro?: number | null;
   // Which DRO curve: -1 for the shot's own (Auto), 0..99 for a built-in preset.
   droLevel?: number | null;
+  // Sony's advanced colour reproduction (ZcTask3DLut). Absent in older
+  // sessions, and off is both the default and what those sessions rendered.
+  sonyAdvancedColour?: boolean;
 };
 
 let isRestoring = false;
@@ -551,6 +578,7 @@ function defaultSnapshot(): Snapshot {
     look: null,
     lookStyle: null,
     dro: null,
+    sonyAdvancedColour: false,
   };
 }
 
@@ -580,6 +608,7 @@ function captureSnapshot(): Snapshot {
     lookStyle: lookStyle.value,
     dro: droStrength.value,
     droLevel: droLevel.value,
+    sonyAdvancedColour: sonyAdvancedColour.value,
   };
 }
 
@@ -609,6 +638,8 @@ function setEditState(s: Snapshot): void {
   // Snapshots taken before manual levels existed carry none, and Auto is what
   // they were rendered with.
   droLevel.value = s.droLevel ?? DRO_AUTO;
+  // Absent in a snapshot predating the switch, and off is what it rendered as.
+  sonyAdvancedColour.value = s.sonyAdvancedColour ?? false;
   dcpCode.value = s.dcp;
   profileId.value = s.profile ?? "standard";
   // Rebake with the snapshot's Basic values (bakeCurveLUT also syncs bakedBasic).
@@ -739,6 +770,77 @@ function applyDcpSelection(selection: ColorProfileMeta["selection"]): void {
 // on "is a RAW": a RAW shot on adapted glass carries none either.
 const visibleGroups = computed(() =>
   groups.filter(g => !g.needsLensCorr || lensCorrAvailable.value));
+
+// ── Edit rail: one group at a time ──
+
+// crop is a tab like the rest, but it drives the viewport's crop editor rather
+// than a set of sliders, so cropMode stays the source of truth and the tab
+// follows it (the R shortcut and the editor's Done button move both).
+const EDIT_TABS: { key: EditTab; icon: string[] }[] = [
+  { key: "light", icon: ["M12 3a9 9 0 0 0 0 18z", "M12 3a9 9 0 0 1 0 18"] },
+  { key: "color", icon: ["M12 3a9 9 0 1 0 0 18c1.1 0 1.6-.9 1.6-1.7 0-1.6-1.4-1.9-1.4-3 0-.9.7-1.6 1.7-1.6H16a5 5 0 0 0 5-5c0-3.7-4-6.7-9-6.7z", "M7.5 12.5h.01", "M9.5 8.5h.01", "M14.5 8h.01"] },
+  { key: "curve", icon: ["M4 20c6.5 0 5-16 16-16"] },
+  { key: "detail", icon: ["M12 4v16", "M4 12h16", "M6.3 6.3l11.4 11.4", "M17.7 6.3L6.3 17.7"] },
+  { key: "look", icon: ["M21 19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h3l1.5-2.5h5L16 7h3a2 2 0 0 1 2 2z", "M12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8z"] },
+  { key: "crop", icon: ["M6 2v14a2 2 0 0 0 2 2h14", "M2 6h14a2 2 0 0 1 2 2v14"] },
+  { key: "settings", icon: ["M4 7h16", "M4 17h16", "M9 7a2 2 0 1 0 4 0 2 2 0 0 0-4 0z", "M13 17a2 2 0 1 0 4 0 2 2 0 0 0-4 0z"] },
+];
+
+const editTab = ref<EditTab>((localStorage.getItem("llr.tab") as EditTab | null) ?? "light");
+// Where the rail was before the crop editor took it, so Done lands back on the
+// group being edited instead of resetting to Light.
+let tabBeforeCrop: EditTab = editTab.value;
+
+// Before an image lands, Settings is the only tab with anything in it; Creative
+// Look needs the shot's own as-shot values to reset back to.
+const availableTabs = computed(() => EDIT_TABS.filter(tb => {
+  if (!activeSource.value) return tb.key === "settings";
+  if (tb.key === "look") return !!lookAsShot.value;
+  return true;
+}));
+
+const tabGroups = computed(() => visibleGroups.value.filter(g => g.tab === editTab.value));
+
+const curveEdited = computed(() =>
+  JSON.stringify(toneCurve.value) !== JSON.stringify(defaultToneCurve()));
+const denoiseEdited = computed(() => {
+  const d = defaultDenoise() as Record<string, unknown>;
+  return Object.entries(denoise).some(([k, v]) => v !== d[k]);
+});
+// The accent dot on a tab: which groups hold a non-default value, so an edit
+// buried in a closed tab is still visible.
+const tabEdited = computed<Record<EditTab, boolean>>(() => ({
+  light: groups.some(g => g.tab === "light" && groupEdited(g)),
+  color: groups.some(g => g.tab === "color" && groupEdited(g)) || hslEdited.value || gradingEdited.value,
+  curve: curveEdited.value,
+  detail: groups.some(g => g.tab === "detail" && groupEdited(g)) || denoiseEdited.value,
+  look: lookEdited.value,
+  crop: !isDefaultCrop(crop),
+  settings: false,
+}));
+
+const anyEdited = computed(() => Object.values(tabEdited.value).some(Boolean));
+
+function selectTab(tab: EditTab): void {
+  if (tab === "crop") { enterCropMode(); return; }
+  if (cropMode.value) exitCropMode();  // the watch below restores tabBeforeCrop
+  editTab.value = tab;
+}
+
+watch(cropMode, on => {
+  if (on) { if (editTab.value !== "crop") tabBeforeCrop = editTab.value; editTab.value = "crop"; }
+  else if (editTab.value === "crop") editTab.value = tabBeforeCrop;
+});
+
+watch(editTab, v => {
+  if (v !== "crop") localStorage.setItem("llr.tab", v);
+  // The curve panel is v-if'd, so its canvas is a fresh element each time the
+  // tab opens and has to be redrawn once it's in the DOM.
+  if (v === "curve") void nextTick(renderCurveCanvas);
+});
+watch(availableTabs, list => {
+  if (list.length && !list.some(tb => tb.key === editTab.value)) editTab.value = list[0].key;
+});
 
 // Full-res camera JPEG for the embedded-preview compare. Bound to the overlay
 // <img> whenever a source is active, so the browser has it fetched before the
@@ -871,6 +973,7 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     bakeCurveLUT();
     webglRenderer.uploadProfileCurveLUT(profileCurveLUT);
     webglRenderer.uploadDcpTables(parseDcpTables(linMeta.colorProfile));
+    applySonyAdvancedColour();
     // Apply the current crop/straighten (sets output dims, fit, draws, histogram).
     applyCropRender();
     src.invalid = false;
@@ -981,7 +1084,20 @@ function buildProfileLUT(cp: ColorProfileMeta | null | undefined): ProfileCurve 
           // contrast 1, which is also the right fallback for an older response.
           lumaPivot: cp?.profileLumaPivot ?? 0,
           lumaContrast: cp?.profileLumaContrast ?? 1,
+          // YGamma's table, which the same stage indexes Y through first. It is
+          // per-look, so it arrives again on every profile rebuild; null for an
+          // older response, which renders as the pivot/contrast line alone.
+          lumaLut: cp?.profileLumaLut ?? null,
+          // ...and the pair "advanced colour reproduction" swaps in for those
+          // two. Both travel so the switch stays a redraw; null for an older
+          // response, which leaves the switch as the 3-D LUT alone.
+          lumaLutAdvanced: cp?.profileLumaLutAdvanced ?? null,
+          lumaContrastAdvanced: cp?.profileLumaContrastAdvanced ?? null,
           saturation: cp?.profileChromaSaturation ?? 1,
+          // ChromaSuppres, which runs inside the same section. Null both for an
+          // older response and for a file whose four SR2 tags could not be
+          // read; either way the shader leaves the chroma alone.
+          suppress: cp?.profileChromaSuppres ?? null,
           sepia: cp?.profileSepia ?? null,
         }
       : null,
@@ -1013,17 +1129,23 @@ function buildProfileLUT(cp: ColorProfileMeta | null | undefined): ProfileCurve 
     spica: cp?.profileSpica?.amount ? cp.profileSpica : null,
     // Marble's other half, the chroma cleanup — on for the same reason the three
     // above are, that the engine runs it and reproducing the engine means
-    // running it. Unlike them it has no per-shot amount to gate on: Marble runs
-    // unconditionally, so the gate is just "is this a Sony render at all", which
-    // profileSpica/profileSharpness being present is what says. A JPEG or a DCP
-    // render has no Marble to reproduce.
+    // running it. Unlike them it has no per-shot amount to gate on: the worker
+    // sends a calibration for every Sony shot, and the stage's own strength is
+    // the ISO and the slider, which sony-marble.ts resolves.
     //
     // The largest single correction in the chain: llr's colour-difference noise
-    // measured 6.59x Edit's without it. At CHROMA_AMOUNT it lands at a geometric
-    // mean of 0.98 and a median of 1.01 over all sixteen engine captures, so the
-    // centre is right; the per-frame spread is still 0.36x-2.44x, and that part
-    // is neither ISO-driven nor yet explained (measured-chroma-gap.md 2.11).
-    chromaNr: cp?.profileSpica || cp?.profileSharpness ? CHROMA_AMOUNT : 0,
+    // measured 6.59x Edit's without it (measured-chroma-gap.md 2.11).
+    //
+    // 2026-09-10: it is not unconditional. Captured at export, Marble leaves the
+    // colour differences alone with Noise Reduction off and removes their fine
+    // band with it on Auto (2.23), so the gate is the NR switch. Any change to
+    // `denoise` re-fetches the linear data and rebuilds this LUT, which is what
+    // keeps the two in step. The panel's colour-NR value is Edit's own 0..10
+    // control at ten times the scale (2.24.2), and that position is what
+    // reaches the stage — it moves both the thresholds and the blend.
+    marble: cp?.profileMarble && denoise.enabled
+      ? { ...cp.profileMarble, slider: sonyChromaNrSlider(denoise.chroma, denoise.auto) }
+      : null,
   };
 }
 
@@ -1070,6 +1192,21 @@ const histogram = useHistogram({
 });
 const histoCanvasRef = histogram.canvasRef;
 const scheduleHistogram = histogram.schedule;
+
+/**
+ * Push the advanced-colour switch at the renderer and repaint once it has the
+ * table. The first `true` fetches public/sony-lut3d.bin, so the redraw is
+ * deferred rather than immediate — and guarded on the renderer still being the
+ * one that asked, since a source switch can replace it while the fetch is out.
+ * A failed fetch resolves too, leaving the switch inert with one warning.
+ */
+function applySonyAdvancedColour(): void {
+  const renderer = webglRenderer;
+  if (!renderer) return;
+  void renderer.setSonyAdvancedColour(sonyAdvancedColour.value).then(() => {
+    if (webglRenderer === renderer) scheduleWebGLDraw();
+  });
+}
 
 function scheduleWebGLDraw(): void {
   if (drawPending) return;
@@ -1404,8 +1541,16 @@ watch(crop, () => {
 // History/persist for the edit state not covered above (redraws handled by
 // their own paths: curve LUT bake, dcp/denoise re-decode; aspect is snapshot
 // state but changes no pixels by itself).
-watch([toneCurve, dcpCode, profileId, denoise, cropAspect, look],
+watch([toneCurve, dcpCode, profileId, denoise, cropAspect, look, sonyAdvancedColour],
   () => { scheduleHistoryCommit(); schedulePersist(); }, { deep: true });
+
+// Sony's advanced colour reproduction. The same trade the camera-match toggle
+// makes: the table is static and lives in a uniform's texture, so the switch
+// costs a redraw and never a RAW round-trip.
+watch(sonyAdvancedColour, () => {
+  if (!currentSourceId) return;
+  applySonyAdvancedColour();
+});
 
 // The Creative Look sliders. Not a re-decode: reloadLookProfile swaps the
 // profile LUT under the pixels already on the GPU. Suppressed only while a
@@ -1523,7 +1668,11 @@ async function onDrop(e: DragEvent): Promise<void> {
   await uploadFiles(Array.from(files));
 }
 
-function resetRecipe(): void { Object.assign(recipe, defaultRecipe()); resetHslGrading(); }
+function resetRecipe(): void {
+  Object.assign(recipe, defaultRecipe());
+  resetHslGrading();
+  resetCurve();
+}
 
 // ── Export ──
 
@@ -1554,6 +1703,7 @@ function buildExportPlan(): ExportPlan | null {
     look: settings.look ?? undefined,
     lookStyle: settings.lookStyle ?? undefined,
     dro: settings.dro ?? undefined,
+    sonyAdvancedColour: settings.sonyAdvancedColour ?? false,
     params: buildPipelineParams(settings),
     curveLUT: buildToneCurveLUT(settings.curve, currentBasic(settings.recipe)),
     profileLUT: (meta) => buildProfileLUT(meta.colorProfile),
@@ -1666,13 +1816,6 @@ const vWheelAdjust = {
             <path d="M17 5l4 4-4 4" />
           </svg>
         </button>
-        <button class="icon-btn" :class="{ 'is-on': cropMode }" :disabled="!activeSource" @click="toggleCropMode"
-          :title="t('action.crop')" :aria-label="t('aria.crop')">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M6 2v14a2 2 0 0 0 2 2h14" />
-            <path d="M2 6h14a2 2 0 0 1 2 2v14" />
-          </svg>
-        </button>
         <button class="icon-btn" :class="{ 'is-on': showOriginal }" :disabled="!activeSource || cropMode"
           @mousedown="startCompare" @mouseup="endCompare" @mouseleave="endCompare"
           @touchstart.prevent="startCompare" @touchend.prevent="endCompare" @touchcancel="endCompare"
@@ -1680,6 +1823,13 @@ const vWheelAdjust = {
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <rect x="3" y="5" width="18" height="14" rx="2" />
             <path d="M12 5v14" />
+          </svg>
+        </button>
+        <button class="icon-btn" :disabled="!anyEdited" @click="resetRecipe"
+          :title="t('action.resetAll')" :aria-label="t('action.resetAll')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 4v6h6" />
+            <path d="M3.5 10a9 9 0 1 1 1.6 6" />
           </svg>
         </button>
         <button class="icon-btn" :class="{ 'is-on': showEmbedded }" :disabled="!activeSource || cropMode || !embeddedSrc"
@@ -1815,10 +1965,12 @@ const vWheelAdjust = {
       </footer>
     </main>
 
-    <aside class="right" v-wheel-adjust>
+    <aside class="rail">
+      <div class="rail-body" v-wheel-adjust>
       <div class="histogram-wrap" v-show="activeSource">
         <canvas ref="histoCanvasRef" class="histogram" />
       </div>
+      <div class="rail-panels">
 
       <section class="panel crop-panel" v-if="activeSource && cropMode">
         <header class="panel-head">
@@ -1875,10 +2027,9 @@ const vWheelAdjust = {
         <button type="button" class="crop-done" @click="exitCropMode">{{ t('crop.done') }}</button>
       </section>
 
-      <section class="panel" v-show="!cropMode">
+      <section class="panel" v-if="editTab === 'settings'">
         <header class="panel-head">
           <span>{{ t('panel.settings') }}</span>
-          <button class="ghost" type="button" @click="resetRecipe">{{ t('common.reset') }}</button>
         </header>
         <div class="control-row">
           <label class="control-label">{{ t('settings.language') }}</label>
@@ -1919,7 +2070,7 @@ const vWheelAdjust = {
       <!-- The shot's in-camera Creative Look tweaks. Its own panel because these
            are Sony's stages, not ours: they start at what the body recorded and
            reset back to it, which is why they cannot share the Tone panel. -->
-      <section class="panel" v-if="lookAsShot && !cropMode">
+      <section class="panel" v-if="editTab === 'look' && lookAsShot">
         <header class="panel-head">
           <span class="panel-title">
             {{ t('panel.creativeLook') }}
@@ -1940,6 +2091,18 @@ const vWheelAdjust = {
         <!-- Say so when the look is not in the RAW. The curve is exact; the
              chroma is another body's, and that is worth admitting on screen. -->
         <p class="control-note" v-if="lookBorrowed">{{ t('look.borrowedHint') }}</p>
+        <!-- Edit's 色彩复制 radio, as a switch: 标准 is the stage off (Edit's
+             own default) and 高级 is Sony's 3-D LUT. Sony renders only — the
+             stage lives inside the engine's YCC section, which a DCP render
+             does not have. A redraw, not a re-decode: the table is static. -->
+        <div class="control-row" v-if="activeProfileKind === 'sony'">
+          <label class="control-label" for="sony-advanced-colour"
+            :title="t('look.advancedColourHint')">{{ t('look.advancedColour') }}</label>
+          <label class="switch">
+            <input id="sony-advanced-colour" type="checkbox" v-model="sonyAdvancedColour" />
+            <span class="switch-track"><span class="switch-thumb" /></span>
+          </label>
+        </div>
         <!-- Sharpening is a camera setting, not one of the six tweaks, so it is
              reported rather than offered: there is no slider here that could
              move it. The two ladder positions are what the body's own menu
@@ -1989,12 +2152,15 @@ const vWheelAdjust = {
           <p class="control-note" v-else-if="droMode === 'level'">{{ t('look.droLevelHint') }}</p>
         </template>
       </section>
-      <section v-for="group in visibleGroups" :key="group.title" class="panel" v-show="!cropMode">
+      <section v-for="group in tabGroups" :key="group.title" class="panel">
         <header class="panel-head">
           <span class="panel-title">
             {{ t(`panel.${group.title}`) }}
             <span v-if="groupEdited(group)" class="panel-dot" aria-hidden="true" />
           </span>
+          <button class="ghost" type="button" :disabled="!groupEdited(group)" @click="resetGroup(group)">
+            {{ t('common.reset') }}
+          </button>
         </header>
         <SliderRow v-for="spec in group.items" :key="spec.key"
           v-model="recipe[spec.key]" :label="t(`slider.${spec.key}`)" :input-id="`s-${spec.key}`"
@@ -2002,7 +2168,7 @@ const vWheelAdjust = {
           :reset-value="SLIDER_DEFAULTS[spec.key]" :track="WB_TRACK[spec.key]" show-modified />
       </section>
 
-      <section class="panel" v-if="activeSource && !cropMode && isRawSource">
+      <section class="panel" v-if="editTab === 'detail' && activeSource && isRawSource">
         <header class="panel-head">
           <span>{{ t('panel.detail') }}</span>
           <span v-if="denoiseBusy" class="panel-hint">{{ t('detail.denoising') }}</span>
@@ -2027,22 +2193,27 @@ const vWheelAdjust = {
           :label="t('detail.amount')" input-id="denoise-amount" :min="0" :max="100" :reset-value="100" />
         <!-- 50 is neutral for both: the camera's own detail-restore value, and
              the tuned chroma threshold. Reset therefore goes to 50, not 100. -->
-        <!-- Color NR hides on frames whose denoiser ignores it — every Sony RAW,
-             since Sony's own filter has no such control. It still appears for
-             frames that fall back to the wavelet, where it works. The value is
-             kept either way, so it comes back if the frame changes. -->
-        <SliderRow v-show="denoise.enabled && denoiseUsesChroma" v-model="denoise.chroma" style="margin-top: 6px;"
+        <!-- Color NR shows where it reaches the pixels: on frames whose RAW
+             denoiser takes it (the wavelet fallback), and on a Sony render in
+             manual mode, where it is Edit's own 色彩降噪 slider and drives
+             Marble's chroma cleanup in the shader (rendering/sony-denoise.ts)
+             rather than the RAW stage — Sony's own filter has no such control,
+             which is why denoiseUsesChroma alone says no. In Auto the engine
+             greys the slider out, so it hides. The value is kept either way, so
+             it comes back if the frame changes. -->
+        <SliderRow v-show="denoise.enabled && (denoiseUsesChroma || (activeProfileKind === 'sony' && !denoise.auto))" v-model="denoise.chroma" style="margin-top: 6px;"
           :label="t('detail.chromaNr')" input-id="denoise-chroma" :min="0" :max="100" :reset-value="50" />
         <SliderRow v-show="denoise.enabled" v-model="denoise.edge" style="margin-top: 6px;"
           :label="t('detail.edgeNr')" input-id="denoise-edge" :min="0" :max="100" :reset-value="50" />
       </section>
 
-      <section class="panel" v-if="activeSource && !cropMode">
+      <section class="panel" v-if="editTab === 'color' && activeSource">
         <header class="panel-head">
           <span class="panel-title">
             {{ t('panel.hsl') }}
             <span v-if="hslEdited" class="panel-dot" aria-hidden="true" />
           </span>
+          <button class="ghost" type="button" :disabled="!hslEdited" @click="resetHsl">{{ t('common.reset') }}</button>
         </header>
         <div class="hsl-tabs">
           <button :class="{ active: hslTab === 'hue' }" @click="hslTab = 'hue'">H</button>
@@ -2055,12 +2226,13 @@ const vWheelAdjust = {
           :min="-100" :max="100" show-modified />
       </section>
 
-      <section class="panel" v-if="activeSource && !cropMode">
+      <section class="panel" v-if="editTab === 'color' && activeSource">
         <header class="panel-head">
           <span class="panel-title">
             {{ t('panel.grading') }}
             <span v-if="gradingEdited" class="panel-dot" aria-hidden="true" />
           </span>
+          <button class="ghost" type="button" :disabled="!gradingEdited" @click="resetGrading">{{ t('common.reset') }}</button>
         </header>
         <div v-for="g in GRADING_BANDS" :key="g.band" class="grading-group">
           <div class="grading-header">
@@ -2074,7 +2246,7 @@ const vWheelAdjust = {
         <SliderRow v-model="grading.balance" :label="t('grading.balance')" :min="-100" :max="100" />
       </section>
 
-      <section class="panel" v-if="activeSource && !cropMode">
+      <section class="panel" v-if="editTab === 'curve' && activeSource">
         <header class="panel-head">
           <span>{{ t('panel.curve') }}</span>
           <button class="ghost" type="button" @click="resetCurve">{{ t('common.reset') }}</button>
@@ -2118,6 +2290,18 @@ const vWheelAdjust = {
             class="curve-preset" @click="applyCurvePreset(name)">{{ t(`curvePreset.${name}`) }}</button>
         </div>
       </section>
+      </div>
+      </div>
+      <nav class="rail-tabs" :aria-label="t('rail.tabs')">
+        <button v-for="tb in availableTabs" :key="tb.key" type="button"
+          class="rail-tab" :class="{ 'is-on': editTab === tb.key }" :aria-pressed="editTab === tb.key"
+          :title="t(`tab.${tb.key}`)" :aria-label="t(`tab.${tb.key}`)" @click="selectTab(tb.key)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <path v-for="(d, i) in tb.icon" :key="i" :d="d" />
+          </svg>
+          <span v-if="tabEdited[tb.key]" class="rail-tab-dot" aria-hidden="true" />
+        </button>
+      </nav>
     </aside>
 
     <Filmstrip v-if="sources.length" :sources="sources" :active-id="activeId"

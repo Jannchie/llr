@@ -52,7 +52,20 @@ import numpy as np
 
 from ..creative_style import normalize_style
 from ..dcp import D50_TO_D65, XYZ_D50_TO_PROPHOTO, XYZ_D65_TO_SRGB
-from .chroma import SATURATION_STEPS, blend_params, luma_terms, saturation_factor, unpack_params
+from .chroma import (
+    LUMA_CONTRAST_ADVANCED,
+    LUMA_LUT_WIRE,
+    SATURATION_STEPS,
+    blend_params,
+    luma_terms,
+    saturation_factor,
+    unpack_params,
+)
+from .chroma import (
+    # Renamed: SonyRenderInfo has a `luma_lut` field of its own, and the two
+    # would shadow each other inside look_render_info.
+    luma_lut as ygamma_lut,
+)
 from .clarity import (
     CLARITY_CALIBRATION_BODY,
     CLARITY_CENTER_MIX,
@@ -79,6 +92,7 @@ from .sr2 import (
     FADE_STEPS,
     LookCalibration,
     look_calibrations,
+    luma_lut_key_for,
     unpack_param_block,
 )
 from .tone import LOOK_ORDER, TUNE_LIMIT, look_index, tone_curve
@@ -182,6 +196,21 @@ class SonyRenderInfo:
     chroma_gain: list[float]
     luma_pivot: float = 0.0
     luma_contrast: float = 1.0
+    # YGamma's table, the first LUMA_LUT_WIRE entries of the look's own (the
+    # rest cannot be reached from a shader whose luma is clamped to 1.0). It is
+    # per-look, so it has to be re-derived whenever the look changes — which is
+    # why it lives here beside the two terms rather than riding forward the way
+    # dro_grid does. About 90 kB of JSON; the alternative is shipping both
+    # tables and an index, which is bigger.
+    luma_lut: list[int] | None = None
+    # ...and the pair Edit's 色彩复制 = 高级 puts in their place. That setting is
+    # a switch in the browser, so both answers have to travel together or
+    # flipping it would cost a round trip for a stage that changes no pixel of
+    # the decode. The contrast is 高级's one constant rather than a per-look
+    # entry (chroma.LUMA_CONTRAST_ADVANCED); the pivot is shared with the
+    # standard path, which is why there is no advanced one here.
+    luma_lut_advanced: list[int] | None = None
+    luma_contrast_advanced: float = LUMA_CONTRAST_ADVANCED
     chroma_saturation: float = 1.0
     sepia: dict[str, Any] | None = None
     # What was applied, and what the body itself recorded. They differ only when
@@ -226,6 +255,17 @@ class SonyRenderInfo:
     # two stages are weighted against each other and a consumer that wants to
     # show the split needs to see both numbers.
     spica: dict[str, Any] | None = None
+    # ChromaSuppres' four terms, in wire form (sony/chromasuppres.py). Derived
+    # from four SR2 tags of the shot's own calibration, so like `sharpen` it is
+    # the body's answer rather than a slider's and rides through a rebuild
+    # untouched. None for a file whose tags could not be read, which renders
+    # with the stage off — the engine's rolloff would otherwise be invented.
+    chroma_suppres: dict[str, Any] | None = None
+    # Marble's chroma cleanup, the engine's last stage (sony/marble.py): the
+    # shot's ISO, which sets how much of the cleaned chroma is blended back
+    # (0.5 at ISO 100, 1.0 from ISO 1600), and the body's threshold calibration.
+    # None for a profile built without exif, which renders with the stage off.
+    marble: dict[str, Any] | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -245,6 +285,24 @@ class SonyRenderInfo:
             # the shot's Fade setting: a contrast pull on luma toward a pivot.
             "profileLumaPivot": self.luma_pivot,
             "profileLumaContrast": self.luma_contrast,
+            # ...and the table it indexes Y through first, on the engine's
+            # 0..16383 scale in and out. Standard and Neutral carry a highlight
+            # knee here; the other eight are near identity. Null only for a
+            # profile built without a calibration to read the selector from.
+            "profileLumaLut": self.luma_lut,
+            # The same stage under 色彩复制 = 高级, which swaps this table and
+            # this contrast as well as adding the 3-D LUT after it. Both ride
+            # along unconditionally so the browser's switch stays a redraw.
+            "profileLumaLutAdvanced": self.luma_lut_advanced,
+            "profileLumaContrastAdvanced": self.luma_contrast_advanced,
+            # ChromaSuppres, which runs just *before* YGamma and reads the luma
+            # from before it: the mid-tones lose 1/256 of their chroma and the
+            # highlights fade out above hiY. Null means the shot's four SR2 tags
+            # could not be read, and the shader leaves the chroma alone.
+            "profileChromaSuppres": self.chroma_suppres,
+            # Marble's chroma cleanup (sony/marble.py): ISO for the blend
+            # amount and the threshold calibration. Null renders it off.
+            "profileMarble": self.marble,
             # The Saturation slider. The gains above are already divided by it;
             # this is the factor the shader multiplies back after the clamp,
             # which is where the setting's whole visible effect comes from.
@@ -400,6 +458,12 @@ def _borrowed_calibration(raw_path: Path, style: str) -> LookCalibration | None:
         luma_contrast=host.luma_contrast,
         # The camera's own blend is for the look it shot, which this is not.
         chroma_final=None,
+        # ...and neither is the host's YGamma table: that pair is per-look, so
+        # borrowing the host's would give a borrowed FL2 the *host look's* knee.
+        # The donor table predates these two tags and does not carry them, so
+        # the family comes from the look's name — Standard and Neutral against
+        # the other eight, which is the split every file measured shows.
+        luma_lut_key=luma_lut_key_for(style),
     )
 
 
@@ -550,6 +614,7 @@ def look_render_info(
     dro_gain: list[float] | None = None, dro_strength: float | None = None,
     dro_grid: dict[str, Any] | None = None, dro_level: int = DRO_LEVEL_AUTO,
     sharpen: dict[str, Any] | None = None, spica: dict[str, Any] | None = None,
+    chroma_suppres: dict[str, Any] | None = None, marble: dict[str, Any] | None = None,
 ) -> SonyRenderInfo:
     """Everything about a shot's rendering that runs in the browser.
 
@@ -563,6 +628,9 @@ def look_render_info(
     # this one is YGamma's, and the two are unrelated numbers on unrelated
     # scales. Reusing the name silently fed YGamma's 1.05 to the tone curve.
     luma_pivot, luma_contrast = luma_terms(cal, tweaks.fade)
+    # 高级's own contrast, beside the shot's. Both go on the wire because the
+    # setting is a switch in the browser rather than something the decode knows.
+    _, luma_contrast_advanced = luma_terms(cal, tweaks.fade, advanced=True)
     # The engine divides the gains before the clamp and multiplies the chroma
     # back after it. The shader can only do the multiply, so the division
     # happens here and it gets the divided gains. chroma.rgb_to_ycc, which is
@@ -607,13 +675,18 @@ def look_render_info(
         sepia=sepia_toning(style),
         luma_pivot=luma_pivot,
         luma_contrast=luma_contrast,
+        luma_lut=[int(v) for v in ygamma_lut(cal)[:LUMA_LUT_WIRE]],
+        luma_lut_advanced=[int(v) for v in ygamma_lut(cal, advanced=True)[:LUMA_LUT_WIRE]],
+        luma_contrast_advanced=luma_contrast_advanced,
         tweaks=tweaks,
         as_shot=tweaks if as_shot is None else as_shot,
-        # What is left of the engine is ChromaSuppres (measured identity in
-        # every luma band), SSCS (touches no pixel on a whole frame), AreaComp
-        # (0.9999) and ITP. On shots without DRO, those come to a chroma ratio
-        # of 0.983..1.008 and under half a degree of hue against the engine's
-        # own output.
+        # ChromaSuppres is reproduced now (sony/chromasuppres.py), bit-exactly
+        # against the engine's own tiles — it was never the identity the note
+        # here used to claim, it just hides in the mid-tones as a flat 255/256.
+        # What is left of the engine is SSCS (touches no pixel on a whole
+        # frame), AreaComp (0.9999) and ITP. On shots without DRO, those come to
+        # a chroma ratio of 0.983..1.008 and under half a degree of hue against
+        # the engine's own output.
         limitations=_limitations(table is not None, borrowed,
                                  dro_global=dro_grid is None,
                                  clarity=clarity_amount(tweaks.clarity) > 0,
@@ -632,6 +705,8 @@ def look_render_info(
         dro_as_shot=as_shot_dro,
         sharpen=sharpen,
         spica=spica,
+        chroma_suppres=chroma_suppres,
+        marble=marble,
         # Every Sony RAW can take a manual level, because the preset curves are
         # the engine's rather than the file's — and this function only ever runs
         # on a Sony RAW, since it needs one for its calibration. Auto is the part
@@ -645,6 +720,7 @@ def apply_sony_profile(
     tweaks: LookTweaks = NO_TWEAKS, dro: bool = False,
     dro_gain: list[float] | None = None, dro_grid: dict[str, Any] | None = None,
     sharpen: dict[str, Any] | None = None, spica: dict[str, Any] | None = None,
+    chroma_suppres: dict[str, Any] | None = None, marble: dict[str, Any] | None = None,
 ) -> tuple[np.ndarray, SonyRenderInfo]:
     """Camera RGB -> scene-linear ProPhoto (D50), plus the matching tone curve.
 
@@ -668,7 +744,8 @@ def apply_sony_profile(
     linear_prophoto = np.clip(rec709 @ REC709_TO_PROPHOTO_D50.T, 0, None)
     return linear_prophoto, look_render_info(cal, style, tweaks, dro=dro, dro_gain=dro_gain,
                                              dro_grid=dro_grid, sharpen=sharpen,
-                                             spica=spica)
+                                             spica=spica, chroma_suppres=chroma_suppres,
+                                             marble=marble)
 
 
 def apply_look_overrides(
@@ -728,14 +805,18 @@ def apply_look_overrides(
     # Sharpening rides forward for the same reason and by the same means: it is
     # a camera setting rather than a Creative Look tweak, so nothing a slider
     # can send here changes it, and carrying the block beats re-reading the RAW
-    # for a number that cannot have moved.
+    # for a number that cannot have moved. ChromaSuppres is the same story with
+    # a stronger claim — its terms come from the body's own calibration tags,
+    # which no camera setting reaches at all.
     rebuilt = {**profile, **look_render_info(
         cal, style, tweaks, as_shot, dro=as_shot_dro > 0.0,
         borrowed=is_borrowed(raw_path, style),
         dro_gain=dro_gain_table(raw_path), dro_strength=strength,
         dro_grid=profile.get("profileDroGrid"), dro_level=level,
         sharpen=profile.get("profileSharpness"),
-        spica=profile.get("profileSpica")).to_json()}
+        spica=profile.get("profileSpica"),
+        chroma_suppres=profile.get("profileChromaSuppres"),
+        marble=profile.get("profileMarble")).to_json()}
     # The notes follow the request, not the decode: _limitations was handed this
     # rebuild's own borrowed/DRO state, so rebuilt already carries the right list
     # in the right order. It is the only producer of them for a sony profile.

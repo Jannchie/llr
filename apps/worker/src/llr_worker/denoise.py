@@ -18,7 +18,10 @@ back into the file's data.
 
 from __future__ import annotations
 
+import os
+import sys
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -121,6 +124,175 @@ def _plane_colors(raw: Any, row_phase: int = 0, col_phase: int = 0) -> list[str]
         return None
 
 
+# ── Compiled plane plumbing ────────────────────────────────────────────────
+#
+# The normalisation either side of a denoiser is trivial arithmetic -- a
+# multiply, an add and a clamp per element -- and on a 33 MP frame it was 0.64 s
+# of the RawNR stage's 0.83 s. Not because of the arithmetic: a numpy chain
+# writes a whole 132 MB plane set per operator and reads it back for the next
+# one, and this machine copies at 21 GB/s (measured: 12.5 ms for a threaded
+# 132 MB copy), so the cost is the *number of passes* and threading alone cannot
+# fix it. `denoise_numba` holds each chain as one fused traversal instead --
+# 0.64 s to 0.09 s, threaded -- and the helpers here dispatch to it, keeping the
+# numpy chain, operator for operator, as the reference.
+#
+# Fusing is not an approximation: `denoise_raw_inplace` round-trips the mosaic
+# through [0, 1] and back, so the result depends on float32 rounding in both
+# directions, and each kernel does the same operations in the same order on the
+# same element. What it drops is the temporaries between them.
+
+#: "numpy" forces the reference chains. Read once at import, like sony/itp.py's
+#: LLR_ITP_BACKEND and sony/rawnr_simd.py's LLR_RAWNR_BACKEND.
+BACKEND = (os.environ.get("LLR_DENOISE_BACKEND") or "numba").strip().lower()
+
+_kernels: Any
+try:
+    from . import denoise_numba as _kernels
+except Exception as exc:  # pragma: no cover - depends on the install
+    _kernels = None
+    print(f"llr: numba unavailable ({exc}); denoise plane plumbing falls back to numpy",
+          file=sys.stderr)
+
+#: Rows per thread task. These kernels are memory-bound, so this only has to be
+#: large enough to amortise the hand-off and small enough that the last task does
+#: not decide the wall clock; 32 to 256 all measured the same.
+_PLANE_STRIP_ROWS = 64
+_PLANE_WORKERS = max(1, os.cpu_count() or 1)
+
+
+def _use_kernels(*levels: np.ndarray) -> bool:
+    """Whether the compiled plumbing runs, given these per-plane level arrays.
+
+    The dtype check is not defensive tidiness. The kernels do their arithmetic
+    in whatever type their arguments carry, so a float64 `black` would quietly
+    promote the whole expression and hand back a result the numpy chain -- which
+    keeps everything in float32 -- did not produce. Declining is the only safe
+    answer; the reference computes those cases in their own dtype.
+    """
+    if _kernels is None or BACKEND == "numpy":
+        return False
+    return all(a.dtype == np.float32 for a in levels)
+
+
+def _over_rows(height: int, work: Callable[[int, int], None]) -> None:
+    """Run `work(y0, y1)` over row bands covering `0..height`, on threads.
+
+    Every kernel here writes each output element from that element's own inputs,
+    so the bands cannot interact and the split cannot change a value.
+    `nogil=True` on the kernels is what makes the threads real rather than a
+    queue behind the GIL.
+    """
+    starts = range(0, height, _PLANE_STRIP_ROWS)
+    n_workers = max(1, min(_PLANE_WORKERS, len(starts)))
+    if n_workers == 1:
+        for a in starts:
+            work(a, min(height, a + _PLANE_STRIP_ROWS))
+        return
+
+    def run(a: int) -> None:
+        work(a, min(height, a + _PLANE_STRIP_ROWS))
+
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        list(pool.map(run, starts))
+
+
+def _pack_normalise(mosaic: np.ndarray, black: np.ndarray, scale: np.ndarray) -> np.ndarray:
+    """`clip((pack_bayer(mosaic).astype(f32) - black) / scale, 0, 1)`, one pass.
+
+    The compiled path reads `mosaic` where it lies. The contiguous copy the
+    numpy path makes exists only so `pack_bayer` can stack four strided views,
+    and stacking is exactly what the kernel does not do.
+    """
+    out = np.empty((mosaic.shape[0] // 2, mosaic.shape[1] // 2, 4), dtype=np.float32)
+    if _use_kernels(black, scale) and mosaic.dtype == np.uint16:
+        _over_rows(out.shape[0],
+                   lambda a, b: _kernels.pack_normalise_rows(mosaic, black, scale, out, a, b))
+        return out
+    planes = pack_bayer(np.ascontiguousarray(mosaic)).astype(np.float32)
+    # `out=` rather than fresh temporaries: the same two ufuncs in the same
+    # order, one allocation instead of three.
+    np.subtract(planes, black, out=out)
+    np.divide(out, scale, out=out)
+    np.clip(out, 0.0, 1.0, out=out)
+    return out
+
+
+def _denormalise_into(planes: np.ndarray, scale: np.ndarray, black: np.ndarray,
+                      white: float, mosaic: np.ndarray) -> None:
+    """`unpack_bayer(rint(clip(planes*scale + black, 0, white)).astype(u16))`,
+    into `mosaic` in place -- which is what `denoise_raw_inplace` promises."""
+    if _use_kernels(black, scale) and mosaic.dtype == np.uint16 and planes.dtype == np.float32:
+        _over_rows(planes.shape[0],
+                   lambda a, b: _kernels.denormalise_rows(
+                       planes, scale, black, np.float32(white), mosaic, a, b))
+        return
+    out = planes * scale + black
+    np.clip(out, 0.0, white, out=out)
+    mosaic[...] = unpack_bayer(np.rint(out).astype(mosaic.dtype))
+
+
+def _to_levels(planes: np.ndarray, span: np.ndarray, black: np.ndarray,
+               full: float) -> np.ndarray:
+    """`clip(planes*span + black, 0, full)`: normalised back to sensor levels."""
+    if _use_kernels(span, black) and planes.dtype == np.float32 and planes.ndim == 3:
+        out = np.empty(planes.shape, dtype=np.float32)
+        _over_rows(planes.shape[0],
+                   lambda a, b: _kernels.to_levels_rows(
+                       planes, span, black, np.float32(full), out, a, b))
+        return out
+    # Built in place off the first product: `planes` is the caller's array and
+    # must not be touched, but `* span` already allocates, so the add and the
+    # clamp land in that result rather than in two more full-frame temporaries.
+    out = planes.astype(np.float32, copy=False) * span
+    out += black
+    np.clip(out, 0.0, full, out=out)
+    return out
+
+
+def _unscale(planes: np.ndarray, black: np.ndarray, span: np.ndarray) -> None:
+    """`(planes - black) / span` in place: sensor levels back to normalised."""
+    if _use_kernels(black, span) and planes.dtype == np.float32 and planes.ndim == 3:
+        _over_rows(planes.shape[0],
+                   lambda a, b: _kernels.unscale_rows(planes, black, span, a, b))
+        return
+    planes -= black
+    planes /= span
+
+
+def warmup() -> None:
+    """Compile the plane kernels on a 4x4 mosaic, so the first frame does not.
+
+    Cold, with an empty numba cache, the four take ~0.5 s of LLVM; warm they
+    come back from the on-disk cache `cache=True` writes, in a few hundredths.
+    The daemon calls this on a background thread at startup (cli.py
+    `_warm_kernels`), alongside sony.itp's and sony.rawnr_simd's. A no-op on the
+    numpy backend.
+    """
+    if not _use_kernels():
+        return
+    black = np.full(4, 512.0, dtype=np.float32)
+    scale = np.full(4, 15871.0, dtype=np.float32)
+    mosaic = np.full((4, 4), 1000, dtype=np.uint16)
+    norm = _pack_normalise(mosaic, black, scale)
+    levels = _to_levels(norm, scale, black, 16383.0)
+    _unscale(levels, black, scale)
+    _denormalise_into(norm, scale, black, 16383.0, mosaic)
+
+
+def _map_planes(fn: Callable[[int], Any], n: int = 4) -> list[Any]:
+    """`[fn(k) for k in range(n)]`, one thread each.
+
+    For the per-plane numpy steps that are pure memory traffic (`np.pad`'s
+    reflect, the strided writes back into the interleaved plane set): they
+    release the GIL, and four of them in parallel run at the memory's speed
+    rather than one core's.
+    """
+    if _PLANE_WORKERS == 1:
+        return [fn(k) for k in range(n)]
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        return list(pool.map(fn, range(n)))
+
+
 # ── Denoiser backends ──────────────────────────────────────────────────────
 
 
@@ -177,6 +349,7 @@ class Denoiser(Protocol):
         self, planes: np.ndarray, sigma: float | None = None, cfa: Sequence[str] | None = None,
         noise: NoiseCurve | None = None, detail: DetailRestore | None = None,
         *, chroma_scale: float = 1.0, sensor_levels: SensorLevels | None = None,
+        strength: float = 1.0,
     ) -> np.ndarray: ...
 
     name: str
@@ -211,6 +384,7 @@ class PassthroughDenoiser:
         self, planes: np.ndarray, sigma: float | None = None, cfa: Sequence[str] | None = None,
         noise: NoiseCurve | None = None, detail: DetailRestore | None = None,
         *, chroma_scale: float = 1.0, sensor_levels: SensorLevels | None = None,
+        strength: float = 1.0,
     ) -> np.ndarray:
         return planes
 
@@ -642,10 +816,13 @@ class WaveletDenoiser:
         self, planes: np.ndarray, sigma: float | None = None, cfa: Sequence[str] | None = None,
         noise: NoiseCurve | None = None, detail: DetailRestore | None = None,
         *, chroma_scale: float = 1.0, sensor_levels: SensorLevels | None = None,
+        strength: float = 1.0,
     ) -> np.ndarray:
         # sensor_levels is for the raw-level filter only; this one works in the
-        # normalised domain the protocol hands it and fits its own scale.
-        del sensor_levels
+        # normalised domain the protocol hands it and fits its own scale. The
+        # ISO strength is likewise the engine's write-back rule for its own
+        # filter; for this one the caller rides it on the decode blend instead.
+        del sensor_levels, strength
         planes = np.clip(planes.astype(np.float32, copy=False), 0.0, 1.0)
         levels = self._levels_for(planes.shape[:2])
 
@@ -725,6 +902,9 @@ class DenoiseStats:
     detail_restored: float | None = None
     #: Multiplier the request put on the chroma threshold (1.0 = the default).
     chroma_scale: float = 1.0
+    #: The ISO strength the denoiser was asked to write back at (1.0 = full).
+    strength: float = 1.0
+
 
 
 def denoise_raw_inplace(
@@ -735,8 +915,12 @@ def denoise_raw_inplace(
     noise: NoiseCurve | None = None,
     detail: DetailRestore | None = None,
     chroma_scale: float = 1.0,
+    strength: float = 1.0,
 ) -> DenoiseStats | None:
     """Denoise ``raw``'s visible Bayer mosaic in place.
+
+    ``strength`` is the engine's ISO strength (sony/rawnr_simd.iso_strength),
+    honoured by the denoiser that reproduces the engine and ignored by the rest.
 
     Mutates ``raw.raw_image`` so a subsequent ``raw.postprocess()`` demosaics the
     cleaned data. Returns stats for logging, or ``None`` when the sensor's CFA is
@@ -749,9 +933,6 @@ def denoise_raw_inplace(
     h, w = visible.shape
     he, we = h - (h % 2), w - (w % 2)
 
-    mosaic = np.ascontiguousarray(visible[:he, :we])
-    planes = pack_bayer(mosaic).astype(np.float32)
-
     # The visible crop can start at an odd margin, shifting the CFA phase of its
     # origin relative to raw_image; pass that parity so black levels stay aligned.
     sizes = raw.sizes
@@ -762,17 +943,15 @@ def denoise_raw_inplace(
     white = float(raw.white_level)
     scale = np.maximum(white - black, 1.0)
 
-    norm = (planes - black) / scale
-    np.clip(norm, 0.0, 1.0, out=norm)
+    mosaic = visible[:he, :we]
+    norm = _pack_normalise(mosaic, black, scale)
 
     denoised = denoiser(norm, sigma, cfa, noise, detail, chroma_scale=chroma_scale,
-                        sensor_levels=(black, white))
+                        sensor_levels=(black, white), strength=strength)
 
-    denoised = denoised * scale + black
-    np.clip(denoised, 0.0, white, out=denoised)
-    denoised = np.rint(denoised).astype(visible.dtype)
-
-    visible[:he, :we] = unpack_bayer(denoised)
+    # Straight back into the mosaic: nothing after this reads `denoised`, so the
+    # denormalise, the clamp, the rounding and the unpack are one traversal.
+    _denormalise_into(denoised, scale, black, white, mosaic)
 
     return DenoiseStats(
         model=getattr(denoiser, "name", "unknown"),
@@ -784,6 +963,7 @@ def denoise_raw_inplace(
         noise_source="camera" if noise is not None else "sigma" if sigma is not None else "fitted",
         detail_restored=None if detail is None else detail[0],
         chroma_scale=float(chroma_scale),
+        strength=float(strength),
     )
 
 
@@ -866,15 +1046,17 @@ class SonyRawNRDenoiser:
     model, so the check belongs there and this raises rather than silently
     doing something else.
 
+    The ISO strength ramp (`rawnr_simd.iso_strength`) is applied here, as
+    `strength`, the way the engine applies it: not in the thresholds and not
+    in the kernels (both match the engine bit for bit at ISO 100) but on the
+    way out, as a truncated blend of the filtered plane with the input
+    (`rawnr_simd.apply_strength`, measured 100.0000% on two frames). The
+    caller passes `iso_strength(ISO)` under Auto and 1.0 otherwise; it must
+    not *also* ride it on the noisy/denoised decode blend, which is what llr
+    did while the location was unknown.
+
     Not applied here, deliberately:
 
-    * **The ISO strength ramp** (`rawnr_simd.iso_strength`). It is a real part
-      of the engine, but not of *this* step: the thresholds captured from the
-      running process match what the tags alone predict, entry for entry, at
-      both ISO 100 and ISO 1250 -- which they could not if the ramp scaled
-      them. Where it does apply was not established, so llr rides it on the
-      noisy/denoised blend instead (cli.py, the Auto switch), and that is
-      marked as the approximation it is rather than folded in here.
     * **Colour NR** (`chroma_scale`). Scaling red and blue's thresholds by it
       would be a guess: whether the engine's slider even reaches this stage is
       still open (`sony_repro/tools/nr_dead_check.py`, unfinished). A guess
@@ -894,6 +1076,7 @@ class SonyRawNRDenoiser:
         self, planes: np.ndarray, sigma: float | None = None, cfa: Sequence[str] | None = None,
         noise: NoiseCurve | None = None, detail: DetailRestore | None = None,
         *, chroma_scale: float = 1.0, sensor_levels: SensorLevels | None = None,
+        strength: float = 1.0,
     ) -> np.ndarray:
         from .sony import rawnr_simd as simd
         from .sony.rawnr import ENGINE_FULL_SCALE, NoiseModel
@@ -912,14 +1095,8 @@ class SonyRawNRDenoiser:
         del sigma, chroma_scale
 
         # Back to raw sensor levels, black included -- see SensorLevels.
-        # Built in place off the first product: `planes` is the caller's array
-        # and must not be touched, but `* span` already allocates, so the add
-        # and the clamp can land in that result rather than in two more
-        # full-frame temporaries.
         span = np.maximum(white - black, 1.0)
-        raw = planes.astype(np.float32, copy=False) * span
-        raw += black
-        np.clip(raw, 0.0, ENGINE_FULL_SCALE, out=raw)
+        raw = _to_levels(planes, span, black, ENGINE_FULL_SCALE)
 
         # float32 once here rather than a full-plane int32->float32 copy per
         # gather inside `filt`.
@@ -937,7 +1114,9 @@ class SonyRawNRDenoiser:
         # zero border is a hard edge, and a sigma filter reads a hard edge as
         # structure and refuses to average across it.
         pad = simd.PHASE_MARGIN
-        padded = [np.pad(raw[..., k], pad, mode="reflect") for k in range(4)]
+        # One thread per plane: this is four independent strided copies of 33 MB
+        # each, so it runs at the memory's speed rather than one core's.
+        padded = _map_planes(lambda k: np.pad(raw[..., k], pad, mode="reflect"))
 
         out = np.empty_like(raw)
         # Both green phases together: each one's filter needs the other's
@@ -950,8 +1129,13 @@ class SonyRawNRDenoiser:
         out[..., red] = simd.denoise_phase_rb(padded[red], table, **kw)
         out[..., blue] = simd.denoise_phase_rb(padded[blue], table, **kw)
 
-        out -= black
-        out /= span
+        # The exec's write-back: blend with the plane it was given by the ISO
+        # strength, then truncate to integer levels. The truncation is the
+        # engine's at any strength (its output plane is uint16), so this runs
+        # at 1.0 too; before it did, llr rounded where the engine truncates.
+        out = simd.apply_strength(out, raw, strength)
+
+        _unscale(out, black, span)
         return out
 
 

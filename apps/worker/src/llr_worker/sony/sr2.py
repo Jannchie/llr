@@ -27,6 +27,8 @@ from pathlib import Path
 
 import numpy as np
 
+from ..creative_style import normalize_style
+
 SR2_PARAM_TAG = 0x780F
 PARAM_BLOCK_SIZE = 276
 _Q = np.float32(1.0 / 1024.0)  # the fixed-point unit, hard-coded at Edit.exe +0x4DEB78
@@ -60,6 +62,40 @@ LUMA_PIVOT_TAG = 0x780B     # uint16[10], on the engine's 0..16383 luma scale
 LUMA_CONTRAST_TAG = 0x780E  # uint16[10], 16384 = x1.0
 FADE_STEPS = 10             # Fade 0..9, one table entry each
 LUMA_CONTRAST_UNIT = 16384
+
+# YGamma's *third* input: the 32768-entry table it indexes Y through before the
+# pivot/contrast line (calib+0x318fc). Which table a look gets is decided by
+# these two SHORTs, and unlike the Fade tables they are per-look — the ten
+# SR2DataIFDs disagree on them within one file. Only two pairs have ever been
+# seen, and they select two tables:
+#
+#   (4096, 14848)  Standard and Neutral — a highlight knee: identity to Y=8192,
+#                  then slope 0.90625, so lut[12288] = 11904 and lut[16383] =
+#                  15614. Identical on ILCE-7CM2 and ILCE-7M5.
+#   (1024, 16384)  the other eight looks — near identity (lut[16383] = 16382).
+#                  Identical on the FL and VV2 frames dumped.
+#
+# The build rule (a 16-step coarse table interpolated linearly, plus a -16 toe
+# below Y=4096 that both families share) was not fully reverse-engineered, so
+# the two tables ship as data keyed by this pair — see sony/data/ygamma_luts.npz
+# and chroma.luma_lut.
+LUMA_LUT_C_TAG = 0x780C     # SHORT, per-look
+LUMA_LUT_D_TAG = 0x780D     # SHORT, per-look
+LUMA_LUT_KNEE = (4096, 14848)   # Standard / Neutral
+LUMA_LUT_FLAT = (1024, 16384)   # the other eight
+#: Codes whose look wears the knee table, for the name-only fallback below.
+LUMA_LUT_KNEE_STYLES = ("ST", "NT")
+
+
+def luma_lut_key_for(name: str) -> tuple[int, int]:
+    """The family a look's *name* implies, for a calibration carrying no tags.
+
+    Only the donor path needs this (profile._borrowed_calibration): the donor
+    table was dumped before these two tags were known, so a borrowed look has
+    to be placed by name. Every file measured agrees that the split is exactly
+    Standard and Neutral against the other eight, so the name is enough.
+    """
+    return LUMA_LUT_KNEE if normalize_style(name) in LUMA_LUT_KNEE_STYLES else LUMA_LUT_FLAT
 
 # DRO's tone curve, as a piecewise cubic Bezier in log2 luma. The camera decides
 # the Auto level and writes the *result* here, so nothing about Sony's grading
@@ -103,6 +139,11 @@ class LookCalibration:
     # (the top-level block is that look's — its 0x7842 matches, and 0x7770 names
     # it). None for the other nine, which have to be blended.
     chroma_final: np.ndarray | None
+    # (0x780c, 0x780d), the pair that picks YGamma's LUT. Per-look, so it does
+    # not travel with the Fade tables above even though the same stage reads it.
+    # Defaulted to the near-identity family: that is the eight-look majority and
+    # the one a file that never wrote these tags renders closest to.
+    luma_lut_key: tuple[int, int] = LUMA_LUT_FLAT
 
 
 def decrypt(data: bytes, start: int, length: int, key: int) -> bytes:
@@ -254,6 +295,28 @@ def read_sr2_scalars(path: str | Path, tags: Sequence[int]) -> dict[int, int]:
         if fmt is None or cnt < 1:
             continue
         out[tag] = int(struct.unpack_from(endian + fmt, dec, vpos)[0])
+    return out
+
+
+def read_sr2_arrays(path: str | Path, tags: Sequence[int]) -> dict[int, list[int]]:
+    """Several SR2SubIFD tags as whole arrays, decrypting the block once.
+
+    read_sr2_scalars' sibling, for tags whose count is the point: ChromaSuppres'
+    anchors are three SHORTs each and taking only the first would silently drop
+    the two the ISO interpolation needs. Same walk, same type dispatch, and the
+    same "absent means omitted rather than raised" contract — only the unpack
+    differs.
+    """
+    dec, sub_pos, endian = _decrypted_sr2(path)
+    want = set(tags)
+    out: dict[int, list[int]] = {}
+    for tag, typ, cnt, vpos, _ in _ifd_entries(dec, sub_pos, endian):
+        if tag not in want:
+            continue
+        fmt = _SCALAR_FMT.get(typ)
+        if fmt is None or cnt < 1:
+            continue
+        out[tag] = [int(v) for v in struct.unpack_from(f"{endian}{cnt}{fmt}", dec, vpos)]
     return out
 
 
@@ -411,12 +474,21 @@ def look_calibrations(path: str | Path) -> list[LookCalibration]:
                 got[tag] = np.array(struct.unpack_from(f"{endian}{cnt}h", dec, tag_pos), dtype=np.int64)
             elif tag == LOOK_NAME_TAG:
                 got[tag] = dec[tag_pos:tag_pos + size]
+            elif tag in (LUMA_LUT_C_TAG, LUMA_LUT_D_TAG) and cnt >= 1:
+                got[tag] = int(struct.unpack_from(endian + "H", dec, tag_pos)[0])
         missing = {CURVE_X_TAG, CURVE_Y_TAG, CHROMA_BASE_TAG} - set(got)
         if missing:
             raise KeyError(f"SR2DataIFD at 0x{pos:x} is missing {sorted(hex(t) for t in missing)}")
         zero = np.zeros(8, dtype=np.int64)
+        name = bytes(got.get(LOOK_NAME_TAG, b"")).split(b"\x00")[0].decode("ascii", "replace")
+        # A file writing only one of the two is not something any frame has
+        # shown; treating the pair as all-or-nothing keeps a half-read pair from
+        # selecting a table nobody measured.
+        lut_key = ((got[LUMA_LUT_C_TAG], got[LUMA_LUT_D_TAG])
+                   if LUMA_LUT_C_TAG in got and LUMA_LUT_D_TAG in got
+                   else luma_lut_key_for(name))
         out.append(LookCalibration(
-            name=bytes(got.get(LOOK_NAME_TAG, b"")).split(b"\x00")[0].decode("ascii", "replace"),
+            name=name,
             param_block=param_block,
             curve_x=got[CURVE_X_TAG],
             curve_y=got[CURVE_Y_TAG],
@@ -431,6 +503,7 @@ def look_calibrations(path: str | Path) -> list[LookCalibration]:
                 final is not None and final.size == 8 and shot_base is not None
                 and np.array_equal(shot_base, got[CHROMA_BASE_TAG])
             ) else None,
+            luma_lut_key=lut_key,
         ))
     return out
 

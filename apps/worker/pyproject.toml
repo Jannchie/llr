@@ -8,6 +8,7 @@ dependencies = [
   "pillow>=11.0.0",
   "rawpy>=0.25.0",
   "pywavelets>=1.6.0",
+  "numba>=0.67.0",
 ]
 
 # The neural denoise backend is deferred and nothing imports torch yet (the

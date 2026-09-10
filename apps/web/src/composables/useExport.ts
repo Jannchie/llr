@@ -28,6 +28,11 @@ export interface ExportPlan {
   lookStyle: string | undefined;
   /** DRO strength; undefined applies whatever the body did (Sony path only). */
   dro: number | undefined;
+  /** Sony's "advanced colour reproduction" (ZcTask3DLut). Render-time, so it
+   * rides the plan rather than the decode — but the export builds its own
+   * renderer, so it has to be handed over explicitly or the exported file would
+   * silently disagree with the preview. */
+  sonyAdvancedColour: boolean;
   params: Partial<EditParams>;
   curveLUT: Float32Array;
   profileLUT: (meta: LinearMeta) => ProfileCurve;
@@ -79,6 +84,9 @@ export function useExport(opts: {
       // needs them as much as the preview does — without them the export would
       // come out unprofiled while the preview looked right.
       renderer.uploadDcpTables(parseDcpTables(meta.colorProfile));
+      // Awaited, unlike the preview's fire-and-redraw: this renderer draws once
+      // and is thrown away, so the table has to be resident before it does.
+      await renderer.setSonyAdvancedColour(plan.sonyAdvancedColour);
       const out = plan.output(meta);
       renderer.setOutput(out.width, out.height, out.texXform, plan.background);
       renderer.draw(plan.params);

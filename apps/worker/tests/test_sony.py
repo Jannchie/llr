@@ -108,7 +108,14 @@ from llr_worker.sony.sharpness import (
     sharpness_amount,
     sharpness_calibration,
 )
-from llr_worker.sony.spica import spica_amount, spica_iso_gain, spica_off
+from llr_worker.sony.spica import (
+    SPICA_GAIN_SCALE,
+    spica_amount,
+    spica_gain_scale,
+    spica_iso_gain,
+    spica_off,
+    spica_range_shift,
+)
 from llr_worker.sony.sr2 import (
     DRO_CURVE_POINTS,
     DRO_LOG_CEILING,
@@ -1614,6 +1621,31 @@ def test_the_profile_carries_sharpening_and_it_survives_a_look_change() -> None:
         assert moved["profileSpica"] == spica
 
 
+@requires_sample
+def test_the_profile_carries_chroma_suppres_and_it_survives_a_look_change() -> None:
+    """ChromaSuppres reaches the browser as four ints, and stays put.
+
+    Its terms come out of four SR2 calibration tags — the body's own rolloff, not
+    a setting — so no slider here can move them and a profile rebuild must carry
+    them rather than quietly drop them. Dropping them would render the
+    highlights with their full chroma, which is what this path did before
+    sony/chromasuppres.py existed.
+    """
+    cal = calibration_for(SAMPLE_FL, "FL")
+    assert cal is not None
+    block = {"hiY": 15360, "loY": 0, "slopeHi": 512, "slopeLo": 512}
+
+    payload = look_render_info(cal, "FL", chroma_suppres=block).to_json()
+    assert payload["profileChromaSuppres"] == block
+    # A file whose four tags could not be read renders with the stage off, and
+    # the key still has to be on the wire for the consumer to branch on.
+    assert look_render_info(cal, "FL").to_json()["profileChromaSuppres"] is None
+
+    for overrides, style in (({"contrast": 3}, None), (None, "VV")):
+        moved = apply_look_overrides(payload, SAMPLE_FL, overrides, style)
+        assert moved["profileChromaSuppres"] == block
+
+
 def test_spica_is_weighted_against_sharpening_rather_than_beside_it() -> None:
     """One control, split across two stages — so the two move in opposition.
 
@@ -1663,6 +1695,8 @@ def test_the_iso_actually_reaches_spica() -> None:
     block = spica_from_exif(exif)
     assert block is not None
     assert block["isoGain"] == pytest.approx(spica_iso_gain(int(exif["ISO"])))
+    assert block["gainScale"] == pytest.approx(spica_gain_scale(int(exif["ISO"])))
+    assert block["rangeShift"] == pytest.approx(spica_range_shift(int(exif["ISO"])))
 
 
 def test_spica_iso_gain_bends_only_above_the_knee() -> None:
@@ -1831,3 +1865,21 @@ def test_the_camera_curve_stabilises_through_the_denoiser_it_feeds() -> None:
         s = (level + rng.normal(0.0, sigma, 40000)).astype(np.float32)
         stds.append(float(vst.forward(s).std()))
     assert max(stds) / min(stds) < 1.15
+
+
+@pytest.mark.parametrize("iso, gain, shift", [
+    # cfg[0xc4] and the range trapezoid's `a`, read out of Edit.exe at 0x35a270
+    # for five frames (sony_repro/tools/spica_gaincfg_*.json); gain / 2048 is
+    # what the shader multiplies by, `a` - 128 is the shift.
+    (100, 4096.0, 0.0), (320, 4096.0, 0.0), (1250, 2645.333, 90.667),
+    (2000, 2030.933, 132.267), (4000, 1945.6, 153.6),
+])
+def test_spica_iso_ramps_reproduce_the_engines_config(iso, gain, shift) -> None:
+    assert spica_gain_scale(iso) * 2048.0 == pytest.approx(gain, abs=0.01)
+    assert spica_range_shift(iso) == pytest.approx(shift, abs=0.01)
+    assert spica_gain_scale(None) == SPICA_GAIN_SCALE and spica_range_shift(None) == 0.0
+
+
+def test_spica_off_carries_the_base_iso_ramps() -> None:
+    off = spica_off()
+    assert off["gainScale"] == SPICA_GAIN_SCALE and off["rangeShift"] == 0.0

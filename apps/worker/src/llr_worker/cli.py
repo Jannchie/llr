@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import functools
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -23,6 +24,7 @@ import numpy as np
 import rawpy
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+from . import denoise as denoise_module
 from .creative_style import normalize_style
 from .dcp import DcpProfile, apply_dcp_profile, load_dcp_profile
 from .denoise import (
@@ -34,22 +36,33 @@ from .denoise import (
 )
 from .fit_profile import camera_match_path, postprocess_camera_native
 from .imported import decode_image_linear
-from .sony import NO_TWEAKS, LookTweaks, apply_look_overrides, apply_sony_profile, calibration_for, looks_in_file
+from .sony import (
+    NO_TWEAKS,
+    LookTweaks,
+    apply_look_overrides,
+    apply_sony_profile,
+    calibration_for,
+    looks_in_file,
+    rawnr_simd,
+)
 from .sony import can_render as sony_can_render
 from .sony import is_borrowed as sony_is_borrowed
+from .sony import itp as sony_itp
+from .sony.chromasuppres import chroma_suppres_from_file
 from .sony.dro import dro_gain_table, dro_grid, dro_grid_json
 from .sony.dro_presets import DRO_LEVEL_AUTO, DRO_LEVEL_MAX
+from .sony.marble import marble_block
 from .sony.profile import look_render_info
 from .sony.rawnr import detail_restore as sony_detail_restore
 from .sony.rawnr import noise_model as sony_noise_model
-from .sony.rawnr_simd import iso_strength
+from .sony.rawnr_simd import iso_strength, manual_strength
 from .sony.sharpness import (
     SHARPNESS_DEFAULT,
     SHARPNESS_RANGE_DEFAULT,
     sharpness_block,
     sharpness_calibration,
 )
-from .sony.spica import spica_block, spica_iso_gain
+from .sony.spica import spica_block, spica_gain_scale, spica_iso_gain, spica_range_shift
 from .sony.sr2 import LookCalibration, dro_strength
 
 RAW_EXTENSIONS = {".arw", ".srf", ".sr2", ".dng", ".cr2", ".cr3", ".nef", ".raf", ".rw2", ".orf"}
@@ -91,6 +104,14 @@ class RawMetadata:
     # ISO term needs the exif this function already has, which is the other
     # reason it is read here rather than derived in the browser.
     spica: dict[str, Any] | None = None
+    # ChromaSuppres' four terms in wire form (sony/chromasuppres.py), derived
+    # from four tags of the RAW's own SR2 block. Read here for the same reason
+    # the DRO curve is, and cached on the file so a profile rebuild costs no
+    # decrypt. None for a file that carries none.
+    chroma_suppres: dict[str, Any] | None = None
+    # Marble's chroma cleanup: the shot's ISO and the body's thresholds
+    # (sony/marble.py), in wire form. None when the exif carries no ISO.
+    marble: dict[str, Any] | None = None
     # Whether DRO actually shaped this shot — not merely whether the body was in
     # Auto, which is a weaker claim (see dro_from_exif).
     dro_active: bool = False
@@ -285,9 +306,31 @@ def _source_lock(source: str) -> threading.Lock:
         return lock
 
 
+def _warm_kernels() -> None:
+    """Compile the numba kernels before the first frame asks for them.
+
+    ITP, RawNR and the plane plumbing either side of it are JIT-compiled
+    (sony/itp.py, sony/rawnr_simd.py, denoise.py); with `cache=True` the
+    compiled code comes back from disk on later runs, but the very first run on
+    a machine pays seconds of LLVM. Doing it here, on a thread, hides that
+    behind the upload of the first image. Each module's warmup is optional so
+    the daemon runs unchanged on a build without numba.
+    """
+    for mod in (sony_itp, rawnr_simd, denoise_module):
+        warm = getattr(mod, "warmup", None)
+        if warm is None:
+            continue
+        try:
+            warm()
+        except Exception as error:
+            sys.stderr.write(f"kernel warm-up ({mod.__name__}) failed: {error}\n")
+            sys.stderr.flush()
+
+
 def run_daemon(root: Path) -> None:
     sys.stderr.write("llr-worker daemon ready\n")
     sys.stderr.flush()
+    threading.Thread(target=_warm_kernels, name="kernel-warmup", daemon=True).start()
     # Exiting the `with` block waits for all in-flight tasks after stdin EOF.
     with ThreadPoolExecutor(max_workers=DAEMON_MAX_WORKERS) as executor:
         for raw_line in sys.stdin:
@@ -369,6 +412,7 @@ def _linear_cache_key(
     denoise_model: str | None,
     denoise_amount: float,
     denoise_tweaks: tuple[float, float] = (50.0, 50.0),
+    denoise_strength: float = 1.0,
 ) -> tuple[Any, ...]:
     """Everything that changes a decoded pixel, and nothing that does not.
 
@@ -382,7 +426,7 @@ def _linear_cache_key(
         base = (str(input_path), st.st_size, int(st.st_mtime_ns))
     except OSError:
         base = (str(input_path),)
-    return (*base, profile_id, bool(half_size), int(max_size or 0), dcp_code or "", denoise_model or "", round(float(denoise_amount), 3), _key_tweaks(denoise_model, denoise_tweaks))
+    return (*base, profile_id, bool(half_size), int(max_size or 0), dcp_code or "", denoise_model or "", round(float(denoise_amount), 3), _key_tweaks(denoise_model, denoise_tweaks), round(float(denoise_strength), 4))
 
 
 _LINEAR_CACHE: OrderedDict[tuple[Any, ...], tuple[np.ndarray, dict[str, Any]]] = OrderedDict()
@@ -394,6 +438,62 @@ _LINEAR_CACHE_BYTES_MAX = 1536 * _MIB
 # would put a full raw read behind the look picker; a decode fills this first.
 _DRO_GRID_CACHE: OrderedDict[tuple[Any, ...], dict[str, Any] | None] = OrderedDict()
 _DRO_GRID_CACHE_MAX = 6
+
+# Open, unpacked LibRaw handles, keyed by file identity. Unpacking a Sony
+# lossless-compressed 33 MP frame costs LibRaw about 7 s single-threaded, and
+# every denoise variant used to pay it again: daemon_linear opened the file,
+# decoded, and closed it, so switching Noise Reduction off and on re-read the
+# RAW twice over (measured 7.2 s of a 17.5 s toggle). The handle's mosaic is
+# mutable -- the RAW-domain denoiser writes it in place -- so each entry keeps a
+# pristine copy and restores it before handing the handle out. Per-file locking
+# in daemon_worker keeps two requests off one handle at the same time. Small
+# on purpose: a handle holds ~70 MB of mosaic plus its pristine copy.
+_RAW_HANDLE_CACHE: OrderedDict[tuple[Any, ...], tuple[rawpy.RawPy, np.ndarray]] = OrderedDict()
+_RAW_HANDLE_CACHE_MAX = 3
+
+
+def open_raw_in_memory(input_path: Path) -> rawpy.RawPy:
+    """rawpy.imread, but off one sequential read of the file.
+
+    LibRaw unpacks through many small seeks and reads. On a local ext4 disk that
+    is nothing; through a Windows drive mounted into WSL (/mnt/e, 9P) it is the
+    whole cost: 7.6 s to unpack a 42 MB lossless-compressed ARW against 0.5 s
+    for the same file on /tmp. One read of the file is a fraction of a second
+    either way, and LibRaw's buffer path does the rest in memory.
+    """
+    with open(input_path, "rb") as f:
+        data = f.read()
+    return rawpy.imread(io.BytesIO(data))
+
+
+def _checkout_raw(input_path: Path) -> rawpy.RawPy:
+    """An unpacked LibRaw handle for this file, its mosaic reset to the file's.
+
+    Cached across requests (see _RAW_HANDLE_CACHE). The caller must not close
+    it; the cache evicts and closes. A mosaic the previous request denoised in
+    place is put back before the handle is returned, so every caller sees the
+    RAW as read.
+    """
+    key = _file_stamp(input_path)
+    with _CACHE_LOCK:
+        hit = _RAW_HANDLE_CACHE.get(key)
+        if hit is not None:
+            _RAW_HANDLE_CACHE.move_to_end(key)
+    if hit is not None:
+        raw, pristine = hit
+        np.copyto(raw.raw_image, pristine)
+        return raw
+    raw = open_raw_in_memory(input_path)
+    pristine = raw.raw_image.copy()   # forces the unpack, and keeps the untouched mosaic
+    evicted: list[rawpy.RawPy] = []
+    with _CACHE_LOCK:
+        _RAW_HANDLE_CACHE[key] = (raw, pristine)
+        while len(_RAW_HANDLE_CACHE) > _RAW_HANDLE_CACHE_MAX:
+            _, (old, _) = _RAW_HANDLE_CACHE.popitem(last=False)
+            evicted.append(old)
+    for old in evicted:
+        old.close()
+    return raw
 
 
 def _file_stamp(input_path: Path) -> tuple[Any, ...]:
@@ -476,31 +576,15 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     # the heavy inference and the second decode are skipped entirely.
     denoise_req = request.get("denoise") or {}
     dn_amount = max(0.0, min(1.0, float(denoise_req.get("amount", 1.0))))
-    # Edit's Auto. The engine does not run its RAW stage at one strength: it
-    # ramps with ISO -- four tenths up to ISO 400, full from ISO 1600, linear in
-    # ISO between them (sony/rawnr_simd.py iso_strength, read out of the running
-    # engine at 0x39fb4c). This is why Edit's own denoising looks like it is not
-    # turned all the way up on a base-ISO frame: it isn't.
-    #
-    # Resolved here, before the cache key, for two reasons: ISO is a property of
-    # the file rather than of the request, and a key naming the resolved
-    # strength still names exactly what the cached pixels were denoised at.
-    # read_exiftool_metadata is memoized per (path, size, mtime), and the
-    # profile path reads it for this same file anyway, so this is free.
-    #
-    # ⚠️ This rides on `amount`, which in llr is a blend between a noisy and a
-    # denoised decode, whereas Edit's strength scales the filter itself. The two
-    # agree at both ends and in direction but not term by term -- an
-    # approximation, and deliberately an explicit one. Matching the engine
-    # properly means running its filter, which is what sony/rawnr_simd.py is
-    # for; the strength belongs inside that operator, not in a lerp.
+    # Edit's Auto: the engine's RAW stage writes back `iso_strength(ISO)` of
+    # its own change -- four tenths up to ISO 400, all of it from ISO 1600,
+    # linear in ISO between (sony/rawnr_simd.py apply_strength; measured on the
+    # engine's input/output planes). Resolved below once the file's denoiser is
+    # known: Sony's own filter takes it as `strength` and applies it exactly;
+    # the wavelet fallback has no such rule, so there it still rides on the
+    # noisy/denoised decode blend as the approximation it always was.
     dn_auto = bool(denoise_req.get("auto", False))
-    if dn_auto and is_raw(input_path):
-        iso = _exif_int(read_exiftool_metadata(input_path).get("ISO"))
-        # An unreadable ISO leaves the caller's amount alone rather than
-        # silently denoising at four tenths -- guessing here would be invisible.
-        if iso:
-            dn_amount = iso_strength(float(iso))
+    dn_strength = 1.0
     # Which filter runs is not the client's to pick: llr has one denoiser and
     # the goal is that it is Edit's. The request says whether to denoise and how
     # much, never with what; migrating means moving DEFAULT_MODEL, once.
@@ -524,6 +608,26 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     # every return below, denoising on or off, so the answer cannot flip with
     # the toggle. Sony's own filter has no such control; the wavelet does.
     dn_uses_chroma = file_model is not None and model_uses_chroma(file_model)
+    if dn_auto and file_model is not None:
+        iso = _exif_int(read_exiftool_metadata(input_path).get("ISO"))
+        # An unreadable ISO leaves the request alone rather than silently
+        # denoising at four tenths -- guessing here would be invisible.
+        if iso:
+            if file_model == "sony":
+                dn_strength = iso_strength(float(iso))
+            else:
+                dn_amount = iso_strength(float(iso))
+    elif file_model == "sony":
+        # Edit's manual panel, measured at export: its default amount of 50 is
+        # Auto to the bit, 0 is off, and in between the write-back strength is
+        # the honest straight line (sony/rawnr_simd.py manual_strength). Above
+        # 50 the engine changes the filter itself, which this cannot follow, so
+        # the strength holds at Auto's. The amount is spent here, as the
+        # engine's own write-back, not as a blend of two decodes.
+        iso = _exif_int(read_exiftool_metadata(input_path).get("ISO"))
+        if iso:
+            dn_strength = manual_strength(dn_amount * 100.0, float(iso))
+            dn_amount = 1.0 if dn_strength > 0.0 else 0.0
     # Forcing denoise off here for a rendered image (rather than no-op'ing
     # deeper) keeps the two-decode blend below from decoding an identical image
     # twice.
@@ -558,7 +662,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
                           else dro_level_from_request(request))
 
     # Check processed sRGB cache first
-    cache_key = _linear_cache_key(input_path, profile_id, half_size, max_size, dcp_code, dn_model, dn_amount, (dn_edge, dn_chroma))
+    cache_key = _linear_cache_key(input_path, profile_id, half_size, max_size, dcp_code, dn_model, dn_amount, (dn_edge, dn_chroma), dn_strength)
     with _CACHE_LOCK:
         cached_linear = _LINEAR_CACHE.get(cache_key)
         if cached_linear is not None:
@@ -588,16 +692,13 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     if dcp_code:
         recipe["dcpCode"] = dcp_code
 
-    # The noisy and denoised variants share one lazily opened LibRaw handle:
-    # opening is skipped entirely when both variants are cache hits, and a
-    # first-time denoise request no longer reads + unpacks the RAW twice.
-    shared_raw: rawpy.RawPy | None = None
-
+    # The noisy and denoised variants share one unpacked LibRaw handle, and so
+    # does the next request for this file: _checkout_raw keeps the handle open
+    # across requests (unpacking is the single most expensive step on a
+    # lossless-compressed frame) and resets its mosaic between uses. Opening is
+    # skipped entirely when every variant is a cache hit.
     def open_raw() -> rawpy.RawPy:
-        nonlocal shared_raw
-        if shared_raw is None:
-            shared_raw = rawpy.imread(str(input_path))
-        return shared_raw
+        return _checkout_raw(input_path)
 
     # Same reasoning as the _LINEAR_CACHE gate below: a one-off export decode
     # must not be pinned in any cache, so the intent is passed down to the decode
@@ -616,6 +717,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
                 half_size=half_size, max_size=max_size,
                 denoise_model=dn_model,
                 denoise_tweaks=(dn_edge, dn_chroma),
+                denoise_strength=dn_strength,
                 raw_provider=open_raw,
                 store_cache=store_cache,
             )
@@ -638,6 +740,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
                     half_size=half_size, max_size=max_size,
                     denoise_model=dn_model,
                     denoise_tweaks=(dn_edge, dn_chroma),
+                    denoise_strength=dn_strength,
                     raw_provider=open_raw,
                     store_cache=store_cache,
                 )
@@ -648,8 +751,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
                     color_profile=prepared.color_profile,
                 )
     finally:
-        if shared_raw is not None:
-            shared_raw.close()
+        pass   # the handle stays in _RAW_HANDLE_CACHE; eviction closes it
 
     # Stash full-resolution dims on the color profile so both this response and
     # the _LINEAR_CACHE-hit path above can report zoom relative to the original.
@@ -734,7 +836,9 @@ def daemon_look_profile(request: dict[str, Any], root: Path) -> dict[str, Any]:
                             dro_grid=dro_grid_cached(input_path, exif),
                             dro_level=dro_level_from_request(request),
                             sharpen=sharpness_from_exif(exif, input_path),
-                            spica=spica_from_exif(exif))
+                            spica=spica_from_exif(exif),
+                            chroma_suppres=chroma_suppres_block(input_path),
+                            marble=marble_from_exif(exif))
     profile = info.to_json()
     # Which looks this particular file can offer, and which one the body chose.
     # Read from the RAW rather than from a constant so a body shipping more than
@@ -1170,7 +1274,7 @@ def extract_preview_image(input_path: Path) -> Image.Image:
 
 def _raw_cache_key(
     input_path: Path, half_size: bool, max_size: int | None, denoise_model: str | None,
-    denoise_tweaks: tuple[float, float] = (50.0, 50.0),
+    denoise_tweaks: tuple[float, float] = (50.0, 50.0), denoise_strength: float = 1.0,
 ) -> tuple[Any, ...]:
     try:
         stat = input_path.stat()
@@ -1180,7 +1284,9 @@ def _raw_cache_key(
     # `amount` is deliberately absent (it blends this entry with the noisy one),
     # but edge and colour change the denoised pixels themselves — for whichever
     # denoiser actually consumes them; see `_key_tweaks`.
-    return (*base, denoise_model or "", _key_tweaks(denoise_model, denoise_tweaks))
+    # The ISO strength changes the denoised pixels too (it is the engine's
+    # write-back blend, applied inside the Sony denoiser), so it is keyed.
+    return (*base, denoise_model or "", _key_tweaks(denoise_model, denoise_tweaks), round(float(denoise_strength), 4))
 
 
 @dataclass(frozen=True)
@@ -1245,7 +1351,8 @@ def render_color(
             # are re-derived per request instead (sony.apply_look_overrides).
             tweaks=metadata.look, dro=metadata.dro_active, dro_gain=metadata.dro_gain,
             dro_grid=metadata.dro_grid, sharpen=metadata.sharpen,
-            spica=metadata.spica,
+            spica=metadata.spica, chroma_suppres=metadata.chroma_suppres,
+            marble=metadata.marble,
         )
         return linear, info.to_json()
 
@@ -1272,6 +1379,7 @@ def prepare_linear(
     denoise_tweaks: tuple[float, float] = (50.0, 50.0),
     raw_provider: Callable[[], rawpy.RawPy] | None = None,
     store_cache: bool = True,
+    denoise_strength: float = 1.0,
 ) -> PreparedLinear:
     """Decode RAW into linear working-space RGB (cached per variant).
 
@@ -1295,7 +1403,7 @@ def prepare_linear(
     if denoise_model:
         denoise_model = effective_model(denoise_model, input_path)
 
-    cache_key = _raw_cache_key(input_path, half_size, max_size, denoise_model, denoise_tweaks)
+    cache_key = _raw_cache_key(input_path, half_size, max_size, denoise_model, denoise_tweaks, denoise_strength)
 
     # Cache hit: re-apply DCP on cached camera RGB without re-decoding RAW
     with _CACHE_LOCK:
@@ -1357,13 +1465,15 @@ def prepare_linear(
                 raw, get_denoiser(denoise_model), noise=curve,
                 detail=None if restore is None or curve is None
                 else (restore.fraction, restore.limit_in_thresholds(curve)),
-                chroma_scale=chroma / 50.0)
+                chroma_scale=chroma / 50.0, strength=denoise_strength)
             # Which of those two happened is invisible from the result, and it
             # is the one input that varies per *file* rather than per request —
             # so a frame that denoises unlike its neighbours is explained here
             # and nowhere else. The API forwards our stderr to its console.
             kept = ("" if stats is None or stats.detail_restored is None
                     else f" detail={stats.detail_restored:.2f}")
+            if stats is not None and stats.strength != 1.0:
+                kept += f" strength={stats.strength:.3f}"
             note = (f"{stats.model} {stats.width}x{stats.height} "
                     f"noise={stats.noise_source}{kept}" if stats is not None
                     else "skipped, sensor CFA is not 2x2 Bayer")
@@ -1397,7 +1507,7 @@ def prepare_linear(
             if store_cache:
                 _remember_pixels(_FALLBACK_CACHE, cache_key, (linear, metadata, color_profile), _FALLBACK_CACHE_BYTES_MAX)
         else:
-            camera_rgb = postprocess_camera_native(raw, half_size=half_size)
+            camera_rgb = decode_camera_rgb_for_render(raw, metadata, half_size, input_path)
             camera_rgb = apply_camera_crop(camera_rgb, metadata.camera_crop)
             if camera_rgb.shape[-1] != 3:
                 raise ValueError("Profiled rendering currently supports only three-channel camera RGB data")
@@ -1409,6 +1519,35 @@ def prepare_linear(
             linear, color_profile = render_color(renderer, camera_rgb, metadata, root, recipe)
 
     return PreparedLinear(linear=linear, metadata=metadata, color_profile=color_profile)
+
+
+#: Which demosaic the profiled path runs on a Sony RGGB frame. "itp" is
+#: Edit.exe's own (sony/itp.py, reproduced to 1 LSB); "libraw" is the AHD that
+#: stood in for it, kept for A/B measurement via LLR_DEMOSAIC=libraw.
+SONY_DEMOSAIC = os.environ.get("LLR_DEMOSAIC", "itp").strip().lower()
+
+
+def decode_camera_rgb_for_render(
+    raw: rawpy.RawPy, metadata: RawMetadata, half_size: bool, input_path: Path,
+) -> np.ndarray:
+    """Camera RGB for the profiled render path.
+
+    Sony bodies get Edit.exe's demosaic: it is the stage that decides whether
+    Bayer noise comes out as colour or as luminance (measured in
+    notes/measured-chroma-gap.md 2.19.1 / 2.20), and it reads the mosaic the
+    RAW-domain denoiser just wrote, in the engine's own order. Everything else,
+    and the fallback when the sensor is not RGGB, is LibRaw exactly as before.
+
+    Scale: the ITP planes divided by Sony's white index (8192) land within 0.1%
+    of LibRaw's use_camera_wb normalisation, so the DCP / camera-match tables
+    fitted on LibRaw decodes stay valid; the fitter itself
+    (fit_profile.postprocess_camera_native) is deliberately left on LibRaw.
+    """
+    if (SONY_DEMOSAIC == "itp" and (metadata.make or "").strip().upper() == "SONY"
+            and sony_itp.supports(raw)):
+        sys.stderr.write(f"demosaic {input_path.name}: sony itp\n")
+        return sony_itp.demosaic_rawpy(raw, half_size=half_size)
+    return postprocess_camera_native(raw, half_size=half_size)
 
 
 def prepare_rendered_image(
@@ -1591,6 +1730,8 @@ def read_raw_metadata(input_path: Path, raw: rawpy.RawPy) -> RawMetadata:
         look=look_from_exif(exif),
         sharpen=sharpness_from_exif(exif, input_path),
         spica=spica_from_exif(exif),
+        chroma_suppres=chroma_suppres_block(input_path),
+        marble=marble_from_exif(exif),
         dro_active=dro_from_exif(exif, input_path),
         dro_gain=dro_gain,
         dro_grid=grid,
@@ -1631,6 +1772,29 @@ def sharpness_from_exif(exif: dict[str, Any], input_path: Path) -> dict[str, Any
     )
 
 
+def chroma_suppres_block(input_path: Path) -> dict[str, Any] | None:
+    """This shot's ChromaSuppres terms in wire form, or None if it carries none.
+
+    No exif at all: the four anchors live in the RAW's own SR2 block, and the
+    engine's ISO axis reads zero on every frame measured, so the file is the
+    whole input. Here rather than in sony/chromasuppres.py for the same reason
+    sharpness_from_exif is here — opening files is this module's job, and the
+    stage module stays a description of the engine's arithmetic.
+    """
+    terms = chroma_suppres_from_file(input_path)
+    return terms.to_json() if terms is not None else None
+
+
+def marble_from_exif(exif: dict[str, Any]) -> dict[str, Any] | None:
+    """Marble's chroma cleanup for this shot: ISO (the blend amount's only
+    per-shot input) plus the body's threshold calibration (sony/marble.py).
+    None without an ISO, and the stage stays off rather than guess a strength."""
+    iso = _exif_int(exif.get("ISO")) or None
+    if not iso:
+        return None
+    return marble_block(int(iso))
+
+
 def spica_from_exif(exif: dict[str, Any]) -> dict[str, Any]:
     """The fine half of sharpening for this shot.
 
@@ -1639,10 +1803,11 @@ def spica_from_exif(exif: dict[str, Any]) -> dict[str, Any]:
     has no per-shot calibration in the SR2 block. `Sharpness` and `ISO` are
     plain exif, so this one takes only the tags.
     """
+    iso = _exif_int(exif.get("ISO")) or None
     return spica_block(
         _exif_int(exif.get("Sharpness"), SHARPNESS_DEFAULT),
         _exif_int(exif.get("SharpnessRange"), SHARPNESS_RANGE_DEFAULT),
-        spica_iso_gain(_exif_int(exif.get("ISO")) or None),
+        spica_iso_gain(iso), spica_gain_scale(iso), spica_range_shift(iso),
     )
 
 

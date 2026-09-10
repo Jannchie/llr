@@ -4,6 +4,7 @@
  */
 
 import type { LinearPixels, ProfileClarity, ProfileSharpen, ProfileSpica } from "./rendering/pipeline-renderer";
+import type { ProfileMarble } from "./rendering/sony-marble";
 
 export const API = (import.meta.env.VITE_API_URL as string | undefined) ?? "/api";
 
@@ -62,6 +63,25 @@ export type ColorProfileMeta = {
   // pivot on the luma scale and a contrast about it. Sony only.
   profileLumaPivot?: number | null;
   profileLumaContrast?: number | null;
+  // The table YGamma indexes Y through before that line: 16384 entries, in and
+  // out on the engine's 0..16383 scale. Standard and Neutral carry a highlight
+  // knee (slope 0.90625 above Y=8192); the other eight are near identity. ~90 kB
+  // of JSON, and per-look, so it arrives with every profile rebuild. Null for an
+  // older response, which renders as the pivot/contrast line alone. Sony only.
+  profileLumaLut?: number[] | null;
+  // The pair Imaging Edge's 色彩复制 = 高级 puts in place of those two. That
+  // setting is not only the 3-D LUT it was first taken for: it swaps YGamma's
+  // table as well, and its contrast, which is 17280/16384 for every look and not
+  // the look's own entry. Both ride along so the browser's switch stays a redraw
+  // rather than a round trip. Null for an older response. Sony only.
+  profileLumaLutAdvanced?: number[] | null;
+  profileLumaContrastAdvanced?: number | null;
+  // ChromaSuppres, which the engine runs just *before* YGamma and indexes by
+  // the luma from before it. The mid-tones lose a flat 1/256 of their chroma
+  // and everything above hiY fades out linearly. All four are in the engine's
+  // own units — hiY/loY on its 0..16383 luma scale, the slopes over 4096.
+  // Null when the shot's four SR2 tags could not be read. Sony only.
+  profileChromaSuppres?: { hiY: number; loY: number; slopeHi: number; slopeLo: number } | null;
   // The Saturation slider: profileChromaGain is already divided by it, and the
   // shader multiplies the chroma back after the clamp. Sony only.
   profileChromaSaturation?: number | null;
@@ -108,6 +128,13 @@ export type ColorProfileMeta = {
   // way, plus the shot's ISO, so it moves with SharpnessRange rather than with
   // any slider here — and rides through a profile rebuild for the same reason.
   profileSpica?: ProfileSpica | null;
+  // Marble's chroma cleanup, the stage that runs last on the finished frame
+  // (worker sony/marble.py::marble_block). `iso` is the amount's only per-shot
+  // input, `amountAuto` is what that amount comes to at the panel's default,
+  // and `calib` is the body's threshold table. The browser recomputes the
+  // amount rather than using amountAuto, because only it knows where the
+  // colour-NR slider sits. Null for a render with no Marble to reproduce.
+  profileMarble?: ProfileMarble | null;
   // What the tone curve and chroma terms above were built with, and what the
   // body itself recorded. The Creative Look panel starts at lookAsShot, which
   // is also what a double-click resets a slider to.

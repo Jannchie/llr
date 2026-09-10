@@ -51,11 +51,17 @@ precision highp float;
 // sampler3D has no default precision in GLSL ES 3.0 (unlike sampler2D), so
 // omitting this is a compile error, not a silent downgrade.
 precision highp sampler3D;
+precision highp isampler3D;
+// int defaults to *mediump* in a fragment shader, which the spec only
+// guarantees to 16 bits. Sony's 3-D LUT reproduces the engine's integer
+// trilinear weights and reaches 2^28 doing it, so it needs the full 32.
+precision highp int;
 in vec2 v_texCoord;
 out vec4 outColor;
 uniform sampler2D u_input;
 uniform mat3 u_wbMatrix;        // relative WB: Bradford adaptation in linear ProPhoto
 uniform float u_exposure;
+uniform int u_sonyLinearExposure;   // 1: Edit's plain 2^EV gain (Sony), 0: shouldered exposure
 uniform float u_highlights;
 uniform float u_shadows;
 uniform float u_vibrance;
@@ -96,14 +102,49 @@ uniform int u_profileCurveSrgb;  // 1 if that curve is defined on sRGB/Rec.709 p
 uniform int u_sonyChromaActive;
 uniform vec4 u_sonyCross;
 uniform vec4 u_sonyGain;
-// YGamma, which runs between the two chroma halves: the shot's Fade setting,
-// as a pivot and a contrast. Fade 0 is pivot 0, so it degenerates to a gain.
+// YGamma, which runs between the two chroma halves: a table lookup, then the
+// shot's Fade setting as a pivot and a contrast. Fade 0 is pivot 0, so the
+// second half degenerates to a gain.
 uniform vec2 u_sonyLuma;        // (pivot, contrast)
+// The table, 16384 entries folded into a 128x128 R32F texture, values on the
+// engine's own 0..16383 scale. Standard and Neutral carry a highlight knee here
+// (slope 0.90625 above Y=8192); the other eight looks are near identity, which
+// is why the stage passed for a plain gain until a Standard frame's highlights
+// came out 2-3% bright and clipped (worker sony/chroma.py). Read with
+// texelFetch and never with texture(): the engine's index is a truncated
+// integer, and filtering across the knee would round off the one feature the
+// table is carried for.
+uniform int u_sonyLumaLutActive;
+uniform sampler2D u_sonyLumaLut;
+// The same table under 色彩复制 = 高级, and the contrast that goes with it.
+// u_sonyLut3dActive drives these too: 高级 is one setting in Imaging Edge and it
+// moves both halves of YGamma as well as adding the 3-D LUT below. The advanced
+// contrast is 17280/16384 for *both* families — including the eight looks whose
+// own entry is 1.0 — and the pivot is not swapped (worker sony/chroma.py
+// luma_terms says why). Same 128x128 fold, same texelFetch rules as above.
+uniform int u_sonyLumaLutAdvActive;
+uniform sampler2D u_sonyLumaLutAdv;
+uniform float u_sonyLumaAdvContrast;
+// ChromaSuppres, which the engine runs just *before* YGamma and indexes by the
+// luma from before it: a flat 255/256 through the mid-tones, then a linear fade
+// to zero above hiY. Engine units — hiY/loY on its 0..16383 luma scale, the
+// slopes over 4096 (worker sony/chromasuppres.py).
+uniform int u_sonyCSActive;
+uniform vec4 u_sonyCS;          // (hiY, loY, slopeHi, slopeLo)
 // The Saturation slider. u_sonyGain arrives already divided by it; this
 // multiplies the chroma back after the clamp, exactly as the engine's separate
 // ZcTaskSIMDHueSaturation stage does. The two nearly cancel — the clamp in
 // between is the whole visible effect.
 uniform float u_sonySat;
+// Sony's ZcTask3DLut — Edit's 色彩复制 = 高级 ("advanced colour reproduction"),
+// the one stage of this section the user chooses. Edit's own default is 标准,
+// which is the stage absent, so this is off unless the switch is on. The table
+// is static — one dump reproduces two bodies, two frames and all eleven
+// Creative Looks bit-exactly — so it ships as an asset (public/sony-lut3d.bin)
+// rather than arriving per file: 33x33x33 int16 triples, uploaded as an RGB16I
+// 3-D texture and read with texelFetch, never filtered (worker sony/lut3d.py).
+uniform int u_sonyLut3dActive;
+uniform isampler3D u_sony_lut3d;
 // Sepia's toning (the engine's ZcTaskEffect, which runs only for that look):
 // throw the chroma away and map one weighted sum through a curve per channel.
 uniform int u_sepiaActive;
@@ -167,6 +208,26 @@ ${LUT_GLSL}
 
 // ===== View transforms: scene-linear ProPhoto -> display-linear ProPhoto [0,1] =====
 
+// The 3-D LUT's 1-D chroma warp, by its closed form. The engine holds
+// int16[65537] here, indexed by a *signed* value, and
+// sign(i) * min(trunc(32768 * (|i|/32768)^(2/3)), 32767) reproduces every one
+// of those 65537 entries (worker sony/lut3d.py checks the formula against the
+// dump). So it costs one pow() instead of a second texture. Evaluated in
+// float32 rather than the worker's double, which moves the result by at most
+// one of 65536 on 78 of the entries — a 1/2048 shift of one cell's fraction.
+float sonyWarpCurve(float x) {
+  return sign(x) * min(trunc(32768.0 * pow(abs(x) / 32768.0, 2.0 / 3.0)), 32767.0);
+}
+
+// One grid point of the 3-D LUT. public/sony-lut3d.bin is int16 triples in
+// [iu][iv][iy] order with iy fastest (sony_repro/tools/make_lut3d_asset.py),
+// uploaded with width = the Y axis, height = v, depth = u — so the fetch
+// coordinate is (iy, iv, iu), and reversing it is a silent colour error rather
+// than a crash.
+ivec3 sonyLut3dPoint(int iu, int iv, int iy) {
+  return texelFetch(u_sony_lut3d, ivec3(iy, iv, iu), 0).rgb;
+}
+
 // Sony's RGB2YCC — the stage that carries a Creative Look's saturation and hue.
 // Runs on display-*encoded* values in the curve's own basis, which is exactly
 // where the engine runs it (worker sony/chroma.py). The chroma differences are
@@ -184,10 +245,96 @@ vec3 sonyChroma(vec3 s) {
   float u2 = (v >= 0.0 ? u_sonyCross.x : u_sonyCross.z) * v + u;
   float cr = clamp((u2 >= 0.0 ? u_sonyGain.y : u_sonyGain.w) * u2, -0.5, 0.5) * u_sonySat;
   float cb = clamp((v2 >= 0.0 ? u_sonyGain.x : u_sonyGain.z) * v2, -0.5, 0.5) * u_sonySat;
-  // YGamma, which the engine runs here, between the two halves: it pulls Y
-  // toward a pivot and clips, and leaves both chroma planes bit-identical
-  // (worker sony/chroma.py). This is where the in-camera Fade setting lives.
-  y = clamp((y - u_sonyLuma.x) * u_sonyLuma.y + u_sonyLuma.x, 0.0, 1.0);
+  // ChromaSuppres, which the engine runs between RGB2YCC and YGamma, on the
+  // luma *before* YGamma (worker sony/chromasuppres.py has the derivation and
+  // the measurement). f is 255 for the mid-tones -- a 255/256 chroma loss, not
+  // identity -- and falls off linearly above hiY (and below loY, unused so far).
+  if (u_sonyCSActive == 1) {
+    float y16 = y * 16383.0;
+    float f = 255.0;
+    if (y16 > u_sonyCS.x) f = 255.0 - floor((y16 - u_sonyCS.x) * u_sonyCS.z / 4096.0);
+    else if (y16 < u_sonyCS.y) f = 255.0 - floor((u_sonyCS.y - y16) * u_sonyCS.w / 4096.0);
+    f = clamp(f, 0.0, 255.0) / 256.0;
+    cr *= f;
+    cb *= f;
+  }
+  // YGamma, which the engine runs here, between the two halves: it maps Y
+  // through the look's table, pulls it toward a pivot and clips, and leaves
+  // both chroma planes bit-identical (worker sony/chroma.py). The table is the
+  // look's highlight shape; the pivot and contrast are the in-camera Fade
+  // setting. ChromaSuppres above deliberately ran on the luma from before both.
+  //
+  // Under 高级 the whole stage runs off the other pair — table and contrast
+  // both — so the switch below drives this as well as the 3-D LUT. Gated on the
+  // advanced table having arrived: an older response carries only the standard
+  // one, and rendering 高级's contrast against 标准's table would be neither.
+  bool adv = u_sonyLut3dActive == 1 && u_sonyLumaLutAdvActive == 1;
+  int idx = int(clamp(floor(y * 16383.0), 0.0, 16383.0));
+  if (adv) {
+    y = texelFetch(u_sonyLumaLutAdv, ivec2(idx & 127, idx >> 7), 0).r / 16383.0;
+  } else if (u_sonyLumaLutActive == 1) {
+    y = texelFetch(u_sonyLumaLut, ivec2(idx & 127, idx >> 7), 0).r / 16383.0;
+  }
+  float lumaContrast = adv ? u_sonyLumaAdvContrast : u_sonyLuma.y;
+  y = clamp((y - u_sonyLuma.x) * lumaContrast + u_sonyLuma.x, 0.0, 1.0);
+  // ZcTask3DLut, which the engine runs here — after YGamma, before the return
+  // trip — and only when the user asks for it. It works on the engine's integer
+  // planes, so they are reconstructed and converted back: 1.0 is 16383 (the
+  // scale YGamma's own table is on), Y truncated as the engine truncates it,
+  // and the two chroma planes rounded onto that same scale offset by 0x8000.
+  // worker sony/lut3d.py apply_lut3d_float owns that pair and says where it was
+  // measured (sony_repro/tools/ycc_exact.py, within 1 of 16383).
+  if (u_sonyLut3dActive == 1) {
+    float crPlane = floor(cr * 16383.0 + 0.5);
+    float cbPlane = floor(cb * 16383.0 + 0.5);
+    int yPlane = int(floor(y * 16383.0));
+    // The forward 2x2: BT.601-ish colour differences u ~ R-Y and v ~ B-Y. The
+    // tiny off-diagonal terms are in Edit.exe and are reproduced verbatim.
+    float uw = sonyWarpCurve(trunc(clamp(cbPlane * 3.7e-05 + crPlane * 1.401988, -32768.0, 32767.0)));
+    float vw = sonyWarpCurve(trunc(clamp(crPlane * 0.000135 + cbPlane * 1.771978, -32768.0, 32767.0)));
+    // 5-bit grid coordinate + 11-bit fraction on each chroma axis, 5 + 9 on Y.
+    int a = int(uw) + 32768;
+    int b = int(vw) + 32768;
+    int iu = a >> 11, f0 = a & 2047;
+    int iv = b >> 11, f1 = b & 2047;
+    int iy = yPlane >> 9, yf = yPlane & 511;
+    int F0 = 2048 - f0, F1 = 2048 - f1, yF = 512 - yf;
+    // The eight trilinear weights in the engine's own integer form, not a float
+    // lerp. That is not pedantry: the weights are quantised to 512ths and w0 is
+    // the *remainder* of the other seven, so all of the rounding lands on one
+    // corner. A plain float trilinear drifts up to 11 of 16383 on saturated
+    // pixels against the worker's bit-exact model; this form leaves only the
+    // float32 curve/matrix, which is under 2. The >> 3 is after the multiply
+    // and really does discard those bits — cancelling it algebraically changes
+    // the answer.
+    int w2 = (((f0 * yf) >> 3) * F1 + 0x40000) >> 19;
+    int w6 = (((f0 * yf) >> 3) * f1 + 0x40000) >> 19;
+    int w3 = (((f0 * yF) >> 3) * F1 + 0x40000) >> 19;
+    int w7 = (((f0 * yF) >> 3) * f1 + 0x40000) >> 19;
+    int w1 = (((F0 * yf) >> 3) * F1 + 0x40000) >> 19;
+    int w5 = (((F0 * yf) >> 3) * f1 + 0x40000) >> 19;
+    int w4 = (((F0 * yF) >> 3) * f1 + 0x40000) >> 19;
+    int w0 = 512 - w7 - w6 - w5 - w4 - w3 - w2 - w1;
+    // Corner order inside a cell is gray-coded on (f1, f0, yf):
+    //   k: 0=000 1=001 2=011 3=010 4=100 5=101 6=111 7=110
+    ivec3 acc = sonyLut3dPoint(iu,     iv,     iy    ) * w0
+              + sonyLut3dPoint(iu,     iv,     iy + 1) * w1
+              + sonyLut3dPoint(iu + 1, iv,     iy + 1) * w2
+              + sonyLut3dPoint(iu + 1, iv,     iy    ) * w3
+              + sonyLut3dPoint(iu,     iv + 1, iy    ) * w4
+              + sonyLut3dPoint(iu,     iv + 1, iy + 1) * w5
+              + sonyLut3dPoint(iu + 1, iv + 1, iy + 1) * w6
+              + sonyLut3dPoint(iu + 1, iv + 1, iy    ) * w7;
+    acc >>= 9;                       // the eight weights always sum to 512
+    // Y has a lower clamp and no upper one (the engine's own test/cmovs); the
+    // clamp below stands in for the upper end, as YCC2RGB's does in the engine.
+    // The chroma goes back through the inverse of the same 2x2 — 0.564341 is
+    // 1/1.771978 and 0.713273 is 1/1.401988 — skipping only the engine's
+    // truncation to integer planes, which is worth under one of 16383.
+    y = float(max(acc.x, 0)) / 16383.0;
+    cr = (float(acc.y) * 0.713273 - float(acc.z) * 1.5e-05) / 16383.0;
+    cb = (float(acc.z) * 0.564341 - float(acc.y) * 5.4e-05) / 16383.0;
+  }
   vec3 o = clamp(vec3(y + 1.4020 * cr, y - 0.7141 * cr - 0.3441 * cb, y + 1.7720 * cb), 0.0, 1.0);
   // Sepia's toning goes here, on the encoded values the engine's own stage sees.
   if (u_sepiaActive == 1) {
@@ -407,6 +554,14 @@ void main() {
   c = applyHsvTable(c, u_dcp_look, u_dcpLookDims);
   if (u_dcpMatchActive == 1) c = applyHsvTable(c, u_dcp_match, u_dcpMatchDims);
 
+  // --- Sony exposure compensation --- Edit's 曝光补偿 is a plain 2^EV gain on
+  // the demosaicked linear RGB, before DRO and before everything tonal: at +1 EV
+  // the ITP output doubles and nothing else in the chain changes
+  // (sony_repro/notes/measured-chroma-gap.md 2.29). No shoulder, so the
+  // shouldered exposure below is bypassed for a Sony profile and highlights
+  // clip where the engine clips them.
+  if (u_sonyLinearExposure == 1) c *= exp2(u_exposure);
+
   // --- DRO --- Before white balance and before exposure, matching where the
   // engine's stage sits. One gain for all three channels, so it never shifts
   // colour; BT.601 luminance because that is what the engine forms it from.
@@ -437,9 +592,11 @@ void main() {
     // Exposure: mids move exactly +E; the stops added above EXPO_KNEE compress
     // through the shoulder so brights roll off instead of walling at clip.
     // Negative exposure stays a pure gain (as in Lightroom).
-    float lOut = (u_exposure > 0.0)
-      ? l + expoShoulder(l + u_exposure) - expoShoulder(l)
-      : l + u_exposure;
+    // A Sony profile already took its exposure as the linear gain above.
+    float expo = (u_sonyLinearExposure == 1) ? 0.0 : u_exposure;
+    float lOut = (expo > 0.0)
+      ? l + expoShoulder(l + expo) - expoShoulder(l)
+      : l + expo;
     if (u_tonalActive == 1 || clarityLocal) {
       float pixLx = lOut - LOG2_MID;                   // stops from middle gray, post-exposure
       // Blurred neighborhood log-luma (see MASK_* shaders), shifted for
@@ -917,7 +1074,13 @@ void main() {
 
 /** Below this local range (14-bit) the engine skips the classifier: table 0. */
 export const SPICA_RANGE_THRESHOLD = 8;
-/** `cfg[0xc4] / 2048` — turns a trapezoid's [48, 512] into the detail gain. */
+/**
+ * `cfg[0xc4] / 2048` at base ISO — turns a trapezoid's [48, 512] into the detail
+ * gain. The engine halves it by ISO 1600 and quarters it by 25600, and shifts
+ * the range curve's a/b up by 128 / 384 over the same ramp; both travel on the
+ * profile as `gainScale` / `rangeShift` (worker sony/spica.py), this constant
+ * is what a profile without them (or a base-ISO frame) means.
+ */
 export const SPICA_GAIN_SCALE = 2;
 /** The three trapezoids: `(a, b, c, d)` then their outside/inside values. */
 export const SPICA_CURVE_DETAIL = [512, 2048, 2304, 3840, 128, 512];
@@ -962,10 +1125,11 @@ uniform sampler2D u_lut;        // 256 x 1 RGBA32F: (table, dx, dy)
 uniform vec2 u_sceneTexel;      // one scene texel — the diamond's step
 uniform float u_amount;         // how much of the filtered value survives, 0 = off
 uniform float u_isoGain;        // detail scale for this shot's ISO
+uniform float u_gainScale;      // cfg[0xc4] / 2048 for this shot's ISO (SPICA_GAIN_SCALE at base ISO)
+uniform float u_rangeShift;     // how far the range trapezoid's a and b move up for this ISO
 const vec3 LUMA = vec3(${glslFloat(REC709_Y[0])}, ${glslFloat(REC709_Y[1])}, ${glslFloat(REC709_Y[2])});
 const float WHITE = ${glslFloat(SPICA_WHITE)};
 const float RANGE_THRESHOLD = ${glslFloat(SPICA_RANGE_THRESHOLD)};
-const float GAIN_SCALE = ${glslFloat(SPICA_GAIN_SCALE)};
 ${trapGlsl("C_DETAIL", SPICA_CURVE_DETAIL)}
 ${trapGlsl("C_RANGE", SPICA_CURVE_RANGE)}
 ${trapGlsl("C_MID", SPICA_CURVE_MID)}
@@ -1031,9 +1195,11 @@ void main() {
   }
 
   float detail = (s - ${glslFloat(SPICA_WEIGHT_SUM)} * y) * u_isoGain;
-  float gain = GAIN_SCALE * min(
+  // Three of the engine's config values ride on the ISO (worker sony/spica.py):
+  // the detail scale above, the gain scale here and the range curve's a/b.
+  float gain = u_gainScale * min(
     min(spicaTrap(abs(detail) / ${glslFloat(SPICA_DETAIL_DIVISOR)}, C_DETAIL, C_DETAIL_V),
-        spicaTrap(range, C_RANGE, C_RANGE_V)),
+        spicaTrap(range, C_RANGE + vec4(u_rangeShift, u_rangeShift, 0.0, 0.0), C_RANGE_V)),
     spicaTrap(mid, C_MID, C_MID_V));
   // Both shifts at once: the weights sum to 512 and the gain is on a 512 scale.
   float filtered = clamp(y + gain * detail / ${glslFloat(SPICA_WEIGHT_SUM * SPICA_WEIGHT_SUM)},
@@ -1046,8 +1212,236 @@ void main() {
   outColor = vec4(clamp(rgb + delta, 0.0, 1.0), 1.0);
 }`;
 
+// ===== Sony in-camera chroma cleanup — the other half of ZcTaskSIMDMarble =====
+// The engine's stage, decoded bit for bit in worker sony/marble.py (each step
+// verified 100% against the engine's own buffers captured at export); this is
+// that port in float. It runs last in the chain, on the 14-bit display RGB, and
+// touches chroma only:
+//
+//   gamut_fwd   sRGB EOTF -> 3x3 /8192 matrix -> clamp -> x^(256/563): the
+//               working space the stage converts back out of at the end.
+//   YCC         Y = (2884R+3523G+625B)/2048 + 4096, C1/C2 the two colour
+//               differences on a 32768 centre — the thresholds below are in
+//               these units, so the shaders keep them rather than normalising.
+//   marbleDown  chroma pair-mean 2:1 then a 4x4 box: everything to 1/4 res.
+//   marbleMean  cnr2: a 5x5 stride-2 window (+-4 texels at 1/4 res) whose
+//               neighbours are admitted only when their Y and chroma sit within
+//               thresholds derived from the centre's Y level and chroma
+//               magnitude; the mean of the admitted ones.
+//   marbleBlur  cnr3: [1 2 1;2 4 2;1 2 1]/16, mixed with the centre by p/256.
+//   marbleCompose  cnr4: bilinear upsample at the engine's centred phases (row
+//               phases 1/8..7/8, column phases 1/4, 3/4), a protect term that
+//               hands strongly red pixels their original C2 back, nearest 2x
+//               horizontal expansion (both pixels of a pair take the same
+//               cleaned chroma), blend with the original chroma by `amount`
+//               (ISO- and slider-dependent, rendering/sony-marble.ts), then the
+//               Q15 inverse YCC matrix and gamut_inv.
+//
+// Float against the engine's integers: the check in scripts/marble-check.ts
+// compares the four passes against the reference on a crop of the engine's own
+// tile input: 0.33/255 at the worst pixel and 0.10/255 on average, against a
+// stage that moves pixels by 24/255. The two edge conventions differ (the engine
+// zero-pads partial boxes at the far edge and leaves two rows undefined; here
+// everything clamps to the edge texel), which only reaches the outermost
+// pixels of the frame.
+const MARBLE_GLSL_COMMON = `
+precision highp int;
+// The engine's gamut matrices over 8192 (marble.py M_FWD / M_INV), written
+// column by column because that is how a GLSL constructor takes them; each
+// column here is one column of the engine's row-major table.
+const mat3 M_FWD = mat3(5042.0, 748.0, 115.0,
+                        3234.0, 6845.0, 595.0,
+                        -84.0, 599.0, 7481.0) / 8192.0;
+const mat3 M_INV = mat3(14306.0, -1555.0, -96.0,
+                        -6820.0, 10614.0, -739.0,
+                        707.0, -867.0, 9029.0) / 8192.0;
+// The tables index by v/16384 with v = rint(rgb*16383) and encode as
+// floor(16384*f): the normaliser is 16384 while white is 16383.
+const float NORM = 16384.0;
+const float WHITE14 = 16383.0;
+
+vec3 srgbEotf3(vec3 u) {
+  return mix(u / 12.92, pow((u + 0.055) / 1.055, vec3(2.4)), step(0.04045, u));
+}
+vec3 srgbOetf3(vec3 u) {
+  return mix(u * 12.92, 1.055 * pow(u, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, u));
+}
+// Display RGB 0..1 -> the stage's working RGB in 14-bit units (gamut_fwd).
+vec3 marbleGamutFwd(vec3 rgb) {
+  vec3 lin = srgbEotf3(clamp(rgb, 0.0, 1.0) * (WHITE14 / NORM));
+  vec3 w = clamp(M_FWD * lin, 0.0, WHITE14 / NORM);
+  return NORM * pow(w, vec3(256.0 / 563.0));
+}
+// The inverse: 14-bit working RGB -> display 0..1 (gamut_inv).
+vec3 marbleGamutInv(vec3 w) {
+  vec3 p = pow(clamp(w, 0.0, WHITE14) / NORM, vec3(563.0 / 256.0));
+  vec3 lin = clamp(M_INV * p, 0.0, WHITE14 / NORM);
+  return srgbOetf3(lin) * (NORM / WHITE14);
+}
+// 14-bit working RGB -> engine YCC (rgb_to_ycc): Y keeps its +4096 offset;
+// C1 and C2 are carried *without* the 32768 the engine adds, which is the
+// form the protect term wants and what keeps a 16F fallback target precise
+// where it matters. The engine clips the offset planes to 16 bits, so the
+// centred ones clip to [-32768, 32767].
+vec3 marbleYcc(vec3 w) {
+  return vec3(dot(w, vec3(2884.0, 3523.0, 625.0)) / 2048.0 + 4096.0,
+              clamp(dot(w, vec3(-1707.0, -2404.0, 4113.0)) / 2048.0, -32768.0, 32767.0),
+              clamp(dot(w, vec3(6860.0, -6848.0, -9.0)) / 2048.0, -32768.0, 32767.0));
+}
+// Engine YCC (centred chroma) -> 14-bit working RGB (ycc_to_rgb, the Q15 matrix).
+vec3 marbleYccToRgb(vec3 ycc) {
+  vec3 v = vec3(ycc.x - 4096.0, ycc.yz);
+  return clamp(vec3(dot(v, vec3(9542.0, -1438.0, 5414.0)),
+                    dot(v, vec3(9547.0, -1459.0, -4376.0)),
+                    dot(v, vec3(9538.0, 14864.0, -310.0))) / 32768.0,
+               0.0, WHITE14);
+}`;
+
 /**
- * The five offscreen programs of Sony's post chain, each with the uniforms the
+ * Full-res display RGB -> (Y, C1, C2) at 1/4 resolution. One texel here is the
+ * 4x4 block of scene texels starting at 4x its coordinate; the engine's 2:1
+ * chroma pair mean followed by its 4x4 box is, in float, just this 16-mean.
+ * Blocks past the edge (a width or height not divisible by 4) repeat the edge
+ * texel.
+ */
+export const MARBLE_DOWN_SHADER = `#version 300 es
+precision highp float;
+out vec4 outColor;
+uniform sampler2D u_scene;
+${MARBLE_GLSL_COMMON}
+void main() {
+  ivec2 size = textureSize(u_scene, 0);
+  ivec2 cell = ivec2(gl_FragCoord.xy) * 4;
+  vec3 acc = vec3(0.0);
+  for (int j = 0; j < 4; j++) {
+    for (int i = 0; i < 4; i++) {
+      ivec2 p = min(cell + ivec2(i, j), size - 1);
+      acc += marbleYcc(marbleGamutFwd(texelFetch(u_scene, p, 0).rgb));
+    }
+  }
+  outColor = vec4(acc / 16.0, 1.0);
+}`;
+
+/**
+ * cnr2 (marble.py cnr2_threshold_mean): the admitted-neighbour mean over the
+ * 25 taps at offsets {-4,-2,0,2,4}^2, centre included, so the count is never
+ * zero. The thresholds are the engine's, in its units: `t0` from the centre's
+ * Y level, `a1`/`a2` from its chroma magnitude, and the products scaled by
+ * the slider-dependent gain (p4c/p50) and clamped to 256..32768. The engine's
+ * (x*p+128)>>8 steps are plain divisions here. Y passes through.
+ */
+export const MARBLE_MEAN_SHADER = `#version 300 es
+precision highp float;
+out vec4 outColor;
+uniform sampler2D u_input;   // marbleDown's output
+uniform vec3 u_thrY;         // p30 (the Y window), p34, p38
+uniform vec3 u_thrC1;        // p3c, p40, p4c
+uniform vec3 u_thrC2;        // p44, p48, p50
+${MARBLE_GLSL_COMMON}
+void main() {
+  ivec2 size = textureSize(u_input, 0);
+  ivec2 at = ivec2(gl_FragCoord.xy);
+  vec3 c = texelFetch(u_input, at, 0).xyz;
+  float t0 = clamp(c.x * u_thrY.y / 256.0 + u_thrY.z, 0.0, 65535.0);
+  float a1 = clamp(c.y * u_thrC1.x / 256.0 + u_thrC1.y, 0.0, 65535.0);
+  float a2 = clamp(c.z * u_thrC2.x / 256.0 + u_thrC2.y, 0.0, 65535.0);
+  float thr1 = clamp(clamp(t0 * a1 / 256.0, 0.0, 65535.0) * u_thrC1.z / 256.0, 256.0, 32768.0);
+  float thr2 = clamp(clamp(t0 * a2 / 256.0, 0.0, 65535.0) * u_thrC2.z / 256.0, 256.0, 32768.0);
+  vec2 sum = vec2(0.0);
+  float n = 0.0;
+  for (int dy = -4; dy <= 4; dy += 2) {
+    for (int dx = -4; dx <= 4; dx += 2) {
+      vec3 s = texelFetch(u_input, clamp(at + ivec2(dx, dy), ivec2(0), size - 1), 0).xyz;
+      vec3 d = abs(c - s);
+      if (d.x <= u_thrY.x && d.y <= thr1 && d.z <= thr2) {
+        sum += s.yz;
+        n += 1.0;
+      }
+    }
+  }
+  outColor = vec4(c.x, sum / n, 1.0);
+}`;
+
+/**
+ * cnr3 (marble.py cnr3_blur): the 3x3 binomial on each chroma plane, mixed
+ * with the centre by p54/256 and p58/256 — (16*c*p + gauss*(256-p))/4096 is
+ * mix(gauss/16, c, p/256). Y passes through so the compose can sample one
+ * texture.
+ */
+export const MARBLE_BLUR_SHADER = `#version 300 es
+precision highp float;
+out vec4 outColor;
+uniform sampler2D u_input;   // marbleMean's output
+uniform vec2 u_centreMix;    // p54/256, p58/256
+${MARBLE_GLSL_COMMON}
+void main() {
+  ivec2 size = textureSize(u_input, 0);
+  ivec2 at = ivec2(gl_FragCoord.xy);
+  vec2 acc = vec2(0.0);
+  for (int dy = -1; dy <= 1; dy++) {
+    for (int dx = -1; dx <= 1; dx++) {
+      float w = float((2 - abs(dx)) * (2 - abs(dy)));
+      acc += w * texelFetch(u_input, clamp(at + ivec2(dx, dy), ivec2(0), size - 1), 0).yz;
+    }
+  }
+  vec3 c = texelFetch(u_input, at, 0).xyz;
+  outColor = vec4(c.x, mix(acc / 16.0, c.yz, u_centreMix), 1.0);
+}`;
+
+/**
+ * cnr4 and the return trip (marble.py cnr4_upsample, cnr4_protect, the
+ * amount blend, ycc_to_rgb, gamut_inv), one pass at full resolution.
+ *
+ * The upsample is the hardware's bilinear read of marbleBlur's target at the
+ * engine's phases. Half-res column hx (= x/2, the chroma pair) sits at 1/4-res
+ * texel coordinate hx/2 - 0.25 — phases 1/4 and 3/4 — and full-res row y at
+ * (y - 1.5)/4 — phases 1/8, 3/8, 5/8, 7/8 — so with texel i centred at index i
+ * the UV is ((hx/2 + 0.25)/W, ((y + 0.5)/4)/H) over the 1/4-res size. Those
+ * are the weights the engine's table holds (84/28/12/4 over 128) and the
+ * "+2, +1" grid offset its writes show. CLAMP_TO_EDGE is the engine's
+ * replicated far row and column. Both pixels of a pair read the same sample,
+ * which is the nearest 2x expansion.
+ *
+ * `tmp`, the original half-res C2 the protect term blends back in, is the pair
+ * mean of the two full-res samples and has to be rebuilt here — the scene
+ * holds RGB, not YCC — which is why this pass converts its partner too.
+ */
+export const MARBLE_COMPOSE_SHADER = `#version 300 es
+precision highp float;
+out vec4 outColor;
+uniform sampler2D u_scene;   // full-res display RGB, the compose output
+uniform sampler2D u_blur;    // marbleBlur's output, sampled LINEAR
+uniform vec4 u_protect;      // lo1*256, r1, lo2*256, r2 (sony-marble.ts)
+uniform float u_strength;    // 0..255, alpha = k*strength over 32768
+uniform float u_amount;      // 0 = off, 1 = fully cleaned
+${MARBLE_GLSL_COMMON}
+void main() {
+  ivec2 size = textureSize(u_scene, 0);
+  ivec2 at = ivec2(gl_FragCoord.xy);
+  int hx = at.x / 2;
+  ivec2 partner = ivec2(min(2 * hx + 1 - (at.x & 1), size.x - 1), at.y);
+  vec3 own = marbleYcc(marbleGamutFwd(texelFetch(u_scene, at, 0).rgb));
+  vec3 other = marbleYcc(marbleGamutFwd(texelFetch(u_scene, partner, 0).rgb));
+  float tmp = 0.5 * (own.z + other.z);
+
+  vec2 lo = vec2(textureSize(u_blur, 0));
+  vec2 uv = vec2((float(hx) * 0.5 + 0.25) / lo.x, (float(at.y) + 0.5) * 0.25 / lo.y);
+  vec2 u = texture(u_blur, uv).yz;
+
+  // Protect: k = ((min(s1, c2) + 32768) >> 16) in 0..128, alpha = k*strength.
+  const float FULL = 8388608.0;   // 2^23
+  float s1 = FULL - clamp((abs(u.x) - u_protect.x) * u_protect.y, 0.0, FULL);
+  float c2 = clamp((u.y - u_protect.z) * u_protect.w, 0.0, FULL);
+  float k = clamp(floor(min(s1, c2) / 65536.0 + 0.5), 0.0, 128.0);
+  float alpha = k * u_strength / 32768.0;
+  vec2 cleaned = vec2(u.x, mix(u.y, tmp, alpha));
+
+  vec2 cc = clamp(mix(own.yz, cleaned, u_amount), -32768.0, 32767.0);
+  outColor = vec4(marbleGamutInv(marbleYccToRgb(vec3(own.x, cc))), 1.0);
+}`;
+
+/**
+ * The offscreen programs of Sony's post chain, each with the uniforms the
  * renderer resolves for it. The list lives beside the shaders rather than in
  * pipeline-renderer so a test can hold the two in lock-step: a name that drifts
  * makes getUniformLocation return null, and gl.uniform1f(null, x) is a silent
@@ -1055,134 +1449,9 @@ void main() {
  *
  * `down`/`edge`/`blur` are Clarity's alone; `compose` applies sharpening and
  * Clarity and is built whenever either is on; `spica` runs between the two and
- * only when it is on.
+ * only when it is on; the four `marble*` passes are the chroma cleanup, which
+ * runs after the compose when the profile carries it and NR is on.
  */
-export const CHROMA_SUBSAMPLE = 8;
-export const CHROMA_COEF_RADIUS = 1;   // at the decimated scale, so 8 full-res
-export const CHROMA_EPS = 1e-4;
-
-/**
- * How much of the filtered chroma survives — `u_amount` in the compose pass,
- * and the same number as DEFAULT_AMOUNT in the worker's chromanr.py.
- *
- * It is the only axis here with real range. CHROMA_COEF_RADIUS is what a
- * levels setting collapses to at this subsample — every band up to 8 full-res
- * pixels is this one 3x3 box — and CHROMA_EPS only bites while it is
- * comparable to the guide's own variance, which on a photograph is dominated
- * by luma detail.
- *
- * 0.90 minimises mean |log(llr/Edit)| of absolute colour difference over all
- * sixteen engine captures: geometric mean 0.98, median 1.01. It replaced 1.0,
- * which scored 0.543 to this one's 0.351 and over-cleaned at a geometric mean
- * of 0.67. Deliberately ISO-independent, unlike Spica and RawNR: fitting an
- * ISO term moves the score by one percent. See measured-chroma-gap.md 2.11.
- */
-export const CHROMA_AMOUNT = 0.9;
-
-// Rec.601, matching the engine's own inverse: ZcTaskYCC2RGB (RVA 0x3713e0) holds
-// 14020, 3441, 7141 and 17720 over a Y coefficient of 10000, and its midpoint
-// offset 0x14ab0000 is exactly (3441 + 7141) * 32768. Not Rec.709 — the engine's
-// chroma axes are 601 and the round trip has to use the pair it uses.
-const CHROMA_GLSL_COMMON = `
-const vec3 CY = vec3(0.299, 0.587, 0.114);
-const float CR2R = 1.4020, CB2G = 0.3441, CR2G = 0.7141, CB2B = 1.7720;`;
-
-// ===== Sony in-camera chroma cleanup — the other half of ZcTaskSIMDMarble =====
-// The notes only ever recorded Clarity. Hooked on Marble's own input and output
-// at full resolution, the fine-scale colour differences also fall 11x to 21x
-// while the whole-tile standard deviation stays put and luma moves 0.3%, and the
-// output's fine chroma band is *uncorrelated* with the input's (|r| <= 0.032) —
-// so the band is removed, not shrunk. sony_repro/notes/measured-chroma-gap.md
-// 2.7; the reference and its calibration are in worker sony/chromanr.py.
-//
-// A plain scale split reproduced the flat-area numbers and still washed small
-// saturated marks out on hard boundaries: a flat area has no edges, so the metric
-// that drove the calibration could not see it. Guiding by luma fixes that and
-// follows from the measurement — Marble leaves luma alone, so luma still carries
-// every edge.
-//
-// Three passes, the standard fast guided filter. The exact filter is 17x17 taps
-// over four moments per pixel, which is no GPU pass; computing the coefficients
-// on an 8x decimated pair and upsampling them bilinearly is, and it is the form
-// the worker calibrates, so what ships is what was measured.
-export const CHROMA_MOMENT_SHADER = `#version 300 es
-precision highp float;
-in vec2 v_uv;
-out vec4 outColor;
-uniform sampler2D u_scene;
-uniform vec2 u_sceneTexel;   // one full-res texel
-uniform float u_second;      // 0 = (Y, Cr, Cb, Y*Y), 1 = (Y*Cr, Y*Cb, 0, 0)
-${CHROMA_GLSL_COMMON}
-const int S = ${CHROMA_SUBSAMPLE};
-void main() {
-  // Sixteen bilinear reads cover the 8x8 box: each lands on a texel corner so
-  // the hardware averages a 2x2 for free. Sampling all 64 costs four times as
-  // much for the same mean.
-  vec4 acc = vec4(0.0);
-  for (int j = 0; j < S / 2; j++) {
-    for (int i = 0; i < S / 2; i++) {
-      vec2 off = (vec2(float(i), float(j)) * 2.0 - float(S) * 0.5 + 1.0) * u_sceneTexel;
-      vec3 c = max(texture(u_scene, v_uv + off).rgb, 0.0);
-      float y = dot(c, CY);
-      vec3 ycc = vec3(y, (c.r - y) / CR2R, (c.b - y) / CB2B);
-      acc += (u_second > 0.5)
-        ? vec4(ycc.x * ycc.y, ycc.x * ycc.z, 0.0, 0.0)
-        : vec4(ycc, ycc.x * ycc.x);
-    }
-  }
-  outColor = acc / float((S / 2) * (S / 2));
-}`;
-
-export const CHROMA_COEF_SHADER = `#version 300 es
-precision highp float;
-in vec2 v_uv;
-out vec4 outColor;
-uniform sampler2D u_m1;      // (meanY, meanCr, meanCb, meanYY)
-uniform sampler2D u_m2;      // (meanYCr, meanYCb, -, -)
-uniform vec2 u_texel;        // one decimated texel
-const int R = ${CHROMA_COEF_RADIUS};
-const float EPS = ${CHROMA_EPS};
-void main() {
-  vec4 s1 = vec4(0.0);
-  vec2 s2 = vec2(0.0);
-  for (int j = -R; j <= R; j++) {
-    for (int i = -R; i <= R; i++) {
-      vec2 off = vec2(float(i), float(j)) * u_texel;
-      s1 += texture(u_m1, v_uv + off);
-      s2 += texture(u_m2, v_uv + off).rg;
-    }
-  }
-  float n = float((2 * R + 1) * (2 * R + 1));
-  s1 /= n; s2 /= n;
-  float varY = max(s1.a - s1.r * s1.r, 0.0);
-  vec2 cov = s2 - s1.r * s1.gb;
-  vec2 a = cov / (varY + EPS);
-  vec2 b = s1.gb - a * s1.r;
-  outColor = vec4(a, b);
-}`;
-
-export const CHROMA_COMPOSE_SHADER = `#version 300 es
-precision highp float;
-in vec2 v_uv;
-out vec4 outColor;
-uniform sampler2D u_scene;
-uniform sampler2D u_coef;    // (a_cr, a_cb, b_cr, b_cb), sampled LINEAR
-uniform float u_amount;      // 0 = off, 1 = fully cleaned
-${CHROMA_GLSL_COMMON}
-void main() {
-  vec3 c = texture(u_scene, v_uv).rgb;
-  float y = dot(c, CY);
-  vec4 ab = texture(u_coef, v_uv);
-  // Luma is carried through untouched; only the two differences are rebuilt.
-  vec2 cc = ab.xy * y + ab.zw;
-  vec2 orig = vec2((c.r - y) / CR2R, (c.b - y) / CB2B);
-  cc = mix(orig, cc, clamp(u_amount, 0.0, 1.0));
-  outColor = vec4(y + CR2R * cc.x,
-                  y - CB2G * cc.y - CR2G * cc.x,
-                  y + CB2B * cc.y,
-                  1.0);
-}`;
-
 export const SONY_POST_PROGRAMS = {
   down: { fsSource: CLARITY_DOWN_SHADER, uniforms: ["u_input", "u_cell", "u_taps"] },
   edge: { fsSource: CLARITY_EDGE_SHADER, uniforms: ["u_input", "u_texel", "u_threshold"] },
@@ -1193,19 +1462,14 @@ export const SONY_POST_PROGRAMS = {
   },
   spica: {
     fsSource: SPICA_SHADER,
-    uniforms: ["u_scene", "u_weights", "u_lut", "u_sceneTexel", "u_amount", "u_isoGain"],
+    uniforms: ["u_scene", "u_weights", "u_lut", "u_sceneTexel", "u_amount", "u_isoGain", "u_gainScale", "u_rangeShift"],
   },
-  chromaMoment: {
-    fsSource: CHROMA_MOMENT_SHADER,
-    uniforms: ["u_scene", "u_sceneTexel", "u_second"],
-  },
-  chromaCoef: {
-    fsSource: CHROMA_COEF_SHADER,
-    uniforms: ["u_m1", "u_m2", "u_texel"],
-  },
-  chromaCompose: {
-    fsSource: CHROMA_COMPOSE_SHADER,
-    uniforms: ["u_scene", "u_coef", "u_amount"],
+  marbleDown: { fsSource: MARBLE_DOWN_SHADER, uniforms: ["u_scene"] },
+  marbleMean: { fsSource: MARBLE_MEAN_SHADER, uniforms: ["u_input", "u_thrY", "u_thrC1", "u_thrC2"] },
+  marbleBlur: { fsSource: MARBLE_BLUR_SHADER, uniforms: ["u_input", "u_centreMix"] },
+  marbleCompose: {
+    fsSource: MARBLE_COMPOSE_SHADER,
+    uniforms: ["u_scene", "u_blur", "u_protect", "u_strength", "u_amount"],
   },
 } as const;
 
@@ -1221,7 +1485,7 @@ export interface PassDef {
 export const PASSES: PassDef[] = [
   { name: "process", fsSource: PROCESS_SHADER, uniforms: [
     "u_texXform", "u_bgColor",
-    "u_wbMatrix", "u_exposure", "u_displayGamut",
+    "u_wbMatrix", "u_exposure", "u_sonyLinearExposure", "u_displayGamut",
     "u_highlights", "u_shadows",
     "u_vibrance", "u_saturation", "u_clarity", "u_dehaze",
     "u_tonalActive", "u_hslActive", "u_maskShift", "u_hasMask",
@@ -1232,6 +1496,10 @@ export const PASSES: PassDef[] = [
     "u_grad_blend","u_grad_balance",
     "u_curve_lut", "u_curveActive", "u_hasProfileCurve", "u_profileCurveSrgb",
     "u_sonyChromaActive", "u_sonyCross", "u_sonyGain", "u_sonyLuma", "u_sonySat",
+    "u_sonyLumaLutActive", "u_sonyLumaLut",
+    "u_sonyLumaLutAdvActive", "u_sonyLumaLutAdv", "u_sonyLumaAdvContrast",
+    "u_sonyCSActive", "u_sonyCS",
+    "u_sonyLut3dActive", "u_sony_lut3d",
     "u_sepiaActive", "u_sepiaWeights", "u_sepia_lut",
     "u_droActive", "u_dro_lut", "u_droScale",
     "u_droGridActive", "u_dro_grid", "u_droGridDims", "u_droGridU", "u_droGridV",

@@ -6,10 +6,11 @@
  */
 
 import {
-  CHROMA_SUBSAMPLE,
+  SPICA_GAIN_SCALE,
   SONY_POST_PROGRAMS, type SonyPostProgramName,
   MASK_BLUR_SHADER, MASK_DOWNSAMPLE_SHADER, MASK_VERTEX_SHADER, PASSES, VERTEX_SHADER,
 } from "./passes";
+import { type MarbleUniforms, type ProfileMarble, marbleUniforms } from "./sony-marble";
 import {
   SPICA_CODE_COUNT, SPICA_LUT, SPICA_TABLE_COUNT, SPICA_TAP_COUNT, SPICA_WEIGHTS,
 } from "./spica-tables";
@@ -73,9 +74,30 @@ export type ProfileChroma = {
   gain: number[];
   lumaPivot: number;
   lumaContrast: number;
+  // YGamma's table, indexed before that pivot/contrast line: 16384 entries, in
+  // and out on the engine's 0..16383 scale. Standard and Neutral carry a
+  // highlight knee here (slope 0.90625 above Y=8192) and the other eight looks
+  // are near identity, so leaving it out lifts a Standard frame's highlights by
+  // 2-3% and clips them (worker sony/chroma.py). Absent for an older response.
+  lumaLut?: number[] | null;
+  // The pair Imaging Edge's "advanced colour reproduction" swaps in: the same
+  // stage, the other dump, and a contrast of 17280/16384 whatever the look's own
+  // entry says. They travel with the standard pair because the switch that
+  // selects them is a redraw here — it is the same switch that adds the 3-D LUT
+  // (setSonyAdvancedColour), which is one setting in Imaging Edge and so is one
+  // setting here. Absent for an older response, which leaves the switch as the
+  // 3-D LUT alone.
+  lumaLutAdvanced?: number[] | null;
+  lumaContrastAdvanced?: number | null;
   // `gain` arrives already divided by this; the shader multiplies it back after
   // the clamp, which is the shot's Saturation setting.
   saturation: number;
+  // ChromaSuppres, which the engine runs between RGB2YCC and YGamma: the
+  // mid-tones keep 255/256 of their chroma and the highlights fade out above
+  // hiY (worker sony/chromasuppres.py). Engine units, so the shader puts the
+  // luma back on the 0..16383 scale before reading them. Absent when the shot
+  // carries no such calibration, which leaves the chroma alone.
+  suppress?: { hiY: number; loY: number; slopeHi: number; slopeLo: number } | null;
   // Sepia's toning stage, absent for the nine looks that do not tone.
   sepia?: SepiaToning | null;
 };
@@ -153,6 +175,10 @@ export type ProfileSharpen = {
 export type ProfileSpica = {
   amount: number;
   isoGain: number;
+  /** `cfg[0xc4] / 2048` for the shot's ISO; absent on profiles from before the ISO ramps were known. */
+  gainScale?: number;
+  /** The range trapezoid's a/b offset for the shot's ISO; absent likewise. */
+  rangeShift?: number;
 };
 /** A texture with the framebuffer that renders into it (see makeRenderTarget). */
 type RenderTarget = { tex: WebGLTexture; fbo: WebGLFramebuffer };
@@ -174,18 +200,21 @@ type SonyPostTargets = {
   // this and `scene`, so whichever it wrote last is the one the compose reads.
   // Null when Spica is off, which is when nothing needs an intermediate.
   mid: RenderTarget | null;
-  // Marble's other half, the chroma cleanup (passes.ts; reference and
-  // calibration in worker sony/chromanr.py). `m1`/`m2` hold the moments at
-  // CHROMA_SUBSAMPLE, `coef` the guided filter's a and b, and `out` is a
-  // full-resolution buffer for the compose to write into — the compose otherwise
-  // writes straight to the destination and nothing can run after it.
+  // Marble's other half, the chroma cleanup (passes.ts marble* shaders,
+  // reference and calibration in worker sony/marble.py). `down`, `mean` and
+  // `blur` are the three 1/4-resolution planes the engine's cnr1..cnr3 work on,
+  // each holding (Y, C1, C2); `out` is a full-resolution buffer for the *sharpen
+  // and Clarity* compose to write into, because marbleCompose has to read a
+  // finished frame and cannot read the texture it is writing.
   //
   // Null whenever the stage is off *or* any of the four will not allocate, and
   // then every line below behaves exactly as it did before this existed. That is
   // deliberate: the stage defaults to off, so the path this shares with Clarity
   // and Spica is untouched until someone turns it on.
-  chroma: {
-    m1: RenderTarget; m2: RenderTarget; coef: RenderTarget; out: RenderTarget;
+  marble: {
+    down: RenderTarget; mean: RenderTarget; blur: RenderTarget; out: RenderTarget;
+    // The 1/4-res grid the first three run on: ceil(w/4) x ceil(h/4), because a
+    // partial 4x4 block at the far edge still gets a texel, as the engine's does.
     w: number; h: number;
   } | null;
   // Render texels per source pixel, capped at 1. Sharpening and Spica step in
@@ -199,13 +228,12 @@ export type ProfileCurve =
     lut: Float32Array; srgbBasis: boolean; chroma?: ProfileChroma | null;
     dro?: ProfileDro | null; clarity?: ProfileClarity | null;
     sharpen?: ProfileSharpen | null; spica?: ProfileSpica | null;
-    // How much of Marble's chroma cleanup to apply, 0..1. Absent or 0 leaves the
-    // post chain byte-for-byte as it was before the stage existed — the profile
-    // has to ask for it. Edit runs the stage unconditionally, but reproducing it
-    // is not 1: CHROMA_AMOUNT (0.9) is what matches Edit's output over the
-    // corpus, and 1 over-cleans. Callers should pass that constant rather than
-    // a literal.
-    chromaNr?: number | null;
+    // Marble's chroma cleanup: the shot's ISO and threshold calibration as the
+    // worker sent them, plus where Edit's 色彩降噪 control (0..10, 5 = Auto)
+    // sits. Everything the four marble* passes need is derived from these by
+    // sony-marble.ts; null — the default — leaves the post chain exactly as it
+    // was before the stage existed.
+    marble?: (ProfileMarble & { slider: number }) | null;
   }
   | null;
 
@@ -277,6 +305,69 @@ const DCP_DIMS_UNIFORM: Record<DcpSlot, string> = {
 // Texture units 0–6 are taken (source, curve, profile curve, mask, sepia, DRO
 // LUT, DRO grid); these follow on.
 const DCP_TEX_UNIT: Record<DcpSlot, number> = { hsm: 7, look: 8, match: 9 };
+/** YGamma's table, on the first unit past the DCP ones. */
+const SONY_LUMA_LUT_UNIT = 10;
+// 16384 entries laid out as a square rather than a 16384x1 strip: MAX_TEXTURE_SIZE
+// is only guaranteed to be 2048 in WebGL2, so the strip would be illegal on a
+// conforming device. 128 is a power of two, which keeps the shader's index split
+// to a mask and a shift.
+const SONY_LUMA_LUT_W = 128;
+const SONY_LUMA_LUT_SIZE = SONY_LUMA_LUT_W * SONY_LUMA_LUT_W;
+/** Sony's 3-D LUT, on the unit after YGamma's table. */
+const SONY_LUT3D_UNIT = 11;
+/**
+ * YGamma's *advanced* table, which "advanced colour reproduction" swaps in for
+ * the one above. A second texture rather than a re-upload of the first: the
+ * switch is meant to be flipped back and forth, and holding both costs 64 KB
+ * against rebuilding 16384 floats on every flip. Unit 12 of the 16 WebGL2
+ * guarantees per stage.
+ */
+const SONY_LUMA_LUT_ADV_UNIT = 12;
+// 33 per axis, which is well inside WebGL2's guaranteed MAX_3D_TEXTURE_SIZE of
+// 256 — checked anyway, because a device that cannot hold it must leave the
+// switch inert rather than render something wrong.
+const SONY_LUT3D_N = 33;
+const SONY_LUT3D_LEN = SONY_LUT3D_N * SONY_LUT3D_N * SONY_LUT3D_N * 3;
+const SONY_LUT3D_URL = "sony-lut3d.bin";
+
+// The asset, fetched at most once per page and shared by every renderer — the
+// preview's and the off-screen one each export builds. null once a fetch has
+// failed, which is what makes the switch inert with a single warning rather
+// than one per redraw.
+let sonyLut3dData: Int16Array | null = null;
+let sonyLut3dPending: Promise<Int16Array | null> | null = null;
+
+/**
+ * Sony's static 3-D LUT: 33x33x33 int16 triples, little-endian, in [iu][iv][iy]
+ * order with the Y axis fastest (sony_repro/tools/make_lut3d_asset.py writes it
+ * from the worker's own table, and passes.ts sonyLut3dPoint documents the fetch
+ * coordinate that layout implies).
+ *
+ * The table is static — one dump out of the engine reproduces two bodies, two
+ * frames and all eleven Creative Looks bit-exactly — so it is an asset rather
+ * than something the decode carries, and one fetch serves the whole session.
+ */
+export function loadSonyLut3d(): Promise<Int16Array | null> {
+  if (sonyLut3dData) return Promise.resolve(sonyLut3dData);
+  sonyLut3dPending ??= fetch(`${import.meta.env.BASE_URL}${SONY_LUT3D_URL}`)
+    .then(async (res) => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const buf = await res.arrayBuffer();
+      const data = new Int16Array(buf);
+      if (data.length !== SONY_LUT3D_LEN) {
+        throw new Error(`expected ${SONY_LUT3D_LEN} int16, got ${data.length}`);
+      }
+      sonyLut3dData = data;
+      return data;
+    })
+    .catch((err: unknown) => {
+      // One line, once: the stage is optional, and a page that cannot fetch it
+      // should keep rendering everything else rather than log per frame.
+      console.warn("[llr] Sony advanced colour reproduction unavailable:", err);
+      return null;
+    });
+  return sonyLut3dPending;
+}
 
 /**
  * base64 IEEE half floats -> the Uint16Array texImage3D takes for HALF_FLOAT.
@@ -348,6 +439,22 @@ export class PipelineRenderer {
   private profileCurveSrgb = false;
   // Sony's RGB2YCC terms, applied right after the curve. null = no such stage.
   private profileChroma: ProfileChroma | null = null;
+  // YGamma's table as a 128x128 R32F texture, read with texelFetch: the engine
+  // indexes it with a truncated integer Y, so nothing here may filter.
+  private sonyLumaLutTex: WebGLTexture | null = null;
+  private sonyLumaLutActive = false;
+  // ...and the same table under "advanced colour reproduction", which swaps both
+  // the table and the contrast. Held beside the standard one so the switch stays
+  // a redraw; the shader picks between them on u_sonyLut3dActive.
+  private sonyLumaLutAdvTex: WebGLTexture | null = null;
+  private sonyLumaLutAdvActive = false;
+  // Sony's 3-D LUT (ZcTask3DLut, "advanced colour reproduction"). A user switch
+  // and a render-time one: the table is static, so turning it on costs a redraw
+  // and never a re-decode. `wanted` is what the user asked for and `Tex` is
+  // whether the asset actually arrived — the stage runs only when both hold.
+  private sonyLut3dWanted = false;
+  private sonyLut3dTex: WebGLTexture | null = null;
+  private sonyLut3dLoaded = false;
   private sepiaLutTex: WebGLTexture | null = null;
   private sepiaActive = false;
   // Sony's DRO gain table. null = nothing to apply, which is the common case.
@@ -425,15 +532,17 @@ export class PipelineRenderer {
   private sonyClarity: ProfileClarity | null = null;
   private sonySharpen: ProfileSharpen | null = null;
   private sonySpica: ProfileSpica | null = null;
-  //: Marble's chroma cleanup, 0 = off. Zero unless the profile asks, so the
-  //: chain below is unchanged until it does.
-  private sonyChromaNr = 0;
-  // Its four buffers, cached together under one size key as [m1, m2, coef, out].
-  // One entry rather than four maps because they are allocated and dropped as a
-  // unit, and stored as an array so evictOldest frees them without a special
-  // case. Not cachedMidTarget: that hands back the *same* target for the same
-  // size, and the compose would end up reading the texture it is writing.
-  private sonyChromaTargets = new Map<string, RenderTarget[]>();
+  // Marble's chroma cleanup: every number its four passes need, resolved from
+  // the profile and the colour-NR slider once per profile rebuild rather than
+  // per frame. Null — the default — means the chain below is unchanged.
+  private sonyMarble: MarbleUniforms | null = null;
+  // Its four buffers, cached together under one size key as
+  // [down, mean, blur, out]. One entry rather than four maps because they are
+  // allocated and dropped as a unit, and stored as an array so evictOldest frees
+  // them without a special case. Not cachedMidTarget: that hands back the *same*
+  // target for the same size, and marbleCompose would end up reading the texture
+  // the compose before it is writing.
+  private sonyMarbleTargets = new Map<string, RenderTarget[]>();
   // Spica's two constant tables, uploaded once and shared by every draw. They
   // are the operator's shape rather than anything per-shot, so unlike the other
   // stages' numbers they are textures instead of uniforms — 2500 weights will
@@ -764,6 +873,8 @@ export class PipelineRenderer {
     this.profileCurveSrgb = curve?.srgbBasis ?? false;
     this.profileChroma = curve?.chroma ?? null;
     this.uploadSepiaLUT(curve?.chroma?.sepia ?? null);
+    this.uploadSonyLumaLUT(curve?.chroma?.lumaLut ?? null, false);
+    this.uploadSonyLumaLUT(curve?.chroma?.lumaLutAdvanced ?? null, true);
     this.uploadDroLUT(curve?.dro ?? null);
     // Neither post stage needs a texture of its own — every constant is a
     // uniform, so a moved Clarity slider costs one uniform upload and a redraw.
@@ -775,7 +886,12 @@ export class PipelineRenderer {
     this.sonySharpen = sharpen && sharpen.amount > 0 ? sharpen : null;
     const spica = curve?.spica ?? null;
     this.sonySpica = spica && spica.amount > 0 ? spica : null;
-    this.sonyChromaNr = Math.max(0, Math.min(1, curve?.chromaNr ?? 0));
+    // Marble's numbers are the slider applied to the body's calibration
+    // (sony-marble.ts). An amount of zero means the blend would put the
+    // original chroma back untouched, so the stage is dropped outright.
+    const marble = curve?.marble ?? null;
+    const uniforms = marble ? marbleUniforms(marble, marble.slider) : null;
+    this.sonyMarble = uniforms && uniforms.amount > 0 ? uniforms : null;
     this.uploadSonyPostUniforms();
   }
 
@@ -911,6 +1027,114 @@ export class PipelineRenderer {
     this.sepiaLutTex = this.writeLut(this.sepiaLutTex, data, 4);
   }
 
+  /**
+   * YGamma's table, verbatim. Unlike every other LUT here it is *not* resampled
+   * onto the shared grid: the engine indexes it with a truncated integer Y, so
+   * resampling to 2048 entries with linear filtering would round the highlight
+   * knee off — the one thing the table is carried for. Values stay on the
+   * engine's 0..16383 scale; the shader divides after the fetch.
+   *
+   * `advanced` selects the second copy, which is the same table as Imaging
+   * Edge's 高级 dumped it. Both are uploaded on every profile change and the
+   * shader chooses, so flipping the switch never touches a texture.
+   */
+  private uploadSonyLumaLUT(lut: number[] | null | undefined, advanced: boolean): void {
+    const gl = this.gl;
+    const active = lut != null && lut.length === SONY_LUMA_LUT_SIZE;
+    if (advanced) this.sonyLumaLutAdvActive = active;
+    else this.sonyLumaLutActive = active;
+    if (!active || !lut) return;
+    const data = new Float32Array(SONY_LUMA_LUT_SIZE);
+    for (let i = 0; i < SONY_LUMA_LUT_SIZE; i++) data[i] = lut[i]!;
+    let tex = advanced ? this.sonyLumaLutAdvTex : this.sonyLumaLutTex;
+    if (!tex) {
+      tex = gl.createTexture();
+      if (advanced) this.sonyLumaLutAdvTex = tex;
+      else this.sonyLumaLutTex = tex;
+    }
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, SONY_LUMA_LUT_W, SONY_LUMA_LUT_W, 0,
+      gl.RED, gl.FLOAT, data);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+
+  /**
+   * Turn Sony's "advanced colour reproduction" on or off.
+   *
+   * One switch, two effects, exactly as in Imaging Edge: YGamma runs off the
+   * advanced table and contrast (already uploaded with the profile), and
+   * ZcTask3DLut runs after it. The 3-D LUT's asset is the only part that has to
+   * be fetched, which is what this awaits.
+   *
+   * A redraw, not a re-decode: the table is static, so nothing about the
+   * decoded pixels depends on the switch. The returned promise settles once the
+   * asset is in a texture (or once its fetch has failed) — await it before
+   * drawing on a path that cannot repaint later, which is what the export does;
+   * the preview can fire and redraw when it resolves.
+   *
+   * Turning it off keeps the texture: the switch is a toggle, and re-fetching
+   * 210 KB every time someone compares the two is the wrong trade.
+   */
+  async setSonyAdvancedColour(on: boolean): Promise<void> {
+    this.sonyLut3dWanted = on;
+    if (!on || this.sonyLut3dLoaded) return;
+    const data = await loadSonyLut3d();
+    if (data) this.uploadSonyLut3d(data);
+  }
+
+  /**
+   * The 3-D LUT as an RGB16I texture, read with texelFetch and never filtered:
+   * the shader reproduces the engine's own integer trilinear weights, so the
+   * hardware must hand it the grid points untouched.
+   */
+  private uploadSonyLut3d(data: Int16Array): void {
+    const gl = this.gl;
+    const limit = gl.getParameter(gl.MAX_3D_TEXTURE_SIZE) as number;
+    if (limit < SONY_LUT3D_N) {
+      console.warn(`[llr] MAX_3D_TEXTURE_SIZE is ${limit}; Sony advanced colour reproduction needs ${SONY_LUT3D_N}`);
+      return;
+    }
+    const tex = this.ensureSonyLut3dTexture();
+    gl.bindTexture(gl.TEXTURE_3D, tex);
+    // int16 rows are 2-byte aligned, and a 33-wide RGB row is 198 bytes — not a
+    // multiple of 4, so the default alignment would tear every other row.
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 2);
+    gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGB16I, SONY_LUT3D_N, SONY_LUT3D_N, SONY_LUT3D_N,
+      0, gl.RGB_INTEGER, gl.SHORT, data);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    gl.bindTexture(gl.TEXTURE_3D, null);
+    this.sonyLut3dLoaded = true;
+  }
+
+  /**
+   * The 3-D LUT's texture, created empty on first use. It exists even before
+   * the asset arrives because an integer sampler3D left pointing at unit 0
+   * would read the (2D) source texture, which some drivers treat as an error
+   * even when every fetch is branched around.
+   */
+  private ensureSonyLut3dTexture(): WebGLTexture {
+    const gl = this.gl;
+    if (!this.sonyLut3dTex) {
+      this.sonyLut3dTex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_3D, this.sonyLut3dTex);
+      gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGB16I, 1, 1, 1, 0, gl.RGB_INTEGER, gl.SHORT,
+        new Int16Array(3));
+      // Integer textures cannot filter at all — NEAREST is the only legal
+      // setting, and an incomplete texture is what LINEAR would leave behind.
+      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+      gl.bindTexture(gl.TEXTURE_3D, null);
+    }
+    return this.sonyLut3dTex;
+  }
+
   draw(params: Partial<EditParams> = {}): void {
     if (!this.sourceTex) return;
     const p = { ...DEFAULT_PARAMS, ...params };
@@ -992,6 +1216,19 @@ export class PipelineRenderer {
       gl.bindTexture(gl.TEXTURE_2D, this.droGridTex);
       gl.uniform1i(this.uniforms["u_dro_grid"], 6);
     }
+    if (this.sonyLumaLutTex) {
+      gl.activeTexture(gl.TEXTURE0 + SONY_LUMA_LUT_UNIT);
+      gl.bindTexture(gl.TEXTURE_2D, this.sonyLumaLutTex);
+      gl.uniform1i(this.uniforms["u_sonyLumaLut"], SONY_LUMA_LUT_UNIT);
+    }
+    if (this.sonyLumaLutAdvTex) {
+      gl.activeTexture(gl.TEXTURE0 + SONY_LUMA_LUT_ADV_UNIT);
+      gl.bindTexture(gl.TEXTURE_2D, this.sonyLumaLutAdvTex);
+      gl.uniform1i(this.uniforms["u_sonyLumaLutAdv"], SONY_LUMA_LUT_ADV_UNIT);
+    }
+    gl.activeTexture(gl.TEXTURE0 + SONY_LUT3D_UNIT);
+    gl.bindTexture(gl.TEXTURE_3D, this.ensureSonyLut3dTexture());
+    gl.uniform1i(this.uniforms["u_sony_lut3d"], SONY_LUT3D_UNIT);
     // Bound unconditionally, unlike the 2D LUTs above: a sampler3D left pointing
     // at unit 0 would read the (2D) source texture, which is an incomplete-
     // texture error on some drivers even though the fetch is branched around.
@@ -1024,7 +1261,7 @@ export class PipelineRenderer {
    */
   private prepareSonyPost(w: number, h: number, xform: Float32Array): SonyPostTargets | null {
     if (!this.sonyPostSupported) return null;
-    if (!this.sonyClarity && !this.sonySharpen && !this.sonySpica && this.sonyChromaNr <= 0) return null;
+    if (!this.sonyClarity && !this.sonySharpen && !this.sonySpica && !this.sonyMarble) return null;
     if (!this.postProgram("compose")) return null;
 
     const float = this.sceneNeedsFloat();
@@ -1042,13 +1279,13 @@ export class PipelineRenderer {
     if (this.sonySpica && !mid) this.sonySpica = null;
     // Same all-or-nothing rule as Spica's: if the stage's programs or buffers
     // will not build, it drops out and the rest of the chain still runs.
-    let chroma: SonyPostTargets["chroma"] = null;
-    if (this.sonyChromaNr > 0
-      && this.postProgram("chromaMoment") && this.postProgram("chromaCoef")
-      && this.postProgram("chromaCompose")) {
-      chroma = this.cachedChromaTargets(w, h);
+    let marble: SonyPostTargets["marble"] = null;
+    if (this.sonyMarble
+      && this.postProgram("marbleDown") && this.postProgram("marbleMean")
+      && this.postProgram("marbleBlur") && this.postProgram("marbleCompose")) {
+      marble = this.cachedMarbleTargets(w, h);
     }
-    if (!this.sonyClarity) return { scene, base: null, mid, chroma, detailScale };
+    if (!this.sonyClarity) return { scene, base: null, mid, marble, detailScale };
     if (!this.postProgram("down") || !this.postProgram("edge") || !this.postProgram("blur")) return null;
 
     const down = this.sonyClarity.downsample;
@@ -1056,7 +1293,7 @@ export class PipelineRenderer {
     const bh = Math.max(1, Math.min(h, Math.round((this.texHeight * zoom) / down)));
     const pair = this.cachedBasePair(bw, bh);
     if (!pair) return null;
-    return { scene, base: { pair, w: bw, h: bh }, mid, chroma, detailScale };
+    return { scene, base: { pair, w: bw, h: bh }, mid, marble, detailScale };
   }
 
   /**
@@ -1074,9 +1311,15 @@ export class PipelineRenderer {
    * Spica needs it for a different reason and needs it more: its classifier
    * compares neighbours against a range threshold of 8/16383, which 8-bit
    * quantisation cannot even represent — every pixel would read as flat.
+   *
+   * Marble is the third: it is a denoiser, so the thing it is measuring *is*
+   * the last couple of bits. Its 4x4 box averages sixteen scene pixels, and at
+   * 8 bits every one of them is already on the same 64/16383 grid the box would
+   * otherwise be averaging away — the noise it exists to remove would arrive
+   * pre-quantised into bands.
    */
   private sceneNeedsFloat(): boolean {
-    return this.sonySharpen !== null || this.sonySpica !== null;
+    return this.sonySharpen !== null || this.sonySpica !== null || this.sonyMarble !== null;
   }
 
   /**
@@ -1121,35 +1364,52 @@ export class PipelineRenderer {
    * so that a preview and a histogram at different sizes cannot evict it.
    */
   /**
-   * The chroma stage's four buffers, or null if any of them will not build.
+   * Marble's four buffers, or null if any of them will not build.
    *
    * All-or-nothing on purpose: a half-allocated set would leave the compose
    * writing into a buffer nothing reads, i.e. a black frame. Returning null
    * instead drops the stage and the rest of the chain runs as before, the same
    * contract Spica's intermediate has.
    *
-   * The moments need float storage — they carry Y*Y and Y*Cr, and an 8-bit
-   * target would quantise the variance to nothing — and `coef` is sampled at
-   * full resolution, which is where the guided filter's bilinear upsample comes
-   * from. makeRenderTarget already sets LINEAR on both axes.
+   * The three small planes are RGBA32F, with RGBA16F as the fallback. They
+   * carry the engine's own YCC units — Y around 4096 and the colour differences
+   * over +-32768 — and 16F has an 11-bit mantissa, so a chroma value near the
+   * top of that range quantises to steps of 16. That is small against the
+   * smallest threshold cnr2 can be clamped to (256) but not nothing; 32F is
+   * exact there.
+   *
+   * The fallback is gated on OES_texture_float_linear rather than on the format
+   * being renderable, because makeRenderTarget sets LINEAR on both axes and
+   * `blur` is genuinely read through the filter (the upsample's phases are what
+   * stands in for the engine's weight table). Without that extension enabled an
+   * RGBA32F texture with a LINEAR filter is *incomplete*: every sample, even a
+   * texelFetch, silently reads zero and the whole stage comes back black with
+   * no GL error to find. RGBA16F is filterable in core WebGL2, so it always
+   * works.
+   *
+   * The grid is ceil(w/4) x ceil(h/4): a partial 4x4 block at the far edge
+   * still gets its own texel, as the engine's box does.
    */
-  private cachedChromaTargets(w: number, h: number): SonyPostTargets["chroma"] {
+  private cachedMarbleTargets(w: number, h: number): SonyPostTargets["marble"] {
     const gl = this.gl;
-    const lo = Math.max(1, Math.floor(w / CHROMA_SUBSAMPLE));
-    const loH = Math.max(1, Math.floor(h / CHROMA_SUBSAMPLE));
+    const lo = Math.max(1, Math.ceil(w / 4));
+    const loH = Math.max(1, Math.ceil(h / 4));
     const key = `${w}x${h}`;
-    const shape = (set: RenderTarget[]): SonyPostTargets["chroma"] =>
-      ({ m1: set[0], m2: set[1], coef: set[2], out: set[3], w: lo, h: loH });
-    const hit = this.sonyChromaTargets.get(key);
+    const shape = (set: RenderTarget[]): SonyPostTargets["marble"] =>
+      ({ down: set[0], mean: set[1], blur: set[2], out: set[3], w: lo, h: loH });
+    const hit = this.sonyMarbleTargets.get(key);
     if (hit) {
-      this.sonyChromaTargets.delete(key);
-      this.sonyChromaTargets.set(key, hit);
+      this.sonyMarbleTargets.delete(key);
+      this.sonyMarbleTargets.set(key, hit);
       return shape(hit);
     }
+    const fmt = this.floatLinear ? gl.RGBA32F : gl.RGBA16F;
+    const small = () => this.makeRenderTarget(lo, loH, fmt, gl.RGBA, gl.FLOAT)
+      ?? this.makeRenderTarget(lo, loH, gl.RGBA16F, gl.RGBA, gl.FLOAT);
     const set = [
-      this.makeRenderTarget(lo, loH, gl.RGBA16F, gl.RGBA, gl.FLOAT),
-      this.makeRenderTarget(lo, loH, gl.RGBA16F, gl.RGBA, gl.FLOAT),
-      this.makeRenderTarget(lo, loH, gl.RGBA16F, gl.RGBA, gl.FLOAT),
+      small(), small(), small(),
+      // The full-resolution handoff only ever holds a display-referred frame,
+      // so it wants the scene's format rather than the planes' precision.
       this.makeRenderTarget(w, h, gl.RGBA16F, gl.RGBA, gl.FLOAT),
     ];
     if (set.some(t => !t)) {
@@ -1161,8 +1421,8 @@ export class PipelineRenderer {
       return null;
     }
     const made = set as RenderTarget[];
-    this.sonyChromaTargets.set(key, made);
-    this.evictOldest(this.sonyChromaTargets, 2);
+    this.sonyMarbleTargets.set(key, made);
+    this.evictOldest(this.sonyMarbleTargets, 2);
     return shape(made);
   }
 
@@ -1355,10 +1615,10 @@ export class PipelineRenderer {
       src = dst;
     }
 
-    // With the chroma stage on, the compose lands in its own buffer so there is
-    // something for it to read; with it off this is `fbo` and the line below is
-    // the same draw it always was.
-    const composeDst = t.chroma ? t.chroma.out.fbo : fbo;
+    // With Marble on, the compose lands in its own buffer so there is something
+    // for it to read; with it off this is `fbo` and the line below is the same
+    // draw it always was.
+    const composeDst = t.marble ? t.marble.out.fbo : fbo;
     this.blitQuad(compose.prog, src.tex, composeDst, () => {
       // The sharpen kernel steps in scene texels — three of them either way,
       // which is what the engine's three sensor pixels become here.
@@ -1377,56 +1637,62 @@ export class PipelineRenderer {
       gl.activeTexture(gl.TEXTURE0);
     });
 
-    if (t.chroma) this.runChromaNr(t.chroma, fbo, w, h);
+    if (t.marble && this.sonyMarble) this.runMarble(t.marble, this.sonyMarble, fbo, w, h);
   }
 
   /**
-   * Marble's chroma cleanup: the fast guided filter, three passes.
+   * Marble's chroma cleanup (ZcTaskSIMDMarble), four passes, the float port of
+   * the bit-exact reference in worker sony/marble.py — its docstring is the
+   * specification and the shaders in passes.ts carry the step-by-step notes.
    *
-   * Moments at CHROMA_SUBSAMPLE (run twice, six quantities across two RGBA
-   * targets), then a and b from a 3x3 box over them, then a full-resolution
-   * rebuild that samples the coefficients bilinearly — which is what stands in
-   * for the exact filter's second box, and what makes this three passes instead
-   * of 17x17 taps over four moments per pixel.
+   *   marbleDown     the finished frame through gamut_fwd and RGB->YCC, then
+   *                  the engine's 2:1 chroma pair mean and 4x4 box in one
+   *                  16-tap average: (Y, C1, C2) at 1/4 resolution.
+   *   marbleMean     cnr2, the 5x5 stride-2 admitted-neighbour mean.
+   *   marbleBlur     cnr3, the 3x3 binomial mixed back with the centre.
+   *   marbleCompose  cnr4's bilinear upsample at the engine's centred phases,
+   *                  the protect term, the amount blend, and the way back out
+   *                  through the inverse YCC matrix and gamut_inv.
    *
-   * Verified against worker/sony/chromanr.py in `scripts/chroma-check.ts`: on a
-   * colour step riding a luma step both keep 66.9% at +-8px and 100.0% at
-   * +-16px, and chroma noise on a flat field falls 13x while luma moves 1.3e-7.
+   * Only the first three run at 1/4 resolution; the compose is full-res and
+   * writes straight to the destination, which is why `out` exists — it is what
+   * the sharpen/Clarity compose wrote and what these four read.
+   *
+   * Checked against the reference on a crop of the engine's own tile input by
+   * `scripts/marble-check.ts`.
    */
-  private runChromaNr(
-    c: NonNullable<SonyPostTargets["chroma"]>, fbo: WebGLFramebuffer | null,
-    w: number, h: number,
+  private runMarble(
+    m: NonNullable<SonyPostTargets["marble"]>, p: MarbleUniforms,
+    fbo: WebGLFramebuffer | null, w: number, h: number,
   ): void {
     const gl = this.gl;
-    const moment = this.sonyPostProgs.get("chromaMoment")!;
-    const coef = this.sonyPostProgs.get("chromaCoef")!;
-    const compose = this.sonyPostProgs.get("chromaCompose")!;
+    const down = this.sonyPostProgs.get("marbleDown")!;
+    const mean = this.sonyPostProgs.get("marbleMean")!;
+    const blur = this.sonyPostProgs.get("marbleBlur")!;
+    const compose = this.sonyPostProgs.get("marbleCompose")!;
 
-    gl.viewport(0, 0, c.w, c.h);
-    for (const [dst, second] of [[c.m1, 0], [c.m2, 1]] as [RenderTarget, number][]) {
-      this.blitQuad(moment.prog, c.out.tex, dst.fbo, () => {
-        gl.uniform2f(moment.u["u_sceneTexel"]!, 1 / w, 1 / h);
-        gl.uniform1f(moment.u["u_second"]!, second);
-      });
-    }
-    this.blitQuad(coef.prog, c.m1.tex, c.coef.fbo, () => {
-      // blitQuad binds the first sampler on unit 0; the second needs saying.
-      gl.uniform1i(coef.u["u_m1"]!, 0);
-      gl.uniform1i(coef.u["u_m2"]!, 1);
-      gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D, c.m2.tex);
-      gl.activeTexture(gl.TEXTURE0);
-      gl.uniform2f(coef.u["u_texel"]!, 1 / c.w, 1 / c.h);
+    gl.viewport(0, 0, m.w, m.h);
+    this.blitQuad(down.prog, m.out.tex, m.down.fbo);
+    this.blitQuad(mean.prog, m.down.tex, m.mean.fbo, () => {
+      gl.uniform3f(mean.u["u_thrY"]!, p.thrY[0], p.thrY[1], p.thrY[2]);
+      gl.uniform3f(mean.u["u_thrC1"]!, p.thrC1[0], p.thrC1[1], p.thrC1[2]);
+      gl.uniform3f(mean.u["u_thrC2"]!, p.thrC2[0], p.thrC2[1], p.thrC2[2]);
+    });
+    this.blitQuad(blur.prog, m.mean.tex, m.blur.fbo, () => {
+      gl.uniform2f(blur.u["u_centreMix"]!, p.centreMix[0], p.centreMix[1]);
     });
 
     gl.viewport(0, 0, w, h);
-    this.blitQuad(compose.prog, c.out.tex, fbo, () => {
+    this.blitQuad(compose.prog, m.out.tex, fbo, () => {
+      // blitQuad binds the first sampler on unit 0; the second needs saying.
       gl.uniform1i(compose.u["u_scene"]!, 0);
-      gl.uniform1i(compose.u["u_coef"]!, 1);
+      gl.uniform1i(compose.u["u_blur"]!, 1);
       gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D, c.coef.tex);
+      gl.bindTexture(gl.TEXTURE_2D, m.blur.tex);
       gl.activeTexture(gl.TEXTURE0);
-      gl.uniform1f(compose.u["u_amount"]!, this.sonyChromaNr);
+      gl.uniform4f(compose.u["u_protect"]!, p.protect[0], p.protect[1], p.protect[2], p.protect[3]);
+      gl.uniform1f(compose.u["u_strength"]!, p.strength);
+      gl.uniform1f(compose.u["u_amount"]!, p.amount);
     });
   }
 
@@ -1494,6 +1760,8 @@ export class PipelineRenderer {
       gl.useProgram(spica.prog);
       gl.uniform1f(spica.u["u_amount"]!, this.sonySpica?.amount ?? 0);
       gl.uniform1f(spica.u["u_isoGain"]!, this.sonySpica?.isoGain ?? 1);
+      gl.uniform1f(spica.u["u_gainScale"]!, this.sonySpica?.gainScale ?? SPICA_GAIN_SCALE);
+      gl.uniform1f(spica.u["u_rangeShift"]!, this.sonySpica?.rangeShift ?? 0);
       // The samplers, bound once: the tables never move between draws.
       gl.uniform1i(spica.u["u_scene"]!, 0);
       gl.uniform1i(spica.u["u_weights"]!, 1);
@@ -1512,7 +1780,7 @@ export class PipelineRenderer {
     this.evictOldest(this.sonySceneTargets, 0);
     this.evictOldest(this.sonyBaseTargets, 0);
     this.evictOldest(this.sonyMidTargets, 0);
-    this.evictOldest(this.sonyChromaTargets, 0);
+    this.evictOldest(this.sonyMarbleTargets, 0);
   }
 
   /**
@@ -1808,6 +2076,17 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     if (this.curveLutTex) gl.deleteTexture(this.curveLutTex);
     if (this.profileLutTex) gl.deleteTexture(this.profileLutTex);
     if (this.sepiaLutTex) gl.deleteTexture(this.sepiaLutTex);
+    // Nulled as well as deleted: uploadSonyLumaLUT creates on null, and release()
+    // leaves the context alive for a later renderer on the same canvas.
+    if (this.sonyLumaLutTex) gl.deleteTexture(this.sonyLumaLutTex);
+    this.sonyLumaLutTex = null;
+    if (this.sonyLumaLutAdvTex) gl.deleteTexture(this.sonyLumaLutAdvTex);
+    this.sonyLumaLutAdvTex = null;
+    if (this.sonyLut3dTex) gl.deleteTexture(this.sonyLut3dTex);
+    this.sonyLut3dTex = null;
+    // The GL object is gone but the fetched bytes are not — they are shared and
+    // static — so a later renderer re-uploads without a second fetch.
+    this.sonyLut3dLoaded = false;
     for (const slot of DCP_SLOTS) {
       if (this.dcpTableTex[slot]) gl.deleteTexture(this.dcpTableTex[slot]);
       this.dcpTableTex[slot] = null;
@@ -1859,6 +2138,26 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     i("u_profileCurveSrgb", this.profileCurveSrgb ? 1 : 0);
     const chroma = this.profileChroma;
     i("u_sonyChromaActive", chroma ? 1 : 0);
+    // Edit's exposure compensation is a linear gain ahead of DRO, not the
+    // shouldered exposure; a profile with the Sony chroma stage is Edit's chain.
+    i("u_sonyLinearExposure", chroma ? 1 : 0);
+    // ChromaSuppres rides inside sonyChroma, so it can only run when that does
+    // — and only when the shot brought terms for it.
+    i("u_sonyCSActive", chroma?.suppress ? 1 : 0);
+    // Same gate, and for the same reason: the table is YGamma's, which only
+    // runs inside sonyChroma. An older response brings no table and renders as
+    // the pivot/contrast line alone, which is what this build used to do.
+    i("u_sonyLumaLutActive", chroma && this.sonyLumaLutActive && this.sonyLumaLutTex ? 1 : 0);
+    // The advanced table, on the same gate. The shader takes it only when the
+    // 3-D LUT is running too, so this flag says "it arrived", not "use it" — an
+    // older response brings none and the switch stays the 3-D LUT alone.
+    i("u_sonyLumaLutAdvActive",
+      chroma && this.sonyLumaLutAdvActive && this.sonyLumaLutAdvTex ? 1 : 0);
+    // Three gates, and each is load-bearing: the stage lives inside sonyChroma
+    // so it needs a Sony render, the user has to have asked for it (Edit's own
+    // default is the stage off), and the asset has to have arrived — a failed
+    // fetch leaves the switch inert rather than rendering a zero table.
+    i("u_sonyLut3dActive", chroma && this.sonyLut3dWanted && this.sonyLut3dLoaded ? 1 : 0);
     i("u_sepiaActive", this.sepiaActive && this.sepiaLutTex ? 1 : 0);
     i("u_droActive", this.droActive && this.droLutTex ? 1 : 0);
     v2("u_droScale", this.droScale[0], this.droScale[1]);
@@ -1875,7 +2174,14 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
       gl.uniform4f(this.uniforms["u_sonyCross"]!, c[0], c[1], c[2], c[3]);
       gl.uniform4f(this.uniforms["u_sonyGain"]!, g[0], g[1], g[2], g[3]);
       gl.uniform2f(this.uniforms["u_sonyLuma"]!, chroma.lumaPivot, chroma.lumaContrast);
+      // 高级's own contrast, which the shader takes together with the advanced
+      // table. Falls back to the shot's, so a response with the table but no
+      // contrast cannot silently apply 1.0.
+      gl.uniform1f(this.uniforms["u_sonyLumaAdvContrast"]!,
+        chroma.lumaContrastAdvanced ?? chroma.lumaContrast);
       gl.uniform1f(this.uniforms["u_sonySat"]!, chroma.saturation);
+      const cs = chroma.suppress;
+      if (cs) gl.uniform4f(this.uniforms["u_sonyCS"]!, cs.hiY, cs.loY, cs.slopeHi, cs.slopeLo);
       const w = chroma.sepia?.weights;
       if (w) gl.uniform3f(this.uniforms["u_sepiaWeights"]!, w[0]!, w[1]!, w[2]!);
     }

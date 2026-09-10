@@ -34,10 +34,16 @@
 import { writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { MASK_VERTEX_SHADER, SPICA_SHADER } from "../src/rendering/passes";
+import { MASK_VERTEX_SHADER, SPICA_GAIN_SCALE, SPICA_SHADER } from "../src/rendering/passes";
 import { SPICA_CODE_COUNT, SPICA_LUT, SPICA_TABLE_COUNT, SPICA_TAP_COUNT, SPICA_WEIGHTS }
   from "../src/rendering/spica-tables";
 
+// The two per-ISO numbers the shader takes as uniforms (worker sony/spica.py).
+// They have to be set or the gain is zero and the stage does nothing — which
+// reads as "sharpening is inverted" rather than as a missing uniform. Base ISO
+// is the shape these tests were written against.
+const GAIN_SCALE = SPICA_GAIN_SCALE;
+const RANGE_SHIFT = 0;
 const N = 32;                 // patch size; wide enough that the +-3 diamond stays interior
 const MARGIN = 4;             // the border reads outside the patch — ignore it
 const AMOUNT = 0.5;           // the camera's default blend
@@ -50,6 +56,7 @@ const FS = ${JSON.stringify(SPICA_SHADER)};
 const WEIGHTS = ${JSON.stringify(Array.from(SPICA_WEIGHTS))};
 const LUT = ${JSON.stringify(Array.from(SPICA_LUT))};
 const N = ${N}, MARGIN = ${MARGIN}, AMOUNT = ${AMOUNT};
+const GAIN_SCALE = ${GAIN_SCALE}, RANGE_SHIFT = ${RANGE_SHIFT};
 const TAPS = ${SPICA_TAP_COUNT}, TABLES = ${SPICA_TABLE_COUNT}, CODES = ${SPICA_CODE_COUNT};
 
 const out = document.getElementById("out");
@@ -129,6 +136,8 @@ if (!gl || !gl.getExtension("EXT_color_buffer_float")) {
     gl.uniform2f(u("u_sceneTexel"), 1 / N, 1 / N);
     gl.uniform1f(u("u_amount"), AMOUNT);
     gl.uniform1f(u("u_isoGain"), 1);
+    gl.uniform1f(u("u_gainScale"), GAIN_SCALE);
+    gl.uniform1f(u("u_rangeShift"), RANGE_SHIFT);
     gl.bindVertexArray(vao);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     const px = new Float32Array(N * N * 4);

@@ -63,6 +63,14 @@ _LUMA = np.array([0.299, 0.587, 0.114], dtype=np.float32)
 #:
 #: 4 is kept because it is what the GLSL implements and because the exact form
 #: (subsample < 2), where the radius does bite, agrees with it there.
+# 2026-09-10: levels 5 / eps 1e-2 / amount 1.0 was tried against Marble's own
+# input/output tiles at export (the fine-band residual landed on the engine's
+# noise floor) and retracted the same day: on the whole frame that setting pulls
+# Cb/Cr sigma to 0.955 / 0.917 of Edit's export and mid-tone saturation to
+# 0.93-0.95, where this one holds 1.011 / 1.000 -- a guided filter with a
+# large eps shrinks real colour along with the noise, and a residual measured on
+# noise-dominated tiles cannot see it (sony_repro/tools/colour_check.py,
+# notes/measured-chroma-gap.md 2.23). Any future retune has to pass both.
 DEFAULT_LEVELS = 4
 
 #: How much of the filtered chroma survives, matching CHROMA_COMPOSE_SHADER's

@@ -15,6 +15,7 @@ const en = {
   "action.undo": "Undo (Ctrl+Z)",
   "action.redo": "Redo (Ctrl+Shift+Z)",
   "action.crop": "Crop & Straighten (R)",
+  "action.resetAll": "Reset all edits",
   "action.compareOriginal": "Hold to compare original ( \\ )",
   "action.compareJpeg": "Hold to compare camera JPEG ( | )",
   "aria.undo": "Undo",
@@ -44,6 +45,16 @@ const en = {
   "status.importing": "Importing…",
   "status.decodedIn": "Decoded in {ms}ms",
   "zoom.fit": "Fit",
+
+  // Edit rail tabs
+  "rail.tabs": "Edit groups",
+  "tab.light": "Light",
+  "tab.color": "Color",
+  "tab.curve": "Tone Curve",
+  "tab.detail": "Detail",
+  "tab.look": "Creative Look",
+  "tab.crop": "Crop & Straighten (R)",
+  "tab.settings": "Settings",
 
   // Crop panel
   "panel.crop": "Crop & Straighten",
@@ -110,6 +121,11 @@ const en = {
   // menu. See STYLE_NAMES in App.vue.
   "look.asShotSuffix": " · as shot",
   "look.borrowedHint": "This look is newer than the camera. Its tone curve is Sony's own, identical across bodies; its colour comes from a body that ships it.",
+  // Imaging Edge's own wording is a two-position radio (Standard / Advanced);
+  // a switch says the same thing in one row, because Standard is the setting
+  // this one is off at. Both halves of what Advanced changes are behind it.
+  "look.advancedColour": "Advanced colour reproduction",
+  "look.advancedColourHint": "Imaging Edge's own Advanced setting: the engine's tone stage switches to its Advanced curve and a 3-D lookup table runs after it. Bright saturated colour loses brightness and saturation, highlights come down, and the brightest colour goes neutral — which is how the camera renders its own JPEG. Off by default, as it is in Imaging Edge.",
   "look.sharpening": "Sharpening",
   "look.sharpeningValue": "{level} · range {range}",
   "look.sharpeningHint": "The body's own sharpening, reproduced on the finished frame. SharpnessRange splits it between a coarse pass and a fine one (Spica); both are applied. Its kernel reaches three sensor pixels, so only an export at full size matches the camera exactly.",
@@ -178,7 +194,7 @@ const en = {
   "curveRegion.lights": "Lights",
   "curveRegion.darks": "Darks",
   "curveRegion.shadows": "Shadows",
-  "curve.splits": "Range Splits",
+  "curve.splits": "Splits",
   "curvePreset.linear": "Linear",
   "curvePreset.mediumContrast": "Medium Contrast",
   "curvePreset.strongContrast": "Strong Contrast",
@@ -206,6 +222,7 @@ const zh: Record<MessageKey, string> = {
   "action.undo": "撤销 (Ctrl+Z)",
   "action.redo": "重做 (Ctrl+Shift+Z)",
   "action.crop": "裁剪并拉直 (R)",
+  "action.resetAll": "重置全部编辑",
   "action.compareOriginal": "按住对比原图 ( \\ )",
   "action.compareJpeg": "按住对比相机 JPEG ( | )",
   "aria.undo": "撤销",
@@ -233,6 +250,16 @@ const zh: Record<MessageKey, string> = {
   "status.importing": "导入中…",
   "status.decodedIn": "解码耗时 {ms} 毫秒",
   "zoom.fit": "适应",
+
+  // Edit rail tabs
+  "rail.tabs": "编辑分组",
+  "tab.light": "光效",
+  "tab.color": "颜色",
+  "tab.curve": "色调曲线",
+  "tab.detail": "细节",
+  "tab.look": "创意外观",
+  "tab.crop": "裁剪并拉直 (R)",
+  "tab.settings": "设置",
 
   "panel.crop": "裁剪并拉直",
   "crop.aspect": "长宽比",
@@ -290,6 +317,8 @@ const zh: Record<MessageKey, string> = {
   "panel.creativeLook": "创意外观",
   "look.asShotSuffix": " · 拍摄时",
   "look.borrowedHint": "该外观比这台机身新。色调曲线是索尼原厂的（跨机身逐字节一致），色彩取自搭载它的机身。",
+  "look.advancedColour": "高级色彩复制",
+  "look.advancedColourHint": "Imaging Edge 的「色彩复制 = 高级」：色调那一级换成高级档自己的曲线，之后再过一张三维查找表。明亮的高饱和色会被压暗、压饱和，高光整体下压，最亮处的色彩直接收回中性——机内 JPEG 就是这么出片的。默认关，和 Imaging Edge 一致。",
   "look.sharpening": "机内锐化",
   "look.sharpeningValue": "{level} · 范围 {range}",
   "look.sharpeningHint": "机身自己的锐化，在成片上复现。锐化范围把它拆成粗细两段（细端为 Spica），两段都已应用。核的跨度是三个传感器像素，因此只有全尺寸导出才与相机完全一致。",
