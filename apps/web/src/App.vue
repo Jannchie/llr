@@ -14,7 +14,7 @@ import {
   ASPECT_PRESETS,
   type AspectPreset, type CropState,
 } from "./rendering/crop";
-import { API, fetchLinear, fetchLookProfile, type ColorProfileMeta, type LookTweaks, type LookTweakKey } from "./api";
+import { API, fetchLinear, fetchLookProfile, type ColorProfileMeta, type DenoisePayload, type LookTweaks, type LookTweakKey } from "./api";
 import { type PersistedEdit } from "./persistence";
 import { gradingTint, gradingHueDeg } from "./rendering/grading";
 import { parseLensCorr, mixLensTable, LENS_IDENTITY, type LensCorr } from "./rendering/lens";
@@ -275,6 +275,14 @@ const isRawSource = ref(true);
 // does — adapted or manual glass writes none — and the Lens panel is nothing
 // but a blend of those tables, so this is what says the panel has a job.
 const lensCorrAvailable = ref(false);
+// Whether Color NR reaches this frame's denoiser, reported by the decode. Not a
+// setting and not a constant: a Sony RAW runs the transcription of Sony's own
+// filter, which has no such control, while a frame without its noise tags falls
+// back to the wavelet, where it works. Reported rather than inferred here so the
+// worker stays the one place that knows which denoiser ran — inferring it from
+// `activeProfileKind` would guess, and guess wrong on a Sony RAW rendered
+// through the DCP path.
+const denoiseUsesChroma = ref(true);
 // Fitted camera-match table (see worker fit_profile.py): pulls the DCP render
 // toward the camera's own JPEG. On by default — it is the point of the profile —
 // but toggleable to compare against Adobe's uncorrected look. Only meaningful
@@ -287,8 +295,29 @@ const hasCameraMatch = ref(false);
 // edge and chroma ride Edit.exe's own 0..100 scale with 50 neutral, and go to
 // the API unscaled — unlike amount. Edge sets how much fine detail survives
 // (the camera's own value at 50); chroma scales the colour-noise threshold.
+//
+// On by default, in Auto. Off was the wrong default and it showed: a frame
+// exported with it off carries the demosaic's own noise straight through, and
+// the tone curve's slope in the shadows lifts it into visible horizontal and
+// vertical texture -- measured at 1.87 axial/diagonal energy in the 2.0-2.7px
+// band against 0.93 with denoising on and 1.23 for the camera's own JPEG
+// (sony_repro/tools/aniso_confirm.py, notes/measured-chroma-gap.md 2.14).
+// Edit's equivalent stage is not something the user turns on either.
+//
+// `auto` is Edit's Auto: the worker replaces `amount` with the strength the
+// engine ramps to for this shot's ISO -- four tenths up to ISO 400, full from
+// ISO 1600. amount stays 100 so that unticking Auto lands on full strength
+// rather than on whatever ISO happened to imply.
+//
+// There is one denoiser, and the goal is that it is Edit's. Which filter runs
+// is therefore not a user-facing choice and must not become one: offering a
+// "method" picker would let a session persist a setting meant to disappear.
+// The worker picks it (denoise.DEFAULT_MODEL), and falls back to the wavelet
+// for frames without Sony's noise tags. How faithful the reproduction is
+// belongs to the worker and is recorded there -- sony/rawnr_simd.py's module
+// docstring -- not copied here, where it goes stale unnoticed.
 const defaultDenoise = () => ({
-  enabled: false, model: "wavelet", amount: 100, edge: 50, chroma: 50,
+  enabled: true, auto: true, amount: 100, edge: 50, chroma: 50,
 });
 const denoise = reactive(defaultDenoise());
 const denoiseBusy = ref(false);
@@ -568,7 +597,12 @@ function setEditState(s: Snapshot): void {
   // Older snapshots have no aspect: fall back to "free" so a legacy crop box
   // that doesn't match the new default lock isn't reshaped by the next drag.
   cropAspect.value = s.aspect ?? "free";
-  Object.assign(denoise, s.denoise ?? defaultDenoise());
+  // Spread the defaults underneath rather than only when `denoise` is absent:
+  // Object.assign leaves keys the snapshot does not carry at whatever the
+  // previously loaded image left them, so a snapshot predating a field would
+  // inherit that field from its neighbour instead of from the default. `auto`
+  // is the first field to have a predecessor, and off is not its default.
+  Object.assign(denoise, { ...defaultDenoise(), ...(s.denoise ?? {}) });
   look.value = s.look ? { ...s.look } : null;
   lookStyle.value = s.lookStyle ?? null;
   droStrength.value = s.dro ?? null;
@@ -736,11 +770,9 @@ const embeddedTransform = computed(() => {
 // `settings.denoise` rather than this function's output. Swapping one for the
 // other silently changes the number by 100x, so keep them apart.
 // edge and chroma are *not* rescaled: 0..100 is the wire scale for those.
-function denoisePayload(d: typeof denoise = denoise): {
-  enabled: boolean; model: string; amount: number; edge: number; chroma: number;
-} {
+function denoisePayload(d: typeof denoise = denoise): DenoisePayload {
   return {
-    enabled: d.enabled, model: d.model, amount: d.amount / 100,
+    enabled: d.enabled, auto: d.auto, amount: d.amount / 100,
     edge: d.edge, chroma: d.chroma,
   };
 }
@@ -783,6 +815,7 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     // if the Lens group is worth offering. Reactive because lensCorr itself is
     // not — it is read by the render path, not by the template.
     lensCorrAvailable.value = lensCorr !== null;
+    denoiseUsesChroma.value = linMeta.denoiseUsesChroma;
     isRawSource.value = linMeta.colorProfile?.kind !== "rendered-image";
     // What the worker *actually* rendered with, which is not always what was
     // asked for: "sony" falls back to the DCP path on a RAW without Sony's
@@ -1981,11 +2014,24 @@ const vWheelAdjust = {
             <span class="switch-track"><span class="switch-thumb" /></span>
           </label>
         </div>
-        <SliderRow v-show="denoise.enabled" v-model="denoise.amount" style="margin-top: 6px;"
+        <!-- Auto is Edit's own: the strength follows the shot's ISO rather than
+             the slider. The worker resolves it, since ISO lives in the file. -->
+        <div class="control-row" v-show="denoise.enabled" style="margin-top: 6px;">
+          <label class="control-label" for="denoise-auto">{{ t('detail.denoiseAuto') }}</label>
+          <label class="switch">
+            <input id="denoise-auto" type="checkbox" v-model="denoise.auto" />
+            <span class="switch-track"><span class="switch-thumb" /></span>
+          </label>
+        </div>
+        <SliderRow v-show="denoise.enabled && !denoise.auto" v-model="denoise.amount" style="margin-top: 6px;"
           :label="t('detail.amount')" input-id="denoise-amount" :min="0" :max="100" :reset-value="100" />
         <!-- 50 is neutral for both: the camera's own detail-restore value, and
              the tuned chroma threshold. Reset therefore goes to 50, not 100. -->
-        <SliderRow v-show="denoise.enabled" v-model="denoise.chroma" style="margin-top: 6px;"
+        <!-- Color NR hides on frames whose denoiser ignores it — every Sony RAW,
+             since Sony's own filter has no such control. It still appears for
+             frames that fall back to the wavelet, where it works. The value is
+             kept either way, so it comes back if the frame changes. -->
+        <SliderRow v-show="denoise.enabled && denoiseUsesChroma" v-model="denoise.chroma" style="margin-top: 6px;"
           :label="t('detail.chromaNr')" input-id="denoise-chroma" :min="0" :max="100" :reset-value="50" />
         <SliderRow v-show="denoise.enabled" v-model="denoise.edge" style="margin-top: 6px;"
           :label="t('detail.edgeNr')" input-id="denoise-edge" :min="0" :max="100" :reset-value="50" />

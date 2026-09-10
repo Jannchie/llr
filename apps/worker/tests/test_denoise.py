@@ -1,5 +1,6 @@
 """Bayer pack/unpack plumbing and the CFA-support guard."""
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -8,6 +9,8 @@ import pytest
 from llr_worker.denoise import (
     _LUMA_CHROMA,
     _VST,
+    DEFAULT_MODEL,
+    FALLBACK_MODEL,
     PassthroughDenoiser,
     WaveletDenoiser,
     _CurveVST,
@@ -16,11 +19,14 @@ from llr_worker.denoise import (
     canonical_plane_order,
     cfa_is_bayer_2x2,
     denoise_raw_inplace,
+    effective_model,
     estimate_noise_model,
     get_denoiser,
+    model_uses_chroma,
     pack_bayer,
     unpack_bayer,
 )
+from llr_worker.sony.rawnr import NoiseModel
 
 RGGB_PATTERN = np.array([[0, 1], [3, 2]], dtype=np.uint8)  # Sony A7C II layout
 XTRANS_PATTERN = np.array(
@@ -210,8 +216,9 @@ def test_denoise_passes_the_cfa_and_the_noise_curve_through() -> None:
         name = "spy"
 
         def __call__(self, planes, sigma=None, cfa=None, noise=None, detail=None,
-                     *, chroma_scale=1.0):
-            seen.update(cfa=cfa, noise=noise, detail=detail, chroma=chroma_scale)
+                     *, chroma_scale=1.0, sensor_levels=None):
+            seen.update(cfa=cfa, noise=noise, detail=detail, chroma=chroma_scale,
+                        levels=sensor_levels)
             return planes
 
     raw = make_raw(random_mosaic(np.random.default_rng(31), 16, 16))
@@ -222,6 +229,13 @@ def test_denoise_passes_the_cfa_and_the_noise_curve_through() -> None:
     assert seen["noise"] is curve
     assert seen["detail"] == (0.97, 16.8)
     assert seen["chroma"] == 1.4
+    # The sensor's own levels ride along so a denoiser can undo the
+    # normalisation. SonyRawNRDenoiser cannot run without them: its thresholds
+    # are indexed by the raw level with black still in it, and handing it
+    # black-subtracted planes lifts the whole green plane by 512 levels.
+    black, white = seen["levels"]
+    assert list(black) == list(raw.black_level_per_channel)
+    assert white == float(raw.white_level)
 
 
 # ── End to end on synthetic sensor noise ──
@@ -454,3 +468,160 @@ def test_the_measured_curve_beats_a_fit_where_the_fit_cannot_reach() -> None:
     err_fit = float(np.abs(fitted - truth)[bright].mean())
     err_mea = float(np.abs(measured - truth)[bright].mean())
     assert err_mea < err_fit, f"measured {err_mea:.3g} did not beat fitted {err_fit:.3g}"
+
+
+# ── Sony's own filter ──
+
+
+def _sony_model(base: int = 13, slope: int = 78, hi: int = 2560) -> NoiseModel:
+    """A curve shaped like the ones the bodies here write.
+
+    These are DSC03036's actual tags (ISO 2000), so the thresholds the tests
+    below run at are the ones a real frame produces rather than round numbers.
+    """
+    return NoiseModel(lo=0, hi=hi, base=base, slope=slope)
+
+
+def _sony_case(seed: int, level: float = 1400.0, spread: float = 40.0,
+               shape: tuple[int, int] = (64, 64)) -> tuple[np.ndarray, np.ndarray, dict]:
+    """A noisy frame in raw levels, the same frame normalised, and the kwargs.
+
+    The Sony denoiser needs its inputs in two domains at once -- normalised
+    planes in, raw levels to compare against -- plus `cfa`, `noise` and
+    `sensor_levels` on every call. Building that inline made three tests
+    identical apart from the seed, so the next required kwarg would have been
+    four edits with a silent pass for whichever one was missed.
+    """
+    black = np.array([512.0] * 4, np.float32)
+    white = 16383.0
+    raw = np.random.default_rng(seed).normal(
+        level, spread, (*shape, 4)).astype(np.float32)
+    planes = ((raw - black) / (white - black)).astype(np.float32)
+    return raw, planes, {"cfa": ["R", "G", "G", "B"], "noise": _sony_model(),
+                         "sensor_levels": (black, white)}
+
+
+def test_the_sony_denoiser_refuses_without_the_camera_s_own_curve() -> None:
+    """Its thresholds are the operator, so there is nothing to fall back on.
+
+    Raising beats guessing here: the caller (cli.py) knows whether the file
+    carries the tags and falls back to the wavelet with a line on stderr, which
+    is diagnosable. A denoiser that quietly invented a threshold would render a
+    different picture with no way to tell.
+    """
+    d = get_denoiser("sony")
+    _, planes, kw = _sony_case(0, spread=0.0, shape=(32, 32))
+    with pytest.raises(ValueError, match="noise model"):
+        d(planes, **{**kw, "noise": None})
+    with pytest.raises(ValueError, match="sensor"):
+        d(planes, **{**kw, "sensor_levels": None})
+
+
+def test_the_sony_denoiser_leaves_a_flat_field_alone() -> None:
+    """Nothing to denoise means nothing changed, on all four phases.
+
+    This is the test that catches the domain error: run on black-subtracted
+    planes, green's `ref = c - d - 512` goes negative in the shadows, clamps at
+    zero, and the filter's closing `- offset` lifts the plane by 512 levels.
+    A constant field makes that a visible offset rather than a subtle one.
+    """
+    # A mid-shadow level, which is where the domain error showed up.
+    raw_level = 900.0
+    _, planes, kw = _sony_case(0, level=raw_level, spread=0.0, shape=(48, 48))
+    black, white = kw["sensor_levels"]
+    out = get_denoiser("sony")(planes, **kw)
+    assert out.shape == planes.shape
+    back = out * (white - black) + black
+    assert np.allclose(back, raw_level, atol=1.0), float(np.abs(back - raw_level).max())
+
+
+def test_the_sony_denoiser_works_in_raw_levels_not_normalised_ones() -> None:
+    """Green must behave like red and blue; the domain error made it not.
+
+    Measured on a real ISO 2000 frame, the four phases change by 1.27-1.59% of
+    their own mean. Black-subtracted they came out at 4.6/38.9/38.8/3.4 — green
+    an order of magnitude out, and lifted by 145 levels. So the property to
+    pin is that green does not stand apart, which is what a wrong domain breaks
+    and a right one cannot.
+    """
+    raw, planes, kw = _sony_case(11)
+    black, white = kw["sensor_levels"]
+    out = get_denoiser("sony")(planes, **kw)
+    back = out * (white - black) + black
+    drift = np.abs(back.mean(axis=(0, 1)) - raw.mean(axis=(0, 1)))
+    # No phase may drift by even a tenth of what the domain error cost green.
+    assert drift.max() < 14.0, list(drift)
+    changed = np.abs(back - raw).mean(axis=(0, 1)) / raw.mean(axis=(0, 1))
+    assert changed.max() < 4.0 * changed.min(), list(changed)
+
+
+def test_the_sony_denoiser_inverts_the_detail_restore_pair_exactly() -> None:
+    """`DetailRestore` travels dimensionless; this puts the engine's units back.
+
+    Both halves are recoverable — `fraction` is gain/256 and the limit is in
+    units of the threshold at `hi` — so the engine's own gain and limit reach
+    the filter unchanged. Checked by giving the pair a gain of zero, which is
+    the one setting whose effect is unmistakable: no detail restored at all,
+    so the output is the sigma filter's mean and strictly smoother.
+    """
+    _, planes, kw = _sony_case(13)
+    d = get_denoiser("sony")
+    full = d(planes, detail=(1.0, 20.0), **kw)
+    none = d(planes, detail=(0.0, 20.0), **kw)
+    assert float(none.std()) < float(full.std())
+
+
+def test_the_sony_denoiser_clamps_the_detail_gain_at_unity() -> None:
+    """The engine loads `min(tag, 256)`, so a tag above it must not amplify.
+
+    Sony's tags run 216..433 and the SIMD parameter block reads 256 for the
+    ones above unity — adopting the raw tag is the mistake `rawnr.py`'s
+    DETAIL_GAIN_UNIT documents. A fraction of 1.7 (a tag of 433) must land on
+    the same picture as a fraction of 1.0.
+    """
+    _, planes, kw = _sony_case(17)
+    d = get_denoiser("sony")
+    assert np.array_equal(d(planes, detail=(433 / 256, 20.0), **kw),
+                          d(planes, detail=(1.0, 20.0), **kw))
+
+
+def test_color_nr_does_not_reach_the_sony_denoiser_and_says_so() -> None:
+    """`uses_chroma` must match what the operator actually does with it.
+
+    The declaration is what keeps Color NR out of the decode cache key, so a
+    denoiser that quietly started (or stopped) consuming `chroma_scale` without
+    updating the flag would either serve stale pixels or re-decode for nothing.
+    Pin both halves: the flag, and the behaviour it claims.
+    """
+    _, planes, kw = _sony_case(19)
+    d = get_denoiser("sony")
+    assert d.uses_chroma is False
+    assert np.array_equal(d(planes, chroma_scale=0.1, **kw),
+                          d(planes, chroma_scale=4.0, **kw))
+    assert model_uses_chroma("sony") is False
+    # The wavelet does consume it, which is why the flag cannot be a constant.
+    assert model_uses_chroma("wavelet") is True
+
+
+def test_the_fallback_is_resolved_from_the_frame_not_assumed(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Which denoiser runs must be answerable *before* anything is keyed on it.
+
+    `sony` needs the camera's noise tags; a frame without them falls back to the
+    wavelet, and the two disagree about Color NR. Deciding that after building a
+    cache key is what would file one denoiser's pixels under the other's key
+    (cli._key_tweaks). The need is the denoiser's own declaration
+    (`requires_noise_model`), not "the default is the fussy one".
+    """
+    import llr_worker.sony.rawnr as rawnr
+
+    path = tmp_path / "x.ARW"
+    monkeypatch.setattr(rawnr, "noise_model", lambda p: _sony_model())
+    assert effective_model(DEFAULT_MODEL, path) == DEFAULT_MODEL
+    monkeypatch.setattr(rawnr, "noise_model", lambda p: None)
+    assert effective_model(DEFAULT_MODEL, path) == FALLBACK_MODEL
+    # The fallback target itself never re-falls -- that was an infinite fallback
+    # when FALLBACK_MODEL still pointed at DEFAULT_MODEL.
+    assert effective_model(FALLBACK_MODEL, path) == FALLBACK_MODEL
+    assert get_denoiser(DEFAULT_MODEL).requires_noise_model
+    assert not get_denoiser(FALLBACK_MODEL).requires_noise_model

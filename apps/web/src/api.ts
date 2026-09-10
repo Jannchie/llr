@@ -16,6 +16,21 @@ export type LookTweaks = {
 };
 export type LookTweakKey = keyof LookTweaks;
 
+// What render-linear takes for denoising, and what an export freezes. Declared
+// here rather than inline at each site because otherwise the two are equal only
+// by hand: an ExportPlan's denoise field is built solely by calling App.vue's
+// denoisePayload, so excess-property checking never runs on it, and a field
+// missing from the plan is dropped at the type level with no error — the worker
+// then falls back to its own defaults and the export denoises unlike the
+// preview it was taken from, silently. That already happened: the plan went
+// without `edge`/`chroma` for a while and nothing caught it.
+// ⚠️ `amount` is 0..1 here. The UI state and the persisted Snapshot are 0..100
+// (see denoisePayload); mixing them up is a silent 100x.
+export type DenoisePayload = {
+  enabled: boolean; auto: boolean; amount: number;
+  edge: number; chroma: number;
+};
+
 export type ColorProfileMeta = {
   // How the worker produced the linear data: a DCP profile, Sony's own rendering
   // reproduced from calibration inside the RAW, LibRaw's matrix fallback, or
@@ -121,6 +136,12 @@ export type ColorProfileMeta = {
 export type LinearMeta = {
   width: number; height: number; fullWidth: number | null; fullHeight: number | null;
   colorProfile: ColorProfileMeta | null; dtype?: string;
+  // Whether Color NR reaches this frame's denoiser. Per-frame, not a setting: a
+  // Sony RAW runs a transcription of Sony's own filter, which has no such
+  // control, while a frame without its noise tags falls back to the wavelet,
+  // where the control works. Always present: the API fills it in (true for a
+  // worker that does not report it), so the "older worker" rule lives there.
+  denoiseUsesChroma: boolean;
 };
 
 // Decode linear data via /render-linear. The response carries the pixels

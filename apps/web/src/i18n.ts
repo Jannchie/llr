@@ -131,10 +131,15 @@ const en = {
   // Detail panel
   "panel.detail": "Detail",
   "detail.denoising": "Denoising…",
-  // Classical wavelet shrinkage, not a neural model — see denoise.py. Named
-  // "AI Denoise" until the backend was checked; if a neural one ever ships it
-  // gets its own control rather than quietly taking over this one.
+  // A transcription of the camera maker's own filter, not a neural model — see
+  // denoise.DEFAULT_MODEL. Named "AI Denoise" until the backend was checked; if
+  // a neural one ever ships it gets its own control rather than quietly taking
+  // over this one.
   "detail.denoise": "Denoise",
+  // Edit's own Auto switch. Strength follows the shot's ISO rather than the
+  // Amount slider — four tenths up to ISO 400, full from ISO 1600 — which is
+  // why the slider hides while this is on rather than sitting there inert.
+  "detail.denoiseAuto": "Auto",
   "detail.amount": "Amount",
   // Named after the controls Imaging Edge exposes, and on its 0..100 scale with
   // 50 neutral, so a value carries the same meaning across both applications.
@@ -306,6 +311,7 @@ const zh: Record<MessageKey, string> = {
   "panel.detail": "细节",
   "detail.denoising": "降噪中…",
   "detail.denoise": "降噪",
+  "detail.denoiseAuto": "自动",
   "detail.amount": "数量",
   "detail.chromaNr": "色彩降噪",
   "detail.edgeNr": "边缘降噪",

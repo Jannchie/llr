@@ -32,7 +32,9 @@ export interface RenderLinearBody {
   dcpCode?: string;
   denoise?: {
     enabled?: boolean;
-    model?: string;
+    // Let the worker set `amount` from the shot's ISO, the way Edit ramps its
+    // RAW stage. See RenderParams.denoise.auto.
+    auto?: boolean;
     amount?: number;
     // Edge and colour ride Edit.exe's own 0..100 scale with 50 neutral, so the
     // same number means the same thing in both applications.
@@ -56,9 +58,17 @@ export interface RenderParams {
   // change must not re-decode the RAW), a one-off export must not be.
   purpose: "preview" | "export";
   dcpCode: string | undefined;
+  // Which filter runs is the worker's own business (denoise.DEFAULT_MODEL) and
+  // deliberately absent from the wire: llr has one denoiser, aimed at being
+  // Edit's, so there is nothing here for a client to pick.
   denoise: {
     enabled: boolean;
-    model: string | undefined;
+    // Whether the worker derives `amount` from ISO rather than taking the one
+    // below. Passed through rather than resolved here because ISO lives in the
+    // file, which only the worker opens — and because resolving it before the
+    // worker's cache key would mean the key no longer names the strength the
+    // cached pixels were actually denoised at.
+    auto: boolean;
     amount: number;
     edge: number;
     chroma: number;
@@ -138,7 +148,12 @@ export function clampRenderParams(body: RenderLinearBody): RenderParams {
     // so applying it is the frontend's call and never reaches the worker.
     denoise: {
       enabled: body.denoise?.enabled === true,
-      model: typeof body.denoise?.model === "string" ? body.denoise.model : undefined,
+      // Auto makes the worker derive `amount` from the shot's ISO instead, the
+      // way Edit ramps its RAW stage (four tenths to ISO 400, full from 1600).
+      // The client still sends an `amount`, and it is still what gets used when
+      // the file has no readable ISO — so this flag adds a source for the
+      // number rather than replacing it.
+      auto: body.denoise?.auto === true,
       amount: Number.isFinite(denoiseAmount) ? Math.min(1, Math.max(0, denoiseAmount)) : 1,
       edge: clamp100(body.denoise?.edge),
       chroma: clamp100(body.denoise?.chroma),
@@ -164,6 +179,14 @@ export function buildLinearFrameHeader(meta: Record<string, unknown>): Buffer {
     fullHeight: meta.fullHeight ?? null,
     colorProfile: meta.colorProfile ?? null,
     dtype: typeof meta.dtype === "string" ? meta.dtype : "float32",
+    // Which denoiser this frame got, and whether Color NR reaches it. Per-frame
+    // rather than a constant: Sony RAWs run the transcription of Sony's own
+    // filter, which has no such control, while anything without its noise tags
+    // falls back to the wavelet, where the control works. The UI hides the
+    // slider when this is false instead of leaving an inert one on screen.
+    // Defaults to true so a worker that does not send it keeps showing the
+    // control — the old behaviour — rather than hiding a working one.
+    denoiseUsesChroma: meta.denoiseUsesChroma !== false,
   }), "utf8");
   if (header.length % 4) header = Buffer.concat([header, Buffer.alloc(4 - (header.length % 4), 0x20)]);
   const prefix = Buffer.alloc(4);

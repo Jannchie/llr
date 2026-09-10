@@ -27,13 +27,19 @@ describe("isValidSourceId", () => {
 
 describe("clampRenderParams", () => {
   it("fills defaults for an empty body", () => {
+    // toEqual, not toMatchObject: this pins the *whole* shape, so a field added
+    // to RenderParams without a default fails here rather than reaching the
+    // worker as undefined.
     expect(clampRenderParams({})).toEqual({
       profile: "standard",
       halfSize: true,
       maxSize: 1600,
       dcpCode: undefined,
-      denoise: { enabled: false, model: undefined, amount: 1, edge: 50, chroma: 50 },
+      denoise: { enabled: false, auto: false, amount: 1, edge: 50, chroma: 50 },
       look: {},
+      style: undefined,
+      dro: undefined,
+      droLevel: undefined,
       purpose: "preview",
     });
   });
@@ -82,12 +88,11 @@ describe("clampRenderParams", () => {
     const params = clampRenderParams({
       dcpCode: 5 as unknown as string,
       halfSize: "yes" as unknown as boolean,
-      denoise: { enabled: 1 as unknown as boolean, model: 3 as unknown as string },
+      denoise: { enabled: 1 as unknown as boolean },
     });
     expect(params.dcpCode).toBeUndefined();
     expect(params.halfSize).toBe(true);
     expect(params.denoise.enabled).toBe(false);
-    expect(params.denoise.model).toBeUndefined();
   });
 });
 
@@ -134,6 +139,7 @@ describe("buildLinearFrameHeader", () => {
       fullHeight: 100,
       colorProfile: { kind: "dcp" },
       dtype: "float16",
+      denoiseUsesChroma: true,
     });
   });
 
@@ -142,6 +148,16 @@ describe("buildLinearFrameHeader", () => {
     expect(parsed.dtype).toBe("float32");
     expect(parsed.fullWidth).toBeNull();
     expect(parsed.colorProfile).toBeNull();
+  });
+
+  it("forwards denoiseUsesChroma, defaulting to true when the worker omits it", () => {
+    // The UI hides Color NR on false, so the default has to be the safe
+    // direction: an older worker that does not report it keeps showing a
+    // control that works, rather than hiding one that does.
+    const on = JSON.parse(buildLinearFrameHeader({ ...meta, denoiseUsesChroma: false }).subarray(4).toString("utf8")) as Record<string, unknown>;
+    expect(on.denoiseUsesChroma).toBe(false);
+    const missing = JSON.parse(buildLinearFrameHeader({ width: 1, height: 1 }).subarray(4).toString("utf8")) as Record<string, unknown>;
+    expect(missing.denoiseUsesChroma).toBe(true);
   });
 
   it("stays aligned across header lengths", () => {

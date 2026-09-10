@@ -25,7 +25,13 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 
 from .creative_style import normalize_style
 from .dcp import DcpProfile, apply_dcp_profile, load_dcp_profile
-from .denoise import DEFAULT_MODEL, denoise_raw_inplace, get_denoiser
+from .denoise import (
+    DEFAULT_MODEL,
+    denoise_raw_inplace,
+    effective_model,
+    get_denoiser,
+    model_uses_chroma,
+)
 from .fit_profile import camera_match_path, postprocess_camera_native
 from .imported import decode_image_linear
 from .sony import NO_TWEAKS, LookTweaks, apply_look_overrides, apply_sony_profile, calibration_for, looks_in_file
@@ -36,6 +42,7 @@ from .sony.dro_presets import DRO_LEVEL_AUTO, DRO_LEVEL_MAX
 from .sony.profile import look_render_info
 from .sony.rawnr import detail_restore as sony_detail_restore
 from .sony.rawnr import noise_model as sony_noise_model
+from .sony.rawnr_simd import iso_strength
 from .sony.sharpness import (
     SHARPNESS_DEFAULT,
     SHARPNESS_RANGE_DEFAULT,
@@ -332,6 +339,27 @@ def handle_daemon_request(request: dict[str, Any], root: Path) -> dict[str, Any]
     raise ValueError(f"unknown command: {command}")
 
 
+def _key_tweaks(denoise_model: str | None,
+                denoise_tweaks: tuple[float, float]) -> tuple[float, float]:
+    """The denoise tweaks that actually reach this model's pixels, rounded.
+
+    A tweak the chosen denoiser ignores must not enter a cache key: it would
+    make every value of an inert control mint its own decode — hundreds of MB
+    each, evicting the entries the user is working with — to return a
+    byte-identical image. `sony` ignores Color NR (it reproduces a filter that
+    has no such control), the wavelet does not, so this cannot be a constant.
+
+    ⚠️ `denoise_model` must already be the *effective* one. Resolving the
+    fallback later would mean deciding this for a denoiser that never ran, and
+    two chroma settings would then collide on one entry with the wavelet's
+    pixels — see `denoise.effective_model`.
+    """
+    edge, chroma = denoise_tweaks
+    if denoise_model and not model_uses_chroma(denoise_model):
+        chroma = 50.0  # any constant would do; 50 is the slider's neutral
+    return (round(float(edge), 3), round(float(chroma), 3))
+
+
 def _linear_cache_key(
     input_path: Path,
     profile_id: str,
@@ -354,7 +382,7 @@ def _linear_cache_key(
         base = (str(input_path), st.st_size, int(st.st_mtime_ns))
     except OSError:
         base = (str(input_path),)
-    return (*base, profile_id, bool(half_size), int(max_size or 0), dcp_code or "", denoise_model or "", round(float(denoise_amount), 3), tuple(round(float(v), 3) for v in denoise_tweaks))
+    return (*base, profile_id, bool(half_size), int(max_size or 0), dcp_code or "", denoise_model or "", round(float(denoise_amount), 3), _key_tweaks(denoise_model, denoise_tweaks))
 
 
 _LINEAR_CACHE: OrderedDict[tuple[Any, ...], tuple[np.ndarray, dict[str, Any]]] = OrderedDict()
@@ -448,16 +476,67 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     # the heavy inference and the second decode are skipped entirely.
     denoise_req = request.get("denoise") or {}
     dn_amount = max(0.0, min(1.0, float(denoise_req.get("amount", 1.0))))
+    # Edit's Auto. The engine does not run its RAW stage at one strength: it
+    # ramps with ISO -- four tenths up to ISO 400, full from ISO 1600, linear in
+    # ISO between them (sony/rawnr_simd.py iso_strength, read out of the running
+    # engine at 0x39fb4c). This is why Edit's own denoising looks like it is not
+    # turned all the way up on a base-ISO frame: it isn't.
+    #
+    # Resolved here, before the cache key, for two reasons: ISO is a property of
+    # the file rather than of the request, and a key naming the resolved
+    # strength still names exactly what the cached pixels were denoised at.
+    # read_exiftool_metadata is memoized per (path, size, mtime), and the
+    # profile path reads it for this same file anyway, so this is free.
+    #
+    # ⚠️ This rides on `amount`, which in llr is a blend between a noisy and a
+    # denoised decode, whereas Edit's strength scales the filter itself. The two
+    # agree at both ends and in direction but not term by term -- an
+    # approximation, and deliberately an explicit one. Matching the engine
+    # properly means running its filter, which is what sony/rawnr_simd.py is
+    # for; the strength belongs inside that operator, not in a lerp.
+    dn_auto = bool(denoise_req.get("auto", False))
+    if dn_auto and is_raw(input_path):
+        iso = _exif_int(read_exiftool_metadata(input_path).get("ISO"))
+        # An unreadable ISO leaves the caller's amount alone rather than
+        # silently denoising at four tenths -- guessing here would be invisible.
+        if iso:
+            dn_amount = iso_strength(float(iso))
+    # Which filter runs is not the client's to pick: llr has one denoiser and
+    # the goal is that it is Edit's. The request says whether to denoise and how
+    # much, never with what; migrating means moving DEFAULT_MODEL, once.
+    #
+    # Resolved for the *file*, before anything is keyed on it and whether or
+    # not this request denoises. Which of the two ran used to be decided inside
+    # prepare_linear, i.e. after both cache keys were built from the requested
+    # model — and the two disagree about whether Color NR reaches the pixels,
+    # so the key would have been built on the wrong answer. It stays cheap: the
+    # tags are lru_cached on file identity and the render reads them anyway.
+    #
+    # Denoise operates on the Bayer mosaic, which a rendered image does not
+    # have, so a rendered image has no denoiser at all.
+    file_model = effective_model(DEFAULT_MODEL, input_path) if is_raw(input_path) else None
+    if file_model is not None and file_model != DEFAULT_MODEL:
+        sys.stderr.write(
+            f"denoise {input_path.name}: no Sony noise tags, "
+            f"falling back from {DEFAULT_MODEL!r} to {file_model!r}\n")
+    # Whether Color NR reaches this file's denoiser, which the UI hides the
+    # slider on. A property of the file, not of the request: it goes out on
+    # every return below, denoising on or off, so the answer cannot flip with
+    # the toggle. Sony's own filter has no such control; the wavelet does.
+    dn_uses_chroma = file_model is not None and model_uses_chroma(file_model)
+    # Forcing denoise off here for a rendered image (rather than no-op'ing
+    # deeper) keeps the two-decode blend below from decoding an identical image
+    # twice.
     dn_model: str | None = None
-    # Denoise operates on the Bayer mosaic, which a rendered image does not have.
-    # Forcing it off here (rather than no-op'ing deeper) keeps the two-decode
-    # blend below from decoding an identical image twice.
-    if bool(denoise_req.get("enabled", False)) and dn_amount > 0.0 and is_raw(input_path):
-        dn_model = str(denoise_req.get("model") or DEFAULT_MODEL)
+    if bool(denoise_req.get("enabled", False)) and dn_amount > 0.0:
+        dn_model = file_model
     # Edge and colour ride Edit.exe's own 0..100 scale with 50 neutral, so a
     # recipe that names them means the same thing in both applications. Unlike
     # `amount` they are not a blend of two decodes — they change the denoised
     # result itself — so they belong in the cache key rather than in the lerp.
+    # ⚠️ "They change the result" is per-denoiser, not universal: `_key_tweaks`
+    # drops the ones the chosen denoiser ignores, or every value of an inert
+    # slider mints its own full-size decode.
     dn_edge = max(0.0, min(100.0, float(denoise_req.get("edge", 50.0))))
     dn_chroma = max(0.0, min(100.0, float(denoise_req.get("chroma", 50.0))))
 
@@ -502,6 +581,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
             "colorProfile": color_profile,
             "dtype": "float16",
             "bytesWritten": bytes_written,
+            "denoiseUsesChroma": dn_uses_chroma,
         }
 
     recipe = merge_recipe(PROFILES[profile_id], {})
@@ -610,6 +690,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
                                              dro_level_override),
         "dtype": "float16",
         "bytesWritten": bytes_written,
+        "denoiseUsesChroma": dn_uses_chroma,
     }
 
 
@@ -826,8 +907,19 @@ def build_llr_attrs(settings: dict[str, Any]) -> OrderedDict[str, str]:
         # the 0..1 that render-linear receives (see denoisePayload in App.vue).
         # Same field name, two scales; the export path must keep reading the
         # UI state rather than the request payload or this drifts by 100x.
-        attrs["llr:DenoiseModel"] = str(denoise.get("model", ""))
+        # No `llr:DenoiseModel`: llr ships one denoiser, nothing on the wire
+        # names a model, and the browser state has no such key to read. Writing
+        # it meant emitting "" for everyone -- or a stale "wavelet" for anyone
+        # whose persisted session predates the picker's removal -- while the
+        # pixels were Sony's either way. Which denoiser actually ran (the
+        # fallback can still pick wavelet) is known in the render path, not
+        # here; it goes to stderr with the rest of the per-file notes.
         attrs["llr:DenoiseAmount"] = f"{round(_num(denoise, 'amount', 100))}"
+        # Under Auto the worker derives the strength from ISO, so the amount
+        # above is the slider's position rather than what was applied. Record
+        # the flag so the pair is self-describing.
+        if denoise.get("auto"):
+            attrs["llr:DenoiseAuto"] = "1"
 
     _add_crop_attrs(attrs, settings.get("crop") or {})
     return attrs
@@ -1086,8 +1178,9 @@ def _raw_cache_key(
     except OSError:
         base = (str(input_path), bool(half_size), int(max_size or 0))
     # `amount` is deliberately absent (it blends this entry with the noisy one),
-    # but edge and colour change the denoised pixels themselves.
-    return (*base, denoise_model or "", tuple(round(float(v), 3) for v in denoise_tweaks))
+    # but edge and colour change the denoised pixels themselves — for whichever
+    # denoiser actually consumes them; see `_key_tweaks`.
+    return (*base, denoise_model or "", _key_tweaks(denoise_model, denoise_tweaks))
 
 
 @dataclass(frozen=True)
@@ -1195,6 +1288,13 @@ def prepare_linear(
     if not is_raw(input_path):
         return prepare_rendered_image(input_path, half_size=half_size, max_size=max_size)
 
+    # Resolve the fallback before the key, not after: `_key_tweaks` decides what
+    # belongs in it from the model, and the two denoisers disagree. The daemon
+    # has already done this, so there it is a no-op; direct callers (the tools
+    # in sony_repro/, tests) come in unresolved.
+    if denoise_model:
+        denoise_model = effective_model(denoise_model, input_path)
+
     cache_key = _raw_cache_key(input_path, half_size, max_size, denoise_model, denoise_tweaks)
 
     # Cache hit: re-apply DCP on cached camera RGB without re-decoding RAW
@@ -1245,6 +1345,14 @@ def prepare_linear(
             edge, chroma = denoise_tweaks
             if restore is not None:
                 restore = restore.for_edge_slider(edge)
+            # Sony's own filter *is* its thresholds, so a frame without the tags
+            # gives it nothing to run on. `denoise_model` is already the one that
+            # can run: the fallback was applied at the top of this function, off
+            # this same `sony_noise_model` call (lru_cached on file identity, so
+            # the two answers cannot differ). Deliberately not re-decided here —
+            # the cache entry this is about to fill was keyed on the resolved
+            # model, and deciding again after the key is what would store one
+            # denoiser's pixels under the other's key.
             stats = denoise_raw_inplace(
                 raw, get_denoiser(denoise_model), noise=curve,
                 detail=None if restore is None or curve is None

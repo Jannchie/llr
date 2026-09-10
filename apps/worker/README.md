@@ -23,9 +23,11 @@ Commands: `ping`, `extract-preview`, `render-linear`, `export`.
   `stripPrivate` export flag excludes GPS/serials/owner/maker notes instead.
 - `dcp.py` — Adobe DCP (classic-TIFF) parsing and application: color matrix,
   ProfileHueSatMap, ProfileLookTable, profile tone curve, in linear ProPhoto.
-- `denoise.py` — Bayer-mosaic denoise before demosaic (wavelet default;
-  2×2 CFAs only, X-Trans is skipped). A neural backend can register itself via
-  `register_denoiser()`; none ships yet (must be non-GPL).
+- `denoise.py` — Bayer-mosaic denoise before demosaic (2×2 CFAs only, X-Trans is
+  skipped). One denoiser, chosen here rather than by the request: `DEFAULT_MODEL`
+  is a transcription of Sony's own filter, with the wavelet as `FALLBACK_MODEL`
+  for frames that carry no Sony noise tags. A neural backend can register itself
+  via `register_denoiser()`; none ships yet (must be non-GPL).
 
 Output pixels are written as float16 (the precision the browser's RGB16F
 textures use); in-memory caches stay float32.

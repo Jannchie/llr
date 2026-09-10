@@ -174,15 +174,28 @@ def test_grading_hues_are_normalized_to_a_full_turn() -> None:
 def test_dcp_and_denoise_are_written_only_when_set() -> None:
     attrs = description(standard_packet(SMALL_SETTINGS)).attrib
     assert f"{LLR_NS}Dcp" not in attrs
-    assert f"{LLR_NS}DenoiseModel" not in attrs
+    assert f"{LLR_NS}DenoiseAmount" not in attrs
 
     settings = edited_settings()
     settings["dcp"] = "canon_eos_r5"
-    settings["denoise"] = {"enabled": True, "model": "wavelet", "amount": 60}
+    settings["denoise"] = {"enabled": True, "amount": 60}
     attrs = description(standard_packet(settings)).attrib
     assert attrs[f"{LLR_NS}Dcp"] == "canon_eos_r5"
-    assert attrs[f"{LLR_NS}DenoiseModel"] == "wavelet"
     assert attrs[f"{LLR_NS}DenoiseAmount"] == "60"
+    # llr ships one denoiser, so nothing records a model any more.
+    assert f"{LLR_NS}DenoiseModel" not in attrs
+    # Auto is off in this recipe, so the amount above is what was applied.
+    assert f"{LLR_NS}DenoiseAuto" not in attrs
+
+
+def test_auto_denoise_is_recorded_alongside_the_amount() -> None:
+    settings = edited_settings()
+    settings["denoise"] = {"enabled": True, "auto": True, "amount": 100}
+    attrs = description(standard_packet(settings)).attrib
+    # Under Auto the worker derives strength from ISO, so the recorded amount is
+    # the slider position, not what ran -- the flag is what makes that readable.
+    assert attrs[f"{LLR_NS}DenoiseAmount"] == "100"
+    assert attrs[f"{LLR_NS}DenoiseAuto"] == "1"
 
 
 def test_identity_crop_writes_no_crop_attrs() -> None:

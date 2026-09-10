@@ -58,10 +58,24 @@ import numpy as np
 from .sr2 import read_sr2_scalars
 
 #: Full scale of the engine's working domain, and the ceiling it clamps
-#: thresholds to. The plane is black-subtracted, so 0 is black and this is
-#: white. The table the engine builds is 32768 entries long, but its filters
-#: clamp the level to this before indexing (`rawnr_simd.py`), so the top half
-#: is never reached and this — not the table's length — is the domain.
+#: thresholds to. The table the engine builds is 32768 entries long, but its
+#: filters clamp the level to this before indexing (`rawnr_simd.py`), so the top
+#: half is never reached and this — not the table's length — is the domain.
+#:
+#: ⚠️ The level indexing this curve is the sensor's **raw** value, black level
+#: still in it. This said "black-subtracted, so 0 is black" until it was
+#: measured, and that was wrong: feeding `rawnr_simd` black-subtracted planes
+#: drives green's `ref = c - d + OFFSET_GREEN` negative in the shadows, where
+#: the clamp at zero pins it and the filter's closing `- offset` lifts the whole
+#: plane by 512 — measured as a +148 level shift and a 38% change rate, against
+#: 2.8-3.9% for red and blue in that same run. On raw values all four phases
+#: agree instead: 0.78-1.17% changed, mean drift within ±0.3 of zero. This
+#: body's black level of 512 is exactly `-OFFSET_GREEN`: that step *is* the
+#: engine's own black alignment, which is why only green carries an offset.
+#: See `sony_repro/tools/rawnr_simd_domain.py` for the adjudication.
+#:
+#: `noise_shape_at` below is unaffected — it only promises a shape, and its
+#: caller (llr's wavelet) works on normalised planes and fits its own scale.
 ENGINE_FULL_SCALE = 0x3FFF
 
 LEVEL_LO_TAG = 0x78C5      # below this level the threshold is constant
@@ -161,7 +175,11 @@ class NoiseModel:
 
         The caller's plane must be black-subtracted and scaled so 1.0 is the
         sensor's white level, which is what `denoise.denoise_raw_inplace`
-        normalises to.
+        normalises to. Note this differs from :meth:`threshold`, which is
+        indexed by the sensor's raw level with black still in it — see
+        ENGINE_FULL_SCALE. The rescaling here is approximate for that reason:
+        it maps a normalised level onto the engine's scale as if black were
+        zero. Harmless for a shape, wrong for a threshold.
         """
         scaled = np.asarray(level, dtype=np.float64) * ENGINE_FULL_SCALE
         return self.threshold(scaled).astype(np.float64) / ENGINE_FULL_SCALE
@@ -194,8 +212,29 @@ class DetailRestore:
         what lets this drive `llr`'s wavelet stage without reproducing Sony's
         filter. Typically 15..25, i.e. the clamp only bites at a hard edge.
         """
-        thr = float(model.threshold(model.hi))
-        return self.limit / max(thr, 1.0)
+        return self.limit / self._hi_threshold(model)
+
+    @classmethod
+    def from_dimensionless(cls, fraction: float, limit_in_thresholds: float,
+                           model: NoiseModel) -> DetailRestore:
+        """The inverse of :attr:`fraction` / :meth:`limit_in_thresholds`.
+
+        Kept beside the forward pair so the two stay mutually inverse in one
+        file; `denoise.SonyRawNRDenoiser` uses it to put the engine's own units
+        back on a pair that travelled dimensionless.
+
+        The gain clamp is the engine's: probing RawNRSIMD's parameter block
+        returns min(tag, 256), not the tag (DETAIL_GAIN_UNIT). ⚠️ Its order
+        against the Edge NR slider is *not* established -- all four probe
+        points sat at neutral, where the two orders agree.
+        """
+        gain = min(round(float(fraction) * DETAIL_GAIN_UNIT), DETAIL_GAIN_UNIT)
+        return cls(gain=gain,
+                   limit=round(float(limit_in_thresholds) * cls._hi_threshold(model)))
+
+    @staticmethod
+    def _hi_threshold(model: NoiseModel) -> float:
+        return max(float(model.threshold(model.hi)), 1.0)
 
     def for_edge_slider(self, ui: float) -> DetailRestore:
         """This pair as Edit.exe's Edge NR slider (0..100, 50 neutral) sets it.

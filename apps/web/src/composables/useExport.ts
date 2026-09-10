@@ -1,6 +1,6 @@
 import { ref, type Ref } from "vue";
 import { PipelineRenderer, parseDcpTables, type EditParams, type ProfileCurve } from "../rendering/pipeline-renderer";
-import { API, fetchLinear, type LinearMeta, type LookTweaks } from "../api";
+import { API, fetchLinear, type DenoisePayload, type LinearMeta, type LookTweaks } from "../api";
 import { t } from "../i18n";
 
 /**
@@ -19,7 +19,9 @@ export interface ExportPlan {
   dcpCode: string | undefined;
   /** Which colour engine renders camera RGB — must match the preview's. */
   profileId: string;
-  denoise: { enabled: boolean; model: string; amount: number };
+  /** Exactly what `denoisePayload` returns — see DenoisePayload for why the
+   * shape is declared once rather than repeated here. */
+  denoise: DenoisePayload;
   /** Creative Look tweaks; undefined renders the shot's own (Sony path only). */
   look: LookTweaks | undefined;
   /** Which Creative Look; undefined renders the body's own (Sony path only). */

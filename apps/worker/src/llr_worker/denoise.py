@@ -21,6 +21,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
@@ -147,6 +148,17 @@ class NoiseCurve(Protocol):
 DetailRestore = tuple[float, float]
 
 
+#: ``(per-plane black, white)`` on the sensor's own scale, so a denoiser that
+#: needs raw levels can undo the normalisation below. Every denoiser here works
+#: in [0, 1] and ignores this; the one that cannot is `SonyRawNRDenoiser`, which
+#: reproduces a filter whose thresholds are indexed by the sensor's raw level
+#: with black still in it, and whose green phase carries an offset that *is* the
+#: black level (sony/rawnr.py ENGINE_FULL_SCALE). Passed rather than folded into
+#: `planes` because normalised planes are the right interface for everything
+#: else — a fitted denoiser has no use for a black level.
+SensorLevels = tuple[np.ndarray, float]
+
+
 class Denoiser(Protocol):
     """A denoiser maps normalised Bayer planes -> denoised planes, same shape.
 
@@ -155,16 +167,36 @@ class Denoiser(Protocol):
     blind / self-estimated). ``cfa`` names each plane's colour ("R"/"G"/"B"),
     which a denoiser needs to tell luma from chroma; None means "assume RGGB".
     ``noise`` is an optional measured noise shape (see :class:`NoiseCurve`)
-    that stands in for fitting one from the pixels.
+    that stands in for fitting one from the pixels. ``sensor_levels`` is the
+    sensor's ``(black, white)``, for the one denoiser that works in raw levels
+    rather than normalised ones (see :data:`SensorLevels`) — spelled in full
+    because `levels` already means wavelet decomposition depth in here.
     """
 
     def __call__(
         self, planes: np.ndarray, sigma: float | None = None, cfa: Sequence[str] | None = None,
         noise: NoiseCurve | None = None, detail: DetailRestore | None = None,
-        *, chroma_scale: float = 1.0,
+        *, chroma_scale: float = 1.0, sensor_levels: SensorLevels | None = None,
     ) -> np.ndarray: ...
 
     name: str
+
+    #: Whether `chroma_scale` reaches this denoiser's pixels.
+    #:
+    #: Declared rather than assumed because the caller caches decodes keyed on
+    #: the tweaks that change them, and a denoiser that ignores one still made
+    #: every value of it mint its own multi-hundred-MB entry — a full
+    #: re-decode per drag of a slider that returned a byte-identical image.
+    #: `cli._key_tweaks` reads this; without it the knowledge lives in two
+    #: places and the cache silently rots when a denoiser changes its mind.
+    uses_chroma: bool
+
+    #: Whether this denoiser can run without a camera-supplied `noise` curve.
+    #: The one that cannot (`SonyRawNRDenoiser`) has nothing to fall back on,
+    #: so `effective_model` swaps it for FALLBACK_MODEL on frames that carry no
+    #: tags. Declared here rather than as "the default model is the fussy one",
+    #: so moving DEFAULT_MODEL cannot silently switch the fallback off.
+    requires_noise_model: bool
 
 
 class PassthroughDenoiser:
@@ -172,11 +204,13 @@ class PassthroughDenoiser:
     a full round-trip should reproduce the original mosaic bit-for-bit."""
 
     name = "passthrough"
+    uses_chroma = False
+    requires_noise_model = False
 
     def __call__(
         self, planes: np.ndarray, sigma: float | None = None, cfa: Sequence[str] | None = None,
         noise: NoiseCurve | None = None, detail: DetailRestore | None = None,
-        *, chroma_scale: float = 1.0,
+        *, chroma_scale: float = 1.0, sensor_levels: SensorLevels | None = None,
     ) -> np.ndarray:
         return planes
 
@@ -565,6 +599,10 @@ class WaveletDenoiser:
     """
 
     name = "wavelet"
+    #: It scales the chroma planes' thresholds, so the slider reaches the pixels.
+    uses_chroma = True
+    #: Fits its own noise shape from the pixels when no curve is supplied.
+    requires_noise_model = False
 
     #: Multiplier on the per-level BayesShrink threshold.
     K = 0.9
@@ -603,8 +641,11 @@ class WaveletDenoiser:
     def __call__(
         self, planes: np.ndarray, sigma: float | None = None, cfa: Sequence[str] | None = None,
         noise: NoiseCurve | None = None, detail: DetailRestore | None = None,
-        *, chroma_scale: float = 1.0,
+        *, chroma_scale: float = 1.0, sensor_levels: SensorLevels | None = None,
     ) -> np.ndarray:
+        # sensor_levels is for the raw-level filter only; this one works in the
+        # normalised domain the protocol hands it and fits its own scale.
+        del sensor_levels
         planes = np.clip(planes.astype(np.float32, copy=False), 0.0, 1.0)
         levels = self._levels_for(planes.shape[:2])
 
@@ -724,7 +765,8 @@ def denoise_raw_inplace(
     norm = (planes - black) / scale
     np.clip(norm, 0.0, 1.0, out=norm)
 
-    denoised = denoiser(norm, sigma, cfa, noise, detail, chroma_scale=chroma_scale)
+    denoised = denoiser(norm, sigma, cfa, noise, detail, chroma_scale=chroma_scale,
+                        sensor_levels=(black, white))
 
     denoised = denoised * scale + black
     np.clip(denoised, 0.0, white, out=denoised)
@@ -745,6 +787,174 @@ def denoise_raw_inplace(
     )
 
 
+# ── Sony's own filter ──────────────────────────────────────────────────────
+
+
+class SonyRawNRDenoiser:
+    """Edit.exe's `ZcTaskRawNRSIMD`, driven by the curve the camera wrote.
+
+    The wavelet above uses Sony's *measurement* and llr's own filter. This uses
+    both halves of Sony's, which is the only self-consistent way to reproduce
+    the engine: a threshold tuned for a sigma filter over a 5x5 sparse
+    neighbourhood is not the right number for a wavelet, and adopting one
+    without the other has twice made the result worse (sony/rawnr.py
+    DETAIL_GAIN_UNIT).
+
+    Both kernels are decoded, and the reproduction is exact. Feeding the
+    engine's own mosaic through this whole path -- deinterleave, both analyses,
+    both filters -- returns all four output planes **bit for bit**, error
+    identically zero, on five frames from three bodies
+    (`sony_repro/tools/rawnr_e2e_verify.py`). Green took a 25-member cross-plane
+    comparison base that no amount of reading the disassembly produced; see
+    `rawnr_simd.BASE_GREEN_OWN`.
+
+    Checking it end to end rather than per kernel is what found the last real
+    defect: the green analysis read the other phase's cross taps on the wrong
+    diagonal, which no per-kernel test could see because it happens *before* the
+    kernel.
+
+    It looks different from the wavelet at a highlight edge -- magenta/green
+    fringing -- but measurement says that is not something this operator adds.
+    Against the undenoised decode, chroma at a highlight edge moves by -0.0011
+    here and -0.0052 for the wavelet: both *remove* colour, this one just
+    removes a fifth as much (sony_repro/tools/fringe_metric.py). The colour is
+    the demosaic's, faithfully kept rather than scrubbed away, which is also
+    what the chroma/luma ratio says: 0.848 undenoised, 0.757 here, 0.532 for
+    the wavelet.
+
+    On grain character it behaves differently from the wavelet rather than
+    strictly better, and the difference is *stability*. Axial/diagonal energy in
+    the 2.0-2.7px band across four frames, against the undenoised frame's own
+    figure (`sony_repro/tools/rawnr_simd_try.py`):
+
+        no denoise    1.49  1.34  1.40  1.49     detail 7.83 4.74 11.61 1.48
+        wavelet       0.94  1.00  1.09  0.65            7.50 4.71 11.61 1.43
+        this          1.32  1.24  1.31  1.39            7.72 4.70 11.60 1.44
+
+    This one tracks the frame it was given -- consistently ~0.15 below the
+    undenoised figure, a 0.15 spread across the four -- while the wavelet lands
+    anywhere from 0.65 to 1.09 (0.44 spread) depending on the picture. So the
+    residual noise keeps its own shape instead of taking the picture's.
+
+    ⚠️ Read that as stability, not as "more isotropic". By distance from 1.00
+    the wavelet is the flatter of the two (mean |x-1| of 0.13 against 0.32), and
+    an earlier version of this table claimed the opposite from a single frame
+    measured while both green phases were wrongly using phase 0's cross-plane
+    table. Fine detail is near enough a wash on the same four (0.1-2.7% lost
+    here, 0-4.2% for the wavelet); the single-frame "1.7% against 4.2%" that
+    stood here was the same bad run.
+
+    None of which is the reason it ships: it ships because it *is* the engine's
+    filter, bit for bit. Grain statistics are a sanity check on that, not the
+    case for it.
+
+    ⚠️ Those are averages over selected blocks, and averages are exactly what
+    missed the fringing and, before it was fixed, a `count == 0` case that wrote
+    raw level 0 into 0.45% of pixels. Anything claiming this operator is ready
+    must come with a whole-frame extreme-value audit
+    (`sony_repro/tools/sony_nr_audit.py`), not another block statistic.
+
+    That audit now reads 0.0748% of pixels at exactly zero against the wavelet's
+    0.0866% -- i.e. the remaining zeros are the frame's own, not this operator's.
+    Green still leaves connected dark blobs (up to 22 pixels, down from 61 when
+    the analysis was wrong) where the wavelet leaves only isolated ones
+    (`edge_block_check.py`); same origin as the fringing, and likewise present
+    in the engine's own output.
+
+    Requires the camera's noise model; there is nothing to fall back on, since
+    the thresholds are the operator. `denoise_raw_inplace`'s caller picks the
+    model, so the check belongs there and this raises rather than silently
+    doing something else.
+
+    Not applied here, deliberately:
+
+    * **The ISO strength ramp** (`rawnr_simd.iso_strength`). It is a real part
+      of the engine, but not of *this* step: the thresholds captured from the
+      running process match what the tags alone predict, entry for entry, at
+      both ISO 100 and ISO 1250 -- which they could not if the ramp scaled
+      them. Where it does apply was not established, so llr rides it on the
+      noisy/denoised blend instead (cli.py, the Auto switch), and that is
+      marked as the approximation it is rather than folded in here.
+    * **Colour NR** (`chroma_scale`). Scaling red and blue's thresholds by it
+      would be a guess: whether the engine's slider even reaches this stage is
+      still open (`sony_repro/tools/nr_dead_check.py`, unfinished). A guess
+      that looks plausible is worse than an omission that is written down.
+    """
+
+    name = "sony"
+    #: The engine has no such control: its thresholds come off the camera's own
+    #: curve, and every plane -- chroma included -- is filtered against that one
+    #: table. Reproducing it means having nothing for this slider to scale, so it
+    #: is dropped (`del chroma_scale` below) rather than approximated.
+    uses_chroma = False
+    #: The thresholds *are* the operator; see the class docstring.
+    requires_noise_model = True
+
+    def __call__(
+        self, planes: np.ndarray, sigma: float | None = None, cfa: Sequence[str] | None = None,
+        noise: NoiseCurve | None = None, detail: DetailRestore | None = None,
+        *, chroma_scale: float = 1.0, sensor_levels: SensorLevels | None = None,
+    ) -> np.ndarray:
+        from .sony import rawnr_simd as simd
+        from .sony.rawnr import ENGINE_FULL_SCALE, NoiseModel
+        from .sony.rawnr import DetailRestore as SonyDetailRestore
+
+        if not isinstance(noise, NoiseModel) or sensor_levels is None:
+            raise ValueError(
+                "the 'sony' denoiser needs the camera's own noise model and the "
+                "sensor's levels; it reproduces a filter whose thresholds are "
+                "its operator, so there is nothing to estimate them from")
+        order = canonical_plane_order(cfa)
+        if order is None:
+            raise ValueError(f"the 'sony' denoiser needs an RGGB-class CFA, got {cfa!r}")
+        red, g0, g1, blue = order
+        black, white = sensor_levels
+        del sigma, chroma_scale
+
+        # Back to raw sensor levels, black included -- see SensorLevels.
+        # Built in place off the first product: `planes` is the caller's array
+        # and must not be touched, but `* span` already allocates, so the add
+        # and the clamp can land in that result rather than in two more
+        # full-frame temporaries.
+        span = np.maximum(white - black, 1.0)
+        raw = planes.astype(np.float32, copy=False) * span
+        raw += black
+        np.clip(raw, 0.0, ENGINE_FULL_SCALE, out=raw)
+
+        # float32 once here rather than a full-plane int32->float32 copy per
+        # gather inside `filt`.
+        table = np.asarray(noise.threshold(np.arange(simd.TABLE_SIZE, dtype=np.int64)),
+                           dtype=np.float32)
+
+        kw: dict[str, int] = {}
+        if detail is not None:
+            # Both halves of DetailRestore are dimensionless on the wire so they
+            # can drive a denoiser in any units; put the engine's own back.
+            restore = SonyDetailRestore.from_dimensionless(*detail, noise)
+            kw["gain"], kw["limit"] = restore.gain, restore.limit
+
+        # Each kernel eats PHASE_MARGIN a side. Reflect rather than zero-pad: a
+        # zero border is a hard edge, and a sigma filter reads a hard edge as
+        # structure and refuses to average across it.
+        pad = simd.PHASE_MARGIN
+        padded = [np.pad(raw[..., k], pad, mode="reflect") for k in range(4)]
+
+        out = np.empty_like(raw)
+        # Both green phases together: each one's filter needs the other's
+        # analysis, so doing them as a pair computes each analysis once instead
+        # of twice. The order of the pair is the phase -- they take different
+        # cross-plane base tables, and swapping them costs 99.85% -> 56%
+        # bit-identical (sony/rawnr_simd.py BASE_GREEN_OTHER).
+        out[..., g0], out[..., g1] = simd.denoise_greens(
+            padded[g0], padded[g1], table, **kw)
+        out[..., red] = simd.denoise_phase_rb(padded[red], table, **kw)
+        out[..., blue] = simd.denoise_phase_rb(padded[blue], table, **kw)
+
+        out -= black
+        out /= span
+        return out
+
+
 # ── Registry ───────────────────────────────────────────────────────────────
 
 # Lazily-constructed singletons so we only build a denoiser when a recipe
@@ -757,10 +967,28 @@ _DENOISER_CACHE: dict[str, Denoiser] = {}
 _FACTORIES: dict[str, Callable[[], Denoiser]] = {
     "passthrough": PassthroughDenoiser,
     "wavelet": WaveletDenoiser,
+    # Edit's own filter. Reachable from here and from the tools in sony_repro/,
+    # but NOT from a render request: nothing on the wire names a model, because
+    # llr ships one denoiser. This entry is the migration target, not a choice.
+    # Only usable on a frame carrying Sony's noise tags; the caller falls back
+    # to DEFAULT_MODEL when there are none (cli.py).
+    "sony": SonyRawNRDenoiser,
 }
 
-# Default model used when a recipe enables denoise without naming a backend.
-DEFAULT_MODEL = "wavelet"
+# The denoiser every render uses. Not a fallback for an unnamed backend -- the
+# request has no way to name one.
+#
+# This is Edit's own filter now. End to end, from the mosaic to the four output
+# planes, it reproduces the engine bit for bit -- error identically zero -- on
+# five frames from three bodies (sony_repro/tools/rawnr_e2e_verify.py).
+DEFAULT_MODEL = "sony"
+
+# Where DEFAULT_MODEL goes when a frame cannot feed it. "sony" needs the noise
+# tags only a Sony body writes, so an imported DNG or another maker's RAW has
+# nothing to drive it with. Kept separate from DEFAULT_MODEL on purpose: making
+# the fallback point at DEFAULT_MODEL made it point at itself the moment the
+# default became "sony", which is an infinite fallback, not a fallback.
+FALLBACK_MODEL = "wavelet"
 
 
 def register_denoiser(model_id: str, factory: Callable[[], Denoiser]) -> None:
@@ -777,3 +1005,29 @@ def get_denoiser(model_id: str) -> Denoiser:
             )
         _DENOISER_CACHE[model_id] = factory()
     return _DENOISER_CACHE[model_id]
+
+
+def effective_model(model_id: str, input_path: str | Path) -> str:
+    """Which denoiser will actually run on this file, fallback already applied.
+
+    The fallback used to be resolved deep in the render, *after* the caller had
+    already keyed a cache on the requested model. That is fine while the two
+    denoisers agree on what affects their pixels and wrong the moment they do
+    not: `uses_chroma` differs between them, so a frame that silently fell back
+    would have had its chroma setting dropped from the key by a decision made
+    for the model that did not run. Resolving first keeps every such decision
+    downstream of the answer.
+
+    Owns the "does this file carry the tags" question so callers cannot spell
+    it differently. Cheap to ask: the tags come from an `lru_cache` keyed on
+    file identity (sony/rawnr.py), and the render reads them anyway.
+    """
+    if not get_denoiser(model_id).requires_noise_model:
+        return model_id
+    from .sony.rawnr import noise_model
+    return model_id if noise_model(input_path) is not None else FALLBACK_MODEL
+
+
+def model_uses_chroma(model_id: str) -> bool:
+    """Whether `model_id` lets the Color NR slider reach its pixels."""
+    return bool(get_denoiser(model_id).uses_chroma)
