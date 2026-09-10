@@ -1,0 +1,39 @@
+0x140152c00  lea      rax, [rip + 0x38a1a9]   ; [0x1404dcdb0 = 2.94057083 (f32) / 1077686864 (i32)]
+0x140152c07  mov      qword ptr [rcx + 0x18], 2   ; 0x18
+0x140152c0f  mov      qword ptr [rcx], rax
+0x140152c12  xor      eax, eax
+0x140152c14  mov      qword ptr [rcx + 8], rax   ; 0x8
+0x140152c18  mov      qword ptr [rcx + 0x10], rax   ; 0x10
+0x140152c1c  mov      qword ptr [rcx + 0x20], rax   ; 0x20
+0x140152c20  mov      qword ptr [rcx + 0x28], rax   ; 0x28
+0x140152c24  mov      byte ptr [rcx + 0x34], al   ; 0x34
+0x140152c27  mov      rax, rcx
+0x140152c2a  mov      dword ptr [rcx + 0x30], 0xffffffff   ; 0x30
+0x140152c31  ret      
+0x140152c40  lea      rax, [rip + 0x38a169]   ; [0x1404dcdb0 = 2.94057083 (f32) / 1077686864 (i32)]
+0x140152c47  mov      dword ptr [rcx + 0x1c], edx   ; 0x1c
+0x140152c4a  mov      qword ptr [rcx], rax
+0x140152c4d  xor      eax, eax
+0x140152c4f  mov      qword ptr [rcx + 8], rax   ; 0x8
+0x140152c53  mov      qword ptr [rcx + 0x10], rax   ; 0x10
+0x140152c57  mov      qword ptr [rcx + 0x20], rax   ; 0x20
+0x140152c5b  mov      qword ptr [rcx + 0x28], rax   ; 0x28
+0x140152c5f  mov      dword ptr [rcx + 0x30], 0xffffffff   ; 0x30
+0x140152c66  mov      byte ptr [rcx + 0x34], al   ; 0x34
+0x140152c69  test     edx, edx
+0x140152c6b  jne      0x140152c78
+0x140152c6d  mov      dword ptr [rcx + 0x18], 2   ; 0x18
+0x140152c74  mov      rax, rcx
+0x140152c77  ret      
+0x140152c78  cmp      edx, 1
+0x140152c7b  jne      0x140152c84
+0x140152c7d  mov      dword ptr [rcx + 0x18], 4   ; 0x18
+0x140152c84  mov      rax, rcx
+0x140152c87  ret      
+0x140152c90  sub      rsp, 0x28
+0x140152c94  lea      rax, [rip + 0x38a115]   ; [0x1404dcdb0 = 2.94057083 (f32) / 1077686864 (i32)]
+0x140152c9b  mov      qword ptr [rcx], rax
+0x140152c9e  call     0x140152df0
+0x140152ca3  nop      
+0x140152ca4  add      rsp, 0x28
+0x140152ca8  ret      

@@ -1,0 +1,53 @@
+0x140152cb0  mov      r9d, 1
+0x140152cb6  jmp      0x140152cc0
+0x140152cc0  mov      qword ptr [rsp + 0x18], rbp   ; 0x18
+0x140152cc5  push     rsi
+0x140152cc6  push     rdi
+0x140152cc7  push     r12
+0x140152cc9  push     r14
+0x140152ccb  push     r15
+0x140152ccd  sub      rsp, 0x30
+0x140152cd1  mov      rdi, qword ptr [rcx + 0x20]   ; 0x20
+0x140152cd5  xor      r14d, r14d
+0x140152cd8  mov      r15d, r9d
+0x140152cdb  mov      r12d, r8d
+0x140152cde  mov      ebp, edx
+0x140152ce0  mov      rsi, rcx
+0x140152ce3  test     rdi, rdi
+0x140152ce6  je       0x140152d86
+0x140152cec  lea      rcx, [rip + 0x40a415]   ; [0x14055d108 = 0 (f32) / 0 (i32)]
+0x140152cf3  call     qword ptr [rip + 0x2a259f]   ; [0x1403f5298 = 7.81852516e-39 (f32) / 5579486 (i32)]
+0x140152cf9  mov      rcx, qword ptr [rip + 0x40a438]   ; [0x14055d138 = 0 (f32) / 0 (i32)]
+0x140152d00  mov      r8, qword ptr [rip + 0x40a439]   ; [0x14055d140 = 0 (f32) / 0 (i32)]
+0x140152d07  cmp      rcx, r8
+0x140152d0a  je       0x140152d75
+0x140152d0c  mov      qword ptr [rsp + 0x68], rbx   ; 0x68
+0x140152d11  mov      rbx, qword ptr [rcx]
+0x140152d14  mov      qword ptr [rsp + 0x20], rbx   ; 0x20
+0x140152d19  test     rbx, rbx
+0x140152d1c  je       0x140152d23
+0x140152d1e  cmp      rdi, qword ptr [rbx]
+0x140152d21  je       0x140152d2e
+0x140152d23  add      rcx, 8
+0x140152d27  cmp      rcx, r8
+0x140152d2a  jne      0x140152d11
+0x140152d2c  jmp      0x140152d70
+0x140152d2e  lea      rdx, [rcx + 8]   ; 0x8
+0x140152d32  sub      r8, rdx
+0x140152d35  call     0x140358a4b
+0x140152d3a  mov      rdx, qword ptr [rip + 0x40a417]   ; [0x14055d158 = 0 (f32) / 0 (i32)]
+0x140152d41  sub      qword ptr [rip + 0x40a3f7], 8   ; [0x14055d140 = 0 (f32) / 0 (i32)]
+0x140152d49  cmp      rdx, qword ptr [rip + 0x40a410]   ; [0x14055d160 = 0 (f32) / 0 (i32)]
+0x140152d50  je       0x140152d5f
+0x140152d52  mov      qword ptr [rdx], rbx
+0x140152d55  add      qword ptr [rip + 0x40a3fb], 8   ; [0x14055d158 = 0 (f32) / 0 (i32)]
+0x140152d5d  jmp      0x140152d70
+0x140152d5f  lea      r8, [rsp + 0x20]   ; 0x20
+0x140152d64  lea      rcx, [rip + 0x40a3e5]   ; [0x14055d150 = 0 (f32) / 0 (i32)]
+0x140152d6b  call     0x140045dc0
+0x140152d70  mov      rbx, qword ptr [rsp + 0x68]   ; 0x68
+0x140152d75  lea      rcx, [rip + 0x40a38c]   ; [0x14055d108 = 0 (f32) / 0 (i32)]
+0x140152d7c  db 0xff
+0x140152d7d  db 0x15
+0x140152d7e  db 0x1e
+0x140152d7f  db 0x25

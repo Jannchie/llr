@@ -30,6 +30,8 @@ import time
 
 import frida
 
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 EXE = r"C:\Program Files\Sony\Imaging Edge\Edit.exe"
 SCR = os.path.dirname(os.path.abspath(__file__))
 EXEC_RVA = 0x3AE920
@@ -38,23 +40,32 @@ EXEC_RVA = 0x3AE920
 #: 全都挂上,谁被调到一目了然 —— 尤其要看共用的编排器派到的是标量核还是 SIMD 核。
 HOOKS = {
     "orch_110": 0x35ECC0, "orch_118": 0x362DF0, "orch_190": 0x363500,
-    "meta_190": 0x35D3E0, "vt58_cvt": 0x35AD60, "vt60": 0x35B810,
+    "vt58_cvt": 0x35AD60, "vt60": 0x35B810,
     "s_lpH": 0x35E750, "s_lpV": 0x35E860, "s_midH": 0x35EA50, "s_midV": 0x35EB70,
-    "s_costH": 0x35BFF0, "s_costV": 0x35C170, "s_aggr": 0x363AE0,
-    "s_crit": 0x35F1C0, "s_b8": 0x361950, "s_g98": 0x3644D0, "s_g90": 0x363D80,
-    "s_blend": 0x360910,
-    "S_3af8d0": 0x3AF8D0, "S_3afac0": 0x3AFAC0, "S_3b0370": 0x3B0370,
-    "S_3b0f00": 0x3B0F00, "S_3b1040": 0x3B1040, "S_3b11f0": 0x3B11F0,
-    "S_3b1330": 0x3B1330, "S_3b14a0": 0x3B14A0, "S_3b1830": 0x3B1830,
-    "S_3b2300": 0x3B2300, "S_3b2920": 0x3B2920, "S_3b2b40": 0x3B2B40,
-    "S_3b2be0": 0x3B2BE0, "S_3b3910": 0x3B3910, "S_3b4230": 0x3B4230,
+    "s_costH": 0x35BFF0, "s_costV": 0x35C170, "s_aggr": 0x363AE0, "s_blend": 0x360910,
+    "vt68_costH": 0x3AF8D0, "vt70_costV": 0x3AFAC0, "vt78": 0x35B920, "vt80": 0x35BA90,
+    "vt88": 0x35BD30, "vt90": 0x3B3C40, "vt98": 0x3B3F60, "vta0_aggr": 0x3B3910,
+    "vta8": 0x362A50, "vtb0_crit": 0x35F1C0, "vtb8": 0x361950, "vtc0": 0x3B14A0,
+    "vtc8": 0x3B2B40, "vtd0": 0x3B2920, "vtd8": 0x3B2660, "vte0": 0x361050,
+    "vte8": 0x3B1830, "vtf0": 0x35F510, "vtf8_blend": 0x3B4230, "vt100": 0x3B24E0,
+    "vt108": 0x3B2300, "vt120": 0x361830, "vt128": 0x35C7B0, "vt130": 0x35CF60,
+    "vt138": 0x3AFCD0, "vt140": 0x3B0070, "vt148": 0x35C4B0, "vt150_lpH": 0x3B0F00,
+    "vt158_lpV": 0x3B1040, "vt160_midH": 0x3B11F0, "vt168_midV": 0x3B1330,
+    "vt170": 0x35D3A0, "vt178": 0x3B0370, "vt180": 0x3B43B0, "vt188": 0x3AAA40,
+    "aniso": 0x3B2BE0, "meta_190": 0x35D3E0,
 }
+#: 每个函数只完整记录前 CAP 次调用,之后只计数 —— 行级回调会被调几百次。
+CAP = 3
+#: 三块判据参数记录(.data,运行时才填),各读 0x30。
+PARAM_RVAS = [0x5A8B28, 0x5A8B48, 0x5A8B68]
 
 JS = r"""
 const mod = Process.getModuleByName('Edit.exe');
 const base = mod.base;
 const HOOKS = HOOKSJS;
 let lockThread = null, done = false, seq = 0;
+const counts = {};
+const CAP = CAPJS;
 const depth = {};
 const vtabs = {};
 
@@ -150,7 +161,9 @@ Interceptor.attach(base.add(EXECJS), {
       } catch (e) {}
       vt[k] = {rows: rows, users: vtabs[k]};
     }
-    send({tag: 'end', vtabs: vt});
+    const params = {};
+    PARAMJS.forEach(function (r) { try { params[r] = Array.from(new Uint8Array(base.add(r).readByteArray(0x30))); } catch (e) {} });
+    send({tag: 'end', vtabs: vt, counts: counts, params: params});
   }
 });
 
@@ -160,13 +173,15 @@ for (const name in HOOKS) {
     Interceptor.attach(base.add(rva), {
       onEnter(a) {
         if (done || lockThread !== this.threadId) return;
+        counts[name] = (counts[name] || 0) + 1;
+        if (counts[name] > CAP) return;
         this.mine = true;
         this.name = name;
         this.seq = seq++;
         this.d = depth[this.threadId] || 0;
         depth[this.threadId] = this.d + 1;
         this.args = [];
-        for (let k = 0; k < 12; k++) {
+        for (let k = 0; k < 16; k++) {
           try { this.args.push(argInfo(a[k])); } catch (e) { this.args.push({err: '' + e}); }
         }
         try {
@@ -187,7 +202,7 @@ for (const name in HOOKS) {
         if (!this.mine) return;
         depth[this.threadId] = this.d;
         const raw = [];
-        for (let k = 0; k < 12; k++) {
+        for (let k = 0; k < 16; k++) {
           try { leaveInfo(this.args[k], this.args[k].ptr ? ptr(this.args[k].raw) : null); } catch (e) {}
         }
         send({tag: 'leave', seq: seq++, enter_seq: this.seq, name: name, depth: this.d,
@@ -208,7 +223,8 @@ def main():
     out_dir = sys.argv[sys.argv.index("--out") + 1] if "--out" in sys.argv else \
         os.path.join(SCR, "..", "..", "tmp")
     stem = os.path.splitext(os.path.basename(arw))[0]
-    js = (JS.replace("HOOKSJS", json.dumps(HOOKS)).replace("EXECJS", hex(EXEC_RVA)))
+    js = (JS.replace("HOOKSJS", json.dumps(HOOKS)).replace("EXECJS", hex(EXEC_RVA))
+          .replace("CAPJS", str(CAP)).replace("PARAMJS", json.dumps(PARAM_RVAS)))
 
     events: list = []
     end: dict = {}

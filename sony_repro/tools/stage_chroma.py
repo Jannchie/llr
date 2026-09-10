@@ -13,9 +13,11 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import numpy as np
 
-Z = Path("/home/jannchie/llr/sony_repro/tools/stage_frames.npz")
+Z = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/home/jannchie/llr/sony_repro/tools/stage_frames.npz")
 TILE = 32
-ORDER = ["ZcTaskSIMDITP_out", "ZcTaskSSCS_out", "ZcTaskAreaCompSIMD_out",
+ORDER = ["ZcTaskSIMDITP_out", "ZcTaskSSCS_out", "ZcTaskSIMDLinearMatrix16_out",
+         "ZcTaskMainGamma_in", "ZcTaskMainGamma_out", "ZcTaskRGB2YCC_out",
+         "ZcTaskChromaSuppres_out", "ZcTaskYGamma_out", "ZcTaskAreaCompSIMD_out",
          "ZcTaskSIMDSharpness_out", "ZcTaskSIMDSpica_out", "ZcTaskSIMDMarble_out"]
 
 

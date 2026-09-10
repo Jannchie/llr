@@ -93,7 +93,7 @@ def explained(target, cand):
 
 def main():
     z = np.load(Z)
-    for tag in ("t12", "t17"):
+    for tag in sorted({k.split("_")[0] for k in z.files if k.endswith("_in")}):
         a = z[f"{tag}_in"].astype(np.float64)
         b = z[f"{tag}_out"].astype(np.float64)
         m = 8  # 切掉边界

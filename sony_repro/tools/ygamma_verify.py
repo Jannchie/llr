@@ -14,6 +14,7 @@ contrast = 1.0546875 = 135/128。这里拿引擎自己的 in/out 逐像素核对
 """
 from pathlib import Path
 
+import sys
 import numpy as np
 
 TOOLS = Path(__file__).parent
@@ -30,7 +31,7 @@ def ygamma(y, lut, pivot, contrast, bl, wl):
 
 def main():
     p = np.load(TOOLS / "ygamma_lut.npz")
-    z = np.load(TOOLS / "stage_frames.npz")
+    z = np.load(sys.argv[1] if len(sys.argv) > 1 else TOOLS / "stage_frames.npz")
     a, b = z["ZcTaskYGamma_in"], z["ZcTaskYGamma_out"]
     ok = a.max(-1) > 0
 

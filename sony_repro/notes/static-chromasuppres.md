@@ -1,5 +1,7 @@
 # ZcTaskChromaSuppres:lo/hi 怎么随 ISO 插值(补 PIPELINE §7.5)
 
+> **2026-09-10 实测:** 四帧十二块 tile 100.0000% 逐位;`lv[0xc]` 恒 0(不是 ISO 轴);lv 与 calib 不是同一块内存;B→hiY 的 LUT 链是往返恒等。见 measured-chroma-gap §2.24.1。已接入 worker/web。
+
 * 反编译产物:`tools/chroma_suppres_decomp.c`
 * exec RVA **`0x36e920`**(1289 字节)。函数不长,已逐句读完
   (含 4 张跳转表,Ghidra 没恢复,用 `jt.py` / 反汇编手工补齐)。

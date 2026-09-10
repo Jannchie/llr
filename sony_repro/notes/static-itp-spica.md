@@ -1,5 +1,7 @@
 # ZcTaskITP 与 ZcTaskSpica:它们各自在干什么
 
+> ✅ **ITP 这一半已经收口:`notes/static-itp-decoded.md` 是权威版**(2026-09-10,整条链逐级对引擎 dump 验证,落地 `sony/itp.py`)。本文 §2.x 是过程记录;§2.7 的各向异性图有四处要按新文修正。
+
 * 反编译产物:`tools/itp_decomp.c`、`tools/spica_decomp.c`
 * 这两个在 `_limitations` 里被列为未复刻且从没查过用途。
   本篇只给**定性结论**,并把已经确认的骨架写下来。

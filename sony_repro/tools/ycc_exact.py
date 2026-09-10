@@ -32,7 +32,12 @@ def main():
     arw = Path(sys.argv[1])
     z = np.load(sys.argv[2])
     style = sys.argv[3] if len(sys.argv) > 3 else "VV2"
-    p = chroma_params(data_ifds(arw)[LOOK_ORDER.index(style)])
+    # 光源权重来自 RAW 的 0x7848(PIPELINE 7.6.1),不是默认的 (1024,0,0,0):
+    # DSC03036(ILCE-7CM2)的权重是 (0,1168,0,0),按默认权重算 Cb 中位差 48。
+    from llr_worker.sony import sr2 as _sr2
+    _w = tuple(int(x) for x in _sr2.look_calibrations(arw)[LOOK_ORDER.index(style)].chroma_weights)
+    print(f"光源权重 {_w}")
+    p = chroma_params(data_ifds(arw)[LOOK_ORDER.index(style)], weights=_w)
     cross, gain = unpack_chroma(p)
     print("%s  外观=%s\n八参数 %s\n  交叉 %s\n  增益 %s\n"
           % (arw.name, style, p.tolist(),

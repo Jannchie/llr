@@ -1,0 +1,11 @@
+0x14035d3a0  subss    xmm1, xmm3
+0x14035d3a4  xorps    xmm0, xmm0
+0x14035d3a7  subss    xmm2, xmm3
+0x14035d3ab  andps    xmm1, xmmword ptr [rip + 0x182eee]
+0x14035d3b2  andps    xmm2, xmmword ptr [rip + 0x182ee7]
+0x14035d3b9  addss    xmm1, xmm2
+0x14035d3bd  ucomiss  xmm1, xmm0
+0x14035d3c0  jp       0x14035d3cd
+0x14035d3c2  jne      0x14035d3cd
+0x14035d3c4  movss    xmm0, dword ptr [rip + 0x18175c]
+0x14035d3cc  ret      

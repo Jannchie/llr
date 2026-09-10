@@ -67,6 +67,14 @@ Preprocess(2) → TileDivRough(1) → DemosaicRough(1)
 > → AreaCompSIMD → SIMDSharpness → SIMDSpica → YCC2RGB → SIMDMarble
 > ```
 >
+> **2026-09-10 修正(整幅抓帧 `tmp/stage_frames_tone.npz`,measured-chroma-gap §2.21):**
+> `AreaCompSIMD:out` 与 `RGB2YCC:out` 逐项相同(最大差 3,DRO 关时直通),而
+> `ChromaSuppres:out` 的 Cr/Cb 已被改过(最大差 107/305,Y 不变)—— 所以 AreaComp 在
+> RGB2YCC **之后、ChromaSuppres 之前**:
+> `… → RGB2YCC → AreaCompSIMD → ChromaSuppres → YGamma → SIMDSharpness → SIMDSpica → YCC2RGB → SIMDMarble`。
+> 同一份数据还给出 MainGamma 入口→出口亮度细节 ×16.2、色度 ×17.6(逐通道 LUT,与 llr 一致),
+> YGamma 入口→出口 Y 传递约 ×1.055、只动 Y。
+>
 > `ZcTaskSIMDITP` 吃的是**马赛克**(入口 tile 的四相位里两个绿位点均值逐位相同,
 > 间距 1 的差是间距 2 的 7~14 倍),**它就是真正的 demosaic**;
 > 开头那个 `DemosaicRough` 只服务粗预览。
@@ -588,6 +596,17 @@ plane0 = max(Y, 0);                          /* Y 顺手钳到非负 */
 `lv+0x79962`/`lv+0x89962` 两张 LUT 的来源(排在 tone LUT 之前,多半是「线性 → 曲线输入域」
 的两级映射)。
 
+> **2026-09-10 已实测并接入(measured-chroma-gap §2.24)。** `tools/export_cs_capture.py` 在导出时刻
+> 抓 tile 入/出 + calib + 四张 LUT,`tools/cs_verify.py` 按上面的 C 逐像素套:**四帧(ISO 100/1250/2000/4000)
+> 十二块 tile Y/Cr/Cb 全部 100.0000% 逐位**。定标结果:(1) 六个锚点就是标签原文
+> (`0x787e`=[512,112,128]、`0x787f`=[15360]×3、`0x7880`=512、`0x7881`=0),机型码 `calib[0x2c]` 实测
+> 0x18d/0x197,不在 0x100..0x115 的表里,走的是「全部读 RAW」那条路;(2) **`lv[0xc]`(所谓 0x74a5 轴)
+> 四个 ISO 上都是 0**,插值与 ramp 从不触发 —— 它不是 ISO 轴,别再当 ISO 用;(3) B→hiY 那条四张 LUT 的链
+> 是个**往返恒等**(B=15360→15356,中段比 0.9997,只在 B>15584 处饱和到 15584),llr 直接取 hiY=B;
+> (4) `lv+0x18ee`=64 → sc=1.0。落地:worker `sony/chromasuppres.py`(整数版逐位 + 浮点增益版)、
+> `chroma.apply_chroma(suppress=)`、profile 的 `profileChromaSuppres`、shader `sonyChroma` 在 YGamma 之前乘增益,
+> `tools/e2e_pipeline.py` 同步。净效果:中间调色度 ×255/256,Y>15356 起线性掉到 0(约 2040 个 Y 单位)。
+
 ### 7.6 「还差两成」是个**假问题** —— YCC 段本身逐像素正确
 
 早前的读数是这样得来的(DSC03015/VV2,拿复刻的**整幅**去比机内 JPEG):
@@ -623,7 +642,7 @@ plane0 = max(Y, 0);                          /* Y 顺手钳到非负 */
 | 机内 JPEG | — | — | 59.5 51.4 43.9 |
 
 平均 RGB 已经基本重合,色相从 -7.70 度收到 -0.59 度。**剩下约 5% 的色度过量**
-(0.9211 对引擎自己的 0.9738)来自还没接的 ChromaSuppres,以及 ITP / Sharpness /
+(0.9211 对引擎自己的 0.9738)来自当时还没接的 ChromaSuppres(2026-09-10 已接,§7.5),以及 ITP / Sharpness /
 Spica 这几段和色相索引的近似误差。
 
 **已接进主管线**(worker `sony/chroma.py` + shader `passes.ts` 的 `sonyChroma`)。
@@ -708,7 +727,7 @@ y = trunc(clamp(((max(0, lut[Y]) - black) * scale - pivot) * contrast + pivot, 0
 | `pivot` | `(int16) calib[0x91962]` | 0(Fade=0);**10624(Fade≥1)** |
 | `contrast` | `(float) calib[0x91964]` | **1.0546875 = 17280/16384**(Fade=0) |
 | `bl` / `wl` | `(int16) [param_3+8][0x2ac / 0x2b0]` | 0 / 0 |
-| `lut[i]` | `(uint16) calib[0x318fc + i*2]` | Y>1024 处**恒等** |
+| `lut[i]` | `(uint16) calib[0x318fc + i*2]` | **随外观变**:FL/VV2 等八种近恒等;Standard/Neutral 从 8192 起斜率 0.90625 的高光膝(2026-09-10,measured-chroma-gap §2.25) |
 | `K`,`k1`,`k2` | `0x1404df248`,`0x140466794`,`0x1404667a0` | 512.0,1/512,32767.0 |
 
 **坑:`bl`/`wl` 来自第三个参数,不是 `task+0x68`**(开头有一句 `mov rdi, r8`)。
@@ -717,7 +736,7 @@ y = trunc(clamp(((max(0, lut[Y]) - black) * scale - pivot) * contrast + pivot, 0
 于是 `black = 0`、`scale = 1.0`,整段塌缩成 `trunc(lut[Y] * 1.0546875)`。
 取整是**截断**不是就近:就近只有 50.31% 逐位相同,截断是 **100.0000%**(2046336 像素)。
 
-LUT 与恒等的偏差只在 Y<1024 且 ≤16/16383,主管线里按恒等近似,**只留 contrast**。
+~~LUT 与恒等的偏差只在 Y<1024 且 ≤16/16383,主管线里按恒等近似,**只留 contrast**。~~ **错:那是 FL 帧的表。** Standard/Neutral 的表从 Y=8192 起斜率 0.90625(高光压 4.5%),llr 按恒等处理导致高光偏亮 2–3% 并撞裁剪。2026-09-10 起两族 LUT 以数据表(`sony/data/ygamma_luts.npz`,按 0x780c/0x780d 选)接入,见 §2.25。
 对**引擎自己的成品**八张实测:亮度偏差中位 **+0.0139 -> -0.0009**(此前一致偏暗)。
 
 **它修的是亮度不是饱和度。** 一度以为「Y 被抬 5%、色度不动」会降低饱和度,
@@ -868,6 +887,8 @@ SE 的八个色度参数和 Standard 一模一样,所以染色一定在别处 �
 
 ### 7.8.5 `ZcTask3DLut`:被一个 Imaging Edge 的编辑参数控制,不是相机写的
 
+> **2026-09-10 更正:** 这个参数就是面板上的「色彩复制:标准 / 高级」,高级档才跑。它是让 Edit 输出接近机内直出的那一级(高光压暗、去饱和),已逐位解出并接入 llr 作为同名开关,表是静态的(跨外观、跨机身同一张)。见 measured-chroma-gap §2.26、notes/static-3dlut.md。
+
 全二进制里它只有**一处**构造点(`0x14017f85c`),守卫是 `[rsi+0x248] != 0`。
 而 `rsi` 这整块设置是从 Imaging Edge 自己的编辑参数表灌进来的
 (`0x140168c40` 起,`mov edx, <id>` + 取值 + 存到固定偏移):
@@ -884,6 +905,11 @@ SE 的八个色度参数和 Standard 一模一样,所以染色一定在别处 �
 结论:它属于 Imaging Edge 的用户 LUT 功能,**与复刻相机渲染无关**,不必再管。
 
 ## 7.9 Marble 内部的色域转换(逐位复刻成功,但净效果只有 1%)
+
+> **2026-09-11 更新:整级(含色差清理)已逐位解出并接入**,见 `notes/measured-chroma-gap.md` §2.27,
+> 产品 `apps/worker/src/llr_worker/sony/marble.py`。三张 LUT 有闭式(float32,幂 563/256,归一 16384),
+> 逆向那一步的编码表在 RVA 0x5bbd60(sRGB OETF)。下文的「解析式不够精确」是 2.2/16383 之误。
+> 真实顺序另见 §2.28:`ChromaSuppres → SIMDSharpness → YGamma → SIMDSpica → YCC2RGB → SIMDMarble`。
 
 `ZcTaskMarble` 一进来就按 `settings+0x44` 二选一调 `FUN_140196170` /
 `FUN_140196500`,两者都是「查表线性化 -> 3x3(每行和为 1) -> 钳 14 位 -> 查表编码」:
@@ -1551,6 +1577,8 @@ level = (st[0x238] == 1) ? ((calib[0x10f0] == 0) ? 5 : -1) : st[0x23c];
 > 若真有第二组,烘死的常量就要按 `0x703b` 分组。
 
 ## 7.11 SIMDSharpness(**已完全解出,逐位 99.987%;已接入渲染器**)
+
+> 2026-09-10 导出路径复核:Sharpness 99.97%、Spica 99.999%、RawNR 100%、ITP 5/134 万;Spica 的 cfg 有三个 ISO 折线量(增益、rng 阈值 a/b),已补进 worker/web —— measured-chroma-gap §2.23。
 
 RVA `0x386da0`;标量孪生 `ZcTaskSharpness` @ `0x388c00`,**前言逐条相同**,
 可以拿标量版当参考实现读。**离线复算对引擎的真实 tile 逐位相同 99.987%,
@@ -2239,6 +2267,8 @@ GLSL 那份按 `BIN[i]·BIN[j]` 累加**颜色**,最后只做一次 luma 点乘 
 
 ## 7.12 SIMDITP:把三通道拆成「基底 + 两条差分」再重建
 
+> ✅ **2026-09-10:整条 demosaic 已逐级解出并复刻,见 `notes/static-itp-decoded.md`**(三帧对引擎 dump 20/22 级逐位相同,端到端每帧 ≤4 像素差 1 LSB;落地 `sony/itp.py`,`prepare_linear` 默认走它)。跑的是 SIMD 版 `0x3ae920`,下面这段读的是标量版 `0x35af00`,骨架相同。
+
 RVA `0x35af00`(2313 字节)。骨架确定,核心滤波器没读。
 
 ```c
@@ -2366,6 +2396,7 @@ tbl3/4/5 是常数 512(两个 ISO 都是),用途未知。
 
 **还有一段按 ISO 的强度插值**(`0x39fb4c..0x39fbbe`):ISO ≤400 取 0.4,
 ISO ≥1600 取 1.0,中间线性。这就是 ISO 100 上"它几乎什么都没做"的直接原因。
+**它加在哪(2026-09-10 定):** 不在阈值表、不在核,而是 exec 写回时 `out = trunc(s·filt + (1−s)·in)`(measured-chroma-gap §2.15 的更正;`rawnr_strength_probe.py`,两帧 100% 逐位)。
 
 **它跑在 CFA 马赛克上,并拆成四个半分辨率相位平面。** 两条独立证据:抓到的入口
 平面里,相隔奇数的差 std 是 388,相隔偶数的只有 84(四个相位均值 1001/1208/1211/721,
@@ -2671,6 +2702,7 @@ ZcTask3DLut.slot7           0 次
 
 | 脚本 | 用途 |
 |---|---|
+| `itp_flow_probe.py` / `itp_dump_probe.py` / `itp_param_probe.py` / `itp_verify.py` / `itp_ab_crop.py` | **ITP(demosaic)的数据流、全量 dump、参数块、逐级验证、肉眼 A/B**,见 `notes/static-itp-decoded.md` |
 | `analyze_batch.py` | 批量结果的标定表 / tone LUT 统计 |
 | `correlate_meta.py` | 与 EXIF(创意外观、DRO、白平衡)关联 |
 | `fit_matrix_model.py` | 检验节点表的生成模型(PCA / 流形维度) |

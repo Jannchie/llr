@@ -1,0 +1,43 @@
+0x140390ce0  mov      r9d, edx
+0x140390ce3  movaps   xmm1, xmm3
+0x140390ce6  mov      edx, dword ptr [rcx + 0x1a8]   ; 0x1a8
+0x140390cec  mov      r10, r8
+0x140390cef  mov      eax, 0xcccccccd
+0x140390cf4  cmp      r9d, edx
+0x140390cf7  ja       0x140390d15
+0x140390cf9  mul      r9d
+0x140390cfc  shr      edx, 3
+0x140390cff  lea      r8d, [rdx + 1]   ; 0x1
+0x140390d03  movzx    ecx, word ptr [r10 + r8*2]
+0x140390d08  movd     xmm3, ecx
+0x140390d0c  cvtdq2ps xmm3, xmm3
+0x140390d0f  mulss    xmm3, xmm1
+0x140390d13  jmp      0x140390d2c
+0x140390d15  mul      edx
+0x140390d17  movzx    eax, word ptr [r10 + 0x12]   ; 0x12
+0x140390d1c  mov      r8d, 0xa
+0x140390d22  shr      edx, 3
+0x140390d25  movd     xmm3, eax
+0x140390d29  cvtdq2ps xmm3, xmm3
+0x140390d2c  movzx    ecx, word ptr [r10 + rdx*2]
+0x140390d31  lea      eax, [rdx + rdx*4]
+0x140390d34  xorps    xmm0, xmm0
+0x140390d37  add      eax, eax
+0x140390d39  xorps    xmm2, xmm2
+0x140390d3c  sub      r9d, eax
+0x140390d3f  mov      eax, r9d
+0x140390d42  sub      r8d, edx
+0x140390d45  cvtsi2ss xmm2, rax
+0x140390d4a  mov      eax, r8d
+0x140390d4d  cvtsi2ss xmm0, rax
+0x140390d52  mulss    xmm0, dword ptr [rip + 0x14e446]   ; [0x1404df1a0 = 10 (f32) / 1092616192 (i32)]
+0x140390d5a  divss    xmm2, xmm0
+0x140390d5e  movd     xmm0, ecx
+0x140390d62  cvtdq2ps xmm0, xmm0
+0x140390d65  mulss    xmm0, xmm1
+0x140390d69  movss    xmm1, dword ptr [rip + 0x14de4b]   ; [0x1404debbc = 1 (f32) / 1065353216 (i32)]
+0x140390d71  subss    xmm1, xmm2
+0x140390d75  mulss    xmm2, xmm3
+0x140390d79  mulss    xmm0, xmm1
+0x140390d7d  addss    xmm0, xmm2
+0x140390d81  ret      

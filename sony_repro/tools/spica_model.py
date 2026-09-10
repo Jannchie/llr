@@ -191,8 +191,9 @@ def main():
     def opt(f, d):
         return float(sys.argv[sys.argv.index(f) + 1]) if f in sys.argv else d
 
-    xmm11, weight = 1.0, opt("--w", 0.5)
-    cfg, W = Cfg(), load_wtab()
+    xmm11, weight = opt("--xmm11", 1.0), opt("--w", 0.5)
+    cfgp = sys.argv[sys.argv.index("--cfg") + 1] if "--cfg" in sys.argv else None
+    cfg, W = Cfg(cfgp), load_wtab()
     npz = sys.argv[sys.argv.index("--npz") + 1] if "--npz" in sys.argv else "tiles_SIMDSpica.npz"
     z = np.load(os.path.join(SCR, npz))
     tiles = sorted(int(k[1:].split("_")[0]) for k in z if k.endswith("_in"))
