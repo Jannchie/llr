@@ -48,7 +48,6 @@
   --shadow-float: 0 6px 22px rgba(0, 0, 0, 0.4), inset 0 0 0 0.5px rgba(255, 255, 255, 0.08);
 
   --stage-inset: 12px;
-  --filmstrip-h: 94px;
   --topbar-h: 42px;
   --rail-w: 336px;
   --tabbar-w: 38px;
@@ -100,7 +99,7 @@ button {
 .app {
   display: grid;
   grid-template-columns: 1fr var(--rail-w);
-  grid-template-rows: var(--topbar-h) 1fr var(--filmstrip-h);
+  grid-template-rows: var(--topbar-h) 1fr auto;
   grid-template-areas:
     "topbar  topbar"
     "center  right"
@@ -1329,8 +1328,12 @@ input[type="range"]:focus::-moz-range-thumb {
 .filmstrip-track {
   display: flex;
   gap: 8px;
-  padding: 10px 12px;
+  padding: 8px 12px;
   overflow-x: auto;
+  overflow-y: hidden;
+  /* Reserve the scrollbar row so the strip doesn't grow by 10px once the
+     library is wide enough to scroll. */
+  scrollbar-gutter: stable;
   align-items: flex-start;
 }
 
