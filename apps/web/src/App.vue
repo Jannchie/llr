@@ -35,7 +35,7 @@ import { useMaskEditor } from "./composables/useMaskEditor";
 import { useLibrary } from "./composables/useLibrary";
 import { useHistogram } from "./composables/useHistogram";
 import { useExport, type ExportPlan } from "./composables/useExport";
-import { useAssistant, modelKey, type AssistantTool, type ToolContent } from "./composables/useAssistant";
+import { useAssistant, modelKey, THINKING_LEVELS, type AssistantTool, type ToolContent, type TurnUsage } from "./composables/useAssistant";
 import { measureHint, measureHistogram, measurePixels } from "./rendering/histogram";
 import ModelSettings from "./components/ModelSettings.vue";
 
@@ -2234,6 +2234,14 @@ const {
 const chatModelOptions = computed(() => chatModels.value.map(m => ({
   value: modelKey(m), label: m.id, disabled: chatProviders.value !== null && !chatProviders.value.includes(m.provider),
 })));
+// The thinking level rides on the selected model's entry, so it persists with
+// the list and each model remembers its own.
+const chatThinking = computed({
+  get: () => chatModels.value.find(m => modelKey(m) === chatModel.value)?.thinking ?? "off",
+  set: thinking => { chatModels.value = chatModels.value.map(m => modelKey(m) === chatModel.value ? { ...m, thinking } : m); },
+});
+const chatThinkingOptions = computed(() => THINKING_LEVELS.map(v => ({ value: v, label: t(`chat.thinking.${v}`) })));
+const CHAT_CHIPS = ["chat.chip.1", "chat.chip.2", "chat.chip.3", "chat.chip.4"] as const;
 const modelSettingsOpen = ref(false);
 const chatDraft = ref("");
 const chatLogRef = ref<HTMLElement | null>(null);
@@ -2241,6 +2249,19 @@ function submitChat(): void {
   const text = chatDraft.value;
   chatDraft.value = "";
   void sendChat(text);
+}
+// Enter sends, Shift+Enter breaks a line — except the Enter that commits an
+// IME composition, which must not send the half-typed text. `keyCode 229` is
+// the legacy IME marker some browsers set without isComposing.
+function onChatEnter(e: KeyboardEvent): void {
+  if (e.shiftKey || e.isComposing || e.keyCode === 229) return;
+  e.preventDefault();
+  submitChat();
+}
+function usageLine(u: TurnUsage): string {
+  const k = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+  const cost = u.cost >= 0.001 ? `$${u.cost.toFixed(3)}` : u.cost > 0 ? "<$0.001" : "$0";
+  return t("chat.usage", { input: k(u.input), output: k(u.output), cached: u.cacheRead ? t("chat.usage.cached", { n: k(u.cacheRead) }) : "", cost });
 }
 // Keep the newest message in view as the reply streams in.
 watch(chatEntries, () => { void nextTick(() => { const el = chatLogRef.value; if (el) el.scrollTop = el.scrollHeight; }); }, { deep: true });
@@ -2623,8 +2644,7 @@ const vWheelAdjust = {
            stays put, which the shared panel scroller cannot give it. -->
       <section class="rail-panels chat" v-if="editTab === 'assistant'">
         <header class="panel-head chat-head">
-          <SelectMenu v-model="chatModel" :options="chatModelOptions" :disabled="chatBusy"
-            :aria-label="t('models.title')" :placeholder="t('models.none')" />
+          <span>{{ t('panel.assistant') }}</span>
           <button class="icon-btn chat-gear" type="button" :title="t('models.title')" :aria-label="t('models.title')" @click="modelSettingsOpen = true">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
               <path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z" />
@@ -2636,13 +2656,20 @@ const vWheelAdjust = {
         <ModelSettings :open="modelSettingsOpen" :models="chatModels" :providers="chatProviders"
           @update:models="v => chatModels = v" @close="modelSettingsOpen = false" />
         <div class="chat-log" ref="chatLogRef">
-          <p class="chat-empty" v-if="!chatEntries.length">{{ t('chat.empty') }}</p>
+          <div class="chat-empty" v-if="!chatEntries.length">
+            <p>{{ t('chat.empty') }}</p>
+            <!-- Chips fill the box rather than send: the send key stays where the words become the user's own. -->
+            <div class="chat-chips">
+              <button v-for="k in CHAT_CHIPS" :key="k" type="button" class="chat-chip" @click="chatDraft = t(k)">{{ t(k) }}</button>
+            </div>
+          </div>
           <template v-for="(entry, i) in chatEntries" :key="i">
             <div v-if="entry.kind === 'user'" class="chat-msg chat-user">{{ entry.text }}<span v-if="entry.steered" class="chat-steered">{{ t('chat.steered') }}</span></div>
             <div v-else-if="entry.kind === 'assistant'" class="chat-msg chat-assistant" :class="{ 'is-error': entry.error }">
               <span v-if="entry.text">{{ entry.text }}</span>
               <span v-if="entry.error" class="chat-error">{{ entry.error }}</span>
               <span v-else-if="!entry.text && chatBusy" class="chat-typing">…</span>
+              <span v-if="entry.usage" class="chat-usage">{{ usageLine(entry.usage) }}</span>
             </div>
             <p v-else-if="entry.kind === 'status'" class="chat-status">{{ t(`chat.status.${entry.status}` as MessageKey) }}</p>
             <details v-else class="chat-tool" :class="{ 'is-done': entry.done, 'is-error': entry.error }">
@@ -2663,13 +2690,20 @@ const vWheelAdjust = {
         </div>
         <form class="chat-compose" @submit.prevent="submitChat">
           <textarea v-model="chatDraft" class="chat-input" rows="2" :placeholder="t('chat.placeholder')"
-            @keydown.enter.exact.prevent="submitChat" />
-          <button v-if="chatBusy" type="button" class="chat-send is-stop" :title="t('chat.stop')" :aria-label="t('chat.stop')" @click="abortChat">
-            <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2" /></svg>
-          </button>
-          <button v-else type="submit" class="chat-send" :disabled="!chatDraft.trim()" :title="t('chat.send')" :aria-label="t('chat.send')">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5" /><path d="M6 11l6-6 6 6" /></svg>
-          </button>
+            @keydown.enter="onChatEnter" />
+          <!-- Which model, and how long it thinks, are decided while writing the
+               prompt — so they sit with it. -->
+          <div class="chat-compose-row">
+            <SelectMenu v-model="chatModel" :options="chatModelOptions" :disabled="chatBusy"
+              :aria-label="t('models.title')" :placeholder="t('models.none')" />
+            <SelectMenu v-model="chatThinking" :options="chatThinkingOptions" :disabled="chatBusy" :aria-label="t('chat.thinking')" />
+            <button v-if="chatBusy" type="button" class="chat-send is-stop" :title="t('chat.stop')" :aria-label="t('chat.stop')" @click="abortChat">
+              <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2" /></svg>
+            </button>
+            <button v-else type="submit" class="chat-send" :disabled="!chatDraft.trim()" :title="t('chat.send')" :aria-label="t('chat.send')">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5" /><path d="M6 11l6-6 6 6" /></svg>
+            </button>
+          </div>
         </form>
       </section>
       <!-- Only the panels scroll; the histogram stays put as a live readout. -->

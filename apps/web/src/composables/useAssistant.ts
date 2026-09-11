@@ -19,8 +19,15 @@ export type AssistantTool = {
   run: (args: any) => Promise<ToolContent[]> | ToolContent[];
 };
 
-export type ModelSpec = { provider: string; id: string };
+// How long the model may think before each step. Part of the model entry, so
+// it persists with the list; the API clamps it to what the model supports.
+export const THINKING_LEVELS = ["off", "low", "medium", "high"] as const;
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+export type ModelSpec = { provider: string; id: string; thinking?: ThinkingLevel };
 export const modelKey = (m: ModelSpec): string => `${m.provider}/${m.id}`;
+
+// Tokens and cost of one turn, summed over its LLM calls (pi-ai's Usage).
+export type TurnUsage = { input: number; output: number; cacheRead: number; cost: number };
 
 // The models the picker offers, editable in the assistant settings. Per browser
 // (localStorage): the API only holds the keys, and which models a person wants
@@ -40,7 +47,8 @@ const SELECTED_KEY = "llr.agent.model";
 function loadModels(): ModelSpec[] {
   try {
     const raw = JSON.parse(localStorage.getItem(MODELS_KEY) ?? "");
-    if (Array.isArray(raw) && raw.every(m => typeof m?.provider === "string" && typeof m?.id === "string")) return raw;
+    if (Array.isArray(raw) && raw.every(m => typeof m?.provider === "string" && typeof m?.id === "string"
+      && (m.thinking === undefined || THINKING_LEVELS.includes(m.thinking)))) return raw;
   } catch { /* fall through to defaults */ }
   return DEFAULT_MODELS.map(m => ({ ...m }));
 }
@@ -48,7 +56,8 @@ function loadModels(): ModelSpec[] {
 export type ChatEntry =
   // `steered`: sent while the model was working, so it reached it mid-run.
   | { kind: "user"; text: string; steered?: boolean }
-  | { kind: "assistant"; text: string; error?: string }
+  // `usage`: the turn's tokens and cost so far, shown under the reply.
+  | { kind: "assistant"; text: string; error?: string; usage?: TurnUsage }
   // `result` is what went back to the model, kept so the log can show it.
   | { kind: "tool"; name: string; args: unknown; done: boolean; error?: string; result?: ToolContent[] }
   // A line about the run itself, not something anyone said.
@@ -135,12 +144,13 @@ export function useAssistant(opts: {
     chat.entries.push({ kind: "user", text });
     const tools = Object.entries(opts.tools()).map(([name, t]) => ({ name, description: t.description, parameters: t.parameters, role: t.role }));
     let reply: (ChatEntry & { kind: "assistant" }) | null = null;
+    const usage: TurnUsage = { input: 0, output: 0, cacheRead: 0, cost: 0 };
     const toolEntries = new Map<string, ChatEntry & { kind: "tool" }>();
     const toolRuns: Promise<void>[] = [];
     try {
       const model = currentModel();
       if (!model) throw new Error("No model configured");
-      const res = await post(chat.session, "prompt", { text, tools, systemPrompt: opts.systemPrompt(), model });
+      const res = await post(chat.session, "prompt", { text, tools, systemPrompt: opts.systemPrompt(), model, thinking: model.thinking ?? "off" });
       if (!res.ok || !res.body) throw new Error((await res.json().catch(() => null))?.error ?? `${res.status} ${res.statusText}`);
       for await (const ev of sseEvents(res.body)) {
         switch (ev.type) {
@@ -155,6 +165,9 @@ export function useAssistant(opts: {
             break;
           case "message_end":
             if (ev.message.role === "assistant") {
+              const u = ev.message.usage;
+              if (u) { usage.input += u.input; usage.output += u.output; usage.cacheRead += u.cacheRead; usage.cost += u.cost?.total ?? 0; }
+              if (reply?.text.trim()) reply.usage = { ...usage };
               if (reply && !reply.text.trim() && ev.message.stopReason !== "error") chat.entries.splice(chat.entries.indexOf(reply), 1);
               if (ev.message.stopReason === "error" && reply) reply.error = ev.message.errorMessage ?? "error";
               if (ev.message.stopReason === "aborted") chat.entries.push({ kind: "status", status: "stopped" });

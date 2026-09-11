@@ -1,5 +1,8 @@
 # 助手 UX：从 preferred-harness 借什么，以及如何让它迭代
 
+> **状态**：实施计划第 1–4 步已落地（`compare`/`measure`/diff/prompt、工具行展开与状态行、API 兜底与 steer、费用/thinking/composer）。第 5–6 步未做。
+> 与本文的偏差：兜底只在 `stopReason === "stop"` 的回合触发（出错/中断的回合若留下 followUp，会在下一次 prompt 开头被消费）；`/agent/steer` 在会话空闲时答 409（空闲时的 steer 会被塞进下一次 prompt）；每回合用量作为累计值挂在助手回复上而不是 user entry；`measure` 的像素读回走渲染器新拆出的 `readFrame()`（`toBlob()` 复用它）；步骤 3 里 `agent_end` 附 `messages.length` 推迟到第 5 步（retract）再加。
+
 面向 LLR 维护者的设计文档。范围：`apps/api/src/agent.ts`、`apps/web/src/composables/useAssistant.ts`、`App.vue` 的 Assistant 块（L1884–2148）与 chat 模板（L2493–2533）。不改源码。
 
 ## 结论：按 价值 ÷ 成本 排序的建造清单

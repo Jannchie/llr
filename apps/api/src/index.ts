@@ -193,6 +193,7 @@ async function routeAgent(action: string, method: string, request: IncomingMessa
         || typeof body.model?.provider !== "string" || typeof body.model?.id !== "string") {
         throw new HttpError(400, "Expected text, systemPrompt, tools and model");
       }
+      if (body.thinking !== undefined && typeof body.thinking !== "string") throw new HttpError(400, "Bad thinking level");
       if (isSessionBusy(body.session)) throw new HttpError(409, "Assistant is busy");
       try {
         await handleAgentPrompt(body, response);

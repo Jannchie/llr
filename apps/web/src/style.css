@@ -1833,7 +1833,6 @@ input[type="range"]:focus::-moz-range-thumb {
   gap: 8px;
 }
 
-/* The model picker is the header's title: it says who you are talking to. */
 .chat-head > :first-child {
   flex: 1;
   min-width: 0;
@@ -1977,6 +1976,57 @@ input[type="range"]:focus::-moz-range-thumb {
   font-variant-numeric: tabular-nums;
 }
 
+/* An empty log offers a few starting points; they fill the box, not send. */
+.chat-empty p {
+  margin: 0 0 10px;
+}
+
+.chat-chips {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px;
+}
+
+.chat-chip {
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-dim);
+  background: var(--control);
+  border: none;
+  border-radius: var(--radius-pill);
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.chat-chip:hover {
+  color: var(--text);
+}
+
+/* Model and thinking pickers under the box, the send button on the right. */
+.chat-compose-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.chat-compose-row > .control-select {
+  width: auto;
+  flex: 1 1 0;
+}
+
+.chat-compose-row > .chat-send {
+  margin-left: auto;
+}
+
+/* Tokens and cost of the turn, under the reply. */
+.chat-usage {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-mute);
+}
+
 /* A message that went in while the model was working. */
 .chat-steered {
   display: block;
@@ -1993,7 +2043,7 @@ input[type="range"]:focus::-moz-range-thumb {
 
 .chat-compose {
   display: flex;
-  align-items: flex-end;
+  flex-direction: column;
   gap: 6px;
   padding: 8px 11px 10px;
   border-top: 1px solid var(--sep);

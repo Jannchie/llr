@@ -8,7 +8,7 @@
 import type { ServerResponse } from "node:http";
 
 import { Agent, type AgentEvent, type AgentMessage, type AgentTool, type AgentToolResult } from "@mariozechner/pi-agent-core";
-import { getEnvApiKey, getModel, getModels, getProviders, type Api, type ImageContent, type KnownProvider, type Model, type TextContent, type TSchema } from "@mariozechner/pi-ai";
+import { clampThinkingLevel, getEnvApiKey, getModel, getModels, getProviders, type Api, type ImageContent, type KnownProvider, type Model, type ModelThinkingLevel, type TextContent, type TSchema } from "@mariozechner/pi-ai";
 
 // `role` is all the API knows about a tool: whether it changes the photo or
 // looks at it, so the nudge below can tell "edited and never looked" without
@@ -21,6 +21,8 @@ export type PromptBody = {
   systemPrompt: string;
   tools: ToolSpec[];
   model: ModelSpec;
+  // Clamped to what the model supports: a non-reasoning model runs at "off".
+  thinking?: ModelThinkingLevel;
   images?: ImageContent[];
 };
 export type ToolResultBody = {
@@ -117,6 +119,7 @@ export function isSessionBusy(session: string): boolean {
 export async function handleAgentPrompt(body: PromptBody, response: ServerResponse): Promise<void> {
   const s = getSession(body.session);
   s.agent.state.model = resolveModel(body.model);
+  s.agent.state.thinkingLevel = clampThinkingLevel(s.agent.state.model, body.thinking ?? "off");
   s.agent.state.systemPrompt = body.systemPrompt;
   s.agent.state.tools = browserTools(s, body.tools);
   response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store", connection: "keep-alive" });
