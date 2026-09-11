@@ -39,6 +39,7 @@ import { useAssistant, modelKey, THINKING_LEVELS, type AssistantTool, type ToolC
 import { measureHint, measureHistogram, measurePixels } from "./rendering/histogram";
 import ModelSettings from "./components/ModelSettings.vue";
 import AssistantMessage from "./components/AssistantMessage.vue";
+import ChatIcon from "./components/ChatIcon.vue";
 import { extractRecipe, applyRecipe, serializeRecipe, parseRecipe, loadSavedRecipes, storeSavedRecipes, type SavedRecipe, type RecipeData } from "./rendering/recipes";
 
 // ── types ──
@@ -2270,6 +2271,20 @@ function usageLine(u: TurnUsage): string {
   const cost = u.cost >= 0.001 ? `$${u.cost.toFixed(3)}` : u.cost > 0 ? "<$0.001" : "$0";
   return t("chat.usage", { input: k(u.input), output: k(u.output), cached: u.cacheRead ? t("chat.usage.cached", { n: k(u.cacheRead) }) : "", cost });
 }
+// The thinking row: live until the block closes, then labelled with what it took.
+type Thinking = { thinking: string; thinkingMs?: number; streaming: boolean };
+const thinkingActive = (e: Thinking): boolean => e.streaming && e.thinkingMs === undefined;
+function thinkingLabel(e: Thinking): string {
+  if (thinkingActive(e)) return t("chat.reasoning.active");
+  const ms = e.thinkingMs ?? 0;
+  return t("chat.reasoning.done", { s: ms < 60_000 ? `${Math.max(1, Math.round(ms / 1000))}s` : `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s` });
+}
+// What stands in for the reasoning while folded: where it has got to while it
+// streams, what it set out to do once it is done.
+function thinkingLine(e: Thinking): string {
+  const lines = e.thinking.split("\n").map(l => l.trim()).filter(Boolean);
+  return (thinkingActive(e) ? lines.at(-1) : lines[0]) ?? "";
+}
 // Keep the newest message in view as the reply streams in.
 watch(chatEntries, () => { void nextTick(() => { const el = chatLogRef.value; if (el) el.scrollTop = el.scrollHeight; }); }, { deep: true });
 function toolSummary(entry: { name: string; args: unknown }): string {
@@ -2718,9 +2733,19 @@ const vWheelAdjust = {
           <template v-for="(entry, i) in chatEntries" :key="i">
             <div v-if="entry.kind === 'user'" class="chat-msg chat-user">{{ entry.text }}<span v-if="entry.steered" class="chat-steered">{{ t('chat.steered') }}</span></div>
             <div v-else-if="entry.kind === 'assistant'" class="chat-msg chat-assistant" :class="{ 'is-error': entry.error }">
+              <!-- Reasoning folds to one line above the reply: the tail while it
+                   streams, the opening line once it has settled. -->
+              <details v-if="entry.thinking" class="chat-row chat-thinking" :class="{ 'is-running': thinkingActive(entry) }">
+                <summary class="chat-row-line">
+                  <ChatIcon class="chat-row-icon" :name="thinkingActive(entry) ? 'loader' : 'bulb'" />
+                  <span class="chat-row-label">{{ thinkingLabel(entry) }}</span>
+                  <span class="chat-row-detail">{{ thinkingLine(entry) }}</span>
+                </summary>
+                <div class="chat-row-body chat-reasoning"><AssistantMessage :text="entry.thinking" :streaming="thinkingActive(entry)" /></div>
+              </details>
               <AssistantMessage v-if="entry.text" :text="entry.text" :streaming="entry.streaming" />
               <span v-if="entry.error" class="chat-error">{{ entry.error }}</span>
-              <span v-else-if="!entry.text && chatBusy" class="chat-typing">…</span>
+              <span v-else-if="!entry.text && !entry.thinking && chatBusy" class="chat-typing">…</span>
               <span v-if="entry.usage" class="chat-usage">{{ usageLine(entry.usage) }}</span>
             </div>
             <p v-else-if="entry.kind === 'status'" class="chat-status">{{ t(`chat.status.${entry.status}` as MessageKey) }}</p>

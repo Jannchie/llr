@@ -57,7 +57,9 @@ export type ChatEntry =
   // `steered`: sent while the model was working, so it reached it mid-run.
   | { kind: "user"; text: string; steered?: boolean }
   // `usage`: the turn's tokens and cost so far, shown under the reply.
-  | { kind: "assistant"; text: string; streaming: boolean; error?: string; usage?: TurnUsage }
+  // `thinking`: the model's reasoning before the text, when its thinking level
+  // is on; `thinkingMs` lands once it stops and marks the block as settled.
+  | { kind: "assistant"; text: string; streaming: boolean; error?: string; usage?: TurnUsage; thinking: string; thinkingMs?: number }
   // `result` is what went back to the model, kept so the log can show it.
   | { kind: "tool"; name: string; args: unknown; done: boolean; error?: string; result?: ToolContent[] }
   // A line about the run itself, not something anyone said.
@@ -152,6 +154,7 @@ export function useAssistant(opts: {
     const usage: TurnUsage = { input: 0, output: 0, cacheRead: 0, cost: 0 };
     const toolEntries = new Map<string, ChatEntry & { kind: "tool" }>();
     const toolRuns: Promise<void>[] = [];
+    let thinkingStart = 0;
     try {
       const model = currentModel();
       if (!model) throw new Error("No model configured");
@@ -162,20 +165,26 @@ export function useAssistant(opts: {
           case "message_start":
             // Mutate the reactive proxy the list hands back, not the raw literal:
             // writes to the literal render nothing until something else redraws.
-            if (ev.message.role === "assistant") reply = pushEntry(chat, { kind: "assistant", text: "", streaming: true });
+            if (ev.message.role === "assistant") reply = pushEntry(chat, { kind: "assistant", text: "", streaming: true, thinking: "" });
             // The API's own follow-up (edited without looking) — a status
             // line, not a user bubble. Other user messages are already shown.
             else if (ev.nudge) chat.entries.push({ kind: "status", status: "nudge" });
             break;
           case "message_update":
-            if (ev.event.type === "text_delta" && reply) reply.text += ev.event.delta;
+            if (!reply) break;
+            if (ev.event.type === "text_delta") reply.text += ev.event.delta;
+            else if (ev.event.type === "thinking_start") thinkingStart = Date.now();
+            else if (ev.event.type === "thinking_delta") reply.thinking += ev.event.delta;
+            else if (ev.event.type === "thinking_end") reply.thinkingMs = (reply.thinkingMs ?? 0) + Date.now() - thinkingStart;
             break;
           case "message_end":
             if (ev.message.role === "assistant") {
               const u = ev.message.usage;
               if (u) { usage.input += u.input; usage.output += u.output; usage.cacheRead += u.cacheRead; usage.cost += u.cost?.total ?? 0; }
               if (reply?.text.trim()) reply.usage = { ...usage };
-              if (reply && !reply.text.trim() && ev.message.stopReason !== "error") chat.entries.splice(chat.entries.indexOf(reply), 1);
+              // Thinking cut short (abort, or a provider that never closes the block) still settles.
+              if (reply?.thinking && reply.thinkingMs === undefined) reply.thinkingMs = Date.now() - thinkingStart;
+              if (reply && !reply.text.trim() && !reply.thinking && ev.message.stopReason !== "error") chat.entries.splice(chat.entries.indexOf(reply), 1);
               if (ev.message.stopReason === "error" && reply) reply.error = ev.message.errorMessage ?? "error";
               if (ev.message.stopReason === "aborted") chat.entries.push({ kind: "status", status: "stopped" });
               if (reply) reply.streaming = false;
@@ -197,7 +206,7 @@ export function useAssistant(opts: {
       }
       await Promise.all(toolRuns);
     } catch (err) {
-      chat.entries.push({ kind: "assistant", text: "", streaming: false, error: err instanceof Error ? err.message : String(err) });
+      chat.entries.push({ kind: "assistant", text: "", streaming: false, thinking: "", error: err instanceof Error ? err.message : String(err) });
     } finally {
       chat.busy = false;
     }

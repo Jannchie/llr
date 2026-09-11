@@ -490,9 +490,10 @@ button {
 .rail {
   grid-area: right;
   display: grid;
-  grid-template-columns: 1fr var(--tabbar-w);
-  /* The one row must not grow past the rail with its content: an auto track
-     would size to the panels and leave the body nothing to scroll within. */
+  /* Neither track may grow past the rail with its content: an auto column
+     would widen to a line the chat cannot wrap, an auto row would size to the
+     panels and leave the body nothing to scroll within. */
+  grid-template-columns: minmax(0, 1fr) var(--tabbar-w);
   grid-template-rows: minmax(0, 1fr);
   min-height: 0;
   background: var(--bg);
@@ -2117,6 +2118,98 @@ input[type="range"]:focus::-moz-range-thumb {
 .chat-send.is-stop {
   background: var(--control);
   color: var(--text);
+}
+
+/* ---------- Activity rows ----------
+   Thinking, a tool call, a note about the run: each is one line in the shape
+   preferred-harness gives them — icon · label · detail · meta — so a reader
+   scanning a turn follows a single column of icons down the left edge. Only
+   the icon and the meta carry a state's colour; the row itself is flat. */
+
+.chat-row {
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.chat-row-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 6px;
+  margin: 0 -6px;
+  border-radius: var(--radius);
+  cursor: pointer;
+  list-style: none;
+}
+
+.chat-row-line::-webkit-details-marker {
+  display: none;
+}
+
+.chat-row-line:hover {
+  background: var(--card-hover);
+}
+
+.chat-row-icon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+.chat-row.is-running .chat-row-icon {
+  color: var(--accent);
+  animation: chat-spin 1s linear infinite;
+}
+
+.chat-row-label {
+  flex-shrink: 0;
+  color: var(--text);
+}
+
+.chat-row-detail {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-mute);
+}
+
+/* Open, the body shows the whole thing; the elided line would say it twice. */
+.chat-row[open] .chat-row-detail {
+  visibility: hidden;
+}
+
+.chat-row-meta {
+  flex-shrink: 0;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Hung off a rule down the row's left edge: it belongs to the line above, not
+   to whatever happened next. */
+.chat-row-body {
+  margin: 4px 0 4px 7px;
+  padding-left: 12px;
+  border-left: 1px solid var(--sep-strong);
+}
+
+/* Reasoning: a size below the reply's and dimmed, so it reads as an aside
+   rather than a second voice in the conversation. */
+.chat-reasoning {
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+
+.chat-reasoning .chat-md {
+  line-height: inherit;
+}
+
+@keyframes chat-spin {
+  to { transform: rotate(360deg); }
 }
 
 /* ---------- Recipes ---------- */
