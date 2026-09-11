@@ -12,6 +12,7 @@ import { LENS_KNOTS } from "./lens";
 import { LUT_GLSL } from "./curve";
 import { HSL_GLSL } from "./hsl-bands";
 import { TONAL_GLSL } from "./tonal-model";
+import { MASK_GLSL, MASK_PREVIEW_MIX, MASK_PREVIEW_TINT } from "./masks";
 
 // Color Grading region edges, on display luma. Balance slides both pairs by up
 // to ±GRAD_BAL_SPAN. That span is capped at 0.15 because the graded colour is
@@ -208,11 +209,24 @@ uniform float u_lensDist[${LENS_KNOTS}];
 uniform float u_lensVig[${LENS_KNOTS}];
 uniform float u_lensScale;
 uniform vec2 u_lensNorm;
+// Masks (masks.ts, docs/masking.md). The per-group data is the Masks uniform
+// block declared in MASK_GLSL; these say how many groups are packed, which
+// blocks any of them touch (MASK_USE_* bits, OR'd into the skip gates), and
+// which packed group the red overlay shows (-1 = off). u_imgFromTex takes
+// v_texCoord to oriented image-norm — the space the gradients are stored in,
+// which is what makes them follow crop / rotate / flip — and u_imgAspect is
+// ih/iw so distances in that space can be made isotropic.
+uniform int u_maskGroups;
+uniform int u_maskUse;
+uniform int u_maskPreview;
+uniform mat3 u_imgFromTex;
+uniform float u_imgAspect;
 
 ${COLOR_GLSL}
 ${TONAL_GLSL}
 ${HSL_GLSL}
 ${LUT_GLSL}
+${MASK_GLSL}
 
 // ===== View transforms: scene-linear ProPhoto -> display-linear ProPhoto [0,1] =====
 
@@ -541,6 +555,31 @@ float droLocalMean(vec2 uv, float ylog) {
   return acc.y <= 0.0 ? u_droScale.x : acc.x / acc.y;
 }
 
+// The selection colour for the HSL mixer and the masks: four bilinear taps
+// around the pixel, averaged, then the same gain -> WB chain as the main
+// sample. Which band a pixel belongs to is a property of its *neighbourhood*,
+// not of the pixel: chroma noise swings a single pixel's hue by more than the
+// Red-Orange centres are apart (0.41 rad, the tightest pair), so per-pixel
+// weights speckle — adjacent pixels land in different bands and only some of
+// them take the move. The adjustment still applies to this pixel's own colour,
+// so detail and edges survive.
+//
+// Radius: half an output pixel, floored at 0.75 source texels. The preview
+// renders at previewScale, so in a fit-to-window view one output pixel spans
+// several texels; fwidth follows that and halves the worst-case residue there
+// (90th-percentile grain 0.21 -> 0.10), while at 1:1 and on export it drops to
+// the floor and the two agree. The floor is 0.75 rather than 0.5 because the
+// source texture falls back to NEAREST when RGB32F is not filterable: at 0.5
+// the taps can all round back to the centre texel and average nothing.
+vec3 wbNeighbourhood(vec2 lensUV, float lensGain) {
+  vec2 ts = max(0.75 / vec2(textureSize(u_input, 0)), 0.5 * fwidth(lensUV));
+  vec3 nb = texture(u_input, lensUV + vec2( ts.x,  ts.y)).rgb
+          + texture(u_input, lensUV + vec2(-ts.x,  ts.y)).rgb
+          + texture(u_input, lensUV + vec2( ts.x, -ts.y)).rgb
+          + texture(u_input, lensUV + vec2(-ts.x, -ts.y)).rgb;
+  return max(u_wbMatrix * (max(nb * 0.25, 0.0) * lensGain), 0.0);
+}
+
 void main() {
   vec2 v_texCoord = v_texCoordH.xy / v_texCoordH.z;
   // Outside the source image (rotated/straightened corners in the crop editor,
@@ -597,8 +636,41 @@ void main() {
     c *= texture(u_dro_lut, vec2(lutCoord(clamp(m / u_droScale.x, 0.0, 1.0)), 0.5)).r;
   }
 
-  // --- White Balance (Bradford adaptation, identity at temp=6500 / tint=0) ---
-  c = max(u_wbMatrix * c, 0.0);
+  // --- Masks: per-pixel weights -> local parameter deltas (docs/masking.md §3) ---
+  // Every local slider below is "a scalar into a per-pixel formula", so the
+  // weights blend the *parameters* — p + Σ w·Δp — and each block runs once,
+  // rather than mixing f(p) with f(p+Δp) per group. White balance is the
+  // exception in form only: it is linear, so blending its matrix is blending
+  // its result. Selection reads the WB'd neighbourhood (same as HSL) on the
+  // perceptual axis toneRegions uses, so a noisy shadow does not speckle the
+  // range. u_maskGroups is a uniform: the branch is coherent, and at 0 the
+  // default path below is untouched — bit for bit.
+  float dExpo = 0.0, dHi = 0.0, dSh = 0.0, dClar = 0.0, dHaze = 0.0, dSat = 0.0, dVib = 0.0, dHue = 0.0, wPrev = 0.0;
+  if (u_maskGroups > 0) {
+    vec3 cSel = wbNeighbourhood(lensUV, lensGain);
+    float pLum = srgbEncode(clamp(ppLuma(cSel) * exp2(u_exposure), 0.0, 1.0));
+    vec3 labSel = proPhotoToOklab(cSel);
+    vec2 pImg = (u_imgFromTex * vec3(v_texCoord, 1.0)).xy;
+    mat3 dWb = mat3(0.0);
+    for (int g = 0; g < u_maskGroups; g++) {
+      int base = g * MASK_STRIDE; vec4 hdr = m[base]; float w = 0.0;
+      for (int k = 0; k < int(hdr.x); k++) {
+        int cb = base + 6 + k * 3; float wc = maskComponent(cb, pImg, pLum, labSel); float op = m[cb].y;
+        w = k == 0 ? wc : op == 0.0 ? 1.0 - (1.0 - w) * (1.0 - wc) : op == 1.0 ? w * (1.0 - wc) : w * wc;
+      }
+      if (hdr.y > 0.5) w = 1.0 - w;
+      if (g == u_maskPreview) wPrev = w;
+      vec4 A = m[base + 1], B = m[base + 2];
+      dExpo += w * A.x; dHi += w * A.y; dSh += w * A.z; dClar += w * A.w;
+      dHaze += w * B.x; dSat += w * B.y; dVib += w * B.z; dHue += w * B.w;
+      dWb += w * mat3(m[base + 3].xyz, m[base + 4].xyz, m[base + 5].xyz);   // packed column-major
+    }
+    // --- White Balance, with the blended local delta ---
+    c = max((u_wbMatrix + dWb) * c, 0.0);
+  } else {
+    // --- White Balance (Bradford adaptation, identity at temp=6500 / tint=0) ---
+    c = max(u_wbMatrix * c, 0.0);
+  }
 
   // === Exposure (highlight-shouldered) + tonal region gains + Clarity ===
   // One log-luminance block, applied to RGB as a single hue-preserving ratio.
@@ -606,15 +678,17 @@ void main() {
   // The branch is on uniforms — coherent across every pixel, no divergence —
   // and it avoids a needless luma round-trip on untouched frames.
   // (Contrast and Blacks are display-referred and live in the curve LUT bake.)
-  bool clarityLocal = (u_clarity != 0.0 && u_hasMask == 1);
-  if (u_exposure != 0.0 || u_tonalActive == 1 || clarityLocal) {
+  // Each gate also admits a mask that touches its block (u_maskUse); the
+  // deltas are zero on every frame that has none, so the maths is unchanged.
+  bool clarityLocal = ((u_clarity != 0.0 || (u_maskUse & MASK_USE_CLARITY) != 0) && u_hasMask == 1);
+  if (u_exposure != 0.0 || u_tonalActive == 1 || clarityLocal || (u_maskUse & MASK_USE_EXPOSURE) != 0) {
     float Y0 = max(ppLuma(c), 1e-6);
     float l = log2(Y0);
     // Exposure: mids move exactly +E; the stops added above EXPO_KNEE compress
     // through the shoulder so brights roll off instead of walling at clip.
     // Negative exposure stays a pure gain (as in Lightroom).
     // A Sony profile already took its exposure as the linear gain above.
-    float expo = (u_sonyLinearExposure == 1) ? 0.0 : u_exposure;
+    float expo = ((u_sonyLinearExposure == 1) ? 0.0 : u_exposure) + dExpo;
     float lOut = (expo > 0.0)
       ? l + expoShoulder(l + expo) - expoShoulder(l)
       : l + expo;
@@ -623,8 +697,10 @@ void main() {
       // Blurred neighborhood log-luma (see MASK_* shaders), shifted for
       // exposure. Guarded by its consumers: an exposure-only edit must not
       // pay a per-pixel texture fetch it never reads.
+      // A local exposure moved the pixel; move its neighbourhood with it, or
+      // Clarity would read the offset as detail.
       float maskLx = (u_hasMask == 1)
-        ? texture(u_mask_lum, lensUV).r + u_maskShift   // mask lives in recorded-frame UV: track the lens warp
+        ? texture(u_mask_lum, lensUV).r + u_maskShift + dExpo   // mask lives in recorded-frame UV: track the lens warp
         : pixLx;
       if (u_tonalActive == 1) {
         // Whites is display-referred on both halves now (curve.ts basicCurve);
@@ -645,7 +721,7 @@ void main() {
         // exp2 is monotone, so max/min over the log values and over the linear
         // ones pick the same side; comparing here costs one exp2, not two.
         float Ym = (u_hasMask == 1) ? exp2(maskLx + LOG2_MID) : Y;
-        lOut = log2(max(toneRegions(Y, u_highlights, u_shadows,
+        lOut = log2(max(toneRegions(Y, u_highlights + dHi, u_shadows + dSh,
                                     max(Y, Ym), min(Y, Ym)), 1e-6));
       }
       // Clarity: local mid-tone contrast — amplify the pixel's deviation from
@@ -654,35 +730,44 @@ void main() {
       // mask there is no neighborhood signal, so the slider is inert — same
       // degradation story as the region weights above falling back per-pixel.
       if (clarityLocal) {
-        lOut += clarityShift(pixLx, maskLx, u_clarity);
+        lOut += clarityShift(pixLx, maskLx, u_clarity + dClar);
       }
     }
     c *= exp2(lOut - l);
   }
 
   // --- Dehaze (global contrast + saturation boost) ---
-  if (u_dehaze != 0.0) {
-    c = max(c + (c - 0.18) * u_dehaze * 0.5, vec3(0.0));
+  if (u_dehaze != 0.0 || (u_maskUse & MASK_USE_DEHAZE) != 0) {
+    float haze = u_dehaze + dHaze;
+    c = max(c + (c - 0.18) * haze * 0.5, vec3(0.0));
     float l3 = ppLuma(c);
     vec3 ch3 = c - vec3(l3);
-    c = max(l3 + ch3 * (1.0 + u_dehaze * 0.25), vec3(0.0));
+    c = max(l3 + ch3 * (1.0 + haze * 0.25), vec3(0.0));
   }
 
   // --- Vibrance + Saturation (Oklab chroma — hue-stable, no skew) ---
-  if (u_vibrance != 1.0 || u_saturation != 1.0) {
+  if (u_vibrance != 1.0 || u_saturation != 1.0 || (u_maskUse & MASK_USE_COLOR) != 0) {
     vec3 lab = proPhotoToOklab(c);
     float C = length(lab.yz);
     float w = 1.0 - smoothstep(0.0, 0.35, C);          // boost low-chroma (vibrance) more
+    // Local deltas add to the scales, floored at zero (a mask cannot invert chroma).
+    float sat = max(u_saturation + dSat, 0.0), vib = max(u_vibrance + dVib, 0.0);
     // Skin protection (vibrance only, as in Lightroom — the Saturation slider
     // stays global): damp the vibrance term inside the skin-tone window
     // (SKIN_* constants and window shape from hsl-bands.ts). Skipped when
     // only Saturation is in play — the term multiplies to zero anyway.
-    float skinW = (u_vibrance != 1.0)
+    float skinW = (vib != 1.0)
       ? hueWindow(atan(lab.z, lab.y), SKIN_HUE, SKIN_HUE_HALF)
         * smoothstep(SKIN_C0, SKIN_C1, C) * (1.0 - smoothstep(SKIN_C2, SKIN_C3, C))
       : 0.0;
-    float scale = u_saturation * (1.0 + (u_vibrance - 1.0) * w * (1.0 - SKIN_DAMP * skinW));
+    float scale = sat * (1.0 + (vib - 1.0) * w * (1.0 - SKIN_DAMP * skinW));
     lab.yz *= scale;
+    // The local Hue slider (no global counterpart): turn (a, b) as the HSL
+    // mixer does, on the same ±0.5 rad scale.
+    if (dHue != 0.0) {
+      float ch = cos(dHue), sh = sin(dHue);
+      lab.yz = vec2(lab.y * ch - lab.z * sh, lab.y * sh + lab.z * ch);
+    }
     c = max(oklabToProPhoto(lab), 0.0);
   }
 
@@ -693,33 +778,12 @@ void main() {
   // pixel every frame. Branch is on a uniform, so it is coherent across the draw.
   if (u_hslActive == 1) {
     vec3 lab = proPhotoToOklab(c);
-    // Which band a pixel belongs to is a property of its *neighbourhood*, not
-    // of the pixel: chroma noise swings a single pixel's hue by more than the
-    // Red-Orange centres are apart (0.41 rad, the tightest pair), so per-pixel
-    // band weights speckle — adjacent pixels land in different bands and only
-    // some of them take the Luminance move. Take the selection colour from
-    // four bilinear taps around the pixel instead. The adjustment still applies
-    // to this pixel's own colour, so detail and edges survive.
-    //
-    // Sampling after white balance is enough: everything between it and here
-    // (exposure, tonal regions, vibrance) scales luminance or chroma without
-    // rotating hue, and the gate reads the ratio C/L, which those scalings
-    // leave near enough alone.
-    // Radius: half an output pixel, floored at 0.75 source texels. The preview
-    // renders at previewScale, so in a fit-to-window view one output pixel
-    // spans several texels; fwidth follows that and halves the worst-case
-    // residue there (90th-percentile grain 0.21 -> 0.10), while at 1:1 and on
-    // export it drops to the floor and the two agree. The floor is 0.75 rather
-    // than 0.5 because the source texture falls back to NEAREST when RGB32F is
-    // not filterable: at 0.5 the taps can all round back to the centre texel
-    // and average nothing.
-    vec2 ts = max(0.75 / vec2(textureSize(u_input, 0)), 0.5 * fwidth(lensUV));
-    vec3 nb = texture(u_input, lensUV + vec2( ts.x,  ts.y)).rgb
-            + texture(u_input, lensUV + vec2(-ts.x,  ts.y)).rgb
-            + texture(u_input, lensUV + vec2( ts.x, -ts.y)).rgb
-            + texture(u_input, lensUV + vec2(-ts.x, -ts.y)).rgb;
-    // Same fetch -> gain -> WB chain as the main sample above, on the average.
-    vec3 labSel = proPhotoToOklab(max(u_wbMatrix * (max(nb * 0.25, 0.0) * lensGain), 0.0));
+    // The selection colour is the neighbourhood's, not the pixel's
+    // (wbNeighbourhood says why). Sampling after white balance is enough:
+    // everything between it and here (exposure, tonal regions, vibrance)
+    // scales luminance or chroma without rotating hue, and the gate reads the
+    // ratio C/L, which those scalings leave near enough alone.
+    vec3 labSel = proPhotoToOklab(wbNeighbourhood(lensUV, lensGain));
     // Chroma gate: hue is meaningless where chroma is, so near-neutral pixels
     // must fall out of every band rather than land in a random one
     // (hsl-bands.ts). Hue/Saturation and Luminance smoothstep the same ratio
@@ -814,6 +878,9 @@ void main() {
   // ===== Display: ProPhoto -> target gamut -> compress -> encode =====
   vec3 disp = (u_displayGamut == 1) ? (PROPHOTO_TO_P3 * c) : (PROPHOTO_TO_SRGB * c);
   disp = gamutMap(disp, (u_displayGamut == 1) ? P3_Y : REC709_Y);
+  // Mask overlay: the previewed group's weight as a red wash. View-only —
+  // u_maskPreview is -1 for export and for the assistant's view_image.
+  if (u_maskPreview >= 0) disp = mix(disp, ${MASK_PREVIEW_TINT}, ${MASK_PREVIEW_MIX} * wPrev);
   outColor = vec4(srgbEncode(disp), 1.0); // sRGB transfer (Display-P3 shares it)
 }`;
 
@@ -1510,6 +1577,7 @@ export const PASSES: PassDef[] = [
     "u_highlights", "u_shadows",
     "u_vibrance", "u_saturation", "u_clarity", "u_dehaze",
     "u_tonalActive", "u_hslActive", "u_maskShift", "u_hasMask",
+    "u_maskGroups", "u_maskUse", "u_maskPreview", "u_imgFromTex", "u_imgAspect",
     "u_hsl_h[0]","u_hsl_h[1]","u_hsl_h[2]","u_hsl_h[3]","u_hsl_h[4]","u_hsl_h[5]","u_hsl_h[6]","u_hsl_h[7]",
     "u_hsl_s[0]","u_hsl_s[1]","u_hsl_s[2]","u_hsl_s[3]","u_hsl_s[4]","u_hsl_s[5]","u_hsl_s[6]","u_hsl_s[7]",
     "u_hsl_l[0]","u_hsl_l[1]","u_hsl_l[2]","u_hsl_l[3]","u_hsl_l[4]","u_hsl_l[5]","u_hsl_l[6]","u_hsl_l[7]",

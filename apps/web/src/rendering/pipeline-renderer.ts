@@ -18,6 +18,8 @@ import { LENS_IDENTITY, LENS_KNOTS, lensFillScale } from "./lens";
 import { computeWbMatrix } from "./color-spaces";
 import { LUT_SIZE, buildToneCurveLUT, defaultToneCurve } from "./curve";
 import { LOG2_MID } from "./tonal-model";
+import { GROUP_STRIDE, MASK_UBO_BYTES, MASK_USE, imgFromTex } from "./masks";
+import { defaultCrop } from "./crop";
 import type { HistogramBins } from "./histogram";
 
 // Contrast and Blacks are not here: they are display-referred and baked into
@@ -47,6 +49,13 @@ export interface EditParams {
   // uncorrected rendering (0). A parameter rather than a per-image upload
   // because it is a user toggle, and it no longer costs a decode to flip.
   cameraMatch: number;
+  // Masks (masks.ts packMasks): the packed uniform block, how many groups it
+  // holds, which blocks they touch, the previewed group's packed index (-1 =
+  // no overlay), and the texcoord -> oriented image-norm matrix plus aspect
+  // the gradients are evaluated in. Empty block = no masks, and the shader's
+  // default path is untouched.
+  masks: Float32Array; maskGroups: number; maskUse: number; maskPreview: number;
+  imgFromTex: Float32Array; imgAspect: number;
 }
 
 const HSL_ZERO = [0, 0, 0, 0, 0, 0, 0, 0];
@@ -428,6 +437,8 @@ export const DEFAULT_PARAMS: EditParams = {
   displayGamut: 0,
   lensDist: [...LENS_IDENTITY], lensVig: [...LENS_IDENTITY],
   cameraMatch: 1,
+  masks: new Float32Array(0), maskGroups: 0, maskUse: 0, maskPreview: -1,
+  imgFromTex: imgFromTex(defaultCrop()), imgAspect: 1,
 };
 
 export class PipelineRenderer {
@@ -435,6 +446,9 @@ export class PipelineRenderer {
   private program: WebGLProgram;
   private uniforms: Record<string, WebGLUniformLocation | null> = {};
   private vao: WebGLVertexArrayObject;
+  // The Masks uniform block (std140, binding 0). Built with the program so an
+  // export's one-shot renderer has it too; refilled per draw with bufferSubData.
+  private maskUbo: WebGLBuffer;
   private sourceTex: WebGLTexture | null = null;
   // The min/mag filter uploadImage settled on for sourceTex. The histogram read
   // forces NEAREST minification and must put *this* back, not re-derive it:
@@ -622,6 +636,11 @@ export class PipelineRenderer {
     this.uniforms["u_dro_lut"] = gl.getUniformLocation(this.program, "u_dro_lut");
     this.uniforms["u_mask_lum"] = gl.getUniformLocation(this.program, "u_mask_lum");
     this.vao = this.createFullScreenQuad();
+    this.maskUbo = gl.createBuffer()!;
+    gl.bindBuffer(gl.UNIFORM_BUFFER, this.maskUbo);
+    gl.bufferData(gl.UNIFORM_BUFFER, MASK_UBO_BYTES, gl.DYNAMIC_DRAW);
+    gl.bindBufferBase(gl.UNIFORM_BUFFER, 0, this.maskUbo);
+    gl.uniformBlockBinding(this.program, gl.getUniformBlockIndex(this.program, "Masks"), 0);
 
     // Upload identity LUTs as defaults (user tone curve + DCP profile curve).
     // The curve default comes from the real bake so the RGBA layout has a
@@ -2117,6 +2136,7 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     this.sonyPostProgs.clear();
     for (const buf of this.quadBuffers) gl.deleteBuffer(buf);
     this.quadBuffers = [];
+    gl.deleteBuffer(this.maskUbo);
     gl.deleteProgram(this.program);
     gl.deleteVertexArray(this.vao);
   }
@@ -2207,7 +2227,23 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     // contrast and the Oklab HSL mixer) when they are at their identity defaults.
     // Whites is display-referred on both halves now (baked into the curve LUT),
     // so it no longer engages the shader's tonal block at all.
-    const tonalActive = p.highlights !== 0 || p.shadows !== 0;
+    // Masks. The block is uploaded only as far as it is filled; with no
+    // groups nothing is read and nothing is sent.
+    const maskGroups = p.maskGroups ?? 0;
+    const maskUse = p.maskUse ?? 0;
+    i("u_maskGroups", maskGroups);
+    i("u_maskUse", maskUse);
+    i("u_maskPreview", p.maskPreview ?? -1);
+    if (maskGroups > 0) {
+      gl.bindBuffer(gl.UNIFORM_BUFFER, this.maskUbo);
+      gl.bufferSubData(gl.UNIFORM_BUFFER, 0, p.masks, 0, maskGroups * GROUP_STRIDE * 4);
+      s("u_imgAspect", p.imgAspect);
+      const imgLoc = this.uniforms["u_imgFromTex"];
+      if (imgLoc) gl.uniformMatrix3fv(imgLoc, false, p.imgFromTex);
+    }
+    // A mask that moves Highlights/Shadows engages the region block like the
+    // global sliders do; the global test alone would leave it skipped.
+    const tonalActive = p.highlights !== 0 || p.shadows !== 0 || (maskUse & MASK_USE.tonal) !== 0;
     const hslActive = (p.hslH?.some((v) => v !== 0) ?? false)
       || (p.hslS?.some((v) => v !== 0) ?? false)
       || (p.hslL?.some((v) => v !== 0) ?? false);
