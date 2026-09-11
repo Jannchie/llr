@@ -3,7 +3,8 @@ import {
   imageDims, constrainCrop, applyAspectRatio, resolveAspectRatio,
   rotate90, cornersInsideImage, customAspectKey, parseCustomAspect, ratioToFraction,
   defaultCrop, straightenAngle, cropGuideShapes, CROP_GUIDES,
-  type CropState, type Rect, type CropGuide,
+  defaultTransform, flipCrop, outFrameToImagePx, imagePxToOutFrame,
+  type CropState, type Rect, type CropGuide, type Transform,
 } from "../rendering/crop";
 import { clamp } from "../ui";
 
@@ -94,11 +95,29 @@ export function useCropEditor(opts: {
   }
 
   function flipCropH(): void {
-    Object.assign(crop, constrainCrop({ ...crop, flipH: !crop.flipH, cx: 1 - crop.cx, angle: -crop.angle }, srcW.value, srcH.value));
+    Object.assign(crop, constrainCrop(flipCrop(crop, "h"), srcW.value, srcH.value));
   }
   function flipCropV(): void {
-    Object.assign(crop, constrainCrop({ ...crop, flipV: !crop.flipV, cy: 1 - crop.cy, angle: -crop.angle }, srcW.value, srcH.value));
+    Object.assign(crop, constrainCrop(flipCrop(crop, "v"), srcW.value, srcH.value));
   }
+
+  // ── Transform (perspective) ──
+
+  function setTransform(patch: Partial<Transform>): void {
+    Object.assign(crop, constrainCrop({ ...crop, xf: { ...crop.xf, ...patch } }, srcW.value, srcH.value));
+  }
+  function resetTransform(): void { setTransform(defaultTransform()); }
+  function removeLastGuide(): void { setTransform({ guides: crop.xf.guides.slice(0, -1) }); }
+
+  // The guided-upright lines, drawn where they land on the transformed image.
+  const guideLinesView = computed(() => {
+    const [iw, ih] = currentImageDims();
+    return crop.xf.guides.map(([x1, y1, x2, y2]) => {
+      const a = imagePxToOutFrame(crop, iw, ih, x1 * iw, y1 * ih);
+      const b = imagePxToOutFrame(crop, iw, ih, x2 * iw, y2 * ih);
+      return { x1: a[0], y1: a[1], x2: b[0], y2: b[1] };
+    });
+  });
 
   // ── Overlay geometry ──
 
@@ -177,15 +196,19 @@ export function useCropEditor(opts: {
     | { mode: "move"; startX: number; startY: number; cx: number; cy: number }
     | { mode: "resize"; handle: CropHandle; l: number; t: number; r: number; b: number; startRatio: number }
     | { mode: "rotate"; startPointerDeg: number; startAngle: number }
-    | { mode: "straighten" };
+    | { mode: "line"; tool: LineTool }
+    | { mode: "guideEnd"; index: number; end: 0 | 1 };
   let cropDrag: CropDrag | null = null;
 
-  // Straighten tool: armed by the panel button (or Ctrl/Cmd-drag), the next
-  // drag draws a line on the photo and the angle levels it. One-shot, like
-  // Lightroom's ruler. `straightenLine` is the line being drawn, output-frame px.
-  const straightenTool = ref(false);
+  // Line tools, armed by the panel buttons: the next drag draws a line on the
+  // photo. "straighten" levels the image by it and disarms (one-shot, like
+  // Lightroom's ruler; Ctrl/Cmd-drag is its shortcut); "guided" adds it to the
+  // upright guides and stays armed. `straightenLine` is the line being drawn,
+  // output-frame px.
+  type LineTool = "straighten" | "guided";
+  const lineTool = ref<LineTool | null>(null);
   const straightenLine = reactive({ x1: 0, y1: 0, x2: 0, y2: 0, active: false });
-  function toggleStraightenTool(): void { straightenTool.value = !straightenTool.value; }
+  function setLineTool(t: LineTool | null): void { lineTool.value = lineTool.value === t ? null : t; }
   // What the on-canvas readout shows: the angle the line being drawn would set,
   // else the current one.
   const readoutAngle = computed(() => straightenLine.active
@@ -214,10 +237,10 @@ export function useCropEditor(opts: {
     const p = overlayPoint(e);
     const r = cropBoxRect.value;
     const inside = p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
-    if (straightenTool.value || e.ctrlKey || e.metaKey) {
+    if (lineTool.value || e.ctrlKey || e.metaKey) {
       e.preventDefault();
       Object.assign(straightenLine, { x1: p.x, y1: p.y, x2: p.x, y2: p.y, active: true });
-      cropDrag = { mode: "straighten" };
+      cropDrag = { mode: "line", tool: lineTool.value ?? "straighten" };
       isRotating.value = true;
     } else if (inside) {
       cropDrag = { mode: "move", startX: p.x, startY: p.y, cx: crop.cx, cy: crop.cy };
@@ -228,6 +251,15 @@ export function useCropEditor(opts: {
       cropDrag = { mode: "rotate", startPointerDeg: deg, startAngle: crop.angle };
       isRotating.value = true;
     }
+    attachCropDrag();
+  }
+
+  function onGuideHandleDown(e: MouseEvent, index: number, end: 0 | 1): void {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    cropDrag = { mode: "guideEnd", index, end };
+    isRotating.value = true;
     attachCropDrag();
   }
 
@@ -251,21 +283,38 @@ export function useCropEditor(opts: {
       // margin) must not read as a full turn.
       const sweep = ((deg - cropDrag.startPointerDeg + 540) % 360) - 180;
       setAngle(cropDrag.startAngle + sweep);
-    } else if (cropDrag.mode === "straighten") {
+    } else if (cropDrag.mode === "line") {
       straightenLine.x2 = p.x;
       straightenLine.y2 = p.y;
+    } else if (cropDrag.mode === "guideEnd") {
+      // Guides live in pre-transform image space, so moving an end re-solves
+      // the upright live.
+      const [x, y] = outFrameToImagePx(crop, iw, ih, p.x, p.y);
+      const guides = crop.xf.guides.map((g) => [...g] as [number, number, number, number]);
+      guides[cropDrag.index][cropDrag.end * 2] = x / iw;
+      guides[cropDrag.index][cropDrag.end * 2 + 1] = y / ih;
+      setTransform({ guides });
     } else {
       resizeCropTo(p.x, p.y, cropDrag, e.shiftKey);
     }
   }
 
   function onCropDragUp(): void {
-    if (cropDrag?.mode === "straighten") {
+    if (cropDrag?.mode === "line") {
       const dx = straightenLine.x2 - straightenLine.x1, dy = straightenLine.y2 - straightenLine.y1;
-      // Shorter than a few screen px is a click, not a line: keep the angle.
-      if (Math.hypot(dx, dy) > 6 * ofPerScreen.value) setAngle(straightenAngle(crop.angle, dx, dy));
+      // Shorter than a few screen px is a click, not a line: nothing happens.
+      if (Math.hypot(dx, dy) > 6 * ofPerScreen.value) {
+        if (cropDrag.tool === "straighten") {
+          setAngle(straightenAngle(crop.angle, dx, dy));
+          lineTool.value = null;
+        } else if (crop.xf.guides.length < 4) {
+          const [iw, ih] = currentImageDims();
+          const a = outFrameToImagePx(crop, iw, ih, straightenLine.x1, straightenLine.y1);
+          const b = outFrameToImagePx(crop, iw, ih, straightenLine.x2, straightenLine.y2);
+          setTransform({ guides: [...crop.xf.guides, [a[0] / iw, a[1] / ih, b[0] / iw, b[1] / ih]] });
+        }
+      }
       straightenLine.active = false;
-      straightenTool.value = false;
     }
     isRotating.value = false;
     cropDrag = null;
@@ -345,8 +394,9 @@ export function useCropEditor(opts: {
     lockedRatio, customAspect, selectAspect, setCustomAspect, swapAspect,
     setAngle, rotateCrop, flipCropH, flipCropV,
     cropGuide, setCropGuide, cycleCropGuide, cycleCropGuideVariant, cropGuideShapes: cropGuideShapesView,
-    isRotating, rotateGridLines, straightenTool, toggleStraightenTool, straightenLine, readoutAngle,
+    isRotating, rotateGridLines, lineTool, setLineTool, straightenLine, readoutAngle,
+    setTransform, resetTransform, removeLastGuide, guideLinesView,
     cropBoxRect, CROP_HANDLES, ofPerScreen, cropViewBox, cropDimPath, cropHandlePos,
-    onCropHandleDown, onCropOverlayDown,
+    onCropHandleDown, onCropOverlayDown, onGuideHandleDown,
   };
 }

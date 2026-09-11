@@ -1640,6 +1640,35 @@ input[type="range"]:focus::-moz-range-thumb {
 
 .crop-grid-fine line { stroke: rgba(255, 255, 255, 0.22); }
 
+.crop-upright line {
+  stroke: var(--accent);
+  stroke-dasharray: 6 4;
+  vector-effect: non-scaling-stroke;
+  pointer-events: none;
+}
+
+.crop-upright circle {
+  fill: var(--accent);
+  stroke: #fff;
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+  pointer-events: all;
+  cursor: grab;
+}
+
+.crop-sub { margin-top: 16px; }
+
+.xf-guided {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.xf-guided-btn { gap: 7px; font-size: 12px; padding: 0 10px; }
+.xf-guided-count { padding: 0 10px; font-size: 12px; font-variant-numeric: tabular-nums; }
+.xf-guided-count:disabled { opacity: 0.4; cursor: default; }
+
 .crop-straighten-line {
   stroke: var(--accent);
   vector-effect: non-scaling-stroke;

@@ -457,15 +457,35 @@ const {
   lockedRatio, customAspect, selectAspect, setCustomAspect, swapAspect,
   setAngle, rotateCrop, flipCropH, flipCropV,
   cropGuide, setCropGuide, cycleCropGuide, cycleCropGuideVariant, cropGuideShapes,
-  isRotating, rotateGridLines, straightenTool, toggleStraightenTool, straightenLine, readoutAngle,
+  isRotating, rotateGridLines, lineTool, setLineTool, straightenLine, readoutAngle,
+  setTransform, resetTransform, removeLastGuide, guideLinesView,
   cropBoxRect, CROP_HANDLES, ofPerScreen, cropViewBox, cropDimPath, cropHandlePos,
-  onCropHandleDown, onCropOverlayDown,
+  onCropHandleDown, onCropOverlayDown, onGuideHandleDown,
 } = useCropEditor({
   crop, srcW, srcH, fitScale, zoom,
   onDragEnd: () => flushPendingHistory(),
 });
 
 const guideOptions = computed(() => CROP_GUIDES.map(g => ({ value: g, label: t(`guide.${g}` as const) })));
+
+// On-canvas readout in the crop editor: the angle while rotating, else the
+// armed line tool's hint.
+const cropReadout = computed(() => {
+  if (lineTool.value === "guided") return t("xf.guidedHint");
+  if (isRotating.value) return `${readoutAngle.value.toFixed(2)}°`;
+  if (lineTool.value === "straighten") return t("crop.straightenHint");
+  return "";
+});
+
+// The transform sliders, in panel order; each is one SliderRow.
+const XF_SLIDERS = [
+  { key: "vertical", min: -100, max: 100, reset: 0 },
+  { key: "horizontal", min: -100, max: 100, reset: 0 },
+  { key: "aspect", min: -100, max: 100, reset: 0 },
+  { key: "scale", min: 50, max: 150, reset: 100 },
+  { key: "offsetX", min: -100, max: 100, reset: 0 },
+  { key: "offsetY", min: -100, max: 100, reset: 0 },
+] as const;
 
 const WORKSPACE_BG: [number, number, number] = [0.07, 0.07, 0.08];
 
@@ -1447,7 +1467,7 @@ function exitCropMode(): void {
   if (!cropMode.value) return;
   flushPendingHistory();
   cropMode.value = false;
-  straightenTool.value = false;
+  lineTool.value = null;
   zoom.value = 1; pan.x = 0; pan.y = 0;
   nextTick(renderNormal);
 }
@@ -1478,7 +1498,8 @@ function onKeyDown(e: KeyboardEvent): void {
   // O cycles the guide overlay, Shift+O mirrors it (Lightroom-style).
   if (!inEditableText && activeSource.value && !e.ctrlKey && !e.metaKey && !e.altKey) {
     if (e.key === "r" || e.key === "R") { e.preventDefault(); toggleCropMode(); return; }
-    if (cropMode.value && straightenTool.value && e.key === "Escape") { e.preventDefault(); toggleStraightenTool(); return; }
+    if (cropMode.value && lineTool.value && e.key === "Escape") { e.preventDefault(); lineTool.value = null; return; }
+    if (cropMode.value && (e.key === "Delete" || e.key === "Backspace") && crop.xf.guides.length) { e.preventDefault(); removeLastGuide(); return; }
     if (cropMode.value && (e.key === "Escape" || e.key === "Enter")) { e.preventDefault(); exitCropMode(); return; }
     if (cropMode.value && (e.key === "x" || e.key === "X")) { e.preventDefault(); swapAspect(); return; }
     if (cropMode.value && e.key === "O") { e.preventDefault(); cycleCropGuideVariant(); return; }
@@ -1954,7 +1975,7 @@ const vWheelAdjust = {
         </div>
         <!-- Space passes the pointer through to the viewport so drags pan. -->
         <svg v-show="cropMode && webglRenderer != null" ref="cropOverlayRef" class="crop-overlay"
-          :class="{ 'is-passthrough': spaceHeld, 'is-straighten': straightenTool }"
+          :class="{ 'is-passthrough': spaceHeld, 'is-straighten': lineTool != null }"
           :style="{ transform: displayTransform, width: imageW + 'px', height: imageH + 'px' }"
           :viewBox="cropViewBox" preserveAspectRatio="none"
           @mousedown="onCropOverlayDown">
@@ -1975,7 +1996,15 @@ const vWheelAdjust = {
           <g class="crop-grid crop-grid-fine" :stroke-width="1 * ofPerScreen">
             <line v-for="(l, i) in rotateGridLines" :key="'r'+i" :x1="l[0]" :y1="l[1]" :x2="l[2]" :y2="l[3]" />
           </g>
-          <!-- the straighten tool's line -->
+          <!-- guided-upright lines, ends draggable -->
+          <g class="crop-upright">
+            <template v-for="(g, i) in guideLinesView" :key="'ug' + i">
+              <line :x1="g.x1" :y1="g.y1" :x2="g.x2" :y2="g.y2" :stroke-width="1.5 * ofPerScreen" />
+              <circle :cx="g.x1" :cy="g.y1" :r="5 * ofPerScreen" @mousedown="onGuideHandleDown($event, i, 0)" />
+              <circle :cx="g.x2" :cy="g.y2" :r="5 * ofPerScreen" @mousedown="onGuideHandleDown($event, i, 1)" />
+            </template>
+          </g>
+          <!-- the line tools' line -->
           <line v-if="straightenLine.active" class="crop-straighten-line"
             :x1="straightenLine.x1" :y1="straightenLine.y1" :x2="straightenLine.x2" :y2="straightenLine.y2"
             :stroke-width="1.5 * ofPerScreen" />
@@ -1988,8 +2017,7 @@ const vWheelAdjust = {
             :style="{ cursor: h.cursor }"
             @mousedown="onCropHandleDown($event, h.key)" />
         </svg>
-        <div v-if="cropMode && isRotating" class="crop-readout">{{ readoutAngle.toFixed(2) }}°</div>
-        <div v-else-if="cropMode && straightenTool" class="crop-readout">{{ t('crop.straightenHint') }}</div>
+        <div v-if="cropMode && cropReadout" class="crop-readout">{{ cropReadout }}</div>
         <img v-show="activeSource && !activeSource.invalid && !webglRenderer && status !== 'rendering'" class="preview" :style="{ transform: displayTransform }" :src="activeSource ? thumbSrc(activeSource) : ''" :alt="t('aria.preview')" />
         <div v-if="activeSource?.invalid" class="invalid-state">
           <img v-if="activeSource && thumbSrc(activeSource)" :src="thumbSrc(activeSource)" :alt="activeSource.name" />
@@ -2063,8 +2091,8 @@ const vWheelAdjust = {
         <SliderRow :model-value="Number(crop.angle.toFixed(2))" @update:model-value="setAngle"
           :label="t('crop.angle')" :min="-45" :max="45" :step="0.01" />
         <div class="crop-buttons">
-          <button type="button" class="crop-tool" :class="{ 'is-on': straightenTool }" :title="t('crop.straighten')"
-            :aria-pressed="straightenTool" @click="toggleStraightenTool">
+          <button type="button" class="crop-tool" :class="{ 'is-on': lineTool === 'straighten' }" :title="t('crop.straighten')"
+            :aria-pressed="lineTool === 'straighten'" @click="setLineTool('straighten')">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M3 17L21 7" /><path d="M6.5 15.2l1.2 2.2" /><path d="M10.5 13l1.2 2.2" /><path d="M14.5 10.8l1.2 2.2" /><path d="M18.5 8.6l1.2 2.2" />
             </svg>
@@ -2090,6 +2118,24 @@ const vWheelAdjust = {
             </svg>
           </button>
         </div>
+        <header class="panel-head crop-sub">
+          <span>{{ t('xf.title') }}</span>
+          <button class="ghost" type="button" @click="resetTransform">{{ t('common.reset') }}</button>
+        </header>
+        <div class="xf-guided">
+          <button type="button" class="crop-tool xf-guided-btn" :class="{ 'is-on': lineTool === 'guided' }"
+            :title="t('xf.guidedTitle')" :aria-pressed="lineTool === 'guided'" @click="setLineTool('guided')">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M7 3v18" /><path d="M17 3v18" /><path d="M3 8h18" /><path d="M3 16h18" />
+            </svg>
+            <span>{{ t('xf.guided') }}</span>
+          </button>
+          <button type="button" class="crop-tool xf-guided-count" :disabled="!crop.xf.guides.length"
+            :title="t('xf.removeGuide')" @click="removeLastGuide">{{ crop.xf.guides.length }} / 4 ×</button>
+        </div>
+        <SliderRow v-for="s in XF_SLIDERS" :key="s.key" :model-value="crop.xf[s.key]"
+          @update:model-value="v => setTransform({ [s.key]: v })"
+          :label="t(`xf.${s.key}`)" :min="s.min" :max="s.max" :step="1" :reset-value="s.reset" show-modified />
         <button type="button" class="crop-done" @click="exitCropMode">{{ t('crop.done') }}</button>
       </section>
 

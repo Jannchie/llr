@@ -3,17 +3,22 @@ import {
   applyAspectRatio, buildCropTransform, cloneCrop, constrainCrop, cornersInsideImage,
   cropOutputRect, cropOutputSize, cropOutputSizeForAspect, cssRecomposeMatrix, customAspectKey, defaultCrop,
   imageDims, isDefaultCrop, parseCustomAspect, ratioToFraction, resolveAspectFraction,
-  resolveAspectRatio, rotate90, straightenedBBox, straightenAngle, cropGuideShapes, cropCornersImage, CROP_GUIDES, type CropState,
+  resolveAspectRatio, rotate90, straightenedBBox, straightenAngle, cropGuideShapes, cropCornersImage, CROP_GUIDES,
+  defaultTransform, transformMatrix, guidedHomography, flipCrop, outFrameToImagePx, imagePxToOutFrame,
+  type CropState, type Transform,
 } from "../crop";
 
 const SRC_W = 6000;
 const SRC_H = 4000;
 
+const XF: Transform = { vertical: 40, horizontal: -20, aspect: 30, scale: 110, offsetX: 10, offsetY: -5, guides: [] };
+
 /** Apply the column-major mat3 from buildCropTransform to an output-frame point p. */
 function applyXform(m: Float32Array, px: number, py: number): [number, number] {
+  const w = m[2] * px + m[5] * py + m[8];
   return [
-    m[0] * px + m[3] * py + m[6],
-    m[1] * px + m[4] * py + m[7],
+    (m[0] * px + m[3] * py + m[6]) / w,
+    (m[1] * px + m[4] * py + m[7]) / w,
   ];
 }
 
@@ -76,10 +81,11 @@ describe("buildCropTransform", () => {
 });
 
 describe("cssRecomposeMatrix", () => {
-  /** Parse "matrix(a, b, c, d, e, f)" and apply it to a source-space px point. */
+  /** Parse "matrix3d(…)" (column-major) and apply it to a source-space px point. */
   function applyCss(css: string, x: number, y: number): [number, number] {
-    const m = css.slice("matrix(".length, -1).split(",").map(Number);
-    return [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
+    const m = css.slice("matrix3d(".length, -1).split(",").map(Number);
+    const w = m[3] * x + m[7] * y + m[15];
+    return [(m[0] * x + m[4] * y + m[12]) / w, (m[1] * x + m[5] * y + m[13]) / w];
   }
 
   // Every recompose the compare overlay can meet: 90° steps, flips, straighten,
@@ -92,8 +98,9 @@ describe("cssRecomposeMatrix", () => {
     ["off-center box", { ...defaultCrop(), cx: 0.4, cy: 0.55, w: 0.5, h: 0.3 }],
     ["straightened", constrainCrop({ ...defaultCrop(), angle: 8, w: 0.7, h: 0.6 }, SRC_W, SRC_H)],
     ["everything", constrainCrop(
-      { cx: 0.45, cy: 0.5, w: 0.6, h: 0.5, angle: -6, flipH: true, flipV: false, orientation: 90 },
+      { cx: 0.45, cy: 0.5, w: 0.6, h: 0.5, angle: -6, flipH: true, flipV: false, orientation: 90, xf: defaultTransform() },
       SRC_W, SRC_H)],
+    ["perspective", constrainCrop({ ...defaultCrop(), angle: 3, orientation: 270, flipV: true, xf: XF }, SRC_W, SRC_H)],
   ];
 
   it.each(CASES)("inverts buildCropTransform for %s", (_name, c) => {
@@ -406,5 +413,105 @@ describe("cropGuideShapes", () => {
     const b = cropGuideShapes("triangle", r, 1).lines[0];
     expect(a).toEqual([r.x, r.y, r.x + r.w, r.y + r.h]);
     expect(b).toEqual([r.x + r.w, r.y, r.x, r.y + r.h]);
+  });
+});
+
+describe("transform", () => {
+  const iw = SRC_W, ih = SRC_H;
+
+  it("is the identity without any slider or guide", () => {
+    expect(transformMatrix(defaultTransform(), iw, ih)).toEqual([1, 0, 0, 0, 1, 0, 0, 0, 1]);
+  });
+
+  it("keeps a constrained crop sampling inside the source", () => {
+    const c = constrainCrop({ ...defaultCrop(), angle: 4, xf: XF }, SRC_W, SRC_H);
+    expect(cornersInsideImage(c, iw, ih)).toBe(true);
+    expect(c.w).toBeLessThan(1);
+    for (const [px, py] of [[0, 0], [1, 0], [0, 1], [1, 1], [0.5, 0.5]] as const) {
+      const [u, v] = probe(c, px, py);
+      expect(u).toBeGreaterThanOrEqual(-1e-3); expect(u).toBeLessThanOrEqual(1 + 1e-3);
+      expect(v).toBeGreaterThanOrEqual(-1e-3); expect(v).toBeLessThanOrEqual(1 + 1e-3);
+    }
+  });
+
+  it("outFrame ↔ image px round-trip", () => {
+    const c = { ...defaultCrop(), angle: 7, cx: 0.4, xf: XF };
+    const [ox, oy] = imagePxToOutFrame(c, iw, ih, 1234, 567);
+    const [x, y] = outFrameToImagePx(c, iw, ih, ox, oy);
+    expect(x).toBeCloseTo(1234, 6);
+    expect(y).toBeCloseTo(567, 6);
+  });
+
+  it("survives four 90° turns and a double flip", () => {
+    const xf: Transform = { ...XF, guides: [[0.1, 0.2, 0.3, 0.9], [0.8, 0.1, 0.7, 0.9]] };
+    // 1 - (1 - y) is not y in floats: compare rounded.
+    const tidy = (t: Transform) => JSON.parse(JSON.stringify(t, (_k, v) => (typeof v === "number" ? Number(v.toFixed(9)) : v)));
+    let c: CropState = { ...defaultCrop(), xf };
+    for (let i = 0; i < 4; i++) c = rotate90(c, 1);
+    expect(tidy(c.xf)).toEqual(tidy(xf));
+    c = flipCrop(flipCrop(c, "h"), "h");
+    c = flipCrop(flipCrop(c, "v"), "v");
+    expect(tidy(c.xf)).toEqual(tidy(xf));
+    expect(isDefaultCrop(c)).toBe(false);
+  });
+
+  it("a 90° turn shows the same picture, turned", () => {
+    // A point on the transformed image, before and after the turn, must be the
+    // same source pixel: the conjugated transform is the same map in the new frame.
+    const c: CropState = constrainCrop({ ...defaultCrop(), w: 0.5, h: 0.5, xf: { ...XF, guides: [[0.1, 0.2, 0.3, 0.9], [0.8, 0.1, 0.7, 0.9]] } }, SRC_W, SRC_H);
+    const r = rotate90(c, 1);
+    const a = probe(c, 0.3, 0.8);
+    const b = probe(r, 0.2, 0.3); // (px,py) → turned clockwise: (1-py, px)
+    expect(b[0]).toBeCloseTo(a[0], 4);
+    expect(b[1]).toBeCloseTo(a[1], 4);
+  });
+});
+
+describe("guidedHomography", () => {
+  const iw = 3000, ih = 2000;
+  // A rectified world seen through a known keystone: warp true verticals /
+  // horizontals through P, hand them to the solver, and check it undoes it.
+  const P = [1, 0, 0, 0, 1, 0, 0.15, -0.3, 1];
+  const warp = (x: number, y: number): [number, number] => {
+    const n = Math.max(iw, ih) / 2;
+    const u = (x * iw - iw / 2) / n, t = (y * ih - ih / 2) / n;
+    const w = P[6] * u + P[7] * t + 1;
+    return [((u / w) * n + iw / 2) / iw, ((t / w) * n + ih / 2) / ih];
+  };
+  const line = (x1: number, y1: number, x2: number, y2: number): [number, number, number, number] => [...warp(x1, y1), ...warp(x2, y2)];
+  const direction = (G: number[], l: [number, number, number, number]): [number, number] => {
+    const n = Math.max(iw, ih) / 2;
+    const to = (x: number, y: number) => {
+      const u = (x * iw - iw / 2) / n, t = (y * ih - ih / 2) / n;
+      const w = G[6] * u + G[7] * t + G[8];
+      return [(G[0] * u + G[1] * t + G[2]) / w, (G[3] * u + G[4] * t + G[5]) / w];
+    };
+    const a = to(l[0], l[1]), b = to(l[2], l[3]);
+    const L = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    return [(b[0] - a[0]) / L, (b[1] - a[1]) / L];
+  };
+
+  it("makes two verticals plumb", () => {
+    const guides = [line(0.2, 0.1, 0.2, 0.9), line(0.8, 0.15, 0.8, 0.85)];
+    const G = guidedHomography(guides, iw, ih);
+    for (const l of guides) expect(Math.abs(direction(G, l)[0])).toBeLessThan(1e-6);
+    // A third, unseen vertical is plumb too: the whole perspective was solved, not just the lines.
+    expect(Math.abs(direction(G, line(0.5, 0.2, 0.5, 0.7))[0])).toBeLessThan(1e-6);
+  });
+
+  it("makes verticals plumb and horizontals level together", () => {
+    const guides = [line(0.2, 0.1, 0.2, 0.9), line(0.8, 0.15, 0.8, 0.85), line(0.1, 0.3, 0.9, 0.3), line(0.15, 0.7, 0.85, 0.7)];
+    const G = guidedHomography(guides, iw, ih);
+    expect(Math.abs(direction(G, guides[0])[0])).toBeLessThan(1e-6);
+    expect(Math.abs(direction(G, guides[1])[0])).toBeLessThan(1e-6);
+    expect(Math.abs(direction(G, guides[2])[1])).toBeLessThan(1e-6);
+    expect(Math.abs(direction(G, guides[3])[1])).toBeLessThan(1e-6);
+    expect(Math.abs(direction(G, line(0.3, 0.5, 0.6, 0.5))[1])).toBeLessThan(1e-6);
+  });
+
+  it("a single line only rotates", () => {
+    const G = guidedHomography([[0.1, 0.5, 0.9, 0.6]], iw, ih);
+    expect(G[6]).toBe(0); expect(G[7]).toBe(0);
+    expect(Math.abs(direction(G, [0.1, 0.5, 0.9, 0.6])[1])).toBeLessThan(1e-9);
   });
 });

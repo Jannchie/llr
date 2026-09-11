@@ -34,15 +34,16 @@ export const GRAD_RENORM_CAP = 4;
 export const VERTEX_SHADER = `#version 300 es
 precision highp float;
 in vec2 a_position;
-out vec2 v_texCoord;
-// Affine map output-quad -> source texcoords (crop / straighten / flip / rotate).
-// Identity for an un-cropped frame; built on the CPU in crop.ts.
+out vec3 v_texCoordH;
+// Homography output-quad -> source texcoords (crop / straighten / flip / rotate
+// / perspective). Identity for an un-cropped frame; built on the CPU in
+// crop.ts. Kept homogeneous here: the projective divide has to happen per
+// fragment, and interpolating the homogeneous vector then dividing is exact.
 uniform mat3 u_texXform;
 void main() {
   vec2 uv = a_position * 0.5 + 0.5;
   vec2 p = vec2(uv.x, 1.0 - uv.y);          // output-frame coord, y-down
-  vec3 t = u_texXform * vec3(p, 1.0);
-  v_texCoord = t.xy;
+  v_texCoordH = u_texXform * vec3(p, 1.0);
   gl_Position = vec4(a_position, 0.0, 1.0);
 }`;
 
@@ -56,7 +57,7 @@ precision highp isampler3D;
 // guarantees to 16 bits. Sony's 3-D LUT reproduces the engine's integer
 // trilinear weights and reaches 2^28 doing it, so it needs the full 32.
 precision highp int;
-in vec2 v_texCoord;
+in vec3 v_texCoordH;
 out vec4 outColor;
 uniform sampler2D u_input;
 uniform mat3 u_wbMatrix;        // relative WB: Bradford adaptation in linear ProPhoto
@@ -541,9 +542,11 @@ float droLocalMean(vec2 uv, float ylog) {
 }
 
 void main() {
-  // Outside the source image (rotated/straightened corners in the crop editor):
-  // paint the workspace background instead of smearing edge texels.
-  if (v_texCoord.x < 0.0 || v_texCoord.x > 1.0 || v_texCoord.y < 0.0 || v_texCoord.y > 1.0) {
+  vec2 v_texCoord = v_texCoordH.xy / v_texCoordH.z;
+  // Outside the source image (rotated/straightened corners in the crop editor,
+  // or past the horizon of a perspective): paint the workspace background
+  // instead of smearing edge texels.
+  if (v_texCoordH.z <= 0.0 || v_texCoord.x < 0.0 || v_texCoord.x > 1.0 || v_texCoord.y < 0.0 || v_texCoord.y > 1.0) {
     outColor = vec4(u_bgColor, 1.0);
     return;
   }

@@ -793,21 +793,22 @@ export class PipelineRenderer {
   }
 
   /**
-   * this.texXform ∘ (window -> full output frame). Both are affine, so this is
-   * one multiply of the 2x3 parts.
+   * this.texXform ∘ (window -> full output frame): one 3×3 product, column-
+   * major. The window map is affine; texXform may be a full homography.
    */
   private windowXform(win: ViewWindow): Float32Array {
     const t = this.texXform;
-    const [a00, a10, , a01, a11, , tx, ty] = t;
     const sx = win.w / this.outWidth;
     const sy = win.h / this.outHeight;
     const ox = win.x / this.outWidth;
     const oy = win.y / this.outHeight;
-    return new Float32Array([
-      a00! * sx, a10! * sx, 0,
-      a01! * sy, a11! * sy, 0,
-      a00! * ox + a01! * oy + tx!, a10! * ox + a11! * oy + ty!, 1,
-    ]);
+    // Columns of W: (sx,0,0), (0,sy,0), (ox,oy,1). (T·W) column j = T · W_j.
+    const col = (x: number, y: number, z: number): number[] => [
+      t[0] * x + t[3] * y + t[6] * z,
+      t[1] * x + t[4] * y + t[7] * z,
+      t[2] * x + t[5] * y + t[8] * z,
+    ];
+    return new Float32Array([...col(sx, 0, 0), ...col(0, sy, 0), ...col(ox, oy, 1)]);
   }
 
   /**
