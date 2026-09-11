@@ -490,6 +490,9 @@ button {
   grid-area: right;
   display: grid;
   grid-template-columns: 1fr var(--tabbar-w);
+  /* The one row must not grow past the rail with its content: an auto track
+     would size to the panels and leave the body nothing to scroll within. */
+  grid-template-rows: minmax(0, 1fr);
   min-height: 0;
   background: var(--bg);
 }
@@ -504,6 +507,9 @@ button {
 }
 
 .rail-panels {
+  /* overflow:hidden zeroes a flex item's automatic minimum, so without this the
+     card is squeezed and clipped instead of overflowing the body to scroll. */
+  flex-shrink: 0;
   background: var(--card);
   border-radius: var(--radius-card);
   box-shadow: var(--shadow-card);
