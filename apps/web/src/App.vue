@@ -18,7 +18,10 @@ import { API, fetchLinear, fetchLookProfile, type ColorProfileMeta, type Denoise
 import { type PersistedEdit } from "./persistence";
 import { gradingTint, gradingHueDeg } from "./rendering/grading";
 import { parseLensCorr, mixLensTable, LENS_IDENTITY, type LensCorr } from "./rendering/lens";
-import { packMasks, type MaskGroup } from "./rendering/masks";
+import {
+  packMasks, presetGroup, defaultComponent, defaultAdjust, MASK_PRESETS, MASK_GROUPS, MASK_COMPS,
+  type MaskGroup, type MaskType, type MaskAdjust, type MaskPresetName,
+} from "./rendering/masks";
 import { trackFill, formatBytes, clamp, IMPORT_ACCEPT, IMPORT_FORMAT_HINT } from "./ui";
 import { t, locale, setLocale, LOCALES, type MessageKey } from "./i18n";
 import SliderRow from "./components/SliderRow.vue";
@@ -451,6 +454,51 @@ const masks = reactive<MaskGroup[]>([]);
 const maskPreview = ref(false);
 const selectedMask = ref<string | null>(null);
 const cloneMasks = (m: readonly MaskGroup[]): MaskGroup[] => JSON.parse(JSON.stringify(m));
+const selectedGroup = computed(() => masks.find(g => g.id === selectedMask.value) ?? null);
+
+const MASK_TYPES: MaskType[] = ["luminance", "color", "linear", "radial"];
+const MASK_OPS = ["add", "subtract", "intersect"] as const;
+// The local sliders: exposure in EV, the rest on the global sliders' ±100.
+type MaskSliderKey = Exclude<keyof MaskAdjust, "contrast" | "blacks">; // the two reserved keys have no slider yet
+const MASK_ADJUST_SLIDERS: { key: MaskSliderKey; min: number; max: number; step: number }[] = [
+  { key: "exposure", min: -5, max: 5, step: 0.05 },
+  ...(["temperature", "tint", "highlights", "shadows", "saturation", "vibrance", "hue", "clarity", "dehaze"] as const)
+    .map(key => ({ key, min: -100, max: 100, step: 1 })),
+];
+// The Add menu: presets first (the common cases), then a bare component of
+// each type. Its model never matches an option, so it always reads "Add…".
+const maskAddOptions = computed(() => [
+  ...(Object.keys(MASK_PRESETS) as MaskPresetName[]).map(k => ({ value: k, label: t(`mask.preset.${k}`) })),
+  ...MASK_TYPES.map(k => ({ value: k, label: t(`mask.type.${k}`) })),
+]);
+const maskTypeOptions = computed(() => MASK_TYPES.map(k => ({ value: k, label: t(`mask.type.${k}`) })));
+
+// A preset group keeps the preset's key as its name and shows it translated;
+// anything else is "Mask".
+function maskLabel(g: MaskGroup): string {
+  return g.name && g.name in MASK_PRESETS ? t(`mask.preset.${g.name as MaskPresetName}`) : g.name ?? t("mask.newGroup");
+}
+const newMaskId = () => Math.random().toString(36).slice(2, 8);
+function addMask(key: string): void {
+  if (masks.length >= MASK_GROUPS) return;
+  const id = newMaskId();
+  masks.push(key in MASK_PRESETS
+    ? presetGroup(key as MaskPresetName, id)
+    : { id, enabled: true, invert: false, components: [defaultComponent(key as MaskType)], adjust: defaultAdjust() });
+  selectedMask.value = id;
+}
+function removeMask(id: string): void {
+  const i = masks.findIndex(g => g.id === id);
+  if (i >= 0) masks.splice(i, 1);
+  if (selectedMask.value === id) selectedMask.value = masks[Math.min(i, masks.length - 1)]?.id ?? null;
+}
+function addComponent(type: string): void {
+  const g = selectedGroup.value;
+  if (g && g.components.length < MASK_COMPS) g.components.push(defaultComponent(type as MaskType));
+}
+function resetMasks(): void { masks.splice(0); selectedMask.value = null; }
+const deg = (rad: number) => Math.round((rad * 180) / Math.PI);
+const rad = (d: number) => (d * Math.PI) / 180;
 
 // The sub-rectangle of the frame the canvas currently covers (output-frame px);
 // null = the whole frame. See updateRenderWindow for why it exists.
@@ -889,6 +937,7 @@ const EDIT_TABS: { key: EditTab; icon: string[] }[] = [
   { key: "light", icon: ["M12 3a9 9 0 0 0 0 18z", "M12 3a9 9 0 0 1 0 18"] },
   { key: "color", icon: ["M12 3a9 9 0 1 0 0 18c1.1 0 1.6-.9 1.6-1.7 0-1.6-1.4-1.9-1.4-3 0-.9.7-1.6 1.7-1.6H16a5 5 0 0 0 5-5c0-3.7-4-6.7-9-6.7z", "M7.5 12.5h.01", "M9.5 8.5h.01", "M14.5 8h.01"] },
   { key: "curve", icon: ["M4 20c6.5 0 5-16 16-16"] },
+  { key: "masks", icon: ["M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z", "M12 3v18", "M12 7.5h5.5", "M12 12h8.5", "M12 16.5h5.5"] },
   { key: "detail", icon: ["M12 4v16", "M4 12h16", "M6.3 6.3l11.4 11.4", "M17.7 6.3L6.3 17.7"] },
   { key: "look", icon: ["M21 19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h3l1.5-2.5h5L16 7h3a2 2 0 0 1 2 2z", "M12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8z"] },
   { key: "crop", icon: ["M6 2v14a2 2 0 0 0 2 2h14", "M2 6h14a2 2 0 0 1 2 2v14"] },
@@ -2735,6 +2784,92 @@ const vWheelAdjust = {
           <button v-for="name in presetNames" :key="name" type="button"
             class="curve-preset" @click="applyCurvePreset(name)">{{ t(`curvePreset.${name}`) }}</button>
         </div>
+      </section>
+
+      <!-- Masks: the group list, then the selected group's components, the
+           overlay switch and its local sliders (rendering/masks.ts). -->
+      <section class="panel" v-if="editTab === 'masks' && activeSource">
+        <header class="panel-head">
+          <span class="panel-title">
+            {{ t('panel.masks') }}
+            <span v-if="masks.length" class="panel-dot" aria-hidden="true" />
+          </span>
+          <button class="ghost" type="button" :disabled="!masks.length" @click="resetMasks">{{ t('common.reset') }}</button>
+        </header>
+        <ol class="mask-list" v-if="masks.length">
+          <li v-for="g in masks" :key="g.id" class="mask-row"
+            :class="{ 'is-selected': selectedMask === g.id, 'is-off': !g.enabled }" @click="selectedMask = g.id">
+            <label class="switch" :title="t('mask.enable')" @click.stop>
+              <input type="checkbox" v-model="g.enabled" />
+              <span class="switch-track"><span class="switch-thumb" /></span>
+            </label>
+            <span class="mask-name">{{ maskLabel(g) }}</span>
+            <button class="icon-mini" :class="{ 'is-on': g.invert }" type="button" :title="t('mask.invert')"
+              :aria-pressed="g.invert" @click.stop="g.invert = !g.invert">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z" /><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none" />
+              </svg>
+            </button>
+            <button class="icon-mini" type="button" :title="t('mask.remove')" @click.stop="removeMask(g.id)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
+            </button>
+          </li>
+        </ol>
+        <SelectMenu :model-value="''" :options="maskAddOptions" :placeholder="t('mask.add')"
+          :aria-label="t('mask.add')" :disabled="masks.length >= MASK_GROUPS" @update:model-value="addMask" />
+
+        <template v-if="selectedGroup">
+          <div class="mask-sub-head">
+            <span>{{ t('mask.components') }}</span>
+            <SelectMenu :model-value="''" :options="maskTypeOptions" :placeholder="t('mask.addComponent')"
+              :aria-label="t('mask.addComponent')" :disabled="selectedGroup.components.length >= MASK_COMPS" @update:model-value="addComponent" />
+          </div>
+          <div v-for="(c, i) in selectedGroup.components" :key="i" class="mask-comp">
+            <div class="mask-comp-head">
+              <span class="mask-comp-type">{{ t(`mask.type.${c.type}`) }}</span>
+              <!-- The first component has nothing to combine with. -->
+              <div v-if="i > 0" class="hsl-tabs mask-ops">
+                <button v-for="op in MASK_OPS" :key="op" type="button" :class="{ active: c.op === op }"
+                  :title="t(`mask.op.${op}`)" @click="c.op = op">{{ t(`mask.op.${op}`) }}</button>
+              </div>
+              <button class="icon-mini" :class="{ 'is-on': c.invert }" type="button" :title="t('mask.invert')"
+                :aria-pressed="c.invert" @click="c.invert = !c.invert">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z" /><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none" />
+                </svg>
+              </button>
+              <button class="icon-mini" type="button" :title="t('mask.remove')" @click="selectedGroup.components.splice(i, 1)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
+              </button>
+            </div>
+            <template v-if="c.type === 'luminance'">
+              <SliderRow v-model="c.lo" :label="t('mask.range.lo')" :min="0" :max="100" />
+              <SliderRow v-model="c.hi" :label="t('mask.range.hi')" :min="0" :max="100" :reset-value="100" />
+              <SliderRow v-model="c.featherLo" :label="t('mask.range.featherLo')" :min="0" :max="100" />
+              <SliderRow v-model="c.featherHi" :label="t('mask.range.featherHi')" :min="0" :max="100" />
+            </template>
+            <template v-else-if="c.type === 'color'">
+              <!-- Stored in Oklab radians, shown in degrees. -->
+              <SliderRow :model-value="deg(c.hue)" @update:model-value="v => c.hue = rad(v)" :label="t('mask.color.hue')" :min="-180" :max="180" />
+              <SliderRow :model-value="deg(c.hueWidth)" @update:model-value="v => c.hueWidth = rad(v)" :label="t('mask.color.width')" :min="5" :max="120" :reset-value="35" />
+            </template>
+            <template v-else-if="c.type === 'radial'">
+              <SliderRow :model-value="Math.round(c.feather * 100)" @update:model-value="v => c.feather = v / 100" :label="t('mask.range.feather')" :min="0" :max="100" :reset-value="50" />
+              <SliderRow v-model="c.angle" :label="t('crop.angle')" :min="-180" :max="180" />
+            </template>
+          </div>
+
+          <div class="control-row mask-overlay-row">
+            <label class="control-label" for="mask-overlay">{{ t('mask.overlay') }}</label>
+            <label class="switch">
+              <input id="mask-overlay" type="checkbox" v-model="maskPreview" />
+              <span class="switch-track"><span class="switch-thumb" /></span>
+            </label>
+          </div>
+          <SliderRow v-for="sp in MASK_ADJUST_SLIDERS" :key="sp.key"
+            v-model="selectedGroup.adjust[sp.key]" :label="t(`slider.${sp.key}`)" :input-id="`m-${sp.key}`"
+            :min="sp.min" :max="sp.max" :step="sp.step" :track="WB_TRACK[sp.key as RecipeKey]" show-modified />
+        </template>
       </section>
       </div>
       </div>

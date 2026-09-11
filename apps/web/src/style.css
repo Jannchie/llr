@@ -2073,3 +2073,81 @@ input[type="range"]:focus::-moz-range-thumb {
   line-height: 1;
   color: var(--text-dim);
 }
+/* ---------- Masks panel ----------
+   The group list reads like the history list (one quiet row per group, the
+   selected one on the accent); the selected group's selection components and
+   local sliders follow below it. */
+
+.mask-list {
+  list-style: none;
+  margin: 0 0 6px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.mask-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 6px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: background 120ms, color 120ms;
+}
+
+.mask-row:hover {
+  background: var(--card-hover);
+  color: var(--text);
+}
+
+.mask-row.is-selected {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.mask-row.is-off .mask-name { color: var(--text-mute); }
+
+.mask-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.icon-mini.is-on { color: var(--accent); }
+
+.mask-sub-head {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+}
+
+.mask-comp { margin-top: 8px; }
+
+.mask-comp-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 2px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+.mask-comp-type { flex: 1; }
+
+/* The op picker is the HSL segmented control, sized to its three short words. */
+.mask-ops { margin: 0; }
+.mask-ops button { flex: none; padding: 1px 7px; font-size: 11.5px; }
+
+.mask-overlay-row { margin-top: 12px; margin-bottom: 4px; }
