@@ -35,22 +35,23 @@
   /* Slider track (unfilled) */
   --track-bg: rgba(255, 255, 255, 0.16);
 
-  /* Shape — generous, soft rounding */
-  --radius-card: 14px;
-  --radius: 9px;
-  --radius-sm: 6px;
+  /* Shape — square. The pill survives only for things that are actually round
+     (knobs, dots, the switch). */
+  --radius-card: 0;
+  --radius: 3px;
+  --radius-sm: 2px;
   --radius-pill: 999px;
 
-  /* Elevation — a hairline defines the card, a short shadow lifts it. A wide
-     ambient blur reads as haze once six cards stack up the rail. */
-  --shadow-knob: 0 1px 3px rgba(0, 0, 0, 0.5), 0 0 0 0.5px rgba(0, 0, 0, 0.12);
-  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.28), inset 0 0 0 0.5px rgba(255, 255, 255, 0.05);
-  --shadow-float: 0 6px 22px rgba(0, 0, 0, 0.4), inset 0 0 0 0.5px rgba(255, 255, 255, 0.08);
+  /* Elevation — nothing lifts off the shell; only true overlays (popups,
+     dialogs, toasts) carry a shadow. */
+  --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.6);
+  --shadow-card: none;
+  --shadow-float: 0 8px 24px rgba(0, 0, 0, 0.5);
 
-  --stage-inset: 12px;
-  --topbar-h: 42px;
-  --rail-w: 336px;
-  --tabbar-w: 38px;
+  --stage-inset: 0px;
+  --topbar-h: 34px;
+  --rail-w: 320px;
+  --tabbar-w: 32px;
 
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
     ui-sans-serif, "Inter", system-ui, sans-serif;
@@ -91,7 +92,7 @@ button {
 }
 
 :focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 1px solid var(--accent);
   outline-offset: 1px;
   border-radius: var(--radius-sm);
 }

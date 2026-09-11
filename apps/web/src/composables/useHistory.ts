@@ -20,6 +20,11 @@ export function useHistory<S>(opts: {
   const historyIndex = ref(-1);
   const pendingDirty = ref(false);
   let historyTimer = 0;
+  // Who made an entry, by snapshot identity. Not persisted: the stored shape is
+  // the bare snapshot list, and a reloaded session reads well enough from the
+  // diff between neighbours (see the caller's step labels).
+  const labels = new WeakMap<object, string>();
+  let pendingLabel: string | undefined;
 
   const canUndo = computed(() => historyIndex.value > 0 || pendingDirty.value);
   const canRedo = computed(() => historyIndex.value < history.value.length - 1);
@@ -29,11 +34,13 @@ export function useHistory<S>(opts: {
   }
 
   // Commit the current edit state as a new history entry, dropping any redo branch.
-  function commit(): void {
+  function commit(label = pendingLabel): void {
     pendingDirty.value = false;
+    pendingLabel = undefined;
     const snap = opts.capture();
     const cur = history.value[historyIndex.value];
     if (cur && snapshotsEqual(cur, snap)) return;
+    if (label) labels.set(snap as object, label);
     const next = history.value.slice(0, historyIndex.value + 1);
     next.push(snap);
     if (next.length > maxEntries) next.shift();
@@ -42,33 +49,33 @@ export function useHistory<S>(opts: {
   }
 
   // Coalesce rapid edits (slider/curve drags) into one entry, committed after a quiet period.
-  function scheduleCommit(): void {
+  function scheduleCommit(label?: string): void {
     if (opts.suspended()) return;
     pendingDirty.value = true;
+    if (label) pendingLabel = label;
     if (historyTimer) clearTimeout(historyTimer);
     historyTimer = window.setTimeout(() => { historyTimer = 0; commit(); }, debounceMs);
   }
 
-  function flushPending(): void {
+  function flushPending(label?: string): void {
     if (historyTimer) { clearTimeout(historyTimer); historyTimer = 0; }
-    if (pendingDirty.value) commit();
+    if (pendingDirty.value) commit(label);
   }
 
-  function undo(): void {
+  const labelOf = (i: number): string | undefined => labels.get(history.value[i] as object);
+
+  // Jump straight to an entry (the history panel's click), undo/redo being the
+  // ±1 special cases.
+  function jumpTo(i: number): void {
     flushPending();
-    if (historyIndex.value <= 0) return;
-    historyIndex.value--;
-    opts.apply(history.value[historyIndex.value]);
+    if (i < 0 || i >= history.value.length || i === historyIndex.value) return;
+    historyIndex.value = i;
+    opts.apply(history.value[i]);
     nextTick(() => opts.onCommitted());
   }
 
-  function redo(): void {
-    flushPending();
-    if (historyIndex.value >= history.value.length - 1) return;
-    historyIndex.value++;
-    opts.apply(history.value[historyIndex.value]);
-    nextTick(() => opts.onCommitted());
-  }
+  function undo(): void { flushPending(); jumpTo(historyIndex.value - 1); }
+  function redo(): void { flushPending(); jumpTo(historyIndex.value + 1); }
 
   function init(): void {
     history.value = [opts.capture()];
@@ -78,6 +85,6 @@ export function useHistory<S>(opts: {
 
   return {
     history, historyIndex, pendingDirty, canUndo, canRedo,
-    commit, scheduleCommit, flushPending, undo, redo, init,
+    commit, scheduleCommit, flushPending, undo, redo, jumpTo, labelOf, init,
   };
 }

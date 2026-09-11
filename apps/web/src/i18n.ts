@@ -55,7 +55,15 @@ const en = {
   "tab.look": "Creative Look",
   "tab.crop": "Crop & Straighten (R)",
   "tab.assistant": "Assistant",
+  "tab.history": "History",
   "tab.settings": "Settings",
+
+  // History panel
+  "panel.history": "History",
+  "history.count": "{n} steps",
+  "history.start": "Open",
+  "history.edit": "Edit",
+  "history.assistant": "Assistant",
 
   // Assistant
   "panel.assistant": "Assistant",
@@ -305,7 +313,15 @@ const zh: Record<MessageKey, string> = {
   "tab.look": "创意外观",
   "tab.crop": "裁剪并拉直 (R)",
   "tab.assistant": "助手",
+  "tab.history": "历史记录",
   "tab.settings": "设置",
+
+  // History panel
+  "panel.history": "历史记录",
+  "history.count": "{n} 步",
+  "history.start": "打开",
+  "history.edit": "编辑",
+  "history.assistant": "助手",
 
   // Assistant
   "panel.assistant": "助手",

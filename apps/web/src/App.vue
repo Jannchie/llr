@@ -48,7 +48,7 @@ type SliderGroup = { title: "tone" | "presence" | "color" | "lens"; tab: EditTab
 // The rail shows one group at a time, picked from the icon strip along its
 // outer edge. Nine always-open panels stacked to 2400px — reaching the curve
 // meant scrolling two and a half screens past controls nobody was using.
-type EditTab = "light" | "color" | "curve" | "detail" | "look" | "crop" | "assistant" | "settings";
+type EditTab = "light" | "color" | "curve" | "detail" | "look" | "crop" | "assistant" | "history" | "settings";
 
 // Distortion correction defaults to fully applied (mirrorless glass is designed
 // around it — uncorrected geometry reads as broken). Vignetting stays off by
@@ -626,8 +626,10 @@ function defaultSnapshot(): Snapshot {
     profile: "standard",
     denoise: defaultDenoise(),
     look: null,
+    lookScale: LOOK_SCALE,
     lookStyle: null,
     dro: null,
+    droLevel: DRO_AUTO,
     sonyAdvancedColour: false,
   };
 }
@@ -635,7 +637,7 @@ function defaultSnapshot(): Snapshot {
 const {
   history, historyIndex, pendingDirty, canUndo, canRedo,
   scheduleCommit: scheduleHistoryCommit, flushPending: flushPendingHistory,
-  undo, redo, init: initHistory,
+  undo, redo, jumpTo: jumpHistory, labelOf: historyLabelOf, init: initHistory,
 } = useHistory<Snapshot>({
   capture: () => captureSnapshot(),
   apply: (s) => applySnapshot(s),
@@ -711,6 +713,40 @@ function applySnapshot(s: Snapshot): void {
 }
 
 initHistory();
+
+// ── History panel ──
+//
+// Every entry is a whole snapshot, so a step's caption is read off the diff
+// with its predecessor: the sliders that moved (with their new value), or the
+// panel that changed. An author tag (the assistant) rides along when known.
+const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+function describeStep(prev: Snapshot, next: Snapshot): string {
+  const parts: string[] = [];
+  for (const key of Object.keys(next.recipe) as RecipeKey[]) {
+    if (prev.recipe[key] !== next.recipe[key]) parts.push(`${t(`slider.${key}`)} ${formatSliderValue(key, next.recipe[key])}`);
+  }
+  if (!same(prev.hslHue, next.hslHue) || !same(prev.hslSat, next.hslSat) || !same(prev.hslLum, next.hslLum)) parts.push(t("panel.hsl"));
+  if (!same(prev.grading, next.grading)) parts.push(t("panel.grading"));
+  if (!same(prev.curve, next.curve)) parts.push(t("panel.curve"));
+  if (!same(prev.crop, next.crop) || prev.aspect !== next.aspect) parts.push(t("panel.crop"));
+  if (prev.dcp !== next.dcp || prev.profile !== next.profile) parts.push(t("settings.engine"));
+  if (!same(prev.denoise, next.denoise)) parts.push(t("panel.detail"));
+  if (!same(prev.look, next.look) || prev.lookStyle !== next.lookStyle || prev.dro !== next.dro || prev.droLevel !== next.droLevel
+    || prev.sonyAdvancedColour !== next.sonyAdvancedColour) parts.push(t("panel.creativeLook"));
+  if (!parts.length) return t("history.edit");
+  return parts.length > 3 ? `${parts.slice(0, 3).join(", ")} +${parts.length - 3}` : parts.join(", ");
+}
+function formatSliderValue(key: RecipeKey, v: number): string {
+  if (key === "temperature") return `${v}K`;
+  if (key === "exposure") return `${v > 0 ? "+" : ""}${v.toFixed(2)}`;
+  return `${v > 0 ? "+" : ""}${v}`;
+}
+// Newest first, the way a photographer reads it back.
+const historySteps = computed(() => history.value.map((snap, i) => ({
+  index: i,
+  label: i === 0 ? t("history.start") : describeStep(history.value[i - 1], snap),
+  author: historyLabelOf(i),
+})).reverse());
 
 // ── Per-image edits + persistence ──
 //
@@ -813,6 +849,9 @@ function applyDcpSelection(selection: ColorProfileMeta["selection"]): void {
   suppressDcpReload = true;
   dcpCode.value = matched;
   void nextTick(() => { suppressDcpReload = false; });
+  // Auto-detection on a fresh image is part of opening it, not a step of its
+  // own: fold it into the starting entry so the history begins at "Open".
+  if (history.value.length === 1 && !pendingDirty.value) history.value = [captureSnapshot()];
 }
 
 // The Lens group is driven entirely by the per-shot tables in the file's maker
@@ -835,6 +874,7 @@ const EDIT_TABS: { key: EditTab; icon: string[] }[] = [
   { key: "look", icon: ["M21 19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h3l1.5-2.5h5L16 7h3a2 2 0 0 1 2 2z", "M12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8z"] },
   { key: "crop", icon: ["M6 2v14a2 2 0 0 0 2 2h14", "M2 6h14a2 2 0 0 1 2 2v14"] },
   { key: "assistant", icon: ["M12 3l1.8 4.7L18.5 9.5l-4.7 1.8L12 16l-1.8-4.7L5.5 9.5l4.7-1.8z", "M19 16l.8 2.2 2.2.8-2.2.8L19 22l-.8-2.2-2.2-.8 2.2-.8z"] },
+  { key: "history", icon: ["M12 8v4l3 2", "M3.5 12a8.5 8.5 0 1 0 2.5-6", "M3 3v4h4"] },
   { key: "settings", icon: ["M4 7h16", "M4 17h16", "M9 7a2 2 0 1 0 4 0 2 2 0 0 0-4 0z", "M13 17a2 2 0 1 0 4 0 2 2 0 0 0-4 0z"] },
 ];
 
@@ -869,6 +909,7 @@ const tabEdited = computed<Record<EditTab, boolean>>(() => ({
   look: lookEdited.value,
   crop: !isDefaultCrop(crop),
   assistant: false,
+  history: false,
   settings: false,
 }));
 
@@ -1902,7 +1943,16 @@ const assistantTools: Record<string, AssistantTool> = {
   set_edit: {
     description: "Apply adjustments. Every field is optional and absolute; omitted fields are left as they are. Returns the resulting edit state.",
     parameters: SET_EDIT_SCHEMA,
-    run: (args) => { applyAssistantEdit(args); return textContent(describeEdit()); },
+    run: async (args) => {
+      // One history step per call, tagged as the assistant's: flush whatever the
+      // user was mid-way through first, then commit this edit on its own once
+      // the watchers have seen it.
+      flushPendingHistory();
+      applyAssistantEdit(args);
+      await nextTick();
+      flushPendingHistory(t("history.assistant"));
+      return textContent(describeEdit());
+    },
   },
 };
 
@@ -2381,6 +2431,22 @@ const vWheelAdjust = {
         <button type="button" class="crop-done" @click="exitCropMode">{{ t('crop.done') }}</button>
       </section>
 
+      <section class="panel history-panel" v-if="editTab === 'history'">
+        <header class="panel-head">
+          <span>{{ t('panel.history') }}</span>
+          <span class="panel-hint">{{ t('history.count', { n: history.length }) }}</span>
+        </header>
+        <ol class="history-list">
+          <li v-for="step in historySteps" :key="step.index">
+            <button type="button" class="history-step"
+              :class="{ 'is-current': step.index === historyIndex, 'is-undone': step.index > historyIndex }"
+              @click="jumpHistory(step.index)">
+              <span class="history-label">{{ step.label }}</span>
+              <span class="history-author" v-if="step.author">{{ step.author }}</span>
+            </button>
+          </li>
+        </ol>
+      </section>
       <section class="panel" v-if="editTab === 'settings'">
         <header class="panel-head">
           <span>{{ t('panel.settings') }}</span>
