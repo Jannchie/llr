@@ -2244,6 +2244,35 @@ function toolSummary(entry: { name: string; args: unknown }): string {
   if (entry.name !== "set_edit" || !entry.args || typeof entry.args !== "object") return "";
   return Object.keys(entry.args as object).join(", ");
 }
+// What the model saw or did, from the tool's own result: the picture it was
+// sent, the fields set_edit changed, the numbers measure reported.
+function toolDetail(entry: { name: string; result?: ToolContent[] }): { image?: string; lines?: string[]; rows?: [string, string][] } | null {
+  const first = entry.result?.[0];
+  if (!first) return null;
+  if (first.type === "image") return { image: `data:${first.mimeType};base64,${first.data}` };
+  let parsed: Record<string, unknown>;
+  try { parsed = JSON.parse(first.text); } catch { return null; }
+  // Signed like the slider readouts (+0.4), except crop fractions and
+  // Kelvin-scale values, where a plus sign would only read as noise.
+  const fmt = (v: unknown, key = "crop."): string =>
+    v == null ? "—"
+    : typeof v === "number" ? (v > 0 && Math.abs(v) <= 100 && !key.startsWith("crop.") ? "+" : "") + String(Math.round(v * 1000) / 1000)
+    : typeof v === "string" && v.length > 60 ? `${v.slice(0, 57)}…` : String(v);
+  if (entry.name === "set_edit") {
+    const changed = Object.entries((parsed.changed ?? {}) as Record<string, { from: unknown; to: unknown }>);
+    return { lines: changed.length ? changed.map(([k, d]) => `${k} ${fmt(d.from, k)} → ${fmt(d.to, k)}`) : [String(parsed.note ?? "")] };
+  }
+  if (entry.name === "measure") {
+    const rows: [string, string][] = [];
+    const walk = (v: unknown, prefix: string) => {
+      if (v && typeof v === "object") for (const [k, x] of Object.entries(v)) walk(x, prefix ? `${prefix}.${k}` : k);
+      else rows.push([prefix, fmt(v)]);
+    };
+    walk(parsed, "");
+    return { rows };
+  }
+  return null;
+}
 
 // ── Export ──
 
@@ -2611,11 +2640,21 @@ const vWheelAdjust = {
               <span v-if="entry.error" class="chat-error">{{ entry.error }}</span>
               <span v-else-if="!entry.text && chatBusy" class="chat-typing">…</span>
             </div>
-            <div v-else class="chat-tool" :class="{ 'is-done': entry.done, 'is-error': entry.error }">
-              <span class="chat-tool-name">{{ t(`chat.tool.${entry.name}` as MessageKey) }}</span>
-              <span class="chat-tool-args" v-if="toolSummary(entry)">{{ toolSummary(entry) }}</span>
-              <span class="chat-error" v-if="entry.error">{{ entry.error }}</span>
-            </div>
+            <p v-else-if="entry.kind === 'status'" class="chat-status">{{ t(`chat.status.${entry.status}` as MessageKey) }}</p>
+            <details v-else class="chat-tool" :class="{ 'is-done': entry.done, 'is-error': entry.error }">
+              <summary>
+                <span class="chat-tool-name">{{ t(`chat.tool.${entry.name}` as MessageKey) }}</span>
+                <span class="chat-tool-args" v-if="toolSummary(entry)">{{ toolSummary(entry) }}</span>
+                <span class="chat-error" v-if="entry.error">{{ entry.error }}</span>
+              </summary>
+              <div class="chat-tool-body" v-if="toolDetail(entry)">
+                <img v-if="toolDetail(entry)!.image" :src="toolDetail(entry)!.image" alt="" />
+                <template v-for="line in toolDetail(entry)!.lines" :key="line">{{ line }}<br /></template>
+                <table v-if="toolDetail(entry)!.rows">
+                  <tr v-for="[k, v] in toolDetail(entry)!.rows" :key="k"><td>{{ k }}</td><td>{{ v }}</td></tr>
+                </table>
+              </div>
+            </details>
           </template>
         </div>
         <form class="chat-compose" @submit.prevent="submitChat">

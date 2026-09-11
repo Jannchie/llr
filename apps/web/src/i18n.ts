@@ -86,6 +86,7 @@ const en = {
   "chat.tool.set_edit": "Adjusting",
   "chat.tool.compare": "Comparing before and after",
   "chat.tool.measure": "Measuring the render",
+  "chat.status.stopped": "Stopped",
 
   // Crop panel
   "panel.crop": "Crop & Straighten",
@@ -379,6 +380,7 @@ const zh: Record<MessageKey, string> = {
   "chat.tool.set_edit": "调整",
   "chat.tool.compare": "对比前后",
   "chat.tool.measure": "测量画面",
+  "chat.status.stopped": "已停止",
 
   "panel.crop": "裁剪并拉直",
   "crop.aspect": "长宽比",

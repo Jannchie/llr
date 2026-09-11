@@ -45,7 +45,10 @@ function loadModels(): ModelSpec[] {
 export type ChatEntry =
   | { kind: "user"; text: string }
   | { kind: "assistant"; text: string; error?: string }
-  | { kind: "tool"; name: string; args: unknown; done: boolean; error?: string };
+  // `result` is what went back to the model, kept so the log can show it.
+  | { kind: "tool"; name: string; args: unknown; done: boolean; error?: string; result?: ToolContent[] }
+  // A line about the run itself, not something anyone said.
+  | { kind: "status"; status: "stopped" };
 
 type Chat = { session: string; entries: ChatEntry[]; busy: boolean };
 
@@ -102,7 +105,8 @@ export function useAssistant(opts: {
     let body: Record<string, unknown>;
     try {
       if (!tool) throw new Error(`Unknown tool ${name}`);
-      body = { toolCallId, content: await tool.run(args) };
+      entry.result = await tool.run(args);
+      body = { toolCallId, content: entry.result };
     } catch (err) {
       entry.error = err instanceof Error ? err.message : String(err);
       body = { toolCallId, error: entry.error };
@@ -139,6 +143,7 @@ export function useAssistant(opts: {
             if (ev.message.role === "assistant") {
               if (reply && !reply.text.trim() && ev.message.stopReason !== "error") chat.entries.splice(chat.entries.indexOf(reply), 1);
               if (ev.message.stopReason === "error" && reply) reply.error = ev.message.errorMessage ?? "error";
+              if (ev.message.stopReason === "aborted") chat.entries.push({ kind: "status", status: "stopped" });
               reply = null;
             }
             break;

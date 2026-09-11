@@ -1899,12 +1899,9 @@ input[type="range"]:focus::-moz-range-thumb {
 }
 
 /* A tool call: one quiet line, an accent dot that settles once the call has
-   returned — the log's version of a "working…" spinner. */
+   returned — the log's version of a "working…" spinner. A <details>: the line
+   is its summary, and it opens on what the model actually sent or saw. */
 .chat-tool {
-  display: flex;
-  align-items: baseline;
-  flex-wrap: wrap;
-  gap: 0 6px;
   font-size: 11px;
   color: var(--text-dim);
   padding-left: 12px;
@@ -1938,6 +1935,53 @@ input[type="range"]:focus::-moz-range-thumb {
 
 @keyframes chat-pulse {
   50% { opacity: 0.25; }
+}
+
+.chat-tool > summary {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0 6px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.chat-tool > summary::-webkit-details-marker {
+  display: none;
+}
+
+.chat-tool-body {
+  margin-top: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+}
+
+.chat-tool-body img {
+  max-width: 100%;
+  border-radius: var(--radius-sm);
+}
+
+.chat-tool-body table {
+  border-collapse: collapse;
+}
+
+.chat-tool-body td {
+  padding: 0 8px 0 0;
+  white-space: nowrap;
+}
+
+.chat-tool-body td + td {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+/* A quiet line in the log about the run itself — stopped, nudged — not a bubble. */
+.chat-status {
+  font-size: 12px;
+  color: var(--text-mute);
+  padding-left: 12px;
 }
 
 .chat-compose {
