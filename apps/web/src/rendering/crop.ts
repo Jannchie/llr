@@ -162,7 +162,7 @@ function outFrameToImage(ox: number, oy: number, cx: number, cy: number, cos: nu
 }
 
 /** Image-space normalized (y-down) → source texcoord (FLIP_Y upload convention). */
-function imageNormToTexcoord(ix: number, iy: number, c: CropState): [number, number] {
+export function imageNormToTexcoord(ix: number, iy: number, c: CropState): [number, number] {
   if (c.flipH) ix = 1 - ix;
   if (c.flipV) iy = 1 - iy;
   let su: number, sv: number;
@@ -177,7 +177,7 @@ function imageNormToTexcoord(ix: number, iy: number, c: CropState): [number, num
 
 /** Source-space normalized (y-down) → image-space normalized. Inverse of the
  *  orientation/flip half of `imageNormToTexcoord`. */
-function sourceNormToImageNorm(su: number, sv: number, c: CropState): [number, number] {
+export function sourceNormToImageNorm(su: number, sv: number, c: CropState): [number, number] {
   let ix: number, iy: number;
   switch (c.orientation) {
     case 90:  ix = 1 - sv; iy = su;     break;
