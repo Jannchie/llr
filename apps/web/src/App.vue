@@ -2217,17 +2217,13 @@ const vWheelAdjust = {
         </div>
         <!-- Sharpening is a camera setting, not one of the six tweaks, so it is
              reported rather than offered: there is no slider here that could
-             move it. The two ladder positions are what the body's own menu
-             showed; the note says which halves of the effect are running. -->
+             move it. The two ladder positions are what the body's own menu showed. -->
         <div class="control-row" v-if="sharpening">
           <span class="control-label">{{ t('look.sharpening') }}</span>
           <span class="control-value">
             {{ t('look.sharpeningValue', { level: `+${sharpening.level}`, range: `+${sharpening.range}` }) }}
           </span>
         </div>
-        <p class="control-note" v-if="sharpening">
-          {{ t(sharpening.fine ? 'look.sharpeningHint' : 'look.sharpeningCoarseOnly') }}
-        </p>
         <SliderRow v-for="spec in lookSliders" :key="spec.key"
           :model-value="effectiveLook[spec.key]" @update:model-value="setLookTweak(spec.key, $event)"
           :label="t(`lookSlider.${spec.key}`)" :input-id="`look-${spec.key}`"
