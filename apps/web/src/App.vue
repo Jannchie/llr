@@ -30,7 +30,8 @@ import { useCropEditor, DEFAULT_ASPECT } from "./composables/useCropEditor";
 import { useLibrary } from "./composables/useLibrary";
 import { useHistogram } from "./composables/useHistogram";
 import { useExport, type ExportPlan } from "./composables/useExport";
-import { useAssistant, type AssistantTool, type ToolContent } from "./composables/useAssistant";
+import { useAssistant, modelKey, type AssistantTool, type ToolContent } from "./composables/useAssistant";
+import ModelSettings from "./components/ModelSettings.vue";
 
 // ── types ──
 
@@ -1914,8 +1915,14 @@ function assistantSystemPrompt(): string {
   ].join("\n");
 }
 
-const { entries: chatEntries, busy: chatBusy, model: chatModel, send: sendChat, abort: abortChat, reset: resetChat } =
-  useAssistant({ tools: () => assistantTools, systemPrompt: assistantSystemPrompt });
+const {
+  entries: chatEntries, busy: chatBusy, models: chatModels, selected: chatModel, providers: chatProviders,
+  send: sendChat, abort: abortChat, reset: resetChat,
+} = useAssistant({ tools: () => assistantTools, systemPrompt: assistantSystemPrompt });
+const chatModelOptions = computed(() => chatModels.value.map(m => ({
+  value: modelKey(m), label: m.id, disabled: chatProviders.value !== null && !chatProviders.value.includes(m.provider),
+})));
+const modelSettingsOpen = ref(false);
 const chatDraft = ref("");
 const chatLogRef = ref<HTMLElement | null>(null);
 function submitChat(): void {
@@ -2247,12 +2254,20 @@ const vWheelAdjust = {
            stays put, which the shared panel scroller cannot give it. -->
       <section class="rail-panels chat" v-if="editTab === 'assistant'">
         <header class="panel-head chat-head">
-          <span>{{ t('panel.assistant') }}</span>
-          <span class="chat-model" v-if="chatModel">{{ chatModel.id }}</span>
+          <SelectMenu v-model="chatModel" :options="chatModelOptions" :disabled="chatBusy"
+            :aria-label="t('models.title')" :placeholder="t('models.none')" />
+          <button class="icon-btn chat-gear" type="button" :title="t('models.title')" :aria-label="t('models.title')" @click="modelSettingsOpen = true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z" />
+              <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" />
+            </svg>
+          </button>
           <button class="ghost" type="button" :disabled="!chatEntries.length || chatBusy" @click="resetChat">{{ t('chat.clear') }}</button>
         </header>
+        <ModelSettings :open="modelSettingsOpen" :models="chatModels" :providers="chatProviders"
+          @update:models="v => chatModels = v" @close="modelSettingsOpen = false" />
         <div class="chat-log" ref="chatLogRef">
-          <p class="chat-empty" v-if="!chatEntries.length">{{ chatModel && !chatModel.hasKey ? t('chat.noKey', { provider: chatModel.provider }) : t('chat.empty') }}</p>
+          <p class="chat-empty" v-if="!chatEntries.length">{{ t('chat.empty') }}</p>
           <template v-for="(entry, i) in chatEntries" :key="i">
             <div v-if="entry.kind === 'user'" class="chat-msg chat-user">{{ entry.text }}</div>
             <div v-else-if="entry.kind === 'assistant'" class="chat-msg chat-assistant" :class="{ 'is-error': entry.error }">

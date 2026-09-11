@@ -8,14 +8,16 @@
 import type { ServerResponse } from "node:http";
 
 import { Agent, type AgentEvent, type AgentTool, type AgentToolResult } from "@mariozechner/pi-agent-core";
-import { getEnvApiKey, getModel, type Api, type ImageContent, type KnownProvider, type Model, type TextContent, type TSchema } from "@mariozechner/pi-ai";
+import { getEnvApiKey, getModel, getModels, getProviders, type Api, type ImageContent, type KnownProvider, type Model, type TextContent, type TSchema } from "@mariozechner/pi-ai";
 
 export type ToolSpec = { name: string; description: string; parameters: Record<string, unknown> };
+export type ModelSpec = { provider: string; id: string };
 export type PromptBody = {
   session: string;
   text: string;
   systemPrompt: string;
   tools: ToolSpec[];
+  model: ModelSpec;
   images?: ImageContent[];
 };
 export type ToolResultBody = {
@@ -35,26 +37,29 @@ setInterval(() => {
   for (const [id, s] of sessions) if (s.lastUsed < cutoff && !s.agent.state.isStreaming) sessions.delete(id);
 }, 10 * 60 * 1000).unref();
 
-// "provider/model-id"; the default follows whichever key is in the environment.
-export function resolveModel(): Model<Api> {
-  const spec = process.env.LLR_AGENT_MODEL
-    ?? (getEnvApiKey("anthropic") ? "anthropic/claude-sonnet-4-6" : "openai/gpt-5.4");
-  const slash = spec.indexOf("/");
-  if (slash < 0) throw new Error(`LLR_AGENT_MODEL must be "provider/model", got "${spec}"`);
-  const model = getModel(spec.slice(0, slash) as KnownProvider, spec.slice(slash + 1) as never) as Model<Api> | undefined;
-  if (!model) throw new Error(`Unknown model "${spec}"`);
-  return model;
+// The browser names the model; the key is whatever the provider's usual env var
+// holds. Ids the bundled registry has not heard of yet (a model released after
+// pi-ai's last update) are served through a sibling of the same provider — same
+// endpoint, API flavour and modalities, only the id differs.
+export function resolveModel(spec: ModelSpec): Model<Api> {
+  const provider = spec.provider as KnownProvider;
+  if (!getProviders().includes(provider)) throw new Error(`Unknown provider "${spec.provider}"`);
+  const known = getModel(provider, spec.id as never) as Model<Api> | undefined;
+  if (known) return known;
+  const sibling = getModels(provider)[0];
+  if (!sibling) throw new Error(`No template model for provider "${spec.provider}"`);
+  return { ...sibling, id: spec.id, name: spec.id };
 }
 
-export function agentModelInfo(): { provider: string; id: string; hasKey: boolean } {
-  const model = resolveModel();
-  return { provider: model.provider, id: model.id, hasKey: !!getEnvApiKey(model.provider) };
+/** Providers whose key is present in the environment. */
+export function agentProviders(): string[] {
+  return getProviders().filter(p => !!getEnvApiKey(p));
 }
 
 function getSession(id: string): Session {
   let s = sessions.get(id);
   if (!s) {
-    s = { agent: new Agent({ initialState: { model: resolveModel() }, getApiKey: getEnvApiKey }), pending: new Map(), lastUsed: Date.now() };
+    s = { agent: new Agent({ getApiKey: getEnvApiKey }), pending: new Map(), lastUsed: Date.now() };
     sessions.set(id, s);
   }
   s.lastUsed = Date.now();
@@ -104,6 +109,7 @@ export function isSessionBusy(session: string): boolean {
 
 export async function handleAgentPrompt(body: PromptBody, response: ServerResponse): Promise<void> {
   const s = getSession(body.session);
+  s.agent.state.model = resolveModel(body.model);
   s.agent.state.systemPrompt = body.systemPrompt;
   s.agent.state.tools = browserTools(s, body.tools);
   response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store", connection: "keep-alive" });

@@ -1,4 +1,4 @@
-import { ref } from "vue";
+import { ref, watch } from "vue";
 import { API } from "../api";
 
 /**
@@ -16,6 +16,32 @@ export type AssistantTool = {
   run: (args: any) => Promise<ToolContent[]> | ToolContent[];
 };
 
+export type ModelSpec = { provider: string; id: string };
+export const modelKey = (m: ModelSpec): string => `${m.provider}/${m.id}`;
+
+// The models the picker offers, editable in the assistant settings. Per browser
+// (localStorage): the API only holds the keys, and which models a person wants
+// on the menu is a preference of theirs, not of the server.
+const DEFAULT_MODELS: ModelSpec[] = [
+  { provider: "openai", id: "gpt-5.6-sol" },
+  { provider: "openai", id: "gpt-5.6-luna" },
+  { provider: "openai", id: "gpt-5.6-terra" },
+  { provider: "openai", id: "gpt-6-astra" },
+  { provider: "anthropic", id: "claude-opus-5" },
+  { provider: "anthropic", id: "claude-fable-5-1" },
+  { provider: "deepseek", id: "deepseek-flash" },
+];
+const MODELS_KEY = "llr.agent.models";
+const SELECTED_KEY = "llr.agent.model";
+
+function loadModels(): ModelSpec[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem(MODELS_KEY) ?? "");
+    if (Array.isArray(raw) && raw.every(m => typeof m?.provider === "string" && typeof m?.id === "string")) return raw;
+  } catch { /* fall through to defaults */ }
+  return DEFAULT_MODELS.map(m => ({ ...m }));
+}
+
 export type ChatEntry =
   | { kind: "user"; text: string }
   | { kind: "assistant"; text: string; error?: string }
@@ -25,8 +51,17 @@ export function useAssistant(opts: { tools: () => Record<string, AssistantTool>;
   const session = crypto.randomUUID();
   const entries = ref<ChatEntry[]>([]);
   const busy = ref(false);
-  const model = ref<{ provider: string; id: string; hasKey: boolean } | null>(null);
-  void fetch(`${API}/agent/model`).then(r => r.ok ? r.json() : null).then(m => { model.value = m; }).catch(() => {});
+  const models = ref<ModelSpec[]>(loadModels());
+  const selected = ref(localStorage.getItem(SELECTED_KEY) ?? modelKey(models.value[0]));
+  // Providers the API has a key for; the picker greys out the rest.
+  const providers = ref<string[] | null>(null);
+  void fetch(`${API}/agent/providers`).then(r => r.ok ? r.json() : null).then(m => { providers.value = m?.providers ?? []; }).catch(() => {});
+  watch(models, list => {
+    localStorage.setItem(MODELS_KEY, JSON.stringify(list));
+    if (list.length && !list.some(m => modelKey(m) === selected.value)) selected.value = modelKey(list[0]);
+  }, { deep: true });
+  watch(selected, v => localStorage.setItem(SELECTED_KEY, v));
+  const currentModel = () => models.value.find(m => modelKey(m) === selected.value) ?? models.value[0];
 
   async function post(action: string, body: Record<string, unknown>): Promise<Response> {
     return fetch(`${API}/agent/${action}`, {
@@ -59,7 +94,9 @@ export function useAssistant(opts: { tools: () => Record<string, AssistantTool>;
     const toolEntries = new Map<string, ChatEntry & { kind: "tool" }>();
     const toolRuns: Promise<void>[] = [];
     try {
-      const res = await post("prompt", { text, tools, systemPrompt: opts.systemPrompt() });
+      const model = currentModel();
+      if (!model) throw new Error("No model configured");
+      const res = await post("prompt", { text, tools, systemPrompt: opts.systemPrompt(), model });
       if (!res.ok || !res.body) throw new Error((await res.json().catch(() => null))?.error ?? `${res.status} ${res.statusText}`);
       for await (const ev of sseEvents(res.body)) {
         switch (ev.type) {
@@ -101,7 +138,7 @@ export function useAssistant(opts: { tools: () => Record<string, AssistantTool>;
   function abort(): void { void post("abort", {}); }
   function reset(): void { entries.value = []; void post("reset", {}); }
 
-  return { entries, busy, model, send, abort, reset };
+  return { entries, busy, models, selected, providers, send, abort, reset };
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

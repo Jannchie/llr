@@ -10,7 +10,7 @@ import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 
 import {
-  agentModelInfo,
+  agentProviders,
   handleAgentAbort,
   handleAgentPrompt,
   handleAgentReset,
@@ -179,8 +179,8 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
 // The editing assistant (see agent.ts). Bodies are JSON; /prompt answers with
 // an SSE stream that lasts for the whole agent run.
 async function routeAgent(action: string, method: string, request: IncomingMessage, response: ServerResponse): Promise<void> {
-  if (method === "GET" && action === "model") {
-    sendJson(response, agentModelInfo());
+  if (method === "GET" && action === "providers") {
+    sendJson(response, { providers: agentProviders() });
     return;
   }
   if (method !== "POST") throw new HttpError(404, "Not found");
@@ -188,11 +188,18 @@ async function routeAgent(action: string, method: string, request: IncomingMessa
   if (typeof body.session !== "string" || !/^[\w-]{1,64}$/.test(body.session)) throw new HttpError(400, "Bad session id");
   switch (action) {
     case "prompt":
-      if (typeof body.text !== "string" || typeof body.systemPrompt !== "string" || !Array.isArray(body.tools)) {
-        throw new HttpError(400, "Expected text, systemPrompt and tools");
+      if (typeof body.text !== "string" || typeof body.systemPrompt !== "string" || !Array.isArray(body.tools)
+        || typeof body.model?.provider !== "string" || typeof body.model?.id !== "string") {
+        throw new HttpError(400, "Expected text, systemPrompt, tools and model");
       }
       if (isSessionBusy(body.session)) throw new HttpError(409, "Assistant is busy");
-      await handleAgentPrompt(body, response);
+      try {
+        await handleAgentPrompt(body, response);
+      } catch (error) {
+        // Before the stream opens the only thing that can fail is the model spec.
+        if (response.headersSent) throw error;
+        throw new HttpError(400, errorMessage(error));
+      }
       return;
     case "tool-result":
       if (typeof body.toolCallId !== "string") throw new HttpError(400, "Expected toolCallId");
