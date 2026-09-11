@@ -1628,17 +1628,50 @@ input[type="range"]:focus::-moz-range-thumb {
   cursor: move;
 }
 
+/* Space held: the viewport underneath takes the drag as a pan. */
+.crop-overlay.is-passthrough * { pointer-events: none; }
+.crop-overlay.is-straighten .crop-catch,
+.crop-overlay.is-straighten .crop-handle { cursor: crosshair; }
+
+.crop-grid-fine line { stroke: rgba(255, 255, 255, 0.22); }
+
+.crop-straighten-line {
+  stroke: var(--accent);
+  vector-effect: non-scaling-stroke;
+  pointer-events: none;
+}
+
+.crop-readout {
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 4px 10px;
+  border-radius: var(--radius-pill);
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  z-index: 6;
+}
+
+.viewport.is-grab { cursor: grab; }
+
 .crop-dim {
   fill: rgba(0, 0, 0, 0.55);
   pointer-events: none;
 }
 
-.crop-grid line {
+.crop-grid line,
+.crop-grid path {
+  fill: none;
   stroke: rgba(255, 255, 255, 0.4);
   pointer-events: none;
   vector-effect: non-scaling-stroke;
-  shape-rendering: crispEdges;
 }
+
+.crop-grid line { shape-rendering: crispEdges; }
 
 .crop-frame {
   fill: none;
@@ -1706,7 +1739,7 @@ input[type="range"]:focus::-moz-range-thumb {
 
 .crop-buttons {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   gap: 6px;
   margin-top: 10px;
 }

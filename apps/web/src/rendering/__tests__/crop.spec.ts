@@ -3,7 +3,7 @@ import {
   applyAspectRatio, buildCropTransform, cloneCrop, constrainCrop, cornersInsideImage,
   cropOutputRect, cropOutputSize, cropOutputSizeForAspect, cssRecomposeMatrix, customAspectKey, defaultCrop,
   imageDims, isDefaultCrop, parseCustomAspect, ratioToFraction, resolveAspectFraction,
-  resolveAspectRatio, rotate90, straightenedBBox, type CropState,
+  resolveAspectRatio, rotate90, straightenedBBox, straightenAngle, cropGuideShapes, cropCornersImage, CROP_GUIDES, type CropState,
 } from "../crop";
 
 const SRC_W = 6000;
@@ -344,5 +344,67 @@ describe("cropOutputSize / straightenedBBox", () => {
     expect(rect.y).toBeGreaterThanOrEqual(bbox.y);
     expect(rect.x + rect.w).toBeLessThanOrEqual(bbox.x + bbox.w);
     expect(rect.y + rect.h).toBeLessThanOrEqual(bbox.y + bbox.h);
+  });
+});
+
+describe("straightenAngle", () => {
+  it("levels a line by adding its output-frame tilt to the angle", () => {
+    // outFrameToImage maps output direction (1,0) to image direction `angle`
+    // (cropCornersImage TL→TR), so an image line at φ shows at φ − angle.
+    const phi = 8;
+    const c: CropState = { ...defaultCrop(), angle: phi };
+    const [tl, tr] = cropCornersImage(c, SRC_W, SRC_H);
+    expect((Math.atan2(tr[1] - tl[1], tr[0] - tl[0]) * 180) / Math.PI).toBeCloseTo(phi, 6);
+    const shown = ((phi - 3) * Math.PI) / 180;
+    expect(straightenAngle(3, Math.cos(shown), Math.sin(shown))).toBeCloseTo(phi, 6);
+  });
+
+  it("makes a near-vertical line plumb rather than level", () => {
+    expect(straightenAngle(0, 10, -100)).toBeCloseTo(5.71, 2);
+    expect(straightenAngle(0, 10, 100)).toBeCloseTo(-5.71, 2);
+    expect(straightenAngle(0, -100, 10)).toBeCloseTo(-5.71, 2);
+  });
+});
+
+describe("cropGuideShapes", () => {
+  const r = { x: 100, y: 50, w: 900, h: 600 };
+  const inside = ([x1, y1, x2, y2]: [number, number, number, number]): boolean =>
+    [x1, x2].every((x) => x >= r.x - 1e-6 && x <= r.x + r.w + 1e-6) &&
+    [y1, y2].every((y) => y >= r.y - 1e-6 && y <= r.y + r.h + 1e-6);
+
+  it("keeps every guide line inside the box for every variant", () => {
+    for (const kind of CROP_GUIDES) {
+      for (let v = 0; v < 4; v++) {
+        const g = cropGuideShapes(kind, r, v);
+        expect(g.lines.every(inside)).toBe(true);
+        expect(g.lines.length > 0 || g.paths.length > 0).toBe(kind !== "off");
+      }
+    }
+    expect(cropGuideShapes("off", r).lines).toHaveLength(0);
+  });
+
+  it("draws the spiral as one chain of quarter arcs", () => {
+    const { paths } = cropGuideShapes("spiral", r);
+    expect(paths).toHaveLength(1);
+    const arcs = paths[0].match(/A/g) ?? [];
+    expect(arcs.length).toBeGreaterThanOrEqual(8);
+    expect(paths[0]).toMatch(/^M[\d.]+,[\d.]+A/);
+    // Arc endpoints stay inside the box.
+    const nums = paths[0].match(/,(\d+\.?\d*),(\d+\.?\d*)(?=A|$)/g) ?? [];
+    expect(nums.length).toBeGreaterThan(0);
+    for (const s of nums) {
+      const [x, y] = s.slice(1).split(",").map(Number);
+      expect(x).toBeGreaterThanOrEqual(r.x - 1e-6);
+      expect(x).toBeLessThanOrEqual(r.x + r.w + 1e-6);
+      expect(y).toBeGreaterThanOrEqual(r.y - 1e-6);
+      expect(y).toBeLessThanOrEqual(r.y + r.h + 1e-6);
+    }
+  });
+
+  it("mirrors the triangle with the variant", () => {
+    const a = cropGuideShapes("triangle", r, 0).lines[0];
+    const b = cropGuideShapes("triangle", r, 1).lines[0];
+    expect(a).toEqual([r.x, r.y, r.x + r.w, r.y + r.h]);
+    expect(b).toEqual([r.x + r.w, r.y, r.x, r.y + r.h]);
   });
 });

@@ -475,3 +475,90 @@ export function rotate90(c: CropState, dir: 1 | -1): CropState {
     cy: dir === 1 ? c.cx : 1 - c.cx,
   };
 }
+
+// ── Straighten tool ──────────────────────────────────────────────────────────
+
+/**
+ * Angle that levels a line the user drew in the output frame (direction
+ * `dx, dy`, y-down), given the current straighten angle. A line closer to
+ * vertical is made plumb instead: the tilt is reduced modulo 90° into
+ * [-45, 45). Output direction θ shows image direction θ + angle (see
+ * `outFrameToImage`), so levelling the line means adding its tilt to the angle.
+ */
+export function straightenAngle(current: number, dx: number, dy: number): number {
+  const theta = (Math.atan2(dy, dx) * 180) / Math.PI;
+  const tilt = ((theta % 90) + 135) % 90 - 45;
+  return current + tilt;
+}
+
+// ── Guide overlays ───────────────────────────────────────────────────────────
+
+export const CROP_GUIDES = ["thirds", "golden", "grid", "diagonal", "triangle", "spiral", "center", "off"] as const;
+export type CropGuide = (typeof CROP_GUIDES)[number];
+export type GuideShapes = { lines: Array<[number, number, number, number]>; paths: string[] };
+
+/**
+ * Guide geometry inside the crop box `r` (output-frame px). `variant` (0–3)
+ * mirrors the asymmetric guides — triangle, spiral — across the box's axes
+ * (bit 0 = horizontal, bit 1 = vertical); it is a no-op for symmetric ones.
+ */
+export function cropGuideShapes(kind: CropGuide, r: Rect, variant = 0): GuideShapes {
+  const flipX = (variant & 1) !== 0;
+  const flipY = (variant & 2) !== 0;
+  const X = (x: number): number => r.x + (flipX ? r.w - x : x);
+  const Y = (y: number): number => r.y + (flipY ? r.h - y : y);
+  const lines: GuideShapes["lines"] = [];
+  const paths: string[] = [];
+  const line = (x1: number, y1: number, x2: number, y2: number): void => { lines.push([X(x1), Y(y1), X(x2), Y(y2)]); };
+  const grid = (fs: number[]): void => {
+    for (const f of fs) { line(f * r.w, 0, f * r.w, r.h); line(0, f * r.h, r.w, f * r.h); }
+  };
+  switch (kind) {
+    case "thirds": grid([1 / 3, 2 / 3]); break;
+    case "golden": grid([0.382, 0.618]); break;
+    case "grid": grid([0.25, 0.5, 0.75]); break;
+    case "center": grid([0.5]); break;
+    case "diagonal": line(0, 0, r.w, r.h); line(r.w, 0, 0, r.h); break;
+    case "triangle": {
+      // One diagonal plus the perpendiculars dropped onto it from the other two corners.
+      const { w, h } = r;
+      const L2 = w * w + h * h;
+      const fx = (w * w * w) / L2;
+      const fy = (w * w * h) / L2;
+      line(0, 0, w, h);
+      line(w, 0, fx, fy);
+      line(0, h, w - fx, h - fy);
+      break;
+    }
+    case "spiral": {
+      // Largest golden rectangle anchored in the (variant's) top-left corner,
+      // cut into squares left/top/right/bottom in turn; each square carries a
+      // quarter arc, all sweeping the same way so they join tangentially.
+      const PHI = (1 + Math.sqrt(5)) / 2;
+      let x = 0, y = 0;
+      let W: number, H: number;
+      if (r.w / r.h > PHI) { H = r.h; W = r.h * PHI; } else { W = r.w; H = r.w / PHI; }
+      if (W < r.w - 0.5) line(W, 0, W, H);
+      if (H < r.h - 0.5) line(0, H, W, H);
+      const sweep = flipX !== flipY ? 0 : 1;
+      let d = "";
+      for (let k = 0; k < 10; k++) {
+        const s = Math.min(W, H);
+        if (s < 1) break;
+        let from: [number, number], to: [number, number];
+        switch (k % 4) {
+          case 0: from = [x, y + s]; to = [x + s, y]; line(x + s, y, x + s, y + H); x += s; W -= s; break;
+          case 1: from = [x, y]; to = [x + s, y + s]; line(x, y + s, x + W, y + s); y += s; H -= s; break;
+          case 2: from = [x + W, y]; to = [x + W - s, y + s]; line(x + W - s, y, x + W - s, y + H); W -= s; break;
+          default: from = [x + W, y + H]; to = [x, y + H - s]; line(x, y + H - s, x + W, y + H - s); H -= s; break;
+        }
+        if (k === 0) d += `M${X(from[0])},${Y(from[1])}`;
+        d += `A${s},${s},0,0,${sweep},${X(to[0])},${Y(to[1])}`;
+      }
+      paths.push(d);
+      break;
+    }
+    default: break;
+  }
+  return { lines, paths };
+}

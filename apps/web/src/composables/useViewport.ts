@@ -11,7 +11,7 @@ export function useViewport(opts: {
   srcH: Ref<number>;
   srcFullW: Ref<number>; // full-resolution dims (for 100% = original 1:1)
   srcFullH: Ref<number>;
-  cropMode: Ref<boolean>; // pan/zoom is disabled inside the crop editor
+  cropMode: Ref<boolean>; // the crop editor owns plain drags; pan needs Space or the middle button
   // Origin of the sub-rectangle the canvas actually renders, in output-frame
   // px (see visibleWindow). The canvas is positioned there rather than at the
   // frame's corner. Null/absent means it covers the whole frame.
@@ -24,6 +24,8 @@ export function useViewport(opts: {
   const fitScale = ref(1);
   const viewportRef = ref<HTMLDivElement | null>(null);
   const isPanning = ref(false);
+  // Space held: drags pan even where a tool (the crop editor) owns the pointer.
+  const spaceHeld = ref(false);
   let panStartX = 0;
   let panStartY = 0;
   let panStartPanX = 0;
@@ -120,7 +122,10 @@ export function useViewport(opts: {
   }
 
   function startPan(e: MouseEvent): void {
-    if (e.button !== 0 || cropMode.value) return;
+    const middle = e.button === 1;
+    if (!(middle || e.button === 0)) return;
+    if (cropMode.value && !(middle || spaceHeld.value)) return;
+    if (middle) e.preventDefault(); // no autoscroll
     isPanning.value = true;
     panStartX = e.clientX;
     panStartY = e.clientY;
@@ -155,7 +160,7 @@ export function useViewport(opts: {
   }
 
   function onWheel(e: WheelEvent): void {
-    if (cropMode.value || !imageW.value || !imageH.value || !viewportRef.value) return;
+    if (!imageW.value || !imageH.value || !viewportRef.value) return;
     e.preventDefault();
     const delta = -e.deltaY;
     const factor = delta > 0 ? 1.1 : 1 / 1.1;
@@ -203,7 +208,7 @@ export function useViewport(opts: {
   }
 
   return {
-    zoom, pan, fitScale, viewportRef, isPanning,
+    zoom, pan, fitScale, viewportRef, isPanning, spaceHeld,
     displayTransform, canvasTransform, previewToFull, zoomPercent, fullResZoom, visibleWindow,
     recomputeFit, startPan, doPan, stopPan, applyZoom,
     onWheel, zoomIn, zoomOut, fitView, zoomToFull, onDoubleClick,

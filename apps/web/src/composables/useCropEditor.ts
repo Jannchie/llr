@@ -2,8 +2,8 @@ import { computed, reactive, ref, type Ref } from "vue";
 import {
   imageDims, constrainCrop, applyAspectRatio, resolveAspectRatio,
   rotate90, cornersInsideImage, customAspectKey, parseCustomAspect, ratioToFraction,
-  defaultCrop,
-  type CropState, type Rect,
+  defaultCrop, straightenAngle, cropGuideShapes, CROP_GUIDES,
+  type CropState, type Rect, type CropGuide,
 } from "../rendering/crop";
 import { clamp } from "../ui";
 
@@ -15,24 +15,24 @@ export type CropHandle = "l" | "r" | "t" | "b" | "tl" | "tr" | "bl" | "br";
 
 // Crop & straighten editor: aspect controls, the SVG overlay geometry
 // (output-frame coordinate space, matching the overlay's viewBox), and the
-// move/resize/rotate drag state machine. The caller owns the `crop` state
-// (it is part of the per-image snapshot) and the render bridge — it writes
-// `cropBBox`/`cropRenderScale` when it renders the editor window.
+// move/resize/rotate/straighten drag state machine. The caller owns the `crop`
+// state (it is part of the per-image snapshot) and the render bridge — it
+// writes `cropBBox` when it renders the editor window.
 export function useCropEditor(opts: {
   crop: CropState;          // reactive
   srcW: Ref<number>;
   srcH: Ref<number>;
   fitScale: Ref<number>;
+  zoom: Ref<number>;
   onDragEnd: () => void;    // commit pending history when a drag finishes
 }) {
-  const { crop, srcW, srcH, fitScale } = opts;
+  const { crop, srcW, srcH, fitScale, zoom } = opts;
 
   const cropAspect = ref<string>(DEFAULT_ASPECT);
-  // Crop-editor render window (output-frame px) + the canvas scale used to draw
-  // it, kept so the overlay can map between screen, output-frame and crop-box
-  // space. Written by the caller's editor render.
+  // Crop-editor render window (output-frame px), kept so the overlay can map
+  // between screen, output-frame and crop-box space. Written by the caller's
+  // editor render.
   const cropBBox = reactive<Rect>({ x: 0, y: 0, w: 1, h: 1 });
-  const cropRenderScale = ref(1);
   const cropOverlayRef = ref<SVGSVGElement | null>(null);
 
   function currentImageDims(): [number, number] {
@@ -108,31 +108,38 @@ export function useCropEditor(opts: {
     return { x: crop.cx * iw - Wc / 2, y: crop.cy * ih - Hc / 2, w: Wc, h: Hc };
   });
 
-  // Guide overlay inside the crop box (O cycles, Lightroom-style).
-  const CROP_GUIDES = ["thirds", "golden", "diagonal", "grid", "off"] as const;
-  type CropGuide = (typeof CROP_GUIDES)[number];
-  const cropGuide = ref<CropGuide>("thirds");
+  // Guide overlay inside the crop box (O cycles, Shift+O mirrors the
+  // asymmetric ones, Lightroom-style). Remembered across sessions: a guide is
+  // a viewing preference, not part of the edit.
+  const cropGuide = ref<CropGuide>(
+    (CROP_GUIDES as readonly string[]).includes(localStorage.getItem("llr.cropGuide") ?? "")
+      ? (localStorage.getItem("llr.cropGuide") as CropGuide) : "thirds");
+  const cropGuideVariant = ref(0);
 
+  function setCropGuide(g: CropGuide): void {
+    cropGuide.value = g;
+    localStorage.setItem("llr.cropGuide", g);
+  }
   function cycleCropGuide(): void {
-    const i = CROP_GUIDES.indexOf(cropGuide.value);
-    cropGuide.value = CROP_GUIDES[(i + 1) % CROP_GUIDES.length];
+    setCropGuide(CROP_GUIDES[(CROP_GUIDES.indexOf(cropGuide.value) + 1) % CROP_GUIDES.length]);
+  }
+  function cycleCropGuideVariant(): void {
+    cropGuideVariant.value = (cropGuideVariant.value + 1) % 4;
   }
 
-  // Guide lines in output-frame coords: fractional v/h lines plus box diagonals.
-  const cropGuideLines = computed(() => {
+  const cropGuideShapesView = computed(() => cropGuideShapes(cropGuide.value, cropBoxRect.value, cropGuideVariant.value));
+
+  // While the angle is being dragged, a fine grid over the box makes lines in
+  // the photo easy to align against (Lightroom does the same).
+  const isRotating = ref(false);
+  const rotateGridLines = computed<Array<[number, number, number, number]>>(() => {
+    if (!isRotating.value) return [];
     const r = cropBoxRect.value;
-    const at = (fs: number[]) => ({
-      v: fs.map((f) => r.x + r.w * f),
-      h: fs.map((f) => r.y + r.h * f),
-      diag: false,
-    });
-    switch (cropGuide.value) {
-      case "thirds": return at([1 / 3, 2 / 3]);
-      case "golden": return at([0.382, 0.618]);
-      case "grid": return at([0.25, 0.5, 0.75]);
-      case "diagonal": return { v: [], h: [], diag: true };
-      default: return { v: [], h: [], diag: false };
-    }
+    const step = Math.max(r.w, r.h) / 24;
+    const out: Array<[number, number, number, number]> = [];
+    for (let x = r.x + step; x < r.x + r.w - step / 2; x += step) out.push([x, r.y, x, r.y + r.h]);
+    for (let y = r.y + step; y < r.y + r.h - step / 2; y += step) out.push([r.x, y, r.x + r.w, y]);
+    return out;
   });
 
   const CROP_HANDLES: { key: CropHandle; fx: number; fy: number; cursor: string }[] = [
@@ -142,9 +149,9 @@ export function useCropEditor(opts: {
   ];
 
   // Output-frame units per on-screen pixel — keeps overlay strokes/handles a
-  // constant size regardless of the editor's fit scale.
+  // constant size regardless of the editor's fit scale and zoom.
   const ofPerScreen = computed(() => {
-    const s = cropRenderScale.value * fitScale.value;
+    const s = fitScale.value * zoom.value;
     return s > 0 ? 1 / s : 1;
   });
 
@@ -169,8 +176,21 @@ export function useCropEditor(opts: {
   type CropDrag =
     | { mode: "move"; startX: number; startY: number; cx: number; cy: number }
     | { mode: "resize"; handle: CropHandle; l: number; t: number; r: number; b: number; startRatio: number }
-    | { mode: "rotate"; startPointerDeg: number; startAngle: number };
+    | { mode: "rotate"; startPointerDeg: number; startAngle: number }
+    | { mode: "straighten" };
   let cropDrag: CropDrag | null = null;
+
+  // Straighten tool: armed by the panel button (or Ctrl/Cmd-drag), the next
+  // drag draws a line on the photo and the angle levels it. One-shot, like
+  // Lightroom's ruler. `straightenLine` is the line being drawn, output-frame px.
+  const straightenTool = ref(false);
+  const straightenLine = reactive({ x1: 0, y1: 0, x2: 0, y2: 0, active: false });
+  function toggleStraightenTool(): void { straightenTool.value = !straightenTool.value; }
+  // What the on-canvas readout shows: the angle the line being drawn would set,
+  // else the current one.
+  const readoutAngle = computed(() => straightenLine.active
+    ? straightenAngle(crop.angle, straightenLine.x2 - straightenLine.x1, straightenLine.y2 - straightenLine.y1)
+    : crop.angle);
 
   function overlayPoint(e: MouseEvent): { x: number; y: number } {
     const svg = cropOverlayRef.value;
@@ -194,13 +214,19 @@ export function useCropEditor(opts: {
     const p = overlayPoint(e);
     const r = cropBoxRect.value;
     const inside = p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
-    if (inside) {
+    if (straightenTool.value || e.ctrlKey || e.metaKey) {
+      e.preventDefault();
+      Object.assign(straightenLine, { x1: p.x, y1: p.y, x2: p.x, y2: p.y, active: true });
+      cropDrag = { mode: "straighten" };
+      isRotating.value = true;
+    } else if (inside) {
       cropDrag = { mode: "move", startX: p.x, startY: p.y, cx: crop.cx, cy: crop.cy };
     } else {
       // Drag in the margin to straighten (rotate the image), Lightroom-style.
       const [iw, ih] = currentImageDims();
       const deg = (Math.atan2(p.y - crop.cy * ih, p.x - crop.cx * iw) * 180) / Math.PI;
       cropDrag = { mode: "rotate", startPointerDeg: deg, startAngle: crop.angle };
+      isRotating.value = true;
     }
     attachCropDrag();
   }
@@ -221,13 +247,27 @@ export function useCropEditor(opts: {
       moveCropTo(cropDrag.cx + dx, cropDrag.cy + dy);
     } else if (cropDrag.mode === "rotate") {
       const deg = (Math.atan2(p.y - crop.cy * ih, p.x - crop.cx * iw) * 180) / Math.PI;
-      setAngle(cropDrag.startAngle + (deg - cropDrag.startPointerDeg));
+      // Wrap the sweep into [-180, 180): crossing atan2's ±180° seam (the left
+      // margin) must not read as a full turn.
+      const sweep = ((deg - cropDrag.startPointerDeg + 540) % 360) - 180;
+      setAngle(cropDrag.startAngle + sweep);
+    } else if (cropDrag.mode === "straighten") {
+      straightenLine.x2 = p.x;
+      straightenLine.y2 = p.y;
     } else {
       resizeCropTo(p.x, p.y, cropDrag, e.shiftKey);
     }
   }
 
   function onCropDragUp(): void {
+    if (cropDrag?.mode === "straighten") {
+      const dx = straightenLine.x2 - straightenLine.x1, dy = straightenLine.y2 - straightenLine.y1;
+      // Shorter than a few screen px is a click, not a line: keep the angle.
+      if (Math.hypot(dx, dy) > 6 * ofPerScreen.value) setAngle(straightenAngle(crop.angle, dx, dy));
+      straightenLine.active = false;
+      straightenTool.value = false;
+    }
+    isRotating.value = false;
     cropDrag = null;
     window.removeEventListener("mousemove", onCropDragMove);
     window.removeEventListener("mouseup", onCropDragUp);
@@ -287,11 +327,12 @@ export function useCropEditor(opts: {
   }
 
   return {
-    cropAspect, cropBBox, cropRenderScale, cropOverlayRef,
+    cropAspect, cropBBox, cropOverlayRef,
     currentImageDims, resetCrop,
     lockedRatio, customAspect, selectAspect, setCustomAspect, swapAspect,
     setAngle, rotateCrop, flipCropH, flipCropV,
-    cropGuide, cycleCropGuide, cropGuideLines,
+    cropGuide, setCropGuide, cycleCropGuide, cycleCropGuideVariant, cropGuideShapes: cropGuideShapesView,
+    isRotating, rotateGridLines, straightenTool, toggleStraightenTool, straightenLine, readoutAngle,
     cropBoxRect, CROP_HANDLES, ofPerScreen, cropViewBox, cropDimPath, cropHandlePos,
     onCropHandleDown, onCropOverlayDown,
   };

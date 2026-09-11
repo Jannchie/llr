@@ -10,7 +10,7 @@ import {
 import {
   defaultCrop, cloneCrop, isDefaultCrop, imageDims, buildCropTransform,
   cropOutputRect, cropOutputSize, straightenedBBox, cssRecomposeMatrix,
-  applyAspectRatio, resolveAspectFraction, cropOutputSizeForAspect,
+  applyAspectRatio, resolveAspectFraction, cropOutputSizeForAspect, CROP_GUIDES,
   ASPECT_PRESETS,
   type AspectPreset, type CropState,
 } from "./rendering/crop";
@@ -420,7 +420,7 @@ const cropMode = ref(false);
 const renderWindow = ref<ViewWindow | null>(null);
 
 const {
-  zoom, pan, fitScale, viewportRef, isPanning,
+  zoom, pan, fitScale, viewportRef, isPanning, spaceHeld,
   displayTransform, canvasTransform, zoomPercent, visibleWindow,
   recomputeFit, startPan, doPan, stopPan,
   onWheel, zoomIn, zoomOut, fitView, zoomToFull, onDoubleClick,
@@ -429,20 +429,22 @@ const {
   renderOrigin: renderWindow,
 });
 const {
-  cropAspect, cropBBox, cropRenderScale, cropOverlayRef,
+  cropAspect, cropBBox, cropOverlayRef,
   currentImageDims, resetCrop,
   lockedRatio, customAspect, selectAspect, setCustomAspect, swapAspect,
   setAngle, rotateCrop, flipCropH, flipCropV,
-  cycleCropGuide, cropGuideLines,
+  cropGuide, setCropGuide, cycleCropGuide, cycleCropGuideVariant, cropGuideShapes,
+  isRotating, rotateGridLines, straightenTool, toggleStraightenTool, straightenLine, readoutAngle,
   cropBoxRect, CROP_HANDLES, ofPerScreen, cropViewBox, cropDimPath, cropHandlePos,
   onCropHandleDown, onCropOverlayDown,
 } = useCropEditor({
-  crop, srcW, srcH, fitScale,
+  crop, srcW, srcH, fitScale, zoom,
   onDragEnd: () => flushPendingHistory(),
 });
 
+const guideOptions = computed(() => CROP_GUIDES.map(g => ({ value: g, label: t(`guide.${g}` as const) })));
+
 const WORKSPACE_BG: [number, number, number] = [0.07, 0.07, 0.08];
-const CROP_EDITOR_MAX = 1800; // cap the editor preview's long edge (px)
 
 function hslValue(i: number): number {
   if (hslTab.value === "hue") return hslHue[i];
@@ -1273,9 +1275,7 @@ const WINDOW_SHRINK = 2;
  */
 function updateRenderWindow(): boolean {
   const cur = renderWindow.value;
-  // The crop editor already renders a size-capped bbox, and its overlay geometry
-  // assumes a canvas covering that whole box.
-  const visible = cropMode.value ? null : visibleWindow(0);
+  const visible = visibleWindow(0);
   if (!visible) {
     if (!cur) return false;
     renderWindow.value = null;
@@ -1370,16 +1370,16 @@ function renderNormal(): void {
   scheduleHistogram();
 }
 
+// The bbox renders at preview resolution like the committed view: previewScale
+// and the render window keep the drawing buffer at viewport size, so zooming in
+// stays crisp without a size cap of its own.
 function renderCropEditor(): void {
   if (!webglRenderer || !srcW.value || !srcH.value) return;
   const [iw, ih] = currentImageDims();
   const bbox = straightenedBBox(crop, iw, ih);
   Object.assign(cropBBox, bbox);
-  const long = Math.max(bbox.w, bbox.h) || 1;
-  const rs = Math.min(1, CROP_EDITOR_MAX / long);
-  cropRenderScale.value = rs;
-  const cw = Math.max(1, Math.round(bbox.w * rs));
-  const ch = Math.max(1, Math.round(bbox.h * rs));
+  const cw = Math.max(1, Math.round(bbox.w));
+  const ch = Math.max(1, Math.round(bbox.h));
   webglRenderer.setOutput(cw, ch, buildCropTransform(crop, srcW.value, srcH.value, bbox), WORKSPACE_BG);
   imageW.value = cw;
   imageH.value = ch;
@@ -1414,6 +1414,7 @@ function exitCropMode(): void {
   if (!cropMode.value) return;
   flushPendingHistory();
   cropMode.value = false;
+  straightenTool.value = false;
   zoom.value = 1; pan.x = 0; pan.y = 0;
   nextTick(renderNormal);
 }
@@ -1434,13 +1435,21 @@ function onKeyDown(e: KeyboardEvent): void {
     if (k === "y") { e.preventDefault(); redo(); return; }
   }
 
+  // Space held turns drags into pans wherever a tool owns the pointer. A focused
+  // button keeps Space as its activation key.
+  if (!inEditableText && e.key === " " && activeSource.value && ae?.tagName !== "BUTTON") {
+    e.preventDefault(); spaceHeld.value = true; return;
+  }
+
   // Crop tool: R toggles, Esc / Enter commit & exit, X swaps orientation,
-  // O cycles the guide overlay (Lightroom-style).
+  // O cycles the guide overlay, Shift+O mirrors it (Lightroom-style).
   if (!inEditableText && activeSource.value && !e.ctrlKey && !e.metaKey && !e.altKey) {
     if (e.key === "r" || e.key === "R") { e.preventDefault(); toggleCropMode(); return; }
+    if (cropMode.value && straightenTool.value && e.key === "Escape") { e.preventDefault(); toggleStraightenTool(); return; }
     if (cropMode.value && (e.key === "Escape" || e.key === "Enter")) { e.preventDefault(); exitCropMode(); return; }
     if (cropMode.value && (e.key === "x" || e.key === "X")) { e.preventDefault(); swapAspect(); return; }
-    if (cropMode.value && (e.key === "o" || e.key === "O")) { e.preventDefault(); cycleCropGuide(); return; }
+    if (cropMode.value && e.key === "O") { e.preventDefault(); cycleCropGuideVariant(); return; }
+    if (cropMode.value && e.key === "o") { e.preventDefault(); cycleCropGuide(); return; }
   }
 
   // Backslash holds the "before" view; release (onKeyUp) restores the edit.
@@ -1458,7 +1467,6 @@ function onKeyDown(e: KeyboardEvent): void {
   }
 
   if (!imageW.value || !imageH.value) return;
-  if (cropMode.value) return; // crop editor owns the view; no pan/zoom shortcuts
   if (e.ctrlKey || e.metaKey) {
     switch (e.key) {
       case '0': e.preventDefault(); fitView(); break;
@@ -1470,6 +1478,7 @@ function onKeyDown(e: KeyboardEvent): void {
 }
 
 function onKeyUp(e: KeyboardEvent): void {
+  if (e.key === " ") spaceHeld.value = false;
   if (e.key === "\\") showOriginal.value = false; // release the hold-to-compare view
   // Releasing Shift before the key makes the keyup report "\" instead of "|",
   // so either key ends the camera-JPEG hold.
@@ -1479,6 +1488,7 @@ function onKeyUp(e: KeyboardEvent): void {
 // Alt-Tab (or Cmd+backslash) mid-hold sends the keyup to the newly focused
 // window, so onKeyUp never fires and the 'before' view would stick on forever.
 function onWindowBlur(): void {
+  spaceHeld.value = false;
   showOriginal.value = false;
   showEmbedded.value = false;
 }
@@ -1518,7 +1528,7 @@ watch([zoom, fitScale], () => { if (webglRenderer) scheduleWebGLDraw(); });
 // pan that reaches the edge of that window has to re-render — but only then,
 // which is what the window's slack is for.
 watch([() => pan.x, () => pan.y], () => {
-  if (!webglRenderer || cropMode.value) return;
+  if (!webglRenderer) return;
   if (updateRenderWindow()) scheduleWebGLDraw();
 });
 
@@ -1868,7 +1878,7 @@ const vWheelAdjust = {
         @mouseup="stopPan"
         @mouseleave="stopPan"
         @dblclick="onDoubleClick"
-        :class="{ 'is-grabbing': isPanning }">
+        :class="{ 'is-grabbing': isPanning, 'is-grab': spaceHeld && !isPanning }">
         <div class="dropzone" v-show="!activeSource" @click="pickFiles">
           <div class="dropzone-inner">
             <svg class="dropzone-icon" viewBox="0 0 48 48" fill="none" aria-hidden="true">
@@ -1909,23 +1919,29 @@ const vWheelAdjust = {
           <span class="spinner" aria-hidden="true" />
           <span>{{ status === 'uploading' ? t('status.importing') : t('status.decoding') }}</span>
         </div>
+        <!-- Space passes the pointer through to the viewport so drags pan. -->
         <svg v-show="cropMode && webglRenderer != null" ref="cropOverlayRef" class="crop-overlay"
+          :class="{ 'is-passthrough': spaceHeld, 'is-straighten': straightenTool }"
           :style="{ transform: displayTransform, width: imageW + 'px', height: imageH + 'px' }"
           :viewBox="cropViewBox" preserveAspectRatio="none"
           @mousedown="onCropOverlayDown">
-          <!-- transparent catcher for move/rotate drags -->
+          <!-- transparent catcher for move/rotate/straighten drags -->
           <rect class="crop-catch" :x="cropBBox.x" :y="cropBBox.y" :width="cropBBox.w" :height="cropBBox.h" />
           <!-- dim outside the crop -->
           <path class="crop-dim" :d="cropDimPath" fill-rule="evenodd" />
-          <!-- guide overlay (O cycles: thirds / golden / diagonal / grid / off) -->
+          <!-- guide overlay (O cycles, Shift+O mirrors) -->
           <g class="crop-grid" :stroke-width="1 * ofPerScreen">
-            <line v-for="(x, i) in cropGuideLines.v" :key="'v'+i" :x1="x" :y1="cropBoxRect.y" :x2="x" :y2="cropBoxRect.y + cropBoxRect.h" />
-            <line v-for="(y, i) in cropGuideLines.h" :key="'h'+i" :x1="cropBoxRect.x" :y1="y" :x2="cropBoxRect.x + cropBoxRect.w" :y2="y" />
-            <template v-if="cropGuideLines.diag">
-              <line :x1="cropBoxRect.x" :y1="cropBoxRect.y" :x2="cropBoxRect.x + cropBoxRect.w" :y2="cropBoxRect.y + cropBoxRect.h" />
-              <line :x1="cropBoxRect.x + cropBoxRect.w" :y1="cropBoxRect.y" :x2="cropBoxRect.x" :y2="cropBoxRect.y + cropBoxRect.h" />
-            </template>
+            <line v-for="(l, i) in cropGuideShapes.lines" :key="'g'+i" :x1="l[0]" :y1="l[1]" :x2="l[2]" :y2="l[3]" />
+            <path v-for="(d, i) in cropGuideShapes.paths" :key="'p'+i" :d="d" />
           </g>
+          <!-- fine alignment grid while the angle is being dragged -->
+          <g class="crop-grid crop-grid-fine" :stroke-width="1 * ofPerScreen">
+            <line v-for="(l, i) in rotateGridLines" :key="'r'+i" :x1="l[0]" :y1="l[1]" :x2="l[2]" :y2="l[3]" />
+          </g>
+          <!-- the straighten tool's line -->
+          <line v-if="straightenLine.active" class="crop-straighten-line"
+            :x1="straightenLine.x1" :y1="straightenLine.y1" :x2="straightenLine.x2" :y2="straightenLine.y2"
+            :stroke-width="1.5 * ofPerScreen" />
           <!-- crop box border -->
           <rect class="crop-frame" :x="cropBoxRect.x" :y="cropBoxRect.y" :width="cropBoxRect.w" :height="cropBoxRect.h" :stroke-width="1.5 * ofPerScreen" />
           <!-- handles -->
@@ -1935,6 +1951,8 @@ const vWheelAdjust = {
             :style="{ cursor: h.cursor }"
             @mousedown="onCropHandleDown($event, h.key)" />
         </svg>
+        <div v-if="cropMode && isRotating" class="crop-readout">{{ readoutAngle.toFixed(2) }}°</div>
+        <div v-else-if="cropMode && straightenTool" class="crop-readout">{{ t('crop.straightenHint') }}</div>
         <img v-show="activeSource && !activeSource.invalid && !webglRenderer && status !== 'rendering'" class="preview" :style="{ transform: displayTransform }" :src="activeSource ? thumbSrc(activeSource) : ''" :alt="t('aria.preview')" />
         <div v-if="activeSource?.invalid" class="invalid-state">
           <img v-if="activeSource && thumbSrc(activeSource)" :src="thumbSrc(activeSource)" :alt="activeSource.name" />
@@ -2000,9 +2018,20 @@ const vWheelAdjust = {
               @change="setCustomAspect(customAspect![0], ($event.target as HTMLInputElement).valueAsNumber)" />
           </div>
         </div>
-        <SliderRow :model-value="Number(crop.angle.toFixed(1))" @update:model-value="setAngle"
-          :label="t('crop.angle')" :min="-45" :max="45" :step="0.1" />
+        <div class="control-row">
+          <label class="control-label">{{ t('crop.guide') }}</label>
+          <SelectMenu :model-value="cropGuide" :options="guideOptions" :aria-label="t('crop.guide')"
+            :title="t('crop.guideHint')" @update:model-value="setCropGuide" />
+        </div>
+        <SliderRow :model-value="Number(crop.angle.toFixed(2))" @update:model-value="setAngle"
+          :label="t('crop.angle')" :min="-45" :max="45" :step="0.01" />
         <div class="crop-buttons">
+          <button type="button" class="crop-tool" :class="{ 'is-on': straightenTool }" :title="t('crop.straighten')"
+            :aria-pressed="straightenTool" @click="toggleStraightenTool">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 17L21 7" /><path d="M6.5 15.2l1.2 2.2" /><path d="M10.5 13l1.2 2.2" /><path d="M14.5 10.8l1.2 2.2" /><path d="M18.5 8.6l1.2 2.2" />
+            </svg>
+          </button>
           <button type="button" class="crop-tool" :title="t('crop.rotateLeft')" @click="rotateCrop(-1)">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5" />
