@@ -39,6 +39,7 @@ import { useAssistant, modelKey, THINKING_LEVELS, type AssistantTool, type ToolC
 import { measureHint, measureHistogram, measurePixels } from "./rendering/histogram";
 import ModelSettings from "./components/ModelSettings.vue";
 import AssistantMessage from "./components/AssistantMessage.vue";
+import { extractRecipe, applyRecipe, serializeRecipe, parseRecipe, loadSavedRecipes, storeSavedRecipes, type SavedRecipe, type RecipeData } from "./rendering/recipes";
 
 // ── types ──
 
@@ -55,7 +56,7 @@ type SliderGroup = { title: "tone" | "presence" | "color" | "lens"; tab: EditTab
 // The rail shows one group at a time, picked from the icon strip along its
 // outer edge. Nine always-open panels stacked to 2400px — reaching the curve
 // meant scrolling two and a half screens past controls nobody was using.
-type EditTab = "light" | "color" | "masks" | "detail" | "look" | "crop" | "assistant" | "history" | "settings";
+type EditTab = "light" | "color" | "masks" | "recipes" | "detail" | "look" | "crop" | "assistant" | "history" | "settings";
 
 // Distortion correction defaults to fully applied (mirrorless glass is designed
 // around it — uncorrected geometry reads as broken). Vignetting stays off by
@@ -964,6 +965,7 @@ const EDIT_TABS: { key: EditTab; icon: string[] }[] = [
   { key: "look", icon: ["M21 19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h3l1.5-2.5h5L16 7h3a2 2 0 0 1 2 2z", "M12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8z"] },
   { key: "crop", icon: ["M6 2v14a2 2 0 0 0 2 2h14", "M2 6h14a2 2 0 0 1 2 2v14"] },
   { key: "assistant", icon: ["M12 3l1.8 4.7L18.5 9.5l-4.7 1.8L12 16l-1.8-4.7L5.5 9.5l4.7-1.8z", "M19 16l.8 2.2 2.2.8-2.2.8L19 22l-.8-2.2-2.2-.8 2.2-.8z"] },
+  { key: "recipes", icon: ["M6 3h12a1 1 0 0 1 1 1v17l-7-4-7 4V4a1 1 0 0 1 1-1z"] },
   { key: "history", icon: ["M12 8v4l3 2", "M3.5 12a8.5 8.5 0 1 0 2.5-6", "M3 3v4h4"] },
   { key: "settings", icon: ["M4 7h16", "M4 17h16", "M9 7a2 2 0 1 0 4 0 2 2 0 0 0-4 0z", "M13 17a2 2 0 1 0 4 0 2 2 0 0 0-4 0z"] },
 ];
@@ -995,6 +997,7 @@ const tabEdited = computed<Record<EditTab, boolean>>(() => ({
   light: groups.some(g => g.tab === "light" && groupEdited(g)) || curveEdited.value,
   color: groups.some(g => g.tab === "color" && groupEdited(g)) || hslEdited.value || gradingEdited.value,
   masks: masks.length > 0,
+  recipes: false,
   detail: groups.some(g => g.tab === "detail" && groupEdited(g)) || denoiseEdited.value,
   look: lookEdited.value,
   crop: !isDefaultCrop(crop),
@@ -1628,6 +1631,9 @@ function onKeyDown(e: KeyboardEvent): void {
     const k = e.key.toLowerCase();
     if (k === "z") { e.preventDefault(); if (e.shiftKey) redo(); else undo(); return; }
     if (k === "y") { e.preventDefault(); redo(); return; }
+    // Lightroom's copy / paste settings.
+    if (e.shiftKey && k === "c") { e.preventDefault(); copyRecipe(); return; }
+    if (e.shiftKey && k === "v") { e.preventDefault(); void pasteRecipe(); return; }
   }
 
   // Space held turns drags into pans wherever a tool owns the pointer. A focused
@@ -2300,6 +2306,51 @@ function toolDetail(entry: { name: string; result?: ToolContent[] }): { image?: 
   return null;
 }
 
+// ── Recipes ──
+//
+// Copy / paste and a saved list of the transferable part of an edit
+// (rendering/recipes.ts says what transfers). Copy also puts the JSON on the
+// system clipboard, so a recipe can cross tabs or be pasted into a note.
+
+const savedRecipes = ref<SavedRecipe[]>(loadSavedRecipes());
+const recipeName = ref("");
+let recipeClipboard: RecipeData | null = null;
+
+function copyRecipe(): void {
+  if (!activeSource.value) return;
+  recipeClipboard = extractRecipe(captureSnapshot());
+  void navigator.clipboard?.writeText(serializeRecipe(recipeClipboard)).catch(() => {});
+}
+
+async function pasteRecipe(): Promise<void> {
+  if (!activeSource.value) return;
+  // The system clipboard wins when it holds a recipe: it is the newer copy.
+  const text = await navigator.clipboard?.readText().catch(() => "") ?? "";
+  const r = parseRecipe(text) ?? recipeClipboard;
+  if (r) await applyRecipeStep(r, t("recipe.pasted"));
+}
+
+// One history step, like the assistant's edits.
+async function applyRecipeStep(r: RecipeData, label: string): Promise<void> {
+  flushPendingHistory();
+  setEditState(applyRecipe(captureSnapshot(), r));
+  await nextTick();
+  flushPendingHistory(label);
+}
+
+function saveRecipe(): void {
+  if (!activeSource.value) return;
+  const name = recipeName.value.trim() || t("recipe.untitled", { n: savedRecipes.value.length + 1 });
+  savedRecipes.value = [...savedRecipes.value.filter(r => r.name !== name), { name, data: extractRecipe(captureSnapshot()) }];
+  storeSavedRecipes(savedRecipes.value);
+  recipeName.value = "";
+}
+
+function deleteRecipe(i: number): void {
+  savedRecipes.value = savedRecipes.value.filter((_, j) => j !== i);
+  storeSavedRecipes(savedRecipes.value);
+}
+
 // ── Export ──
 
 function exportFilename(): string {
@@ -2795,6 +2846,30 @@ const vWheelAdjust = {
         <button type="button" class="crop-done" @click="exitCropMode">{{ t('crop.done') }}</button>
       </section>
 
+      <section class="panel" v-if="editTab === 'recipes' && activeSource">
+        <header class="panel-head">
+          <span>{{ t('panel.recipes') }}</span>
+          <span class="recipe-actions">
+            <button class="ghost" type="button" :title="t('recipe.copyHint')" @click="copyRecipe">{{ t('recipe.copy') }}</button>
+            <button class="ghost" type="button" :title="t('recipe.pasteHint')" @click="pasteRecipe">{{ t('recipe.paste') }}</button>
+          </span>
+        </header>
+        <form class="recipe-save" @submit.prevent="saveRecipe">
+          <input class="model-field" v-model="recipeName" :placeholder="t('recipe.namePlaceholder')" spellcheck="false" @keydown.stop />
+          <button class="ghost" type="submit">{{ t('recipe.save') }}</button>
+        </form>
+        <ol class="history-list recipe-list" v-if="savedRecipes.length">
+          <li v-for="(r, i) in savedRecipes" :key="r.name" class="recipe-row">
+            <button type="button" class="history-step" @click="applyRecipeStep(r.data, r.name)">
+              <span class="history-label">{{ r.name }}</span>
+            </button>
+            <button class="icon-mini" type="button" :aria-label="t('common.remove')" @click="deleteRecipe(i)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
+            </button>
+          </li>
+        </ol>
+        <p class="control-note">{{ t('recipe.hint') }}</p>
+      </section>
       <section class="panel history-panel" v-if="editTab === 'history'">
         <header class="panel-head">
           <span>{{ t('panel.history') }}</span>

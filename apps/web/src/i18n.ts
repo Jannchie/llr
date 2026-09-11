@@ -55,7 +55,20 @@ const en = {
   "tab.look": "Creative Look",
   "tab.crop": "Crop & Straighten (R)",
   "tab.assistant": "Assistant",
+  "tab.recipes": "Recipes",
   "tab.history": "History",
+
+  // Recipes
+  "panel.recipes": "Recipes",
+  "recipe.copy": "Copy",
+  "recipe.paste": "Paste",
+  "recipe.copyHint": "Copy the edit (Ctrl+Shift+C)",
+  "recipe.pasteHint": "Paste the copied edit (Ctrl+Shift+V)",
+  "recipe.save": "Save",
+  "recipe.namePlaceholder": "Save current edit as…",
+  "recipe.untitled": "Recipe {n}",
+  "recipe.pasted": "Paste recipe",
+  "recipe.hint": "A recipe carries the tone, colour, curve and pixel-based masks. Crop and gradient masks stay with the photo, as do the colour engine, Creative Look and denoise.",
   "tab.settings": "Settings",
 
   // History panel
@@ -362,7 +375,20 @@ const zh: Record<MessageKey, string> = {
   "tab.look": "创意外观",
   "tab.crop": "裁剪并拉直 (R)",
   "tab.assistant": "助手",
+  "tab.recipes": "配方",
   "tab.history": "历史记录",
+
+  // Recipes
+  "panel.recipes": "配方",
+  "recipe.copy": "复制",
+  "recipe.paste": "粘贴",
+  "recipe.copyHint": "复制当前编辑 (Ctrl+Shift+C)",
+  "recipe.pasteHint": "粘贴已复制的编辑 (Ctrl+Shift+V)",
+  "recipe.save": "保存",
+  "recipe.namePlaceholder": "将当前编辑保存为…",
+  "recipe.untitled": "配方 {n}",
+  "recipe.pasted": "粘贴配方",
+  "recipe.hint": "配方包含影调、颜色、曲线和基于像素的蒙版。裁切、渐变蒙版留在照片上，颜色引擎、创意外观、降噪也不带走。",
   "tab.settings": "设置",
 
   // History panel

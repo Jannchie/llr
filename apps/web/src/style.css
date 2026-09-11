@@ -2119,6 +2119,30 @@ input[type="range"]:focus::-moz-range-thumb {
   color: var(--text);
 }
 
+/* ---------- Recipes ---------- */
+
+.recipe-actions {
+  display: inline-flex;
+  gap: 2px;
+}
+
+.recipe-save {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.recipe-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 4px;
+}
+
+.recipe-list { margin-bottom: 8px; }
+
 /* ---------- Sheet (modal dialog) ----------
    A native <dialog> in the card language: the backdrop dims the whole app,
    the sheet floats over it. */
