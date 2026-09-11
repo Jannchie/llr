@@ -85,6 +85,81 @@ export function clipIndicators(bins: HistogramBins): { shadow: string | null; hi
   };
 }
 
+/** What the assistant's `measure` tool reports, in display-encoded 0..255. */
+export interface HistogramMeasure {
+  luminance: { p1: number; p5: number; p50: number; p95: number; p99: number; mean: number };
+  clipped: { shadows_pct: number; highlights_pct: number; shadow_channels: string | null; highlight_channels: string | null };
+}
+
+// Which channels rail at an edge bin, named the way the clipping indicator
+// colours them ("R+G" is the yellow triangle).
+function railedChannels(bins: HistogramBins, i: 0 | 255, thr: number): string | null {
+  const names = (["r", "g", "b"] as const).filter(c => bins[c][i] > thr).map(c => c.toUpperCase());
+  return names.length ? names.join("+") : null;
+}
+
+/**
+ * Luminance percentiles and clipped fractions from the bins alone. Percentiles
+ * walk the cumulative count; the clip threshold is clipIndicators' so the two
+ * never disagree about whether a frame clips.
+ */
+export function measureHistogram(bins: HistogramBins): HistogramMeasure {
+  const total = bins.l.reduce((s, v) => s + v, 0);
+  const pct = (n: number) => Math.round((n / Math.max(1, total)) * 1000) / 10;
+  let acc = 0, sum = 0;
+  const targets = [0.01, 0.05, 0.5, 0.95, 0.99];
+  const p: number[] = [];
+  for (let i = 0; i < 256; i++) {
+    acc += bins.l[i];
+    sum += bins.l[i] * i;
+    while (p.length < targets.length && acc >= targets[p.length] * total && total > 0) p.push(i);
+  }
+  while (p.length < targets.length) p.push(0);
+  const thr = Math.max(CLIP_MIN_PX, total * CLIP_FRACTION);
+  return {
+    luminance: { p1: p[0], p5: p[1], p50: p[2], p95: p[3], p99: p[4], mean: total ? Math.round(sum / total) : 0 },
+    clipped: {
+      shadows_pct: pct(bins.l[0]), highlights_pct: pct(bins.l[255]),
+      shadow_channels: railedChannels(bins, 0, thr), highlight_channels: railedChannels(bins, 255, thr),
+    },
+  };
+}
+
+/**
+ * Region means (top/middle/bottom thirds of the luminance) and mean chroma
+ * ((max-min)/255, so 0 is grey and 1 a pure primary) from a small RGBA
+ * read-back, top-down rows.
+ */
+export function measurePixels(rgba: Uint8ClampedArray | Uint8Array, w: number, h: number): { regions: { top: number; middle: number; bottom: number }; chroma_mean: number } {
+  const sums = [0, 0, 0], counts = [0, 0, 0];
+  let chroma = 0;
+  for (let y = 0; y < h; y++) {
+    const band = Math.min(2, Math.floor((y * 3) / h));
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      const r = rgba[i], g = rgba[i + 1], b = rgba[i + 2];
+      sums[band] += 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      counts[band]++;
+      chroma += (Math.max(r, g, b) - Math.min(r, g, b)) / 255;
+    }
+  }
+  const mean = (i: number) => counts[i] ? Math.round(sums[i] / counts[i]) : 0;
+  const n = w * h;
+  return { regions: { top: mean(0), middle: mean(1), bottom: mean(2) }, chroma_mean: n ? Math.round((chroma / n) * 100) / 100 : 0 };
+}
+
+// The clipping indicator in words, for a reader who gets numbers instead of
+// the histogram plot. Only speaks when a threshold trips, so silence means
+// "nothing to fix here".
+export function measureHint(m: HistogramMeasure): string | undefined {
+  const hints: string[] = [];
+  if (m.clipped.highlights_pct >= 0.5) hints.push(`highlights clip${m.clipped.highlight_channels ? ` in ${m.clipped.highlight_channels}` : ""}: lower highlights/whites or exposure`);
+  if (m.clipped.shadows_pct >= 0.5) hints.push(`shadows clip${m.clipped.shadow_channels ? ` in ${m.clipped.shadow_channels}` : ""}: raise shadows/blacks or exposure`);
+  if (m.luminance.p50 < 50) hints.push("median is dark; the picture may read as underexposed");
+  else if (m.luminance.p50 > 200) hints.push("median is bright; the picture may read as washed out");
+  return hints.length ? hints.join("; ") : undefined;
+}
+
 /**
  * Render histogram bins to a 2D canvas.
  */

@@ -54,6 +54,8 @@ export function useAssistant(opts: {
   systemPrompt: () => string;
   /** Which photo the chat is about; each gets its own transcript and server session. */
   scope: () => string | null;
+  /** Called as a prompt goes out, before the model's first tool call. */
+  onTurnStart?: () => void;
 }) {
   // One conversation per photo, so advice about one shot never bleeds into the
   // next. The page prefix keeps a reload from resuming a server session whose
@@ -114,6 +116,7 @@ export function useAssistant(opts: {
     const chat = current.value;
     if (!text || chat.busy) return;
     chat.busy = true;
+    opts.onTurnStart?.();
     chat.entries.push({ kind: "user", text });
     const tools = Object.entries(opts.tools()).map(([name, t]) => ({ name, description: t.description, parameters: t.parameters }));
     let reply: (ChatEntry & { kind: "assistant" }) | null = null;

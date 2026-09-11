@@ -2051,30 +2051,37 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
   }
 
   /**
-   * Read the currently-drawn frame back into an encoded image Blob.
-   * Call right after draw(): reads the WebGL back buffer (origin bottom-left,
-   * so rows are flipped to top-down), composites onto a 2D canvas and encodes.
+   * Read the currently-drawn frame back as top-down RGBA. Call right after
+   * draw(): reads the WebGL back buffer (origin bottom-left, so rows are
+   * flipped), tagged with the gamut the last draw() chose.
    */
-  async toBlob(type = "image/jpeg", quality = 0.92): Promise<Blob> {
+  readFrame(): { w: number; h: number; data: Uint8ClampedArray<ArrayBuffer>; colorSpace: PredefinedColorSpace } {
     const gl = this.gl;
     // Read the actual drawing-buffer size (= outWidth/outHeight for a 1.0-scale
     // export renderer; smaller for a downscaled preview).
     const w = this.canvas.width;
     const h = this.canvas.height;
     if (!w || !h) throw new Error("nothing to read back");
-    // The back buffer holds values in the gamut chosen for the last draw(); tag the
-    // read-back canvas with the same colour space so the export matches the preview.
     const colorSpace: PredefinedColorSpace =
       this.lastParams.displayGamut === 1 && this.p3Supported ? "display-p3" : "srgb";
     const raw = new Uint8Array(w * h * 4);
     gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, raw);
-    // Flip vertically (GL framebuffer origin is bottom-left)
     const flipped = new Uint8ClampedArray(w * h * 4);
     const rowBytes = w * 4;
     for (let y = 0; y < h; y++) {
       const src = (h - 1 - y) * rowBytes;
       flipped.set(raw.subarray(src, src + rowBytes), y * rowBytes);
     }
+    return { w, h, data: flipped, colorSpace };
+  }
+
+  /**
+   * Read the currently-drawn frame back into an encoded image Blob: readFrame()
+   * composited onto a 2D canvas in the same colour space, so the export
+   * matches the preview.
+   */
+  async toBlob(type = "image/jpeg", quality = 0.92): Promise<Blob> {
+    const { w, h, data: flipped, colorSpace } = this.readFrame();
     const cvs = document.createElement("canvas");
     cvs.width = w;
     cvs.height = h;

@@ -84,6 +84,8 @@ const en = {
   "chat.tool.view_image": "Looking at the photo",
   "chat.tool.get_edit": "Reading the edit",
   "chat.tool.set_edit": "Adjusting",
+  "chat.tool.compare": "Comparing before and after",
+  "chat.tool.measure": "Measuring the render",
 
   // Crop panel
   "panel.crop": "Crop & Straighten",
@@ -375,6 +377,8 @@ const zh: Record<MessageKey, string> = {
   "chat.tool.view_image": "查看照片",
   "chat.tool.get_edit": "读取当前参数",
   "chat.tool.set_edit": "调整",
+  "chat.tool.compare": "对比前后",
+  "chat.tool.measure": "测量画面",
 
   "panel.crop": "裁剪并拉直",
   "crop.aspect": "长宽比",

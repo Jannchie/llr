@@ -36,6 +36,7 @@ import { useLibrary } from "./composables/useLibrary";
 import { useHistogram } from "./composables/useHistogram";
 import { useExport, type ExportPlan } from "./composables/useExport";
 import { useAssistant, modelKey, type AssistantTool, type ToolContent } from "./composables/useAssistant";
+import { measureHint, measureHistogram, measurePixels } from "./rendering/histogram";
 import ModelSettings from "./components/ModelSettings.vue";
 
 // ── types ──
@@ -1919,22 +1920,94 @@ function describeEdit(): unknown {
   };
 }
 
-// Render the whole (cropped) frame at a modest size and hand back the JPEG.
-// Borrows the preview renderer for one draw: window off, scale set from the
-// target size, then the on-screen view is put back by the next frame.
-async function capturePreview(maxEdge = 1024): Promise<string> {
+// Render the whole (cropped) frame at a modest size — the live edit, or a
+// frozen Snapshot (the "before" of a compare) without touching reactive state
+// or history. Borrows the preview renderer for one draw: window off, scale set
+// from the target size, the snapshot's own curve LUT uploaded; then bakedBasic
+// is dropped so the next frame rebakes the live LUT and puts the view back.
+function renderFrame(s: Snapshot | null, maxEdge: number): PipelineRenderer {
   requireImage();
   if (!webglRenderer) throw new Error("WebGL renderer unavailable");
-  if (bakedBasic === null || !sameBasic(bakedBasic, currentBasic())) bakeCurveLUT();
+  webglRenderer.uploadCurveLUT(buildToneCurveLUT(s?.curve ?? toneCurve.value, currentBasic(s?.recipe ?? recipe)));
   webglRenderer.setViewWindow(null);
   webglRenderer.setPreviewScale(maxEdge / Math.max(imageW.value, imageH.value));
-  webglRenderer.draw(buildPipelineParams(undefined, { preview: false }));
-  const blob = await webglRenderer.toBlob("image/jpeg", 0.85);
+  webglRenderer.draw(buildPipelineParams(s ?? undefined, { preview: false }));
+  bakedBasic = null;
   scheduleWebGLDraw();
+  return webglRenderer;
+}
+
+async function captureFrame(s: Snapshot | null, maxEdge: number): Promise<Blob> {
+  return renderFrame(s, maxEdge).toBlob("image/jpeg", 0.85);
+}
+
+async function blobToBase64(blob: Blob): Promise<string> {
   const bytes = new Uint8Array(await blob.arrayBuffer());
   let bin = "";
   for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
   return btoa(bin);
+}
+
+// Before/after side by side on one canvas, labels burnt in, the way a person
+// would flick hold-to-compare — the model gets both halves in one look.
+async function compareFrames(before: Snapshot, halfEdge = 512): Promise<Blob> {
+  const [a, b] = await Promise.all([captureFrame(before, halfEdge), captureFrame(null, halfEdge)].map(p => p.then(createImageBitmap)));
+  const gap = 4;
+  const cvs = document.createElement("canvas");
+  cvs.width = a.width + gap + b.width;
+  cvs.height = Math.max(a.height, b.height);
+  const ctx = cvs.getContext("2d");
+  if (!ctx) throw new Error("2D context unavailable");
+  ctx.fillStyle = "#808080";
+  ctx.fillRect(0, 0, cvs.width, cvs.height);
+  ctx.drawImage(a, 0, 0);
+  ctx.drawImage(b, a.width + gap, 0);
+  ctx.font = "bold 16px sans-serif";
+  ctx.textBaseline = "top";
+  for (const [label, x] of [["before", 0], ["after", a.width + gap]] as const) {
+    const w = ctx.measureText(label).width + 12;
+    ctx.fillStyle = "rgba(0,0,0,0.6)";
+    ctx.fillRect(x, 0, w, 24);
+    ctx.fillStyle = "#fff";
+    ctx.fillText(label, x + 6, 4);
+  }
+  return new Promise<Blob>((res, rej) => cvs.toBlob(b => (b ? res(b) : rej(new Error("toBlob failed"))), "image/jpeg", 0.85));
+}
+
+// The edit as flat "path → value" pairs, so two snapshots diff line by line
+// (exposure 0 → 0.4) instead of the model re-reading the whole state.
+function flattenEdit(s: Snapshot): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const sp of SLIDER_SPECS) out[sp.key] = s.recipe[sp.key];
+  HSL_RANGES.forEach((r, i) => { out[`hsl.${r.key}.hue`] = s.hslHue[i]; out[`hsl.${r.key}.sat`] = s.hslSat[i]; out[`hsl.${r.key}.lum`] = s.hslLum[i]; });
+  for (const [name, p] of Object.entries(GRADING_NAMES)) { out[`grading.${name}.hue`] = s.grading[`${p}H`]; out[`grading.${name}.sat`] = s.grading[`${p}S`]; }
+  out["grading.blend"] = s.grading.blend; out["grading.balance"] = s.grading.balance;
+  for (const k of ["highlights", "lights", "darks", "shadows"] as const) out[`curve.parametric.${k}`] = s.curve.parametric[k];
+  for (const k of ["rgb", "red", "green", "blue"] as const) out[`curve.${k}`] = JSON.stringify(s.curve[k]);
+  for (const k of ["cx", "cy", "w", "h", "angle", "orientation", "flipH", "flipV"] as const) out[`crop.${k}`] = s.crop[k];
+  out["crop.aspect"] = s.aspect;
+  out.masks = JSON.stringify(s.masks ?? []);
+  return out;
+}
+function diffEdit(before: Snapshot, after: Snapshot): Record<string, { from: unknown; to: unknown }> {
+  const a = flattenEdit(before), b = flattenEdit(after);
+  const changed: Record<string, { from: unknown; to: unknown }> = {};
+  for (const k of Object.keys(b)) if (a[k] !== b[k]) changed[k] = { from: a[k], to: b[k] };
+  return changed;
+}
+
+// What the photo looked like when the current turn started, and just before
+// the last set_edit: the two "before"s compare can be asked for. Neither is
+// reactive state or history — they are the model's memory, not the user's.
+let turnBaseline: Snapshot | null = null;
+let editBaseline: Snapshot | null = null;
+
+async function measureFrame(): Promise<unknown> {
+  const renderer = renderFrame(null, 256);
+  const { w, h, data } = renderer.readFrame();
+  const m = measureHistogram(await renderer.readHistogram());
+  const hint = measureHint(m);
+  return { ...m, ...measurePixels(data, w, h), ...(hint ? { hint } : {}) };
 }
 
 const num = (min: number, max: number, description?: string) => ({ type: "number", minimum: min, maximum: max, ...(description ? { description } : {}) });
@@ -2088,11 +2161,25 @@ function applyAssistantEdit(args: any): void {
 }
 
 const textContent = (v: unknown): ToolContent[] => [{ type: "text", text: JSON.stringify(v) }];
+const imageContent = async (blob: Promise<Blob>): Promise<ToolContent[]> => [{ type: "image", data: await blobToBase64(await blob), mimeType: "image/jpeg" }];
 const assistantTools: Record<string, AssistantTool> = {
   view_image: {
-    description: "Render the photo with the current edit and return it as a JPEG (long edge ~1024px). Call it to see the photo before deciding, and again after set_edit to check the result.",
+    description: "Render the photo with the current edit and return it as a JPEG (long edge ~768px). This is for the first look; prefer compare after set_edit.",
     parameters: { type: "object", properties: {} },
-    run: async () => [{ type: "image", data: await capturePreview(), mimeType: "image/jpeg" }],
+    run: () => imageContent(captureFrame(null, 768)),
+  },
+  compare: {
+    description: "Before/after side by side (two ~512px halves, labelled). Call it after set_edit to judge the change: too much, too little, anything clipped? `against` picks the before: the edit when this turn started (default) or the edit just before your last set_edit.",
+    parameters: { type: "object", properties: { against: { type: "string", enum: ["turn_start", "previous_edit"] } } },
+    run: (args) => {
+      const before = (args?.against === "previous_edit" ? editBaseline : turnBaseline) ?? captureSnapshot();
+      return imageContent(compareFrames(before));
+    },
+  },
+  measure: {
+    description: "Numbers about the current render, display-encoded 0..255: luminance percentiles and mean, clipped shadow/highlight percentages with the railed channels, mean luminance of the top/middle/bottom thirds, mean chroma, and a hint when something trips a threshold.",
+    parameters: { type: "object", properties: {} },
+    run: async () => textContent(await measureFrame()),
   },
   get_edit: {
     description: "The current edit: every slider with its range and default, HSL, colour grading, tone curve, crop, masks, and the image dimensions.",
@@ -2100,17 +2187,20 @@ const assistantTools: Record<string, AssistantTool> = {
     run: () => { requireImage(); return textContent(describeEdit()); },
   },
   set_edit: {
-    description: "Apply adjustments. Every field is optional and absolute; omitted fields are left as they are. Returns the resulting edit state.",
+    description: "Apply adjustments. Every field is optional and absolute; omitted fields are left as they are. Returns only what changed, as {field: {from, to}}.",
     parameters: SET_EDIT_SCHEMA,
     run: async (args) => {
+      requireImage();
       // One history step per call, tagged as the assistant's: flush whatever the
       // user was mid-way through first, then commit this edit on its own once
       // the watchers have seen it.
       flushPendingHistory();
+      editBaseline = captureSnapshot();
       applyAssistantEdit(args);
       await nextTick();
       flushPendingHistory(t("history.assistant"));
-      return textContent(describeEdit());
+      const changed = diffEdit(editBaseline, captureSnapshot());
+      return textContent(Object.keys(changed).length ? { changed } : { changed: {}, note: "nothing changed" });
     },
   },
 };
@@ -2118,8 +2208,13 @@ const assistantTools: Record<string, AssistantTool> = {
 function assistantSystemPrompt(): string {
   return [
     "You are the editing assistant inside LLR, a RAW photo editor with Lightroom-style controls. The user has a photo open; you edit it by calling tools, and every change shows up live and can be undone.",
-    "Workflow: look at the photo with view_image (and get_edit for the current values) before deciding, apply changes with set_edit, then view_image again to judge the result and refine if needed. Values are absolute, not deltas.",
-    "Slider semantics: exposure in stops; contrast, highlights, shadows, whites, blacks, clarity, dehaze, vibrance, saturation in -100..100; temperature in Kelvin (higher = warmer rendering), tint negative = green, positive = magenta. Keep adjustments natural and proportionate unless the user asks for a strong look. For crops, think about composition (subject placement, horizon, distractions at the edges) and use angle to straighten.",
+    "Workflow, in this order, every time you change the photo:",
+    "1. Look first: get_edit for the current values and view_image for the picture.",
+    "2. Apply with set_edit (absolute values, not deltas). Change 2–4 controls per round, not everything at once.",
+    "3. Judge with compare (before/after side by side) and measure (numbers). Ask: is it too much, too little, did anything clip?",
+    "4. Refine with another set_edit, then compare again. Expect 2–4 rounds; stop when compare shows the intent without over-correction. Never finish a turn with a set_edit you have not looked at.",
+    "Strength calibration (Lightroom semantics): exposure ±0.3 EV is one visible step, ±1 EV is dramatic. On -100..100 sliders, ±10 is subtle (visible only in compare), ±30 clearly visible, ±60 strong, beyond that is a special effect. Temperature: ±300 K subtle, ±1000 K obviously warm/cool. Start at the subtle-to-visible end and increase only if compare shows too little.",
+    "Slider semantics: exposure in stops; contrast, highlights, shadows, whites, blacks, clarity, dehaze, vibrance, saturation in -100..100; temperature in Kelvin (higher = warmer rendering), tint negative = green, positive = magenta. For crops, think about composition (subject placement, horizon, distractions at the edges) and use angle to straighten.",
     "masks: use presets (sky needs a blue sky; for grey skies use highlights or a linear gradient from the top); adjust values are local deltas added to the global sliders.",
     `Answer briefly, in the user's language (UI locale: ${locale.value}). Say what you changed and why; do not list every value.`,
   ].join("\n");
@@ -2128,7 +2223,10 @@ function assistantSystemPrompt(): string {
 const {
   entries: chatEntries, busy: chatBusy, models: chatModels, selected: chatModel, providers: chatProviders,
   send: sendChat, abort: abortChat, reset: resetChat,
-} = useAssistant({ tools: () => assistantTools, systemPrompt: assistantSystemPrompt, scope: () => activeId.value });
+} = useAssistant({
+  tools: () => assistantTools, systemPrompt: assistantSystemPrompt, scope: () => activeId.value,
+  onTurnStart: () => { turnBaseline = editBaseline = activeSource.value && hasLinearData ? captureSnapshot() : null; },
+});
 const chatModelOptions = computed(() => chatModels.value.map(m => ({
   value: modelKey(m), label: m.id, disabled: chatProviders.value !== null && !chatProviders.value.includes(m.provider),
 })));
