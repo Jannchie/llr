@@ -1885,7 +1885,29 @@ input[type="range"]:focus::-moz-range-thumb {
 .chat-assistant {
   align-self: flex-start;
   color: var(--text);
+  white-space: normal;   /* markdown brings its own block spacing */
 }
+
+/* fadedown's markdown, tightened to chat scale. */
+.chat-md {
+  --fadedown-animation-duration: 0.35s;
+  --fadedown-code-bg: var(--control);
+  --fadedown-code-radius: var(--radius-sm);
+  --fadedown-code-toolbar-bg: var(--control-hover);
+  --fadedown-code-toolbar-color: var(--text-dim);
+  line-height: 1.5;
+}
+
+.chat-md > :first-child { margin-top: 0; }
+.chat-md > :last-child { margin-bottom: 0; }
+.chat-md p, .chat-md ul, .chat-md ol { margin: 0.35em 0; }
+.chat-md ul, .chat-md ol { padding-left: 1.3em; }
+.chat-md h1, .chat-md h2, .chat-md h3, .chat-md h4 { font-size: 1em; font-weight: 600; margin: 0.6em 0 0.2em; }
+.chat-md code { font-size: 0.92em; background: var(--control); padding: 0 4px; border-radius: 4px; }
+.chat-md pre code { background: none; padding: 0; }
+.chat-md a { color: var(--accent); }
+.chat-md table { border-collapse: collapse; font-size: 0.95em; }
+.chat-md th, .chat-md td { border: 1px solid var(--sep-strong); padding: 2px 6px; }
 
 .chat-typing {
   color: var(--text-mute);

@@ -38,6 +38,7 @@ import { useExport, type ExportPlan } from "./composables/useExport";
 import { useAssistant, modelKey, THINKING_LEVELS, type AssistantTool, type ToolContent, type TurnUsage } from "./composables/useAssistant";
 import { measureHint, measureHistogram, measurePixels } from "./rendering/histogram";
 import ModelSettings from "./components/ModelSettings.vue";
+import AssistantMessage from "./components/AssistantMessage.vue";
 
 // ── types ──
 
@@ -2666,7 +2667,7 @@ const vWheelAdjust = {
           <template v-for="(entry, i) in chatEntries" :key="i">
             <div v-if="entry.kind === 'user'" class="chat-msg chat-user">{{ entry.text }}<span v-if="entry.steered" class="chat-steered">{{ t('chat.steered') }}</span></div>
             <div v-else-if="entry.kind === 'assistant'" class="chat-msg chat-assistant" :class="{ 'is-error': entry.error }">
-              <span v-if="entry.text">{{ entry.text }}</span>
+              <AssistantMessage v-if="entry.text" :text="entry.text" :streaming="entry.streaming" />
               <span v-if="entry.error" class="chat-error">{{ entry.error }}</span>
               <span v-else-if="!entry.text && chatBusy" class="chat-typing">…</span>
               <span v-if="entry.usage" class="chat-usage">{{ usageLine(entry.usage) }}</span>

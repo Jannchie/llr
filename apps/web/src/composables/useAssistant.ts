@@ -57,7 +57,7 @@ export type ChatEntry =
   // `steered`: sent while the model was working, so it reached it mid-run.
   | { kind: "user"; text: string; steered?: boolean }
   // `usage`: the turn's tokens and cost so far, shown under the reply.
-  | { kind: "assistant"; text: string; error?: string; usage?: TurnUsage }
+  | { kind: "assistant"; text: string; streaming: boolean; error?: string; usage?: TurnUsage }
   // `result` is what went back to the model, kept so the log can show it.
   | { kind: "tool"; name: string; args: unknown; done: boolean; error?: string; result?: ToolContent[] }
   // A line about the run itself, not something anyone said.
@@ -155,7 +155,7 @@ export function useAssistant(opts: {
       for await (const ev of sseEvents(res.body)) {
         switch (ev.type) {
           case "message_start":
-            if (ev.message.role === "assistant") { reply = { kind: "assistant", text: "" }; chat.entries.push(reply); }
+            if (ev.message.role === "assistant") { reply = { kind: "assistant", text: "", streaming: true }; chat.entries.push(reply); }
             // The API's own follow-up (edited without looking) — a status
             // line, not a user bubble. Other user messages are already shown.
             else if (ev.nudge) chat.entries.push({ kind: "status", status: "nudge" });
@@ -171,6 +171,7 @@ export function useAssistant(opts: {
               if (reply && !reply.text.trim() && ev.message.stopReason !== "error") chat.entries.splice(chat.entries.indexOf(reply), 1);
               if (ev.message.stopReason === "error" && reply) reply.error = ev.message.errorMessage ?? "error";
               if (ev.message.stopReason === "aborted") chat.entries.push({ kind: "status", status: "stopped" });
+              if (reply) reply.streaming = false;
               reply = null;
             }
             break;
@@ -190,7 +191,7 @@ export function useAssistant(opts: {
       }
       await Promise.all(toolRuns);
     } catch (err) {
-      chat.entries.push({ kind: "assistant", text: "", error: err instanceof Error ? err.message : String(err) });
+      chat.entries.push({ kind: "assistant", text: "", streaming: false, error: err instanceof Error ? err.message : String(err) });
     } finally {
       chat.busy = false;
     }
