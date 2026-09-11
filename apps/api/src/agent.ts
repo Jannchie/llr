@@ -40,7 +40,9 @@ setInterval(() => {
 // The browser names the model; the key is whatever the provider's usual env var
 // holds. Ids the bundled registry has not heard of yet (a model released after
 // pi-ai's last update) are served through a sibling of the same provider — same
-// endpoint, API flavour and modalities, only the id differs.
+// endpoint and API flavour, only the id differs. Vision is assumed: every current
+// frontier model takes images, and a text-only sibling (deepseek-v4-flash in the
+// registry) would otherwise silently swap view_image's frames for placeholders.
 export function resolveModel(spec: ModelSpec): Model<Api> {
   const provider = spec.provider as KnownProvider;
   if (!getProviders().includes(provider)) throw new Error(`Unknown provider "${spec.provider}"`);
@@ -48,7 +50,7 @@ export function resolveModel(spec: ModelSpec): Model<Api> {
   if (known) return known;
   const sibling = getModels(provider)[0];
   if (!sibling) throw new Error(`No template model for provider "${spec.provider}"`);
-  return { ...sibling, id: spec.id, name: spec.id };
+  return { ...sibling, id: spec.id, name: spec.id, input: ["text", "image"] };
 }
 
 /** Providers whose key is present in the environment. */
