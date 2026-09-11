@@ -313,15 +313,11 @@ def _warm_kernels() -> None:
     (sony/itp.py, sony/rawnr_simd.py, denoise.py); with `cache=True` the
     compiled code comes back from disk on later runs, but the very first run on
     a machine pays seconds of LLVM. Doing it here, on a thread, hides that
-    behind the upload of the first image. Each module's warmup is optional so
-    the daemon runs unchanged on a build without numba.
+    behind the upload of the first image.
     """
     for mod in (sony_itp, rawnr_simd, denoise_module):
-        warm = getattr(mod, "warmup", None)
-        if warm is None:
-            continue
         try:
-            warm()
+            mod.warmup()
         except Exception as error:
             sys.stderr.write(f"kernel warm-up ({mod.__name__}) failed: {error}\n")
             sys.stderr.flush()

@@ -10,18 +10,16 @@ passes, so threading the chain as it stood could not have fixed it. Fused into
 one traversal each and threaded, the same work is 0.09 s.
 
 So these kernels are worth reading for their *pass structure*, not their maths:
-each one is a whole numpy chain -- `pack_bayer` + `astype` + subtract + divide +
-clip, say -- collapsed into a single traversal that reads its input once and
-writes its output once.
+each one is a whole chain -- `pack_bayer` + `astype` + subtract + divide + clip,
+say -- collapsed into a single traversal that reads its input once and writes
+its output once.
 
-The arithmetic is unchanged, operation for operation and in the same order per
-element, and that is not decoration either: `denoise_raw_inplace` round-trips
-the mosaic through [0, 1] and back, and `SonyRawNRDenoiser` round-trips it again
-through raw levels, so the result depends on float32 rounding in both
-directions. `tests/test_denoise.py` pins the round trip bit for bit (a
-passthrough denoise must return the original mosaic exactly), and the whole-frame
-check in `tests/test_rawnr_simd.py` compares this path against the numpy one on
-all 33 M pixels.
+The order of operations per element is the whole-array chain's, and that is
+not decoration: `denoise_raw_inplace` round-trips the mosaic through [0, 1] and
+back, and `SonyRawNRDenoiser` round-trips it again through raw levels, so the
+result depends on float32 rounding in both directions. `tests/test_denoise.py`
+pins the round trip bit for bit (a passthrough denoise must return the original
+mosaic exactly).
 
 Two numba details that would otherwise be silent:
 

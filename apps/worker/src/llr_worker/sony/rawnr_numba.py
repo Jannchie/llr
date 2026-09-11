@@ -1,21 +1,21 @@
 """The compiled half of `rawnr_simd`: its three kernels, as compiled loops.
 
-`rawnr_simd._filt_rows` stays the reference -- it is the transcription that was
-scored against the engine's own planes -- but it spells 25 taps as 25
-whole-strip numpy passes, and on a 33 MP frame that is 1.5 s of the RawNR
-stage's 2.5 s. The strip schedule around it exists only so those 25 full-strip
-temporaries fit in cache; it does not make them fewer. Carrying a short segment
-of one row through all 25 taps instead keeps the whole working set in L1, and
-measured on that frame takes `filt` from 1.53 s to 0.08 s (24 threads) and the
-two analyses from 0.32 s to 0.04 s.
+Why compiled loops rather than whole-plane numpy: the sigma filter spelled as
+25 whole-strip array passes was 1.5 s of the RawNR stage's 2.5 s on a 33 MP
+frame, and a strip schedule around it only made the 25 temporaries fit in
+cache, not fewer. Carrying a short segment of one row through all 25 taps
+instead keeps the whole working set in L1, and measured on that frame takes
+`filt` from 1.53 s to 0.08 s (24 threads) and the two analyses from 0.32 s to
+0.04 s.
 
-Every expression here is the reference's, operation for operation and in the
-same order, because the transcription is only bit-exact in that order (see
-`rawnr_simd._filt_rows`: own-then-cross member accumulation, the centre tap
-accumulated in its scan position, `base` in the engine's own
-`[(1024-blend)*mean + blend*centre] * (1/1024)` form). float32 addition is not
-associative, so "the same arithmetic in a tidier order" is a different result,
-and the pixels it moves are exactly the ones sitting an ulp from a threshold.
+Every expression here is the transcription that was scored against the
+engine's own planes, operation for operation and in the same order, because
+it is only bit-exact in that order (see `rawnr_simd.filt`: own-then-cross
+member accumulation, the centre tap accumulated in its scan position, `base`
+in the engine's own `[(1024-blend)*mean + blend*centre] * (1/1024)` form).
+float32 addition is not associative, so "the same arithmetic in a tidier
+order" is a different result, and the pixels it moves are exactly the ones
+sitting an ulp from a threshold.
 
 Three rules follow from that, and none of them is style:
 
@@ -26,18 +26,16 @@ Three rules follow from that, and none of them is style:
   multiply, and one of those promotes the rest of the expression. Every
   constant arrives as a `np.float32` argument, and every cast is spelled
   `np.float32(...)`.
-* **The tap list is the caller's.** `rawnr_simd` builds it from the same list
-  comprehension `_filt_rows` iterates, so scan order -- which decides where the
-  unconditional centre tap lands in the accumulation -- cannot drift between
-  the two operators.
+* **The tap list is the caller's.** `rawnr_simd` builds it in scan order, which
+  decides where the unconditional centre tap lands in the accumulation.
 
-`tests/test_rawnr_simd.py` checks the two agree bit for bit on the fixtures and
-on random planes of odd sizes; `sony_repro/tools/rawnr_export_verify.py` checks
-the compiled path still reproduces the engine's own export tile at 100.0000%.
+`tests/test_rawnr_simd.py` pins the kernels to the engine's own planes;
+`sony_repro/tools/rawnr_export_verify.py` checks the compiled path still
+reproduces the engine's own export tile at 100.0000%.
 
-Each kernel takes `y0`/`y1` and writes only those output rows, so the caller can
-keep the strip schedule `rawnr_simd.filt` already had. `nogil=True` is what
-makes that schedule real threads rather than a queue behind the GIL.
+Each kernel takes `y0`/`y1` and writes only those output rows, so the caller
+can schedule strips over threads. `nogil=True` is what makes that schedule real
+threads rather than a queue behind the GIL.
 """
 
 from __future__ import annotations
@@ -50,7 +48,7 @@ import numpy as np
 def filt_rows(d, ref, other, thr_tab, tap_off, centre_k, own_off, other_off, out,
               y0, y1, r, chunk, w_mean, w_ctr, inv_blend, inv_n,
               gain_f, limit_f, nlimit_f, off_f, thr_hi, ceil_f):
-    """`_filt_rows`' operator for output rows `y0:y1`, a row segment at a time.
+    """`rawnr_simd.filt`'s operator for output rows `y0:y1`, a row segment at a time.
 
     The neighbour tables arrive as *flat* element offsets (`dy*stride + dx`)
     rather than (dy, dx) pairs, so a tap costs one integer add instead of a
@@ -168,7 +166,7 @@ def strength_rows(filtered, original, out, s, one_minus_s, i0, i1):
     Flat rather than 2-D because the exec's write-back is elementwise and its
     callers are not all the same rank -- the frame path hands it (H, W, 4) and
     the fixture test a single (96, 96) plane. `one_minus_s` is computed once by
-    the caller, exactly as the numpy operator does.
+    the caller.
 
     `np.trunc` returns float64 in numba even for a float32 argument; the
     `np.float32` around it is exact (truncating a float32 lands on a value

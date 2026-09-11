@@ -1,13 +1,14 @@
-r"""`itp_numpy`'s pipeline, one compiled pass per stage instead of one per array op.
+r"""`ZcTaskSIMDITP`'s stages as compiled kernels, one pass per stage.
 
-Why: the numpy transcription is memory bound, not compute bound. Each stage is a
-chain of whole-strip array expressions, so a 33 MP frame streams a few hundred
-full planes through DRAM with ~20 float32 temporaries live per strip; measured on
-a 12900K, `demosaic` took 9.15 s on one thread and 7.51 s on six -- six times the
-cores bought 18%, which is what a bandwidth wall looks like. The stages here
-compute each output pixel from its neighbourhood in one pass, so only the planes
-that cross a stage boundary (W, m1, m3, base and four activity maps) ever reach
-memory: same frame, 2.78 s on one thread and 0.43 s on twelve.
+Why per-pixel kernels rather than whole-array numpy: the operator is memory
+bound, not compute bound. Written as chains of whole-strip array expressions, a
+33 MP frame streamed a few hundred full planes through DRAM with ~20 float32
+temporaries live per strip; measured on a 12900K, `demosaic` took 9.15 s on one
+thread and 7.51 s on six -- six times the cores bought 18%, which is what a
+bandwidth wall looks like. Here each output pixel is computed from its
+neighbourhood in one pass, so only the planes that cross a stage boundary (W,
+m1, m3, base and four activity maps) ever reach memory: same frame, 2.78 s on
+one thread and 0.43 s on twelve.
 
 Bit-exactness is the whole constraint -- these planes are compared against the
 engine to 1 LSB, so a reassociated sum is a regression. The rules followed here,
@@ -15,20 +16,19 @@ all of them load-bearing:
 
 * every literal is `np.float32(...)`; a bare Python float would promote the
   expression to float64 and round at a different point.
-* every accumulator starts at `_ZERO` and takes its terms in the order the numpy
-  code's `acc = acc + ...` loop did (`aggregate`'s tap-dict order, `_fir_*`'s
-  ascending k, `malvar`'s row-major 5x5, `_conv_into`'s row-major kernel). In
-  float32 `(a + b) + c` is not `a + (b + c)`, and `_ZERO + x` is not `x` when x
-  is a negative zero, which the -0.0625 FIR taps do produce.
+* every accumulator starts at `_ZERO` and takes its terms in the order the
+  transcription that was scored against the engine did (aggregate's tap order,
+  the FIRs' ascending k, malvar's row-major 5x5, the activity kernels' row-major
+  order). In float32 `(a + b) + c` is not `a + (b + c)`, and `_ZERO + x` is not
+  `x` when x is a negative zero, which the -0.0625 FIR taps do produce.
 * no `fastmath`: it licenses both reassociation and FMA contraction.
-* the unwritten zeros matter. Each numpy stage writes a sub-rectangle of a
-  `np.zeros_like` plane and later stages read the zeros outside it, so the same
-  borders are reproduced here: `_lp_h` returns 0 outside `[2, w - 2)`, the
-  aggregate reads 0 past the right edge where numpy padded by 4, anisotropy is 0
+* the unwritten zeros matter. Each engine stage writes a sub-rectangle of a
+  zeroed plane and later stages read the zeros outside it, so the same borders
+  are reproduced here: `_lp_h` returns 0 outside `[2, w - 2)`, the aggregate
+  reads 0 past the right edge (the engine's row padding), anisotropy is 0
   outside rect inset by 4, and t1..t4 are 0 outside the 2x2-aligned rectangle.
 
-Everything below is a literal transcription of `itp_numpy`; read that module for
-what the stages mean and where they came from.
+What the stages mean and how they were decoded is in `sony/itp.py`'s docstring.
 """
 from __future__ import annotations
 
@@ -139,7 +139,7 @@ def _convert(mosaic, gains, black, W):
 
 @njit(**_INL)
 def _agg_tap(src, y, x, w):
-    """Row 0's taps reach x + 4, into the four zero columns numpy padded on."""
+    """Row 0's taps reach x + 4: the engine reads its zero row padding there."""
     if x >= w:
         return _ZERO
     return src[y, x]
@@ -550,7 +550,7 @@ def _pipeline(mosaic, gains, black, x0, y0, x1, y1):
 
 @njit(**_JIT)
 def itp_tile(mosaic, gains, black, x0, y0, x1, y1):
-    """`itp_numpy.itp_tile` with the rect unpacked; the same three uint16 planes."""
+    """One engine tile with the rect unpacked: uint16 mosaic -> (R, G, B) uint16 planes."""
     W, m1, base = _pipeline(mosaic, gains, black, x0, y0, x1, y1)
     return _planes(W, m1, base, x0, y0, x1, y1)
 
@@ -560,8 +560,8 @@ def strip(mosaic, gains, black, x0, y0, x1, y1, top, bottom, left, right, scale,
     """One `demosaic` strip: tile in, its scaled interior straight into `out`.
 
     Folding the crop and the /8192 into the kernel keeps the three uint16 planes
-    from being materialised and read back, which in the numpy path was one more
-    full pass over the frame plus 200 MB of allocation per frame.
+    from being materialised and read back -- one more full pass over the frame
+    plus 200 MB of allocation per frame otherwise.
     """
     h, w = mosaic.shape
     W, m1, base = _pipeline(mosaic, gains, black, x0, y0, x1, y1)

@@ -34,15 +34,14 @@ textures use); in-memory caches stay float32.
 
 ## Compiled kernels
 
-The two hot stages of the Sony path are numba-compiled, each with its numpy
-transcription kept as the reference and proven bit-identical (whole-frame
-`array_equal`, the engine's own tiles, random inputs):
-
-| stage | kernel | reference | switch |
-|---|---|---|---|
-| ITP demosaic | `sony/itp_numba.py` | `sony/itp_numpy.py` | `LLR_ITP_BACKEND=numpy` |
-| RawNR sigma filter | `sony/rawnr_numba.py` | `rawnr_simd._filt_rows` | `LLR_RAWNR_BACKEND=numpy` |
-| denoise plumbing | `denoise_numba.py` | the numpy chains in `denoise.py` | `LLR_DENOISE_BACKEND=numpy` |
+The two hot stages of the Sony path are numba-compiled: the ITP demosaic
+(`sony/itp_numba.py`, driven by `sony/itp.py`), the RawNR sigma filter and
+its analyses (`sony/rawnr_numba.py`, driven by `sony/rawnr_simd.py`), and the
+normalisation either side of a denoiser (`denoise_numba.py`). Each was ported
+from a whole-array numpy transcription that had been scored against the
+engine's own dumps and proven bit-identical to it (whole-frame `array_equal`,
+the engine's own tiles, random inputs) before that transcription was retired;
+the tests now pin the kernels to the engine fixtures directly.
 
 `sony/marble.py` is the engine's last stage, the chroma cleanup of
 `ZcTaskSIMDMarble`, decoded bit for bit (its test fixture is a crop of the
@@ -53,8 +52,7 @@ kept for the notes that cite it.
 
 On a 33 MP frame the cold decode went from 12.4 s to 2.5 s (ITP 7.7 → 0.35 s,
 RawNR 2.4 → 0.3 s). Kernels are `cache=True`; the first run on a machine pays
-~8 s of LLVM, which the daemon hides in a background warm-up at startup. A
-build without numba falls back to the reference paths with one stderr line.
+~8 s of LLVM, which the daemon hides in a background warm-up at startup.
 Bit-identity rules for anyone touching a kernel: every constant `np.float32`,
-no `fastmath`, accumulate in the reference's loop order, reproduce the zeros the
-reference leaves in unwritten margins, and keep `strip_rows` even.
+no `fastmath`, keep the accumulation order the comments call out, reproduce the
+zeros the engine leaves in unwritten margins, and keep `strip_rows` even.

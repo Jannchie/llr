@@ -19,7 +19,6 @@ back into the file's data.
 from __future__ import annotations
 
 import os
-import sys
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -28,6 +27,8 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
+
+from . import denoise_numba as _kernels
 
 # ── Bayer pack / unpack ────────────────────────────────────────────────────
 #
@@ -127,31 +128,21 @@ def _plane_colors(raw: Any, row_phase: int = 0, col_phase: int = 0) -> list[str]
 # ── Compiled plane plumbing ────────────────────────────────────────────────
 #
 # The normalisation either side of a denoiser is trivial arithmetic -- a
-# multiply, an add and a clamp per element -- and on a 33 MP frame it was 0.64 s
-# of the RawNR stage's 0.83 s. Not because of the arithmetic: a numpy chain
-# writes a whole 132 MB plane set per operator and reads it back for the next
-# one, and this machine copies at 21 GB/s (measured: 12.5 ms for a threaded
-# 132 MB copy), so the cost is the *number of passes* and threading alone cannot
-# fix it. `denoise_numba` holds each chain as one fused traversal instead --
-# 0.64 s to 0.09 s, threaded -- and the helpers here dispatch to it, keeping the
-# numpy chain, operator for operator, as the reference.
+# multiply, an add and a clamp per element -- and as whole-array numpy on a
+# 33 MP frame it was 0.64 s of the RawNR stage's 0.83 s. Not because of the
+# arithmetic: a numpy chain writes a whole 132 MB plane set per operator and
+# reads it back for the next one, and this machine copies at 21 GB/s
+# (measured: 12.5 ms for a threaded 132 MB copy), so the cost is the *number
+# of passes* and threading alone cannot fix it. `denoise_numba` holds each
+# chain as one fused traversal instead -- 0.64 s to 0.09 s, threaded.
 #
 # Fusing is not an approximation: `denoise_raw_inplace` round-trips the mosaic
 # through [0, 1] and back, so the result depends on float32 rounding in both
 # directions, and each kernel does the same operations in the same order on the
-# same element. What it drops is the temporaries between them.
-
-#: "numpy" forces the reference chains. Read once at import, like sony/itp.py's
-#: LLR_ITP_BACKEND and sony/rawnr_simd.py's LLR_RAWNR_BACKEND.
-BACKEND = (os.environ.get("LLR_DENOISE_BACKEND") or "numba").strip().lower()
-
-_kernels: Any
-try:
-    from . import denoise_numba as _kernels
-except Exception as exc:  # pragma: no cover - depends on the install
-    _kernels = None
-    print(f"llr: numba unavailable ({exc}); denoise plane plumbing falls back to numpy",
-          file=sys.stderr)
+# same element as the whole-array chain it was checked `array_equal` against.
+# The kernels do their arithmetic in whatever type their arguments carry, so
+# the per-plane level arrays are handed over as float32 -- a float64 `black`
+# would quietly promote the whole expression.
 
 #: Rows per thread task. These kernels are memory-bound, so this only has to be
 #: large enough to amortise the hand-off and small enough that the last task does
@@ -160,18 +151,8 @@ _PLANE_STRIP_ROWS = 64
 _PLANE_WORKERS = max(1, os.cpu_count() or 1)
 
 
-def _use_kernels(*levels: np.ndarray) -> bool:
-    """Whether the compiled plumbing runs, given these per-plane level arrays.
-
-    The dtype check is not defensive tidiness. The kernels do their arithmetic
-    in whatever type their arguments carry, so a float64 `black` would quietly
-    promote the whole expression and hand back a result the numpy chain -- which
-    keeps everything in float32 -- did not produce. Declining is the only safe
-    answer; the reference computes those cases in their own dtype.
-    """
-    if _kernels is None or BACKEND == "numpy":
-        return False
-    return all(a.dtype == np.float32 for a in levels)
+def _f32(a: np.ndarray) -> np.ndarray:
+    return np.ascontiguousarray(a, dtype=np.float32)
 
 
 def _over_rows(height: int, work: Callable[[int, int], None]) -> None:
@@ -197,23 +178,12 @@ def _over_rows(height: int, work: Callable[[int, int], None]) -> None:
 
 
 def _pack_normalise(mosaic: np.ndarray, black: np.ndarray, scale: np.ndarray) -> np.ndarray:
-    """`clip((pack_bayer(mosaic).astype(f32) - black) / scale, 0, 1)`, one pass.
-
-    The compiled path reads `mosaic` where it lies. The contiguous copy the
-    numpy path makes exists only so `pack_bayer` can stack four strided views,
-    and stacking is exactly what the kernel does not do.
-    """
+    """`clip((pack_bayer(mosaic).astype(f32) - black) / scale, 0, 1)`, one pass,
+    reading the uint16 `mosaic` where it lies."""
     out = np.empty((mosaic.shape[0] // 2, mosaic.shape[1] // 2, 4), dtype=np.float32)
-    if _use_kernels(black, scale) and mosaic.dtype == np.uint16:
-        _over_rows(out.shape[0],
-                   lambda a, b: _kernels.pack_normalise_rows(mosaic, black, scale, out, a, b))
-        return out
-    planes = pack_bayer(np.ascontiguousarray(mosaic)).astype(np.float32)
-    # `out=` rather than fresh temporaries: the same two ufuncs in the same
-    # order, one allocation instead of three.
-    np.subtract(planes, black, out=out)
-    np.divide(out, scale, out=out)
-    np.clip(out, 0.0, 1.0, out=out)
+    black, scale = _f32(black), _f32(scale)
+    _over_rows(out.shape[0],
+               lambda a, b: _kernels.pack_normalise_rows(mosaic, black, scale, out, a, b))
     return out
 
 
@@ -221,42 +191,30 @@ def _denormalise_into(planes: np.ndarray, scale: np.ndarray, black: np.ndarray,
                       white: float, mosaic: np.ndarray) -> None:
     """`unpack_bayer(rint(clip(planes*scale + black, 0, white)).astype(u16))`,
     into `mosaic` in place -- which is what `denoise_raw_inplace` promises."""
-    if _use_kernels(black, scale) and mosaic.dtype == np.uint16 and planes.dtype == np.float32:
-        _over_rows(planes.shape[0],
-                   lambda a, b: _kernels.denormalise_rows(
-                       planes, scale, black, np.float32(white), mosaic, a, b))
-        return
-    out = planes * scale + black
-    np.clip(out, 0.0, white, out=out)
-    mosaic[...] = unpack_bayer(np.rint(out).astype(mosaic.dtype))
+    planes, black, scale = _f32(planes), _f32(black), _f32(scale)
+    _over_rows(planes.shape[0],
+               lambda a, b: _kernels.denormalise_rows(
+                   planes, scale, black, np.float32(white), mosaic, a, b))
 
 
 def _to_levels(planes: np.ndarray, span: np.ndarray, black: np.ndarray,
                full: float) -> np.ndarray:
     """`clip(planes*span + black, 0, full)`: normalised back to sensor levels."""
-    if _use_kernels(span, black) and planes.dtype == np.float32 and planes.ndim == 3:
-        out = np.empty(planes.shape, dtype=np.float32)
-        _over_rows(planes.shape[0],
-                   lambda a, b: _kernels.to_levels_rows(
-                       planes, span, black, np.float32(full), out, a, b))
-        return out
-    # Built in place off the first product: `planes` is the caller's array and
-    # must not be touched, but `* span` already allocates, so the add and the
-    # clamp land in that result rather than in two more full-frame temporaries.
-    out = planes.astype(np.float32, copy=False) * span
-    out += black
-    np.clip(out, 0.0, full, out=out)
+    planes, span, black = _f32(planes), _f32(span), _f32(black)
+    out = np.empty(planes.shape, dtype=np.float32)
+    _over_rows(planes.shape[0],
+               lambda a, b: _kernels.to_levels_rows(
+                   planes, span, black, np.float32(full), out, a, b))
     return out
 
 
 def _unscale(planes: np.ndarray, black: np.ndarray, span: np.ndarray) -> None:
     """`(planes - black) / span` in place: sensor levels back to normalised."""
-    if _use_kernels(black, span) and planes.dtype == np.float32 and planes.ndim == 3:
-        _over_rows(planes.shape[0],
-                   lambda a, b: _kernels.unscale_rows(planes, black, span, a, b))
-        return
-    planes -= black
-    planes /= span
+    if planes.dtype != np.float32:
+        raise TypeError("in-place unscale needs a float32 plane set")
+    black, span = _f32(black), _f32(span)
+    _over_rows(planes.shape[0],
+               lambda a, b: _kernels.unscale_rows(planes, black, span, a, b))
 
 
 def warmup() -> None:
@@ -265,11 +223,8 @@ def warmup() -> None:
     Cold, with an empty numba cache, the four take ~0.5 s of LLVM; warm they
     come back from the on-disk cache `cache=True` writes, in a few hundredths.
     The daemon calls this on a background thread at startup (cli.py
-    `_warm_kernels`), alongside sony.itp's and sony.rawnr_simd's. A no-op on the
-    numpy backend.
+    `_warm_kernels`), alongside sony.itp's and sony.rawnr_simd's.
     """
-    if not _use_kernels():
-        return
     black = np.full(4, 512.0, dtype=np.float32)
     scale = np.full(4, 15871.0, dtype=np.float32)
     mosaic = np.full((4, 4), 1000, dtype=np.uint16)
@@ -930,6 +885,10 @@ def denoise_raw_inplace(
     if not cfa_is_bayer_2x2(raw):
         return None
     visible = raw.raw_image_visible  # view into raw.raw_image
+    # ponytail: the plane kernels are typed for uint16; a floating-point DNG
+    # is left untouched like a non-Bayer CFA rather than given a second path.
+    if visible.dtype != np.uint16:
+        return None
     h, w = visible.shape
     he, we = h - (h % 2), w - (w % 2)
 

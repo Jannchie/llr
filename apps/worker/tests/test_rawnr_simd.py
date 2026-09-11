@@ -18,7 +18,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from llr_worker.sony import rawnr_simd
 from llr_worker.sony.rawnr_simd import (
     BASE_GREEN_OTHER,
     BASE_GREEN_OWN,
@@ -37,7 +36,6 @@ from llr_worker.sony.rawnr_simd import (
     analysis_rb,
     apply_strength,
     blend_table_value,
-    denoise_greens,
     denoise_phase_green,
     denoise_phase_rb,
     filt,
@@ -441,182 +439,10 @@ def test_the_manual_amount_meets_auto_at_fifty_and_off_at_zero() -> None:
     assert manual_strength(-5, 2000) == 0.0
 
 
-# ── The compiled operator against the reference one ────────────────────────
-#
-# `rawnr_numba` is a second transcription of the same arithmetic, and the only
-# thing that makes it usable is that it is the *same* arithmetic down to the
-# last bit -- the whole module docstring above is about orders of float32
-# addition that decide which taps clear a threshold. So the tests here are not
-# "close enough" tests: they are `array_equal`, and a single differing pixel is
-# a defect in the port, not a tolerance to widen.
-#
-# The numpy operator stays the reference on both sides of that comparison. It is
-# what was scored against Edit.exe's own planes (100.0000% on five frames from
-# three bodies, sony_repro/tools/rawnr_e2e_verify.py), so agreeing with it is
-# what "reproduces the engine" means for the compiled path.
-
-needs_numba = pytest.mark.skipif(rawnr_simd._kernels is None,
-                                 reason="numba is an optional dependency")
-
-
-def _both_backends(monkeypatch: pytest.MonkeyPatch, call) -> tuple[object, object]:
-    """`call()` under the compiled backend and under the reference one."""
-    monkeypatch.setattr(rawnr_simd, "BACKEND", "numba")
-    fast = call()
-    monkeypatch.setattr(rawnr_simd, "BACKEND", "numpy")
-    ref = call()
-    monkeypatch.setattr(rawnr_simd, "BACKEND", "numba")
-    return fast, ref
-
-
-def _same_bits(name: str, fast: np.ndarray, ref: np.ndarray) -> None:
-    assert fast.dtype == ref.dtype and fast.shape == ref.shape, name
-    if np.array_equal(fast, ref):
-        return
-    bad = int(np.count_nonzero(fast != ref))
-    worst = float(np.max(np.abs(fast.astype(np.float64) - ref.astype(np.float64))))
-    raise AssertionError(f"{name}: {bad}/{fast.size} pixels differ, max |d| {worst}")
-
-
-@needs_numba
-@pytest.mark.parametrize("shape", [(37, 41), (64, 64), (129, 97), (23, 71), (211, 301)])
-@pytest.mark.parametrize("table_dtype", [np.int32, np.float32])
-def test_the_compiled_operator_is_bit_identical_on_random_planes(
-        monkeypatch: pytest.MonkeyPatch, shape: tuple[int, int],
-        table_dtype: type) -> None:
-    """Odd sizes on purpose: the kernel walks a row in fixed-width chunks and
-    strips its rows for threads, so a plane whose width is not a multiple of
-    either is where an off-by-one in the tail would live. Random thresholds
-    rather than a flat table for the same reason the operator needs a table at
-    all -- a flat one accepts or rejects whole neighbourhoods together and
-    hides exactly the taps that sit on the boundary."""
-    rng = np.random.default_rng(sum(shape))
-    plane = rng.uniform(0.0, 9000.0, shape).astype(np.float32)
-    other = rng.uniform(0.0, 9000.0, shape).astype(np.float32)
-    table = (rng.integers(0, 400, TABLE_SIZE).astype(np.int32) if table_dtype is np.int32
-             else rng.uniform(0.0, 400.0, TABLE_SIZE).astype(np.float32))
-
-    for name, call in (
-        ("analysis_rb", lambda: analysis_rb(plane, OFFSET_RB)),
-        ("analysis_green0", lambda: analysis_green(plane, other, OFFSET_GREEN, 0)),
-        ("analysis_green1", lambda: analysis_green(other, plane, OFFSET_GREEN, 1)),
-    ):
-        fast, ref = _both_backends(monkeypatch, call)
-        _same_bits(f"{name}.d", fast[0], ref[0])
-        _same_bits(f"{name}.ref", fast[1], ref[1])
-
-    fast, ref = _both_backends(monkeypatch, lambda: denoise_phase_rb(plane, table))
-    _same_bits("denoise_phase_rb", fast, ref)
-    fast, ref = _both_backends(monkeypatch, lambda: denoise_greens(plane, other, table))
-    _same_bits("denoise_greens[0]", fast[0], ref[0])
-    _same_bits("denoise_greens[1]", fast[1], ref[1])
-
-
-@needs_numba
-@pytest.mark.parametrize(("blend", "gain", "limit"), [
-    (0, 256, 1023),          # the neighbourhood mean, i.e. base = mean(members)
-    (1024, 256, 1023),       # the centre low-pass, i.e. base = centre
-    (BLEND_NEUTRAL, 0, 1),   # no detail restored, and a clamp that bites
-    (300, 480, 2000),        # the `0x78cc` tag's gain, off-neutral blend
-])
-def test_the_compiled_operator_is_bit_identical_for_any_kernel_parameters(
-        monkeypatch: pytest.MonkeyPatch, blend: int, gain: int, limit: int) -> None:
-    """`blend` and `gain` are not scale factors on the result -- `blend` moves
-    the comparison base and so which taps are accepted, and `gain`/`limit` the
-    detail put back. Both reach different arms of the kernel from the defaults,
-    and both are things the Manual Noise Reduction panel moves."""
-    rng = np.random.default_rng(blend * 7 + gain)
-    plane = rng.uniform(0.0, 9000.0, (83, 67)).astype(np.float32)
-    other = rng.uniform(0.0, 9000.0, (83, 67)).astype(np.float32)
-    table = rng.uniform(0.0, 400.0, TABLE_SIZE).astype(np.float32)
-    kw = {"blend": blend, "gain": gain, "limit": limit}
-
-    fast, ref = _both_backends(monkeypatch, lambda: denoise_phase_rb(plane, table, **kw))
-    _same_bits("denoise_phase_rb", fast, ref)
-    for phase in (0, 1):
-        fast, ref = _both_backends(
-            monkeypatch,
-            lambda p=phase: denoise_phase_green(plane, other, table, phase=p, **kw))
-        _same_bits(f"denoise_phase_green[{phase}]", fast, ref)
-
-
-@needs_numba
-def test_the_compiled_operator_is_bit_identical_on_the_engines_own_levels(
-        monkeypatch: pytest.MonkeyPatch) -> None:
-    """Random planes are uniform noise; a real frame is not.
-
-    `rawnr_strength.npz` holds two of the engine's own input planes (fl_test at
-    ISO 1250, a7v_donor at ISO 100), so this runs the operator over the level
-    distribution and the local correlation it was transcribed against, with a
-    threshold table shaped like a real noise curve rather than a flat one. That
-    matters because what separates the two operators, if anything ever does, is
-    a tap landing within an ulp of its threshold -- which needs neighbours that
-    are actually close to each other.
-    """
-    z = np.load(STRENGTH_FIXTURE)
-    # A NoiseModel-shaped curve: linear in the level, then flat (sony/rawnr.py).
-    levels = np.arange(TABLE_SIZE, dtype=np.float32)
-    table = (13.0 + 78.0 * np.minimum(levels, 2560.0) / 256.0).astype(np.float32)
-    for tag in ("fl", "a7v"):
-        plane = z[f"{tag}_in"].astype(np.float32)
-        other = z[f"{tag}_filt"].astype(np.float32)
-        fast, ref = _both_backends(monkeypatch, lambda p=plane: denoise_phase_rb(p, table))
-        _same_bits(f"{tag} denoise_phase_rb", fast, ref)
-        fast, ref = _both_backends(
-            monkeypatch, lambda p=plane, o=other: denoise_greens(p, o, table))
-        _same_bits(f"{tag} denoise_greens[0]", fast[0], ref[0])
-        _same_bits(f"{tag} denoise_greens[1]", fast[1], ref[1])
-
-
-class _Forbidden:
-    """A stand-in for the kernel module that fails if anything reaches it."""
-
-    def __getattr__(self, name: str) -> object:
-        raise RuntimeError(f"the numpy backend called the kernel ({name})")
-
-
-@needs_numba
-def test_the_backend_switch_actually_selects_which_operator_runs(
-        monkeypatch: pytest.MonkeyPatch) -> None:
-    """`LLR_RAWNR_BACKEND=numpy` has to reach the dispatch, not just a flag.
-
-    Checked by making the kernel module unusable: under the reference backend
-    nothing may touch it, and under the compiled one everything must. A switch
-    that silently kept running the compiled path would make the reference
-    unreachable, and the reference is the one scored against the engine.
-    """
-    plane = np.full((40, 40), 3000.0, dtype=np.float32)
-    table = _flat_thresholds(60)
-    monkeypatch.setattr(rawnr_simd, "_kernels", _Forbidden())
-
-    monkeypatch.setattr(rawnr_simd, "BACKEND", "numpy")
-    assert rawnr_simd._use_kernels() is False
-    denoise_phase_rb(plane, table)
-
-    monkeypatch.setattr(rawnr_simd, "BACKEND", "numba")
-    assert rawnr_simd._use_kernels() is True
-    with pytest.raises(RuntimeError, match="called the kernel"):
-        denoise_phase_rb(plane, table)
-
-
-@needs_numba
-def test_a_plane_the_kernel_is_not_typed_for_falls_back_to_the_reference() -> None:
-    """float64 in means float64 arithmetic, which is the reference's job.
-
-    The kernel is compiled for the float32 planes the whole transcription is
-    written in. Casting a float64 caller's plane down to reach it would be a
-    different result quietly returned faster, so the dispatch declines instead.
-    """
-    ref = np.full((30, 30), 3000.0, dtype=np.float64)
-    out = filt(np.zeros_like(ref), ref, _flat_thresholds(60))
-    assert out.dtype == np.float64
-
-
 def test_warmup_compiles_the_kernels_without_a_real_plane() -> None:
     """The daemon calls this on a background thread at startup (cli.py).
 
-    It has to be safe to call with no numba installed (a no-op), safe to call
-    twice, and small enough to be worth calling -- the point is to move the
+    It has to be safe to call twice, and small enough to be worth calling -- the point is to move the
     one-off LLVM cost off the first frame, not to do a frame's work early.
     """
     warmup()
