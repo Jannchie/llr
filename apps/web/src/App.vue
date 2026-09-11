@@ -31,6 +31,7 @@ import { useViewport } from "./composables/useViewport";
 import { useHistory } from "./composables/useHistory";
 import { useToneCurve } from "./composables/useToneCurve";
 import { useCropEditor, DEFAULT_ASPECT } from "./composables/useCropEditor";
+import { useMaskEditor } from "./composables/useMaskEditor";
 import { useLibrary } from "./composables/useLibrary";
 import { useHistogram } from "./composables/useHistogram";
 import { useExport, type ExportPlan } from "./composables/useExport";
@@ -529,6 +530,16 @@ const {
 });
 
 const guideOptions = computed(() => CROP_GUIDES.map(g => ({ value: g, label: t(`guide.${g}` as const) })));
+
+// Gradient handles for the selected mask group, on an overlay that shares the
+// crop overlay's placement (normal view only; the crop editor has its own).
+const {
+  overlayRef: maskOverlayRef, viewBox: maskViewBox, shapes: maskShapes,
+  onLinearEndDown, onLinearLineDown, onRadialCentreDown, onRadialAxisDown, onRadialRotateDown,
+} = useMaskEditor({
+  crop, srcW, srcH, group: selectedGroup, ofPerScreen,
+  onDragEnd: () => flushPendingHistory(),
+});
 
 // On-canvas readout in the crop editor: the angle while rotating, else the
 // armed line tool's hint.
@@ -2346,6 +2357,34 @@ const vWheelAdjust = {
             @mousedown="onCropHandleDown($event, h.key)" />
         </svg>
         <div v-if="cropMode && cropReadout" class="crop-readout">{{ cropReadout }}</div>
+        <!-- Mask gradient handles (useMaskEditor): same box as the crop
+             overlay, viewBox = the committed crop window. Only the handles take
+             the pointer; the rest passes through to the viewport. -->
+        <svg v-show="editTab === 'masks' && !cropMode && webglRenderer != null && maskShapes.length" ref="maskOverlayRef"
+          class="crop-overlay mask-overlay" :class="{ 'is-passthrough': spaceHeld }"
+          :style="{ transform: displayTransform, width: imageW + 'px', height: imageH + 'px' }"
+          :viewBox="maskViewBox" preserveAspectRatio="none">
+          <template v-for="sh in maskShapes" :key="sh.index">
+            <g v-if="sh.kind === 'linear'" class="mask-linear">
+              <line class="mask-ref" :x1="sh.ref0[0][0]" :y1="sh.ref0[0][1]" :x2="sh.ref0[1][0]" :y2="sh.ref0[1][1]" />
+              <line class="mask-ref" :x1="sh.ref1[0][0]" :y1="sh.ref1[0][1]" :x2="sh.ref1[1][0]" :y2="sh.ref1[1][1]" />
+              <line class="mask-axis" :x1="sh.p0[0]" :y1="sh.p0[1]" :x2="sh.p1[0]" :y2="sh.p1[1]"
+                :stroke-width="10 * ofPerScreen" @mousedown="onLinearLineDown($event, sh.index)" />
+              <circle class="mask-handle" :cx="sh.p0[0]" :cy="sh.p0[1]" :r="6 * ofPerScreen" @mousedown="onLinearEndDown($event, sh.index, 0)" />
+              <circle class="mask-handle mask-handle-end" :cx="sh.p1[0]" :cy="sh.p1[1]" :r="6 * ofPerScreen" @mousedown="onLinearEndDown($event, sh.index, 1)" />
+            </g>
+            <g v-else class="mask-radial">
+              <polygon class="mask-ref" :points="sh.inner" />
+              <polygon class="mask-outline" :points="sh.outline" />
+              <rect v-for="(a, k) in sh.axes" :key="k" class="mask-handle mask-handle-sq"
+                :x="a[0] - 5 * ofPerScreen" :y="a[1] - 5 * ofPerScreen" :width="10 * ofPerScreen" :height="10 * ofPerScreen"
+                @mousedown="onRadialAxisDown($event, sh.index, k as 0 | 1 | 2 | 3)" />
+              <circle class="mask-handle mask-handle-rotate" :cx="sh.rotate[0]" :cy="sh.rotate[1]" :r="5 * ofPerScreen"
+                @mousedown="onRadialRotateDown($event, sh.index)" />
+              <circle class="mask-handle" :cx="sh.centre[0]" :cy="sh.centre[1]" :r="6 * ofPerScreen" @mousedown="onRadialCentreDown($event, sh.index)" />
+            </g>
+          </template>
+        </svg>
         <img v-show="activeSource && !activeSource.invalid && !webglRenderer && status !== 'rendering'" class="preview" :style="{ transform: displayTransform }" :src="activeSource ? thumbSrc(activeSource) : ''" :alt="t('aria.preview')" />
         <div v-if="activeSource?.invalid" class="invalid-state">
           <img v-if="activeSource && thumbSrc(activeSource)" :src="thumbSrc(activeSource)" :alt="activeSource.name" />
