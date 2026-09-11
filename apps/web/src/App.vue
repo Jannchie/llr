@@ -2050,9 +2050,9 @@ const vWheelAdjust = {
 
     <aside class="rail">
       <div class="rail-body" v-wheel-adjust>
-      <div class="histogram-wrap" v-show="activeSource">
-        <canvas ref="histoCanvasRef" class="histogram" />
-      </div>
+      <canvas ref="histoCanvasRef" class="histogram" v-show="activeSource" />
+      <!-- Only the panels scroll; the histogram stays put as a live readout. -->
+      <div class="rail-scroll">
       <div class="rail-panels">
 
       <section class="panel crop-panel" v-if="activeSource && cropMode">
@@ -2398,6 +2398,7 @@ const vWheelAdjust = {
             class="curve-preset" @click="applyCurvePreset(name)">{{ t(`curvePreset.${name}`) }}</button>
         </div>
       </section>
+      </div>
       </div>
       </div>
       <nav class="rail-tabs" :aria-label="t('rail.tabs')">

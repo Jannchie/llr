@@ -502,8 +502,13 @@ button {
   flex-direction: column;
   gap: 8px;
   padding: var(--stage-inset) 0;
-  overflow-y: auto;
   min-height: 0;
+}
+
+.rail-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .rail-panels {
@@ -648,19 +653,15 @@ button {
 
 /* ---------- Histogram ---------- */
 
-.histogram-wrap {
-  background: var(--card);
-  border-radius: var(--radius-card);
-  padding: 8px;
-  box-shadow: var(--shadow-card);
-}
-
+/* Sits bare in the rail: the plot is already a dark slab on the dark rail, a
+   card around it only adds a second frame. */
 .histogram {
   display: block;
   width: 100%;
   height: 86px;
+  flex-shrink: 0;
   background: var(--viewport-bg);
-  border-radius: var(--radius);
+  border-radius: var(--radius-card);
 }
 
 /* ---------- Slider rows ---------- */
@@ -1573,25 +1574,25 @@ input[type="range"]:focus::-moz-range-thumb {
 
 /* ---------- Scrollbars ---------- */
 
-.rail-body::-webkit-scrollbar,
+.rail-scroll::-webkit-scrollbar,
 .filmstrip-track::-webkit-scrollbar {
   height: 10px;
   width: 10px;
 }
 
-.rail-body::-webkit-scrollbar-thumb,
+.rail-scroll::-webkit-scrollbar-thumb,
 .filmstrip-track::-webkit-scrollbar-thumb {
   background: var(--sep-strong);
   border-radius: var(--radius-pill);
   border: 2px solid var(--bg);
 }
 
-.rail-body::-webkit-scrollbar-thumb:hover,
+.rail-scroll::-webkit-scrollbar-thumb:hover,
 .filmstrip-track::-webkit-scrollbar-thumb:hover {
   background: var(--text-mute);
 }
 
-.rail-body::-webkit-scrollbar-track,
+.rail-scroll::-webkit-scrollbar-track,
 .filmstrip-track::-webkit-scrollbar-track {
   background: transparent;
 }
