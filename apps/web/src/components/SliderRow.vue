@@ -31,6 +31,18 @@ const emit = defineEmits<{ (e: "update:modelValue", v: number): void }>();
 
 const trackStyle = computed(() => props.track ?? trackFill(props.modelValue, props.min, props.max));
 
+// A small tick on the track marks the double-click target, so a nudged slider
+// still shows where "untouched" was. The thumb's centre travels from half a
+// knob in from either end, not edge to edge, so the mark is placed on that
+// inner span. Defaults pinned to an end of the range get no mark — the empty
+// fill already says it.
+const markStyle = computed(() => {
+  const r = props.resetValue;
+  if (!(r > props.min && r < props.max)) return undefined;
+  const p = (r - props.min) / (props.max - props.min);
+  return { left: `calc(var(--knob) / 2 + ${p} * (100% - var(--knob)))` };
+});
+
 function onInput(e: Event): void {
   const v = (e.target as HTMLInputElement).valueAsNumber;
   if (Number.isFinite(v)) emit("update:modelValue", v);
@@ -60,10 +72,13 @@ async function onCommit(e: Event): Promise<void> {
       <span class="hsl-label">{{ label }}</span>
     </template>
     <label v-else :for="inputId">{{ label }}</label>
-    <input :id="inputId" type="range" :min="min" :max="max" :step="step"
-      :value="modelValue" :style="{ '--track': trackStyle }"
-      @input="onInput" @dblclick="emit('update:modelValue', resetValue)"
-      :title="t('slider.hint')" />
+    <span class="range-wrap">
+      <span v-if="markStyle" class="range-mark" :style="markStyle" />
+      <input :id="inputId" type="range" :min="min" :max="max" :step="step"
+        :value="modelValue" :style="{ '--track': trackStyle }"
+        @input="onInput" @dblclick="emit('update:modelValue', resetValue)"
+        :title="t('slider.hint')" />
+    </span>
     <input :class="numberClass" type="number" :min="min" :max="max" :step="step"
       :value="modelValue" :aria-label="label"
       @input="onInput" @change="onCommit" @blur="onCommit" />
