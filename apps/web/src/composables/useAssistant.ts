@@ -65,6 +65,11 @@ export type ChatEntry =
 
 type Chat = { session: string; entries: ChatEntry[]; busy: boolean };
 
+function pushEntry<E extends ChatEntry>(chat: Chat, entry: E): E {
+  chat.entries.push(entry);
+  return chat.entries[chat.entries.length - 1] as E;
+}
+
 export function useAssistant(opts: {
   tools: () => Record<string, AssistantTool>;
   systemPrompt: () => string;
@@ -155,7 +160,9 @@ export function useAssistant(opts: {
       for await (const ev of sseEvents(res.body)) {
         switch (ev.type) {
           case "message_start":
-            if (ev.message.role === "assistant") { reply = { kind: "assistant", text: "", streaming: true }; chat.entries.push(reply); }
+            // Mutate the reactive proxy the list hands back, not the raw literal:
+            // writes to the literal render nothing until something else redraws.
+            if (ev.message.role === "assistant") reply = pushEntry(chat, { kind: "assistant", text: "", streaming: true });
             // The API's own follow-up (edited without looking) — a status
             // line, not a user bubble. Other user messages are already shown.
             else if (ev.nudge) chat.entries.push({ kind: "status", status: "nudge" });
@@ -176,8 +183,7 @@ export function useAssistant(opts: {
             }
             break;
           case "tool_execution_start": {
-            const entry: ChatEntry & { kind: "tool" } = { kind: "tool", name: ev.toolName, args: ev.args, done: false };
-            chat.entries.push(entry);
+            const entry = pushEntry(chat, { kind: "tool", name: ev.toolName, args: ev.args, done: false });
             toolEntries.set(ev.toolCallId, entry);
             toolRuns.push(runTool(chat, ev.toolCallId, ev.toolName, ev.args, entry));
             break;
