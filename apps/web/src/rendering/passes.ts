@@ -11,6 +11,7 @@ import { COLOR_GLSL, PROPHOTO_Y, REC709_Y, glslFloat } from "./color-spaces";
 import { LENS_KNOTS } from "./lens";
 import { LUT_GLSL } from "./curve";
 import { HSL_GLSL } from "./hsl-bands";
+import { HSAT_GLSL } from "./highlight-sat";
 import { TONAL_GLSL } from "./tonal-model";
 
 // Color Grading region edges, on display luma. Balance slides both pairs by up
@@ -91,6 +92,11 @@ uniform vec3 u_grad_md_tint;
 uniform vec3 u_grad_hl_tint;
 uniform float u_grad_blend;
 uniform float u_grad_balance;
+// Highlight Saturation (highlight-sat.ts): chroma gain in [-1, 1], the Oklab L
+// where the weight starts rising, and a view-only flag that draws the weight.
+uniform float u_hsatAmount;
+uniform float u_hsatLo;
+uniform int u_hsatPreview;
 // Tone Curve LUT (LUT_SIZE×1 RGBA texture) — per-channel point + parametric
 // curves, applied display-referred. .r/.g/.b hold the baked R/G/B channel curves.
 uniform sampler2D u_curve_lut;
@@ -212,6 +218,7 @@ uniform vec2 u_lensNorm;
 ${COLOR_GLSL}
 ${TONAL_GLSL}
 ${HSL_GLSL}
+${HSAT_GLSL}
 ${LUT_GLSL}
 
 // ===== View transforms: scene-linear ProPhoto -> display-linear ProPhoto [0,1] =====
@@ -782,6 +789,24 @@ void main() {
       texture(u_curve_lut, vec2(lutCoord(c.g), 0.5)).g,
       texture(u_curve_lut, vec2(lutCoord(c.b), 0.5)).b
     );
+  }
+
+  // --- Highlight Saturation (display-referred Oklab chroma scaling) ---
+  // Lives after the view transform on purpose: the per-channel clamps and
+  // curve shoulders in there are what drain highlight chroma, so a gain placed
+  // before them is eaten again. Here L is bounded (display white -> Oklab L 1)
+  // and gamutMap below is the out-of-gamut backstop. Multiplicative, so white
+  // (C = 0) is never tinted; the HSL near-neutral gate keeps bright chroma
+  // noise from being amplified into coloured grain. Uniform branch: 0 is a
+  // bit-exact no-op with no Oklab round-trip.
+  if (u_hsatAmount != 0.0 || u_hsatPreview == 1) {
+    vec3 lab = proPhotoToOklab(c);
+    float C = length(lab.yz);
+    float w = smoothstep(u_hsatLo, u_hsatLo + HSAT_SOFT, lab.x)
+      * smoothstep(HSL_SEL_S0, HSL_SEL_S1, hslChromaRatio(C, lab.x));
+    if (u_hsatPreview == 1) { outColor = vec4(vec3(srgbEncode(w)), 1.0); return; }
+    lab.yz *= 1.0 + u_hsatAmount * w;
+    c = max(oklabToProPhoto(lab), 0.0);
   }
 
   // --- Color Grading (display-referred split-toning) ---
@@ -1515,6 +1540,7 @@ export const PASSES: PassDef[] = [
     "u_hsl_l[0]","u_hsl_l[1]","u_hsl_l[2]","u_hsl_l[3]","u_hsl_l[4]","u_hsl_l[5]","u_hsl_l[6]","u_hsl_l[7]",
     "u_grad_sh_tint","u_grad_md_tint","u_grad_hl_tint",
     "u_grad_blend","u_grad_balance",
+    "u_hsatAmount", "u_hsatLo", "u_hsatPreview",
     "u_curve_lut", "u_curveActive", "u_hasProfileCurve", "u_profileCurveSrgb",
     "u_sonyChromaActive", "u_sonyCross", "u_sonyGain", "u_sonyLuma", "u_sonySat",
     "u_sonyHue", "u_sonyLevels",

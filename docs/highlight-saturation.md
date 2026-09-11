@@ -1,5 +1,7 @@
 # Highlight Saturation：设计文档
 
+> 已实现（phase 1，§2–§3）。与设计的唯一出入：shader 分支条件是 `u_hsatAmount != 0.0 || u_hsatPreview == 1`，让"显示作用范围"在 amount 仍为 0 时也能看到权重图；amount=0 且 preview 关闭仍是精确 no-op。
+
 ## 结论
 
 在 `PROCESS_SHADER` 的 display-referred 半段——tone curve 之后、Color Grading 之前（`passes.ts:785`–`787` 之间）——加一个 Oklab 色度缩放块：`C_out = C_in * (1 + amount * w(L) * g(C, L))`，`w` 是 Oklab L 上的 smoothstep 高光权重，`g` 复用 HSL 的近中性门。两个 recipe slider（`highlightSat`、`highlightSatRange`），跟在 Color 组的 Saturation 后面；出界由现有 `gamutMap`（`passes.ts:476`）兜底，不新增 pass；amount=0 时按 uniform 分支整块跳过，是精确 no-op。
