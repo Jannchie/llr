@@ -13,10 +13,7 @@
  */
 
 import { computeWbMatrix, smoothstep, type Mat3 } from "./color-spaces";
-import {
-  HSL_CENTERS, HSL_SEL_L_FLOOR, HSL_SEL_S0, HSL_SEL_S1,
-  SKIN_C0, SKIN_C1, SKIN_HUE, SKIN_HUE_HALF, hueWindow,
-} from "./hsl-bands";
+import { HSL_CENTERS, HSL_SEL_L_FLOOR, SKIN_HUE, SKIN_HUE_HALF, hueWindow } from "./hsl-bands";
 import { imageDims, sourceNormToImageNorm, type CropState } from "./crop";
 
 export type MaskOp = "add" | "subtract" | "intersect";
@@ -62,6 +59,15 @@ export const MASK_USE = { exposure: 1, tonal: 2, clarity: 4, dehaze: 8, color: 1
 // slider. Hue: ±100 ↦ ±0.5 rad, the HSL mixer's scale.
 export const MASK_TEMP_PER_UNIT = 40;
 export const MASK_HUE_RAD = 0.5;
+// Chroma gates for the colour selections, on the HSL mixer's C/L ratio. The
+// mixer's own window (0.012–0.03) is set low so desaturated colour still takes
+// a slider; a *selection* needs the opposite bias — near-neutral shadows must
+// fall out or the matte speckles with sensor noise (DSC01157's bokeh) and a
+// warm-lit white plate half-joins a skin mask (DSC04568). Foliage reads ~0.04.
+export const MASK_COLOR_C0 = 0.03;
+export const MASK_COLOR_C1 = 0.08;
+export const MASK_SKIN_C0 = 0.04;
+export const MASK_SKIN_C1 = 0.10;
 // GLSL smoothstep is undefined at e0 == e1, so a zero feather / radius / span
 // is packed as this instead: a step the width of a float ulp on the axis.
 const EPS = 1e-3;
@@ -81,7 +87,7 @@ export function defaultComponent<T extends MaskType>(type: T): Extract<MaskCompo
   const base: CompBase = { op: "add", invert: false };
   const all: { [K in MaskType]: Extract<MaskComponent, { type: K }> } = {
     luminance: { ...base, type: "luminance", lo: 50, hi: 100, featherLo: 20, featherHi: 0 },
-    color: { ...base, type: "color", hue: HSL_CENTERS[5], hueWidth: 0.6, chromaLo: HSL_SEL_S0, chromaHi: HSL_SEL_S1 },
+    color: { ...base, type: "color", hue: HSL_CENTERS[5], hueWidth: 0.6, chromaLo: MASK_COLOR_C0, chromaHi: MASK_COLOR_C1 },
     linear: { ...base, type: "linear", x0: 0.5, y0: 0.15, x1: 0.5, y1: 0.55 },
     radial: { ...base, type: "radial", cx: 0.5, cy: 0.5, rx: 0.35, ry: 0.35, angle: 0, feather: 0.5 },
   };
@@ -100,9 +106,9 @@ export const MASK_PRESETS = {
   shadows:    { components: [{ type: "luminance", lo: 0, hi: 35, featherLo: 0, featherHi: 20 }] },
   midtones:   { components: [{ type: "luminance", lo: 30, hi: 70, featherLo: 20, featherHi: 20 }] },
   // Blue sky only; a grey sky is a highlights or linear job.
-  sky:        { components: [{ type: "color", hue: HSL_CENTERS[5], hueWidth: 0.9, chromaLo: HSL_SEL_S0, chromaHi: HSL_SEL_S1 },
+  sky:        { components: [{ type: "color", hue: HSL_CENTERS[5], hueWidth: 0.9, chromaLo: MASK_COLOR_C0, chromaHi: MASK_COLOR_C1 },
                              { type: "luminance", op: "intersect", lo: 40, hi: 100, featherLo: 15, featherHi: 0 }] },
-  skin:       { components: [{ type: "color", hue: SKIN_HUE, hueWidth: SKIN_HUE_HALF, chromaLo: SKIN_C0, chromaHi: SKIN_C1 }] },
+  skin:       { components: [{ type: "color", hue: SKIN_HUE, hueWidth: SKIN_HUE_HALF, chromaLo: MASK_SKIN_C0, chromaHi: MASK_SKIN_C1 }] },
   vignette:   { components: [{ type: "radial", cx: 0.5, cy: 0.5, rx: 0.55, ry: 0.55, angle: 0, feather: 0.6, invert: true }],
                 adjust: { exposure: -0.7 } },
 } satisfies Record<string, MaskPreset>;

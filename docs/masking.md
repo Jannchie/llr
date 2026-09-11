@@ -1,5 +1,15 @@
 # Masking / 局部调整：Phase 1 设计
 
+> **实施状态（2026-09-12）**：§9 的 1–7 步已落地（`rendering/masks.ts`、`composables/useMaskEditor.ts`、`passes.ts` / `pipeline-renderer.ts`、`App.vue` 蒙版 tab、assistant `set_edit.masks[]`、`test_xmp.py`）。与本文的偏差：
+> - **预览是黑白 matte 不是红色叠加**：`u_maskPreview >= 0` 时 `disp = vec3(wPrev)`——实现中改的，权重直接可读，红色在彩色内容上看不清。顺带效应：预览开着时直方图读的也是 matte。
+> - **`packMasks(groups, crop, srcW, srcH, {temperature, tint}, previewId)`**，返回值直接用 `EditParams` 的字段名（`masks / maskGroups / maskUse / maskPreview / imgFromTex / imgAspect`）以便 `...` 展开；ΔWB 需要全局 temp/tint，所以是参数而不是 renderer 侧算。
+> - `radial.angle` 存**角度**（与 `crop.angle` 一致），打包时转弧度；`color.hue/hueWidth` 仍存 Oklab 弧度，UI 与 assistant 以角度进出。
+> - 模糊 mask 的 log 位移带上局部曝光（`maskLx + dExpo`），否则 Clarity 把局部曝光当细节放大。
+> - **色度门调参**（§10）：颜色选区默认门与 `sky` 用 `MASK_COLOR_C0/C1 = 0.03/0.08`，`skin` 用 `MASK_SKIN_C0/C1 = 0.04/0.10`（都是 C/L 比），不再借 HSL 的 0.012/0.03 与 vibrance 的 SKIN_C0/C1——mixer 的门偏低是为了让低饱和色仍吃滑块，选区要的相反：DSC01157 暗部 bokeh 的噪声斑、DSC04568 暖光白盘边缘半选，都是门太低。代价：叶片（C/L≈0.04）在颜色选区里只有部分权重。
+> - UI：luminance 组件暴露 `featherLo/featherHi` 两个羽化（i18n `mask.range.featherLo/Hi`），radial 暴露 feather + angle，linear 只有手柄；assistant schema 的 `feather` 对 luminance 同时设两端、对 radial 是 0..100。
+> - 未做：`llr:MaskCount` 结构化字段（`cli.py` 有未提交的外部改动，JSON blob 已带 masks）；P3 一遍（headless 无 P3）；帧时间只在 SwiftShader（软件 GL）上量到 8 组 ≈ 1.7× 无蒙版，16 ms 目标要在真 GPU 上看。
+> - 已知限制：`shadows` 的亮度轴是 scene-referred（§2.1，`toneRegions` 同轴），室内暗场景（fl_test）会几乎全选；整屋钨丝灯（fl_test）下 `skin` 的色相窗放过全帧，matte 变成色度噪声斑——Phase 2 guided filter 的事。
+
 ## 结论
 
 - **数据**：`Snapshot.masks?: MaskGroup[]`（缺省 → 空）。一个 group = ≤4 个解析式 component（luminance / color / linear / radial，各带 add / subtract / intersect + invert）+ 一组局部滑块（exposure, temperature, tint, saturation, vibrance, highlights, shadows, clarity, dehaze, hue）。上限 8 组。
