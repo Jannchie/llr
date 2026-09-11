@@ -59,7 +59,11 @@ curves (as baked LUT textures) and color grading run *after* it, on [0,1], as
 does the final gamut map and sRGB/P3 encode. Uniform-only edits redraw in real
 time; Contrast/Blacks are display-referred and re-bake the curve LUT; crop is a
 per-frame affine on the sampling UVs (`u_texXform`), no re-decode; denoise/DCP
-changes re-request linear data.
+changes re-request linear data. Masks (`rendering/masks.ts`, `docs/masking.md`)
+are analytic components — luminance/colour range, linear/radial gradient —
+packed into a uniform block; the shader evaluates each group's weight per pixel
+and blends the *parameters* (exposure, WB, tonal, clarity, dehaze,
+saturation/vibrance, hue) before those blocks run once.
 
 `App.vue` holds the editing state; the mechanics live in composables
 (`useLibrary`, `useHistory`, `useViewport`, `useCropEditor`, `useToneCurve`,

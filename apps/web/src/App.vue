@@ -20,7 +20,7 @@ import { gradingTint, gradingHueDeg } from "./rendering/grading";
 import { parseLensCorr, mixLensTable, LENS_IDENTITY, type LensCorr } from "./rendering/lens";
 import {
   packMasks, presetGroup, defaultComponent, defaultAdjust, MASK_PRESETS, MASK_GROUPS, MASK_COMPS,
-  type MaskGroup, type MaskType, type MaskAdjust, type MaskPresetName,
+  type MaskGroup, type MaskType, type MaskAdjust, type MaskPresetName, type MaskComponent,
 } from "./rendering/masks";
 import { trackFill, formatBytes, clamp, IMPORT_ACCEPT, IMPORT_FORMAT_HINT } from "./ui";
 import { t, locale, setLocale, LOCALES, type MessageKey } from "./i18n";
@@ -1900,6 +1900,14 @@ function describeEdit(): unknown {
     },
     curve: toneCurve.value,
     crop: { cx: crop.cx, cy: crop.cy, w: crop.w, h: crop.h, angle: crop.angle, orientation: crop.orientation, flipH: crop.flipH, flipV: crop.flipV, aspect: cropAspect.value },
+    // In the schema's units: hues in degrees, radial feather 0..100.
+    masks: masks.map(g => ({
+      ...g,
+      components: g.components.map(c =>
+        c.type === "color" ? { ...c, hue: deg(c.hue), hueWidth: deg(c.hueWidth) }
+        : c.type === "radial" ? { ...c, feather: Math.round(c.feather * 100) }
+        : c),
+    })),
   };
 }
 
@@ -1951,6 +1959,24 @@ const SET_EDIT_SCHEMA = {
         flipH: { type: "boolean" }, flipV: { type: "boolean" },
         aspect: { type: "string", description: "'free', 'orig', or 'W:H' such as '3:2', '16:9', '1:1' — fits the largest box of that ratio at cx,cy" },
       },
+    },
+    masks: {
+      type: "array", description: "Local adjustments. Replaces the whole mask list (send [] to clear). Start each mask from a preset, or give components; adjust values are deltas added to the global sliders where the mask applies.",
+      items: { type: "object", properties: {
+        preset: { type: "string", enum: Object.keys(MASK_PRESETS) },
+        name: { type: "string" }, invert: { type: "boolean" },
+        components: {
+          type: "array", description: "Combined in order: luminance/color select by tone or hue, linear/radial by position in fractions of the oriented image.",
+          items: { type: "object", properties: {
+            type: { type: "string", enum: MASK_TYPES }, op: { type: "string", enum: MASK_OPS }, invert: { type: "boolean" },
+            lo: num(0, 100), hi: num(0, 100), feather: num(0, 100),
+            hue: num(-180, 180, "degrees"), hueWidth: num(5, 120, "degrees"),
+            x0: num(0, 1), y0: num(0, 1), x1: num(0, 1), y1: num(0, 1),
+            cx: num(0, 1), cy: num(0, 1), rx: num(0.02, 1), ry: num(0.02, 1), angle: num(-180, 180),
+          } },
+        },
+        adjust: { type: "object", properties: Object.fromEntries(MASK_ADJUST_SLIDERS.map(sp => [sp.key, num(sp.min, sp.max)])) },
+      } },
     },
   },
 };
@@ -2016,6 +2042,41 @@ function applyAssistantEdit(args: any): void {
     const key = typeof c.aspect === "string" ? aspectKeyFor(c.aspect) : null;
     if (key) selectAspect(key);
   }
+  if (Array.isArray(args.masks)) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    masks.splice(0, masks.length, ...args.masks.slice(0, MASK_GROUPS).flatMap((m: any) => {
+      const id = newMaskId();
+      const g: MaskGroup = m?.preset in MASK_PRESETS
+        ? presetGroup(m.preset as MaskPresetName, id)
+        : { id, enabled: true, invert: false, components: [], adjust: defaultAdjust() };
+      if (typeof m?.name === "string") g.name = m.name;
+      if (typeof m?.invert === "boolean") g.invert = m.invert;
+      if (Array.isArray(m?.components)) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        g.components = m.components.slice(0, MASK_COMPS).flatMap((c: any): MaskComponent[] => {
+          if (!MASK_TYPES.includes(c?.type)) return [];
+          const d = defaultComponent(c.type as MaskType);
+          d.op = MASK_OPS.includes(c.op) ? c.op : d.op;
+          d.invert = typeof c.invert === "boolean" ? c.invert : d.invert;
+          if (d.type === "luminance") {
+            d.lo = numOr(c.lo, d.lo, 0, 100); d.hi = numOr(c.hi, d.hi, 0, 100);
+            d.featherLo = d.featherHi = numOr(c.feather, d.featherLo, 0, 100);
+          } else if (d.type === "color") {
+            d.hue = rad(numOr(c.hue, deg(d.hue), -180, 180)); d.hueWidth = rad(numOr(c.hueWidth, deg(d.hueWidth), 5, 120));
+          } else if (d.type === "linear") {
+            d.x0 = numOr(c.x0, d.x0, 0, 1); d.y0 = numOr(c.y0, d.y0, 0, 1); d.x1 = numOr(c.x1, d.x1, 0, 1); d.y1 = numOr(c.y1, d.y1, 0, 1);
+          } else {
+            d.cx = numOr(c.cx, d.cx, 0, 1); d.cy = numOr(c.cy, d.cy, 0, 1); d.rx = numOr(c.rx, d.rx, 0.02, 1); d.ry = numOr(c.ry, d.ry, 0.02, 1);
+            d.angle = numOr(c.angle, d.angle, -180, 180); d.feather = numOr(c.feather, d.feather * 100, 0, 100) / 100;
+          }
+          return [d];
+        });
+      }
+      for (const sp of MASK_ADJUST_SLIDERS) g.adjust[sp.key] = numOr(m?.adjust?.[sp.key], g.adjust[sp.key], sp.min, sp.max);
+      return g.components.length ? [g] : [];
+    }));
+    selectedMask.value = masks[masks.length - 1]?.id ?? null;
+  }
 }
 
 const textContent = (v: unknown): ToolContent[] => [{ type: "text", text: JSON.stringify(v) }];
@@ -2026,7 +2087,7 @@ const assistantTools: Record<string, AssistantTool> = {
     run: async () => [{ type: "image", data: await capturePreview(), mimeType: "image/jpeg" }],
   },
   get_edit: {
-    description: "The current edit: every slider with its range and default, HSL, colour grading, tone curve, crop, and the image dimensions.",
+    description: "The current edit: every slider with its range and default, HSL, colour grading, tone curve, crop, masks, and the image dimensions.",
     parameters: { type: "object", properties: {} },
     run: () => { requireImage(); return textContent(describeEdit()); },
   },
@@ -2051,6 +2112,7 @@ function assistantSystemPrompt(): string {
     "You are the editing assistant inside LLR, a RAW photo editor with Lightroom-style controls. The user has a photo open; you edit it by calling tools, and every change shows up live and can be undone.",
     "Workflow: look at the photo with view_image (and get_edit for the current values) before deciding, apply changes with set_edit, then view_image again to judge the result and refine if needed. Values are absolute, not deltas.",
     "Slider semantics: exposure in stops; contrast, highlights, shadows, whites, blacks, clarity, dehaze, vibrance, saturation in -100..100; temperature in Kelvin (higher = warmer rendering), tint negative = green, positive = magenta. Keep adjustments natural and proportionate unless the user asks for a strong look. For crops, think about composition (subject placement, horizon, distractions at the edges) and use angle to straighten.",
+    "masks: use presets (sky needs a blue sky; for grey skies use highlights or a linear gradient from the top); adjust values are local deltas added to the global sliders.",
     `Answer briefly, in the user's language (UI locale: ${locale.value}). Say what you changed and why; do not list every value.`,
   ].join("\n");
 }

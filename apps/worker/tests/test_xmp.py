@@ -312,3 +312,23 @@ def test_embed_rejects_non_jpeg() -> None:
 def test_embed_rejects_oversized_payload() -> None:
     with pytest.raises(ValueError, match="exceeds segment limit"):
         embed_xmp_app1(make_jpeg(), [b"\x00" * 0x10000])
+
+
+def test_masks_travel_in_the_settings_blob() -> None:
+    # Masks have no structured llr:* attributes; the lossless JSON blob is
+    # their record, so it has to come back exactly as the app wrote it.
+    settings = edited_settings()
+    settings["masks"] = [{
+        "id": "a1b2c3", "name": "sky", "enabled": True, "invert": False,
+        "components": [
+            {"type": "color", "op": "add", "invert": False,
+             "hue": -1.6745, "hueWidth": 0.9, "chromaLo": 0.012, "chromaHi": 0.03},
+            {"type": "luminance", "op": "intersect", "invert": False,
+             "lo": 40, "hi": 100, "featherLo": 15, "featherHi": 0},
+        ],
+        "adjust": {"exposure": -0.5, "temperature": 0, "tint": 0, "saturation": 20, "vibrance": 0,
+                   "highlights": 0, "shadows": 0, "clarity": 0, "dehaze": 0, "hue": 0},
+    }]
+    assert settings_from_packet(standard_packet(settings))["masks"] == settings["masks"]
+    # A snapshot from before masks existed carries no key at all: still a valid packet.
+    assert "masks" not in settings_from_packet(standard_packet(default_settings()))
