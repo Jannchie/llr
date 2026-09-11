@@ -18,6 +18,7 @@ import { API, fetchLinear, fetchLookProfile, type ColorProfileMeta, type Denoise
 import { type PersistedEdit } from "./persistence";
 import { gradingTint, gradingHueDeg } from "./rendering/grading";
 import { parseLensCorr, mixLensTable, LENS_IDENTITY, type LensCorr } from "./rendering/lens";
+import { packMasks, type MaskGroup } from "./rendering/masks";
 import { trackFill, formatBytes, clamp, IMPORT_ACCEPT, IMPORT_FORMAT_HINT } from "./ui";
 import { t, locale, setLocale, LOCALES, type MessageKey } from "./i18n";
 import SliderRow from "./components/SliderRow.vue";
@@ -48,7 +49,7 @@ type SliderGroup = { title: "tone" | "presence" | "color" | "lens"; tab: EditTab
 // The rail shows one group at a time, picked from the icon strip along its
 // outer edge. Nine always-open panels stacked to 2400px — reaching the curve
 // meant scrolling two and a half screens past controls nobody was using.
-type EditTab = "light" | "color" | "curve" | "detail" | "look" | "crop" | "assistant" | "history" | "settings";
+type EditTab = "light" | "color" | "curve" | "masks" | "detail" | "look" | "crop" | "assistant" | "history" | "settings";
 
 // Distortion correction defaults to fully applied (mirrorless glass is designed
 // around it — uncorrected geometry reads as broken). Vignetting stays off by
@@ -440,6 +441,17 @@ const viewSettings = reactive({ displayGamut: 0, exportStripPrivate: 0 });
 const crop = reactive<CropState>(defaultCrop());
 const cropMode = ref(false);
 
+// ── Masks (local adjustments) ──
+//
+// Part of the per-image edit like the crop; the geometry lives in oriented
+// image-norm so it follows the crop (rendering/masks.ts, docs/masking.md).
+// maskPreview / selectedMask are view state: which group the red overlay
+// shows, never part of a snapshot and never on the export path.
+const masks = reactive<MaskGroup[]>([]);
+const maskPreview = ref(false);
+const selectedMask = ref<string | null>(null);
+const cloneMasks = (m: readonly MaskGroup[]): MaskGroup[] => JSON.parse(JSON.stringify(m));
+
 // The sub-rectangle of the frame the canvas currently covers (output-frame px);
 // null = the whole frame. See updateRenderWindow for why it exists.
 const renderWindow = ref<ViewWindow | null>(null);
@@ -605,6 +617,8 @@ type Snapshot = {
   // Sony's advanced colour reproduction (ZcTask3DLut). Absent in older
   // sessions, and off is both the default and what those sessions rendered.
   sonyAdvancedColour?: boolean;
+  // Local adjustments; absent in sessions that predate them, which is empty.
+  masks?: MaskGroup[];
 };
 
 let isRestoring = false;
@@ -631,6 +645,7 @@ function defaultSnapshot(): Snapshot {
     dro: null,
     droLevel: DRO_AUTO,
     sonyAdvancedColour: false,
+    masks: [],
   };
 }
 
@@ -662,6 +677,7 @@ function captureSnapshot(): Snapshot {
     dro: droStrength.value,
     droLevel: droLevel.value,
     sonyAdvancedColour: sonyAdvancedColour.value,
+    masks: cloneMasks(masks),
   };
 }
 
@@ -693,6 +709,8 @@ function setEditState(s: Snapshot): void {
   droLevel.value = s.droLevel ?? DRO_AUTO;
   // Absent in a snapshot predating the switch, and off is what it rendered as.
   sonyAdvancedColour.value = s.sonyAdvancedColour ?? false;
+  masks.splice(0, masks.length, ...cloneMasks(s.masks ?? []));
+  if (selectedMask.value && !masks.some(g => g.id === selectedMask.value)) selectedMask.value = null;
   dcpCode.value = s.dcp;
   profileId.value = s.profile ?? "standard";
   // Rebake with the snapshot's Basic values (bakeCurveLUT also syncs bakedBasic).
@@ -733,6 +751,7 @@ function describeStep(prev: Snapshot, next: Snapshot): string {
   if (!same(prev.denoise, next.denoise)) parts.push(t("panel.detail"));
   if (!same(prev.look, next.look) || prev.lookStyle !== next.lookStyle || prev.dro !== next.dro || prev.droLevel !== next.droLevel
     || prev.sonyAdvancedColour !== next.sonyAdvancedColour) parts.push(t("panel.creativeLook"));
+  if (!same(prev.masks ?? [], next.masks ?? [])) parts.push(t("panel.masks"));
   if (!parts.length) return t("history.edit");
   return parts.length > 3 ? `${parts.slice(0, 3).join(", ")} +${parts.length - 3}` : parts.join(", ");
 }
@@ -905,6 +924,7 @@ const tabEdited = computed<Record<EditTab, boolean>>(() => ({
   light: groups.some(g => g.tab === "light" && groupEdited(g)),
   color: groups.some(g => g.tab === "color" && groupEdited(g)) || hslEdited.value || gradingEdited.value,
   curve: curveEdited.value,
+  masks: masks.length > 0,
   detail: groups.some(g => g.tab === "detail" && groupEdited(g)) || denoiseEdited.value,
   look: lookEdited.value,
   crop: !isDefaultCrop(crop),
@@ -1117,7 +1137,11 @@ async function reloadLookProfile(): Promise<void> {
 // Live reactive state by default; pass a Snapshot to derive the params from a
 // frozen edit instead (export). viewSettings stays live either way — it is
 // view-only state and not part of a per-image snapshot.
-function buildPipelineParams(s?: Snapshot): Partial<EditParams> {
+//
+// `preview: false` drops the mask overlay: it is view-only, so the one live
+// (no-snapshot) caller that must not see it — the assistant's view_image —
+// says so; a snapshot never carries it, and hold-to-compare has no masks at all.
+function buildPipelineParams(s?: Snapshot, opts: { preview?: boolean } = {}): Partial<EditParams> {
   const r = s?.recipe ?? recipe;
   const [hue, sat, lum] = s ? [s.hslHue, s.hslSat, s.hslLum] : [hslHue, hslSat, hslLum];
   const g = s?.grading ?? grading;
@@ -1148,6 +1172,9 @@ function buildPipelineParams(s?: Snapshot): Partial<EditParams> {
     // Not read off the snapshot: the match is a global profile setting, like the
     // display gamut, not a per-image edit that undo should travel with.
     cameraMatch: cameraMatch.value ? 1 : 0,
+    ...packMasks(s?.masks ?? masks, s?.crop ?? crop, srcW.value, srcH.value,
+      { temperature: r.temperature, tint: r.tint },
+      !s && opts.preview !== false && maskPreview.value ? selectedMask.value : null),
   };
 }
 
@@ -1610,11 +1637,13 @@ watch(showOriginal, () => {
 // second deep watcher over the same objects would re-traverse them on every
 // slider input for no benefit (history/persist scheduling self-guards on
 // isRestoring and is debounced).
-watch([recipe, hslHue, hslSat, hslLum, grading], () => {
+watch([recipe, hslHue, hslSat, hslLum, grading, masks], () => {
   if (!isRestoring) scheduleWebGLDraw();
   scheduleHistoryCommit();
   schedulePersist();
 }, { deep: true });
+// The overlay is a draw parameter, not an edit: redraw, no history.
+watch([maskPreview, selectedMask], () => scheduleWebGLDraw());
 watch(viewSettings, () => { scheduleWebGLDraw(); schedulePersist(); }, { deep: true });
 
 // Zoom/fit only move CSS pixels; the drawing buffer is rendered at the on-screen
@@ -1781,6 +1810,7 @@ function resetRecipe(): void {
   Object.assign(recipe, defaultRecipe());
   resetHslGrading();
   resetCurve();
+  masks.splice(0);
 }
 
 // ── Assistant ──
@@ -1822,7 +1852,7 @@ async function capturePreview(maxEdge = 1024): Promise<string> {
   if (bakedBasic === null || !sameBasic(bakedBasic, currentBasic())) bakeCurveLUT();
   webglRenderer.setViewWindow(null);
   webglRenderer.setPreviewScale(maxEdge / Math.max(imageW.value, imageH.value));
-  webglRenderer.draw(buildPipelineParams());
+  webglRenderer.draw(buildPipelineParams(undefined, { preview: false }));
   const blob = await webglRenderer.toBlob("image/jpeg", 0.85);
   scheduleWebGLDraw();
   const bytes = new Uint8Array(await blob.arrayBuffer());

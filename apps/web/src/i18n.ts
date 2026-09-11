@@ -51,6 +51,7 @@ const en = {
   "tab.light": "Light",
   "tab.color": "Color",
   "tab.curve": "Tone Curve",
+  "tab.masks": "Masks",
   "tab.detail": "Detail",
   "tab.look": "Creative Look",
   "tab.crop": "Crop & Straighten (R)",
@@ -238,6 +239,7 @@ const en = {
 
   // Tone curve panel
   "panel.curve": "Tone Curve",
+  "panel.masks": "Masks",
   "curve.parametric": "Param",
   "curve.rgb": "RGB",
   "curve.red": "R",
@@ -309,6 +311,7 @@ const zh: Record<MessageKey, string> = {
   "tab.light": "光效",
   "tab.color": "颜色",
   "tab.curve": "色调曲线",
+  "tab.masks": "蒙版",
   "tab.detail": "细节",
   "tab.look": "创意外观",
   "tab.crop": "裁剪并拉直 (R)",
@@ -471,6 +474,7 @@ const zh: Record<MessageKey, string> = {
   "grading.balance": "平衡",
 
   "panel.curve": "色调曲线",
+  "panel.masks": "蒙版",
   "curve.parametric": "参数",
   "curve.rgb": "RGB",
   "curve.red": "R",
