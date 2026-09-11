@@ -12,7 +12,7 @@ import { LENS_KNOTS } from "./lens";
 import { LUT_GLSL } from "./curve";
 import { HSL_GLSL } from "./hsl-bands";
 import { TONAL_GLSL } from "./tonal-model";
-import { MASK_GLSL, MASK_PREVIEW_MIX, MASK_PREVIEW_TINT } from "./masks";
+import { MASK_GLSL } from "./masks";
 
 // Color Grading region edges, on display luma. Balance slides both pairs by up
 // to ±GRAD_BAL_SPAN. That span is capped at 0.15 because the graded colour is
@@ -878,9 +878,10 @@ void main() {
   // ===== Display: ProPhoto -> target gamut -> compress -> encode =====
   vec3 disp = (u_displayGamut == 1) ? (PROPHOTO_TO_P3 * c) : (PROPHOTO_TO_SRGB * c);
   disp = gamutMap(disp, (u_displayGamut == 1) ? P3_Y : REC709_Y);
-  // Mask overlay: the previewed group's weight as a red wash. View-only —
-  // u_maskPreview is -1 for export and for the assistant's view_image.
-  if (u_maskPreview >= 0) disp = mix(disp, ${MASK_PREVIEW_TINT}, ${MASK_PREVIEW_MIX} * wPrev);
+  // Mask preview: the previewed group's weight as a black-and-white matte —
+  // white where the adjustment applies in full. View-only: u_maskPreview is
+  // -1 for export and for the assistant's view_image.
+  if (u_maskPreview >= 0) disp = vec3(wPrev);
   outColor = vec4(srgbEncode(disp), 1.0); // sRGB transfer (Display-P3 shares it)
 }`;
 

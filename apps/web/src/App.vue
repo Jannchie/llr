@@ -449,8 +449,8 @@ const cropMode = ref(false);
 //
 // Part of the per-image edit like the crop; the geometry lives in oriented
 // image-norm so it follows the crop (rendering/masks.ts, docs/masking.md).
-// maskPreview / selectedMask are view state: which group the red overlay
-// shows, never part of a snapshot and never on the export path.
+// maskPreview / selectedMask are view state: which group the black-and-white
+// matte previews, never part of a snapshot and never on the export path.
 const masks = reactive<MaskGroup[]>([]);
 const maskPreview = ref(false);
 const selectedMask = ref<string | null>(null);
@@ -2888,7 +2888,7 @@ const vWheelAdjust = {
       </section>
 
       <!-- Masks: the group list, then the selected group's components, the
-           overlay switch and its local sliders (rendering/masks.ts). -->
+           matte-preview switch and its local sliders (rendering/masks.ts). -->
       <section class="panel" v-if="editTab === 'masks' && activeSource">
         <header class="panel-head">
           <span class="panel-title">

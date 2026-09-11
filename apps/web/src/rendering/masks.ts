@@ -12,7 +12,7 @@
  * drift.
  */
 
-import { computeWbMatrix, glslFloat, smoothstep, type Mat3 } from "./color-spaces";
+import { computeWbMatrix, smoothstep, type Mat3 } from "./color-spaces";
 import {
   HSL_CENTERS, HSL_SEL_L_FLOOR, HSL_SEL_S0, HSL_SEL_S1,
   SKIN_C0, SKIN_C1, SKIN_HUE, SKIN_HUE_HALF, hueWindow,
@@ -286,8 +286,3 @@ float maskComponent(int base, vec2 pImg, float pLum, vec3 labSel) {
   return h.z > 0.5 ? 1.0 - w : w;
 }
 `;
-
-// The overlay: display colour mixed toward this red by MIX × the previewed
-// group's weight, after the gamut map and before the encode.
-export const MASK_PREVIEW_TINT = `vec3(${[1.0, 0.15, 0.1].map(glslFloat).join(", ")})`;
-export const MASK_PREVIEW_MIX = glslFloat(0.6);
