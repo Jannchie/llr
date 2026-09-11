@@ -54,7 +54,20 @@ const en = {
   "tab.detail": "Detail",
   "tab.look": "Creative Look",
   "tab.crop": "Crop & Straighten (R)",
+  "tab.assistant": "Assistant",
   "tab.settings": "Settings",
+
+  // Assistant
+  "panel.assistant": "Assistant",
+  "chat.placeholder": "Ask for an edit, a look, or a crop…",
+  "chat.send": "Send",
+  "chat.stop": "Stop",
+  "chat.clear": "Clear",
+  "chat.empty": "Describe what you want — “warmer and brighter”, “cinematic look”, “straighten the horizon”. The assistant looks at the photo and moves the controls for you.",
+  "chat.noKey": "No API key for {provider} — set it in the API server's environment (LLR_AGENT_MODEL picks the model).",
+  "chat.tool.view_image": "Looking at the photo",
+  "chat.tool.get_edit": "Reading the edit",
+  "chat.tool.set_edit": "Adjusting",
 
   // Crop panel
   "panel.crop": "Crop & Straighten",
@@ -283,7 +296,20 @@ const zh: Record<MessageKey, string> = {
   "tab.detail": "细节",
   "tab.look": "创意外观",
   "tab.crop": "裁剪并拉直 (R)",
+  "tab.assistant": "助手",
   "tab.settings": "设置",
+
+  // Assistant
+  "panel.assistant": "助手",
+  "chat.placeholder": "描述想要的调色、风格或构图…",
+  "chat.send": "发送",
+  "chat.stop": "停止",
+  "chat.clear": "清空",
+  "chat.empty": "说出你想要的效果——“暖一点、亮一点”“电影感”“把地平线拉直”。助手会看着照片替你调整各项参数。",
+  "chat.noKey": "缺少 {provider} 的 API key——请在 API 服务的环境变量中设置（LLR_AGENT_MODEL 指定模型）。",
+  "chat.tool.view_image": "查看照片",
+  "chat.tool.get_edit": "读取当前参数",
+  "chat.tool.set_edit": "调整",
 
   "panel.crop": "裁剪并拉直",
   "crop.aspect": "长宽比",

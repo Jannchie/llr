@@ -10,7 +10,7 @@ import {
 import {
   defaultCrop, cloneCrop, isDefaultCrop, imageDims, buildCropTransform,
   cropOutputRect, cropOutputSize, straightenedBBox, cssRecomposeMatrix,
-  applyAspectRatio, resolveAspectFraction, cropOutputSizeForAspect, CROP_GUIDES,
+  applyAspectRatio, resolveAspectFraction, cropOutputSizeForAspect, CROP_GUIDES, constrainCrop,
   ASPECT_PRESETS,
   type AspectPreset, type CropState,
 } from "./rendering/crop";
@@ -19,7 +19,7 @@ import { type PersistedEdit } from "./persistence";
 import { gradingTint, gradingHueDeg } from "./rendering/grading";
 import { parseLensCorr, mixLensTable, LENS_IDENTITY, type LensCorr } from "./rendering/lens";
 import { trackFill, formatBytes, clamp, IMPORT_ACCEPT, IMPORT_FORMAT_HINT } from "./ui";
-import { t, locale, setLocale, LOCALES } from "./i18n";
+import { t, locale, setLocale, LOCALES, type MessageKey } from "./i18n";
 import SliderRow from "./components/SliderRow.vue";
 import SelectMenu from "./components/SelectMenu.vue";
 import Filmstrip from "./components/Filmstrip.vue";
@@ -30,6 +30,7 @@ import { useCropEditor, DEFAULT_ASPECT } from "./composables/useCropEditor";
 import { useLibrary } from "./composables/useLibrary";
 import { useHistogram } from "./composables/useHistogram";
 import { useExport, type ExportPlan } from "./composables/useExport";
+import { useAssistant, type AssistantTool, type ToolContent } from "./composables/useAssistant";
 
 // ── types ──
 
@@ -46,7 +47,7 @@ type SliderGroup = { title: "tone" | "presence" | "color" | "lens"; tab: EditTab
 // The rail shows one group at a time, picked from the icon strip along its
 // outer edge. Nine always-open panels stacked to 2400px — reaching the curve
 // meant scrolling two and a half screens past controls nobody was using.
-type EditTab = "light" | "color" | "curve" | "detail" | "look" | "crop" | "settings";
+type EditTab = "light" | "color" | "curve" | "detail" | "look" | "crop" | "assistant" | "settings";
 
 // Distortion correction defaults to fully applied (mirrorless glass is designed
 // around it — uncorrected geometry reads as broken). Vignetting stays off by
@@ -832,6 +833,7 @@ const EDIT_TABS: { key: EditTab; icon: string[] }[] = [
   { key: "detail", icon: ["M12 4v16", "M4 12h16", "M6.3 6.3l11.4 11.4", "M17.7 6.3L6.3 17.7"] },
   { key: "look", icon: ["M21 19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h3l1.5-2.5h5L16 7h3a2 2 0 0 1 2 2z", "M12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8z"] },
   { key: "crop", icon: ["M6 2v14a2 2 0 0 0 2 2h14", "M2 6h14a2 2 0 0 1 2 2v14"] },
+  { key: "assistant", icon: ["M12 3l1.8 4.7L18.5 9.5l-4.7 1.8L12 16l-1.8-4.7L5.5 9.5l4.7-1.8z", "M19 16l.8 2.2 2.2.8-2.2.8L19 22l-.8-2.2-2.2-.8 2.2-.8z"] },
   { key: "settings", icon: ["M4 7h16", "M4 17h16", "M9 7a2 2 0 1 0 4 0 2 2 0 0 0-4 0z", "M13 17a2 2 0 1 0 4 0 2 2 0 0 0-4 0z"] },
 ];
 
@@ -865,6 +867,7 @@ const tabEdited = computed<Record<EditTab, boolean>>(() => ({
   detail: groups.some(g => g.tab === "detail" && groupEdited(g)) || denoiseEdited.value,
   look: lookEdited.value,
   crop: !isDefaultCrop(crop),
+  assistant: false,
   settings: false,
 }));
 
@@ -1738,6 +1741,195 @@ function resetRecipe(): void {
   resetCurve();
 }
 
+// ── Assistant ──
+//
+// The chat tab. The agent loop itself runs on the API (apps/api/src/agent.ts);
+// what lives here is the model's view of the edit and the tools it calls, run
+// against the same reactive state the sliders drive — so every change it makes
+// redraws, lands in history and persists exactly like a hand edit.
+
+const SLIDER_SPECS = groups.flatMap(g => g.items);
+const GRADING_NAMES = { shadows: "sh", midtones: "md", highlights: "hl" } as const;
+
+function requireImage(): void {
+  if (!activeSource.value || !hasLinearData) throw new Error("No image is loaded");
+}
+
+function describeEdit(): unknown {
+  const [iw, ih] = currentImageDims();
+  return {
+    image: { width: srcFullW.value, height: srcFullH.value, orientedWidth: iw, orientedHeight: ih, name: activeSource.value?.name },
+    sliders: Object.fromEntries(visibleGroups.value.flatMap(g => g.items).map(sp =>
+      [sp.key, { value: recipe[sp.key], min: sp.min, max: sp.max, default: SLIDER_DEFAULTS[sp.key] }])),
+    hsl: Object.fromEntries(HSL_RANGES.map((r, i) => [r.key, { hue: hslHue[i], sat: hslSat[i], lum: hslLum[i] }])),
+    grading: {
+      ...Object.fromEntries(Object.entries(GRADING_NAMES).map(([name, p]) => [name, { hue: grading[`${p}H`], sat: grading[`${p}S`] }])),
+      blend: grading.blend, balance: grading.balance,
+    },
+    curve: toneCurve.value,
+    crop: { cx: crop.cx, cy: crop.cy, w: crop.w, h: crop.h, angle: crop.angle, orientation: crop.orientation, flipH: crop.flipH, flipV: crop.flipV, aspect: cropAspect.value },
+  };
+}
+
+// Render the whole (cropped) frame at a modest size and hand back the JPEG.
+// Borrows the preview renderer for one draw: window off, scale set from the
+// target size, then the on-screen view is put back by the next frame.
+async function capturePreview(maxEdge = 1024): Promise<string> {
+  requireImage();
+  if (!webglRenderer) throw new Error("WebGL renderer unavailable");
+  if (bakedBasic === null || !sameBasic(bakedBasic, currentBasic())) bakeCurveLUT();
+  webglRenderer.setViewWindow(null);
+  webglRenderer.setPreviewScale(maxEdge / Math.max(imageW.value, imageH.value));
+  webglRenderer.draw(buildPipelineParams());
+  const blob = await webglRenderer.toBlob("image/jpeg", 0.85);
+  scheduleWebGLDraw();
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+
+const num = (min: number, max: number, description?: string) => ({ type: "number", minimum: min, maximum: max, ...(description ? { description } : {}) });
+const HSL_BAND_SCHEMA = { type: "object", properties: { hue: num(-100, 100), sat: num(-100, 100), lum: num(-100, 100) } };
+const GRADING_BAND_SCHEMA = { type: "object", properties: { hue: num(-180, 180, "hue angle"), sat: num(0, 100) } };
+const POINTS_SCHEMA = { type: "array", description: "Point curve, 2+ points with x,y in 0..1 sorted by x (identity is [{x:0,y:0},{x:1,y:1}])", items: { type: "object", properties: { x: num(0, 1), y: num(0, 1) }, required: ["x", "y"] } };
+const SET_EDIT_SCHEMA = {
+  type: "object",
+  properties: {
+    reset: { type: "boolean", description: "Reset every adjustment and the crop to defaults before applying the rest" },
+    sliders: {
+      type: "object", description: "Basic sliders, absolute values (Lightroom semantics). Omitted keys keep their value.",
+      properties: Object.fromEntries(SLIDER_SPECS.map(sp => [sp.key, num(sp.min, sp.max)])),
+    },
+    hsl: { type: "object", description: "Per-colour HSL, each band {hue,sat,lum} in -100..100", properties: Object.fromEntries(HSL_RANGES.map(r => [r.key, HSL_BAND_SCHEMA])) },
+    grading: { type: "object", description: "Colour grading", properties: { shadows: GRADING_BAND_SCHEMA, midtones: GRADING_BAND_SCHEMA, highlights: GRADING_BAND_SCHEMA, blend: num(0, 100), balance: num(-100, 100) } },
+    curve: {
+      type: "object", description: "Tone curve: parametric regions and/or point curves (each channel replaces the whole curve)",
+      properties: {
+        parametric: { type: "object", properties: { highlights: num(-100, 100), lights: num(-100, 100), darks: num(-100, 100), shadows: num(-100, 100) } },
+        rgb: POINTS_SCHEMA, red: POINTS_SCHEMA, green: POINTS_SCHEMA, blue: POINTS_SCHEMA,
+      },
+    },
+    crop: {
+      type: "object", description: "Crop & straighten. cx,cy,w,h are fractions of the oriented image (full frame: 0.5,0.5,1,1).",
+      properties: {
+        cx: num(0, 1), cy: num(0, 1), w: num(0.05, 1), h: num(0.05, 1),
+        angle: num(-45, 45, "straighten angle in degrees"),
+        orientation: { type: "integer", enum: [0, 90, 180, 270], description: "90° rotation of the whole image" },
+        flipH: { type: "boolean" }, flipV: { type: "boolean" },
+        aspect: { type: "string", description: "'free', 'orig', or 'W:H' such as '3:2', '16:9', '1:1' — fits the largest box of that ratio at cx,cy" },
+      },
+    },
+  },
+};
+
+function aspectKeyFor(spec: string): string | null {
+  if (spec === "free" || spec === "orig") return spec;
+  const m = /^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$/.exec(spec.trim());
+  if (!m) return null;
+  const [w, h] = [Number(m[1]), Number(m[2])];
+  const preset = ASPECT_PRESETS.find(a => a.ratio && Math.abs(a.ratio - Math.max(w, h) / Math.min(w, h)) < 1e-6);
+  return preset ? preset.key : `custom:${w}:${h}`;
+}
+
+const numOr = (v: unknown, fallback: number, min: number, max: number) => typeof v === "number" && Number.isFinite(v) ? clamp(v, min, max) : fallback;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function applyAssistantEdit(args: any): void {
+  requireImage();
+  if (args.reset) { resetRecipe(); resetCrop(); }
+  for (const sp of SLIDER_SPECS) recipe[sp.key] = numOr(args.sliders?.[sp.key], recipe[sp.key], sp.min, sp.max);
+  HSL_RANGES.forEach((r, i) => {
+    const band = args.hsl?.[r.key];
+    if (!band) return;
+    hslHue[i] = numOr(band.hue, hslHue[i], -100, 100);
+    hslSat[i] = numOr(band.sat, hslSat[i], -100, 100);
+    hslLum[i] = numOr(band.lum, hslLum[i], -100, 100);
+  });
+  if (args.grading) {
+    for (const [name, p] of Object.entries(GRADING_NAMES)) {
+      grading[`${p}H`] = numOr(args.grading[name]?.hue, grading[`${p}H`], -180, 180);
+      grading[`${p}S`] = numOr(args.grading[name]?.sat, grading[`${p}S`], 0, 100);
+    }
+    grading.blend = numOr(args.grading.blend, grading.blend, 0, 100);
+    grading.balance = numOr(args.grading.balance, grading.balance, -100, 100);
+  }
+  if (args.curve) {
+    const cur = toneCurve.value;
+    const pm = args.curve.parametric ?? {};
+    toneCurve.value = normalizeToneCurve({
+      rgb: args.curve.rgb ?? cur.rgb, red: args.curve.red ?? cur.red, green: args.curve.green ?? cur.green, blue: args.curve.blue ?? cur.blue,
+      parametric: {
+        ...cur.parametric,
+        highlights: numOr(pm.highlights, cur.parametric.highlights, -100, 100),
+        lights: numOr(pm.lights, cur.parametric.lights, -100, 100),
+        darks: numOr(pm.darks, cur.parametric.darks, -100, 100),
+        shadows: numOr(pm.shadows, cur.parametric.shadows, -100, 100),
+      },
+    });
+    applyCurveLUT();
+  }
+  if (args.crop) {
+    const c = args.crop;
+    const next: CropState = {
+      ...crop,
+      cx: numOr(c.cx, crop.cx, 0, 1), cy: numOr(c.cy, crop.cy, 0, 1),
+      w: numOr(c.w, crop.w, 0.05, 1), h: numOr(c.h, crop.h, 0.05, 1),
+      angle: numOr(c.angle, crop.angle, -45, 45),
+      orientation: [0, 90, 180, 270].includes(c.orientation) ? c.orientation : crop.orientation,
+      flipH: typeof c.flipH === "boolean" ? c.flipH : crop.flipH,
+      flipV: typeof c.flipV === "boolean" ? c.flipV : crop.flipV,
+    };
+    Object.assign(crop, constrainCrop(next, srcW.value, srcH.value));
+    const key = typeof c.aspect === "string" ? aspectKeyFor(c.aspect) : null;
+    if (key) selectAspect(key);
+  }
+}
+
+const textContent = (v: unknown): ToolContent[] => [{ type: "text", text: JSON.stringify(v) }];
+const assistantTools: Record<string, AssistantTool> = {
+  view_image: {
+    description: "Render the photo with the current edit and return it as a JPEG (long edge ~1024px). Call it to see the photo before deciding, and again after set_edit to check the result.",
+    parameters: { type: "object", properties: {} },
+    run: async () => [{ type: "image", data: await capturePreview(), mimeType: "image/jpeg" }],
+  },
+  get_edit: {
+    description: "The current edit: every slider with its range and default, HSL, colour grading, tone curve, crop, and the image dimensions.",
+    parameters: { type: "object", properties: {} },
+    run: () => { requireImage(); return textContent(describeEdit()); },
+  },
+  set_edit: {
+    description: "Apply adjustments. Every field is optional and absolute; omitted fields are left as they are. Returns the resulting edit state.",
+    parameters: SET_EDIT_SCHEMA,
+    run: (args) => { applyAssistantEdit(args); return textContent(describeEdit()); },
+  },
+};
+
+function assistantSystemPrompt(): string {
+  return [
+    "You are the editing assistant inside LLR, a RAW photo editor with Lightroom-style controls. The user has a photo open; you edit it by calling tools, and every change shows up live and can be undone.",
+    "Workflow: look at the photo with view_image (and get_edit for the current values) before deciding, apply changes with set_edit, then view_image again to judge the result and refine if needed. Values are absolute, not deltas.",
+    "Slider semantics: exposure in stops; contrast, highlights, shadows, whites, blacks, clarity, dehaze, vibrance, saturation in -100..100; temperature in Kelvin (higher = warmer rendering), tint negative = green, positive = magenta. Keep adjustments natural and proportionate unless the user asks for a strong look. For crops, think about composition (subject placement, horizon, distractions at the edges) and use angle to straighten.",
+    `Answer briefly, in the user's language (UI locale: ${locale.value}). Say what you changed and why; do not list every value.`,
+  ].join("\n");
+}
+
+const { entries: chatEntries, busy: chatBusy, model: chatModel, send: sendChat, abort: abortChat, reset: resetChat } =
+  useAssistant({ tools: () => assistantTools, systemPrompt: assistantSystemPrompt });
+const chatDraft = ref("");
+const chatLogRef = ref<HTMLElement | null>(null);
+function submitChat(): void {
+  const text = chatDraft.value;
+  chatDraft.value = "";
+  void sendChat(text);
+}
+// Keep the newest message in view as the reply streams in.
+watch(chatEntries, () => { void nextTick(() => { const el = chatLogRef.value; if (el) el.scrollTop = el.scrollHeight; }); }, { deep: true });
+function toolSummary(entry: { name: string; args: unknown }): string {
+  if (entry.name !== "set_edit" || !entry.args || typeof entry.args !== "object") return "";
+  return Object.keys(entry.args as object).join(", ");
+}
+
 // ── Export ──
 
 function exportFilename(): string {
@@ -2051,8 +2243,43 @@ const vWheelAdjust = {
     <aside class="rail">
       <div class="rail-body" v-wheel-adjust>
       <canvas ref="histoCanvasRef" class="histogram" v-show="activeSource" />
+      <!-- The chat fills the rail on its own: its log scrolls and its composer
+           stays put, which the shared panel scroller cannot give it. -->
+      <section class="rail-panels chat" v-if="editTab === 'assistant'">
+        <header class="panel-head chat-head">
+          <span>{{ t('panel.assistant') }}</span>
+          <span class="chat-model" v-if="chatModel">{{ chatModel.id }}</span>
+          <button class="ghost" type="button" :disabled="!chatEntries.length || chatBusy" @click="resetChat">{{ t('chat.clear') }}</button>
+        </header>
+        <div class="chat-log" ref="chatLogRef">
+          <p class="chat-empty" v-if="!chatEntries.length">{{ chatModel && !chatModel.hasKey ? t('chat.noKey', { provider: chatModel.provider }) : t('chat.empty') }}</p>
+          <template v-for="(entry, i) in chatEntries" :key="i">
+            <div v-if="entry.kind === 'user'" class="chat-msg chat-user">{{ entry.text }}</div>
+            <div v-else-if="entry.kind === 'assistant'" class="chat-msg chat-assistant" :class="{ 'is-error': entry.error }">
+              <span v-if="entry.text">{{ entry.text }}</span>
+              <span v-if="entry.error" class="chat-error">{{ entry.error }}</span>
+              <span v-else-if="!entry.text && chatBusy" class="chat-typing">…</span>
+            </div>
+            <div v-else class="chat-tool" :class="{ 'is-done': entry.done, 'is-error': entry.error }">
+              <span class="chat-tool-name">{{ t(`chat.tool.${entry.name}` as MessageKey) }}</span>
+              <span class="chat-tool-args" v-if="toolSummary(entry)">{{ toolSummary(entry) }}</span>
+              <span class="chat-error" v-if="entry.error">{{ entry.error }}</span>
+            </div>
+          </template>
+        </div>
+        <form class="chat-compose" @submit.prevent="submitChat">
+          <textarea v-model="chatDraft" class="chat-input" rows="2" :placeholder="t('chat.placeholder')"
+            @keydown.enter.exact.prevent="submitChat" />
+          <button v-if="chatBusy" type="button" class="chat-send is-stop" :title="t('chat.stop')" :aria-label="t('chat.stop')" @click="abortChat">
+            <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2" /></svg>
+          </button>
+          <button v-else type="submit" class="chat-send" :disabled="!chatDraft.trim()" :title="t('chat.send')" :aria-label="t('chat.send')">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5" /><path d="M6 11l6-6 6 6" /></svg>
+          </button>
+        </form>
+      </section>
       <!-- Only the panels scroll; the histogram stays put as a live readout. -->
-      <div class="rail-scroll">
+      <div class="rail-scroll" v-else>
       <div class="rail-panels">
 
       <section class="panel crop-panel" v-if="activeSource && cropMode">

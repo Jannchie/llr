@@ -10,6 +10,16 @@ import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 
 import {
+  agentModelInfo,
+  handleAgentAbort,
+  handleAgentPrompt,
+  handleAgentReset,
+  handleAgentToolResult,
+  isSessionBusy,
+  type PromptBody,
+  type ToolResultBody,
+} from "./agent.js";
+import {
   SOURCE_ID,
   buildLinearFrameHeader,
   clampDroLevel,
@@ -158,7 +168,48 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
     return;
   }
 
+  if (pathname.startsWith("/agent/")) {
+    await routeAgent(pathname.slice("/agent/".length), method, request, response);
+    return;
+  }
+
   sendJson(response, { error: "Not found", path: pathname }, 404);
+}
+
+// The editing assistant (see agent.ts). Bodies are JSON; /prompt answers with
+// an SSE stream that lasts for the whole agent run.
+async function routeAgent(action: string, method: string, request: IncomingMessage, response: ServerResponse): Promise<void> {
+  if (method === "GET" && action === "model") {
+    sendJson(response, agentModelInfo());
+    return;
+  }
+  if (method !== "POST") throw new HttpError(404, "Not found");
+  const body = await readJson<PromptBody & ToolResultBody>(request);
+  if (typeof body.session !== "string" || !/^[\w-]{1,64}$/.test(body.session)) throw new HttpError(400, "Bad session id");
+  switch (action) {
+    case "prompt":
+      if (typeof body.text !== "string" || typeof body.systemPrompt !== "string" || !Array.isArray(body.tools)) {
+        throw new HttpError(400, "Expected text, systemPrompt and tools");
+      }
+      if (isSessionBusy(body.session)) throw new HttpError(409, "Assistant is busy");
+      await handleAgentPrompt(body, response);
+      return;
+    case "tool-result":
+      if (typeof body.toolCallId !== "string") throw new HttpError(400, "Expected toolCallId");
+      if (!handleAgentToolResult(body)) throw new HttpError(404, "No pending tool call");
+      sendJson(response, { ok: true });
+      return;
+    case "abort":
+      handleAgentAbort(body.session);
+      sendJson(response, { ok: true });
+      return;
+    case "reset":
+      handleAgentReset(body.session);
+      sendJson(response, { ok: true });
+      return;
+    default:
+      throw new HttpError(404, "Not found");
+  }
 }
 
 async function handleSourceUpload(request: IncomingMessage, response: ServerResponse): Promise<void> {

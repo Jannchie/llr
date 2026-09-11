@@ -11,5 +11,9 @@
   },
   "devDependencies": {
     "vitest": "^4.1.10"
+  },
+  "dependencies": {
+    "@mariozechner/pi-agent-core": "0.73.1",
+    "@mariozechner/pi-ai": "0.73.1"
   }
 }

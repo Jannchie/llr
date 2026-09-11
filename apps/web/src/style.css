@@ -1814,3 +1814,176 @@ input[type="range"]:focus::-moz-range-thumb {
 }
 
 .crop-done:hover { background: var(--accent-strong); }
+
+/* ---------- Assistant ----------
+   The chat is the whole rail when its tab is open: the log takes the height
+   and scrolls on its own, the composer stays pinned beneath it. */
+
+.chat {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-head {
+  padding: 9px 11px 0;
+  margin-bottom: 0;
+  gap: 8px;
+}
+
+.chat-model {
+  flex: 1;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: var(--text-mute);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat-log {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.chat-empty {
+  margin: auto 0;
+  color: var(--text-mute);
+  text-align: center;
+  padding: 0 8px;
+}
+
+.chat-msg {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-width: 92%;
+}
+
+.chat-user {
+  align-self: flex-end;
+  background: var(--accent);
+  color: #fff;
+  padding: 6px 10px;
+  border-radius: 14px 14px 4px 14px;
+}
+
+.chat-assistant {
+  align-self: flex-start;
+  color: var(--text);
+}
+
+.chat-typing {
+  color: var(--text-mute);
+}
+
+.chat-error {
+  display: block;
+  color: var(--error);
+  font-size: 11.5px;
+}
+
+/* A tool call: one quiet line, an accent dot that settles once the call has
+   returned — the log's version of a "working…" spinner. */
+.chat-tool {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+  padding-left: 12px;
+  position: relative;
+}
+
+.chat-tool::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0.55em;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: chat-pulse 1s ease-in-out infinite;
+}
+
+.chat-tool.is-done::before {
+  animation: none;
+  background: var(--text-mute);
+}
+
+.chat-tool.is-error::before {
+  background: var(--error);
+}
+
+.chat-tool-args {
+  color: var(--text-mute);
+}
+
+@keyframes chat-pulse {
+  50% { opacity: 0.25; }
+}
+
+.chat-compose {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  padding: 8px 11px 10px;
+  border-top: 1px solid var(--sep);
+}
+
+.chat-input {
+  flex: 1;
+  resize: none;
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--text);
+  background: var(--control);
+  border: none;
+  border-radius: var(--radius);
+  padding: 7px 10px;
+}
+
+.chat-input::placeholder {
+  color: var(--text-mute);
+}
+
+.chat-send {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  display: grid;
+  place-items: center;
+  transition: background 120ms, opacity 120ms;
+}
+
+.chat-send svg {
+  width: 15px;
+  height: 15px;
+}
+
+.chat-send:hover:not(:disabled) {
+  background: var(--accent-strong);
+}
+
+.chat-send:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.chat-send.is-stop {
+  background: var(--control);
+  color: var(--text);
+}

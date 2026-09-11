@@ -76,6 +76,18 @@ owner name, and maker notes instead) and embeds the edit recipe as XMP:
 structured `llr:*` fields plus a lossless JSON blob, spilling into
 Extended-XMP chunks when a heavy edit overflows the 64 KB APP1 limit.
 
+## Assistant
+
+The Assistant tab is a chat that edits the open photo. The agent loop
+(`@mariozechner/pi-agent-core`) runs in the API (`apps/api/src/agent.ts`),
+which holds the LLM key and streams events to the browser over SSE; every tool
+the model calls — look at the render, read the edit, apply an edit — executes in
+the browser against the same reactive state the sliders drive, so its changes
+redraw, enter history and persist like hand edits. The tool schemas travel with
+each prompt, so the API knows nothing about photography. `LLR_AGENT_MODEL`
+(`provider/model`) picks the model; the key comes from the provider's usual env
+var.
+
 ## Testing
 
 Pure logic is tested where it lives: vitest for the web rendering maths and
