@@ -8,12 +8,15 @@ import type { ProfileMarble } from "./rendering/sony-marble";
 
 export const API = (import.meta.env.VITE_API_URL as string | undefined) ?? "/api";
 
-// The in-camera Creative Look tweaks, on Sony's own scales. Sony only. What
-// each one can be set to is not written here: the ranges are the engine's, so
-// they come down with the profile as lookRanges.
+// The Creative Look tweaks, on Imaging Edge Edit's own panel scale — the
+// numbers Edit shows in its 创意外观 panel, -100..100 (褪色 and 清晰 0..100).
+// The camera's own -9..+9 stops arrive already converted (worker
+// sony/profile.py stops_to_panel), so the as-shot values read the same here as
+// in Edit. Sony only. What each one can be set to is not written here: the
+// ranges are the engine's, so they come down with the profile as lookRanges.
 export type LookTweaks = {
-  highlights: number; shadows: number; contrast: number; fade: number;
-  saturation: number; clarity: number;
+  contrast: number; highlights: number; shadows: number; white: number; black: number;
+  fade: number; hue: number; saturation: number; clarity: number;
 };
 export type LookTweakKey = keyof LookTweaks;
 
@@ -76,6 +79,11 @@ export type ColorProfileMeta = {
   // rather than a round trip. Null for an older response. Sony only.
   profileLumaLutAdvanced?: number[] | null;
   profileLumaContrastAdvanced?: number | null;
+  // Edit's 黑色/白色 sliders as YGamma applies them: y = (y - black) * scale
+  // between the table and the pivot line (worker sony/chroma.py luma_levels).
+  // (0, 1) on every camera-shot frame, and for an older response. Sony only.
+  profileLumaBlack?: number | null;
+  profileLumaScale?: number | null;
   // ChromaSuppres, which the engine runs just *before* YGamma and indexes by
   // the luma from before it. The mid-tones lose a flat 1/256 of their chroma
   // and everything above hiY fades out linearly. All four are in the engine's
@@ -85,6 +93,9 @@ export type ColorProfileMeta = {
   // The Saturation slider: profileChromaGain is already divided by it, and the
   // shader multiplies the chroma back after the clamp. Sony only.
   profileChromaSaturation?: number | null;
+  // Edit's 色相 slider as a rotation of (Cb, Cr) in degrees, applied right
+  // after that multiply (worker sony/chroma.py rotate_chroma). 0 is off.
+  profileChromaHue?: number | null;
   // Sepia's toning stage: a weighted sum of the encoded RGB through one curve
   // per channel. Null for every look but Sepia.
   profileSepia?: { weights: number[]; lut: number[][] } | null;

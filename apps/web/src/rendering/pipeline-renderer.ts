@@ -89,9 +89,18 @@ export type ProfileChroma = {
   // 3-D LUT alone.
   lumaLutAdvanced?: number[] | null;
   lumaContrastAdvanced?: number | null;
+  // Edit's 黑色/白色 sliders, as YGamma applies them between the table and the
+  // pivot line: y = (y - lumaBlack) * lumaScale (worker sony/chroma.py
+  // luma_levels). (0, 1) is the identity and every camera-shot frame.
+  lumaBlack?: number | null;
+  lumaScale?: number | null;
   // `gain` arrives already divided by this; the shader multiplies it back after
   // the clamp, which is the shot's Saturation setting.
   saturation: number;
+  // Edit's 色相: (Cb, Cr) turned by this many degrees right after that
+  // multiply, the result's angle snapped to the engine's 512-step sine table
+  // (worker sony/chroma.py rotate_chroma). 0 skips the stage.
+  hue?: number | null;
   // ChromaSuppres, which the engine runs between RGB2YCC and YGamma: the
   // mid-tones keep 255/256 of their chroma and the highlights fade out above
   // hiY (worker sony/chromasuppres.py). Engine units, so the shader puts the
@@ -2180,6 +2189,8 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
       gl.uniform1f(this.uniforms["u_sonyLumaAdvContrast"]!,
         chroma.lumaContrastAdvanced ?? chroma.lumaContrast);
       gl.uniform1f(this.uniforms["u_sonySat"]!, chroma.saturation);
+      gl.uniform2f(this.uniforms["u_sonyLevels"]!, chroma.lumaBlack ?? 0, chroma.lumaScale ?? 1);
+      gl.uniform1f(this.uniforms["u_sonyHue"]!, ((chroma.hue ?? 0) * Math.PI) / 180);
       const cs = chroma.suppress;
       if (cs) gl.uniform4f(this.uniforms["u_sonyCS"]!, cs.hiY, cs.loY, cs.slopeHi, cs.slopeLo);
       const w = chroma.sepia?.weights;

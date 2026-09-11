@@ -84,16 +84,39 @@ const groups: SliderGroup[] = [
   ]},
 ];
 
-// The in-camera Creative Look tweaks, in the order the camera's own menu lists
-// them. These are not the Tone panel's sliders under another name — they drive
-// Sony's own stages (the look's tone curve, YGamma, RGB2YCC, and Clarity's blur
-// chain), which is why they live with the look instead of with our edits.
+// The Creative Look tweaks, in the order and on the scale of Imaging Edge
+// Edit's own 创意外观 panel: 对比度/高光/阴影/白色/黑色/褪色, then 色相/饱和度,
+// then 清晰, every one -100..100 (褪色 and 清晰 0..100). The camera's -9..+9
+// stops are converted on the worker (five panel units per stop on the tone
+// sliders, ten on 褪色/清晰, 饱和度 by the engine's own ladder), so the as-shot
+// numbers here are exactly what Edit shows when it opens the file. These are
+// not the Tone panel's sliders under another name — they drive Sony's own
+// stages (the look's tone curve, YGamma, RGB2YCC, and Clarity's blur chain),
+// which is why they live with the look instead of with our edits.
 //
-// Only the order is ours. Each one's range is the engine's and arrives with the
-// profile (lookRanges), the way DRO's level ladder does: Clarity, for one, has
-// no negative side at all — the engine clamps it at zero — and a slider that
-// let it go there would be offering stops that all render the same.
-const LOOK_TWEAK_ORDER = ["contrast", "highlights", "shadows", "fade", "saturation", "clarity"] as const;
+// Each one's range is the engine's and arrives with the profile (lookRanges),
+// the way DRO's level ladder does: 清晰, for one, has no negative side at all
+// — the engine clamps it at zero — and a slider that let it go there would be
+// offering stops that all render the same.
+const LOOK_TWEAK_ORDER = [
+  "contrast", "highlights", "shadows", "white", "black", "fade", "hue", "saturation", "clarity",
+] as const;
+// Sessions saved before the panel scale stored the camera's stops. The same
+// conversion the worker does (sony/profile.py stops_to_panel), so a restored
+// session lands where it rendered; the three sliders the camera lacks were
+// never stored and start at zero.
+const LOOK_SCALE = "panel";
+const SATURATION_STOPS = [0, 10, 20, 25, 30, 35, 40, 45, 50, 55];
+function lookStopsToPanel(old: Partial<Record<string, number>>): LookTweaks {
+  const n = (k: string) => Math.trunc(old[k] ?? 0);
+  const sat = Math.min(Math.abs(n("saturation")), SATURATION_STOPS.length - 1);
+  return {
+    contrast: n("contrast") * 5, highlights: n("highlights") * 5, shadows: n("shadows") * 5,
+    white: 0, black: 0, fade: n("fade") * 10, hue: 0,
+    saturation: SATURATION_STOPS[sat]! * (n("saturation") < 0 ? -1 : 1),
+    clarity: n("clarity") * 10,
+  };
+}
 
 function aspectLabel(a: AspectPreset): string {
   return a.labelKey ? t(a.labelKey) : a.label;
@@ -547,6 +570,9 @@ type Snapshot = {
   denoise?: typeof denoise;  // optional: absent in pre-denoise persisted sessions
   // Creative Look tweaks; null (or absent, in older sessions) means as shot.
   look?: LookTweaks | null;
+  // Which scale `look` is on. Absent means the camera's stops, which is what
+  // every session before Edit's panel scale stored (see lookStopsToPanel).
+  lookScale?: typeof LOOK_SCALE;
   // Which Creative Look to render, when it is not the body's own. Same "null
   // means as shot" convention, and likewise absent in older sessions.
   lookStyle?: string | null;
@@ -607,6 +633,7 @@ function captureSnapshot(): Snapshot {
     profile: profileId.value,
     denoise: { ...denoise },
     look: look.value ? { ...look.value } : null,
+    lookScale: LOOK_SCALE,
     lookStyle: lookStyle.value,
     dro: droStrength.value,
     droLevel: droLevel.value,
@@ -634,7 +661,7 @@ function setEditState(s: Snapshot): void {
   // inherit that field from its neighbour instead of from the default. `auto`
   // is the first field to have a predecessor, and off is not its default.
   Object.assign(denoise, { ...defaultDenoise(), ...(s.denoise ?? {}) });
-  look.value = s.look ? { ...s.look } : null;
+  look.value = s.look ? (s.lookScale === LOOK_SCALE ? { ...s.look } : lookStopsToPanel(s.look)) : null;
   lookStyle.value = s.lookStyle ?? null;
   droStrength.value = s.dro ?? null;
   // Snapshots taken before manual levels existed carry none, and Auto is what
@@ -1095,7 +1122,13 @@ function buildProfileLUT(cp: ColorProfileMeta | null | undefined): ProfileCurve 
           // response, which leaves the switch as the 3-D LUT alone.
           lumaLutAdvanced: cp?.profileLumaLutAdvanced ?? null,
           lumaContrastAdvanced: cp?.profileLumaContrastAdvanced ?? null,
+          // Edit's 黑色/白色 pair, the identity on every camera-shot frame and
+          // for an older response.
+          lumaBlack: cp?.profileLumaBlack ?? 0,
+          lumaScale: cp?.profileLumaScale ?? 1,
           saturation: cp?.profileChromaSaturation ?? 1,
+          // Edit's 色相, in degrees; 0 (and an older response) skips the stage.
+          hue: cp?.profileChromaHue ?? 0,
           // ChromaSuppres, which runs inside the same section. Null both for an
           // older response and for a file whose four SR2 tags could not be
           // read; either way the shader leaves the chroma alone.
@@ -1925,8 +1958,12 @@ const vWheelAdjust = {
           :style="{ transform: displayTransform, width: imageW + 'px', height: imageH + 'px' }"
           :viewBox="cropViewBox" preserveAspectRatio="none"
           @mousedown="onCropOverlayDown">
-          <!-- transparent catcher for move/rotate/straighten drags -->
-          <rect class="crop-catch" :x="cropBBox.x" :y="cropBBox.y" :width="cropBBox.w" :height="cropBBox.h" />
+          <!-- transparent catchers: anywhere outside the box rotates (the rect
+               far exceeds the bbox so it covers the viewport at any zoom/pan;
+               overflow is visible and the viewport clips), inside moves. -->
+          <rect class="crop-catch crop-catch-rotate" :x="cropBBox.x - 50 * cropBBox.w" :y="cropBBox.y - 50 * cropBBox.h"
+            :width="101 * cropBBox.w" :height="101 * cropBBox.h" />
+          <rect class="crop-catch" :x="cropBoxRect.x" :y="cropBoxRect.y" :width="cropBoxRect.w" :height="cropBoxRect.h" />
           <!-- dim outside the crop -->
           <path class="crop-dim" :d="cropDimPath" fill-rule="evenodd" />
           <!-- guide overlay (O cycles, Shift+O mirrors) -->

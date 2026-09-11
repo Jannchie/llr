@@ -136,6 +136,13 @@ uniform vec4 u_sonyCS;          // (hiY, loY, slopeHi, slopeLo)
 // ZcTaskSIMDHueSaturation stage does. The two nearly cancel — the clamp in
 // between is the whole visible effect.
 uniform float u_sonySat;
+// Edit's 色相 slider, in radians: ZcTaskHueSaturation turns (Cb, Cr) by it,
+// right after the saturation multiply, and snaps the result's angle to its
+// 512-entry sine table (worker sony/chroma.py rotate_chroma). 0 is off.
+uniform float u_sonyHue;
+// Edit's 黑色/白色 sliders as YGamma applies them, between the table and the
+// pivot line: y = (y - black) * scale (worker sony/chroma.py luma_levels).
+uniform vec2 u_sonyLevels;      // (black, scale); (0, 1) is the identity
 // Sony's ZcTask3DLut — Edit's 色彩复制 = 高级 ("advanced colour reproduction"),
 // the one stage of this section the user chooses. Edit's own default is 标准,
 // which is the stage absent, so this is off unless the switch is on. The table
@@ -245,6 +252,15 @@ vec3 sonyChroma(vec3 s) {
   float u2 = (v >= 0.0 ? u_sonyCross.x : u_sonyCross.z) * v + u;
   float cr = clamp((u2 >= 0.0 ? u_sonyGain.y : u_sonyGain.w) * u2, -0.5, 0.5) * u_sonySat;
   float cb = clamp((v2 >= 0.0 ? u_sonyGain.x : u_sonyGain.z) * v2, -0.5, 0.5) * u_sonySat;
+  // 色相: the chroma vector turned, its angle then snapped to steps of
+  // 2*pi/512 — the engine reads its sine table at round(ang * 256 / pi).
+  if (u_sonyHue != 0.0) {
+    float mag = length(vec2(cb, cr));
+    float ang = atan(cb, cr) + u_sonyHue;
+    ang = floor(ang * (256.0 / 3.14159265358979) + 0.5) * (3.14159265358979 / 256.0);
+    cb = mag * sin(ang);
+    cr = mag * cos(ang);
+  }
   // ChromaSuppres, which the engine runs between RGB2YCC and YGamma, on the
   // luma *before* YGamma (worker sony/chromasuppres.py has the derivation and
   // the measurement). f is 255 for the mid-tones -- a 255/256 chroma loss, not
@@ -275,6 +291,8 @@ vec3 sonyChroma(vec3 s) {
   } else if (u_sonyLumaLutActive == 1) {
     y = texelFetch(u_sonyLumaLut, ivec2(idx & 127, idx >> 7), 0).r / 16383.0;
   }
+  // 黑色/白色, between the table and the pivot line.
+  y = (y - u_sonyLevels.x) * u_sonyLevels.y;
   float lumaContrast = adv ? u_sonyLumaAdvContrast : u_sonyLuma.y;
   y = clamp((y - u_sonyLuma.x) * lumaContrast + u_sonyLuma.x, 0.0, 1.0);
   // ZcTask3DLut, which the engine runs here — after YGamma, before the return
@@ -1496,6 +1514,7 @@ export const PASSES: PassDef[] = [
     "u_grad_blend","u_grad_balance",
     "u_curve_lut", "u_curveActive", "u_hasProfileCurve", "u_profileCurveSrgb",
     "u_sonyChromaActive", "u_sonyCross", "u_sonyGain", "u_sonyLuma", "u_sonySat",
+    "u_sonyHue", "u_sonyLevels",
     "u_sonyLumaLutActive", "u_sonyLumaLut",
     "u_sonyLumaLutAdvActive", "u_sonyLumaLutAdv", "u_sonyLumaAdvContrast",
     "u_sonyCSActive", "u_sonyCS",
