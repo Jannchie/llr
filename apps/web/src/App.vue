@@ -1918,7 +1918,7 @@ function assistantSystemPrompt(): string {
 const {
   entries: chatEntries, busy: chatBusy, models: chatModels, selected: chatModel, providers: chatProviders,
   send: sendChat, abort: abortChat, reset: resetChat,
-} = useAssistant({ tools: () => assistantTools, systemPrompt: assistantSystemPrompt });
+} = useAssistant({ tools: () => assistantTools, systemPrompt: assistantSystemPrompt, scope: () => activeId.value });
 const chatModelOptions = computed(() => chatModels.value.map(m => ({
   value: modelKey(m), label: m.id, disabled: chatProviders.value !== null && !chatProviders.value.includes(m.provider),
 })));
