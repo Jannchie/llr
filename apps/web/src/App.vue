@@ -2897,80 +2897,86 @@ const vWheelAdjust = {
           </span>
           <button class="ghost" type="button" :disabled="!masks.length" @click="resetMasks">{{ t('common.reset') }}</button>
         </header>
+        <!-- An accordion: the selected group opens under its own row, so the
+             rows read as things to click. Names edit in place. -->
         <ol class="mask-list" v-if="masks.length">
           <li v-for="g in masks" :key="g.id" class="mask-row"
-            :class="{ 'is-selected': selectedMask === g.id, 'is-off': !g.enabled }" @click="selectedMask = g.id">
-            <label class="switch" :title="t('mask.enable')" @click.stop>
-              <input type="checkbox" v-model="g.enabled" />
-              <span class="switch-track"><span class="switch-thumb" /></span>
-            </label>
-            <span class="mask-name">{{ maskLabel(g) }}</span>
-            <button class="icon-mini" :class="{ 'is-on': g.invert }" type="button" :title="t('mask.invert')"
-              :aria-pressed="g.invert" @click.stop="g.invert = !g.invert">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z" /><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none" />
-              </svg>
-            </button>
-            <button class="icon-mini" type="button" :title="t('mask.remove')" @click.stop="removeMask(g.id)">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
-            </button>
-          </li>
-        </ol>
-        <SelectMenu :model-value="''" :options="maskAddOptions" :placeholder="t('mask.add')"
-          :aria-label="t('mask.add')" :disabled="masks.length >= MASK_GROUPS" @update:model-value="addMask" />
-
-        <template v-if="selectedGroup">
-          <div class="mask-sub-head">
-            <span>{{ t('mask.components') }}</span>
-            <SelectMenu :model-value="''" :options="maskTypeOptions" :placeholder="t('mask.addComponent')"
-              :aria-label="t('mask.addComponent')" :disabled="selectedGroup.components.length >= MASK_COMPS" @update:model-value="addComponent" />
-          </div>
-          <div v-for="(c, i) in selectedGroup.components" :key="i" class="mask-comp">
-            <div class="mask-comp-head">
-              <span class="mask-comp-type">{{ t(`mask.type.${c.type}`) }}</span>
-              <!-- The first component has nothing to combine with. -->
-              <div v-if="i > 0" class="hsl-tabs mask-ops">
-                <button v-for="op in MASK_OPS" :key="op" type="button" :class="{ active: c.op === op }"
-                  :title="t(`mask.op.${op}`)" @click="c.op = op">{{ t(`mask.op.${op}`) }}</button>
-              </div>
-              <button class="icon-mini" :class="{ 'is-on': c.invert }" type="button" :title="t('mask.invert')"
-                :aria-pressed="c.invert" @click="c.invert = !c.invert">
+            :class="{ 'is-selected': selectedMask === g.id, 'is-off': !g.enabled }">
+            <div class="mask-head" role="button" :aria-expanded="selectedMask === g.id" @click="selectedMask = g.id">
+              <svg class="mask-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6" /></svg>
+              <input class="mask-name" type="text" :value="maskLabel(g)" :aria-label="t('mask.rename')" spellcheck="false"
+                @change="g.name = ($event.target as HTMLInputElement).value.trim() || undefined"
+                @keydown.enter="($event.target as HTMLInputElement).blur()" @keydown.stop />
+              <label class="switch" :title="t('mask.enable')" @click.stop>
+                <input type="checkbox" v-model="g.enabled" />
+                <span class="switch-track"><span class="switch-thumb" /></span>
+              </label>
+              <button class="icon-mini" :class="{ 'is-on': g.invert }" type="button" :title="t('mask.invert')"
+                :aria-pressed="g.invert" @click.stop="g.invert = !g.invert">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z" /><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none" />
                 </svg>
               </button>
-              <button class="icon-mini" type="button" :title="t('mask.remove')" @click="selectedGroup.components.splice(i, 1)">
+              <button class="icon-mini" type="button" :title="t('mask.remove')" @click.stop="removeMask(g.id)">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
               </button>
             </div>
-            <template v-if="c.type === 'luminance'">
-              <SliderRow v-model="c.lo" :label="t('mask.range.lo')" :min="0" :max="100" />
-              <SliderRow v-model="c.hi" :label="t('mask.range.hi')" :min="0" :max="100" :reset-value="100" />
-              <SliderRow v-model="c.featherLo" :label="t('mask.range.featherLo')" :min="0" :max="100" />
-              <SliderRow v-model="c.featherHi" :label="t('mask.range.featherHi')" :min="0" :max="100" />
-            </template>
-            <template v-else-if="c.type === 'color'">
-              <!-- Stored in Oklab radians, shown in degrees. -->
-              <SliderRow :model-value="deg(c.hue)" @update:model-value="v => c.hue = rad(v)" :label="t('mask.color.hue')" :min="-180" :max="180" />
-              <SliderRow :model-value="deg(c.hueWidth)" @update:model-value="v => c.hueWidth = rad(v)" :label="t('mask.color.width')" :min="5" :max="120" :reset-value="35" />
-            </template>
-            <template v-else-if="c.type === 'radial'">
-              <SliderRow :model-value="Math.round(c.feather * 100)" @update:model-value="v => c.feather = v / 100" :label="t('mask.range.feather')" :min="0" :max="100" :reset-value="50" />
-              <SliderRow v-model="c.angle" :label="t('crop.angle')" :min="-180" :max="180" />
-            </template>
-          </div>
+            <div class="mask-body" v-if="selectedMask === g.id">
+            <div class="mask-sub-head">
+              <span>{{ t('mask.components') }}</span>
+              <SelectMenu :model-value="''" :options="maskTypeOptions" :placeholder="t('mask.addComponent')"
+                :aria-label="t('mask.addComponent')" :disabled="g.components.length >= MASK_COMPS" @update:model-value="addComponent" />
+            </div>
+            <div v-for="(c, i) in g.components" :key="i" class="mask-comp">
+              <div class="mask-comp-head">
+                <span class="mask-comp-type">{{ t(`mask.type.${c.type}`) }}</span>
+                <!-- The first component has nothing to combine with. -->
+                <div v-if="i > 0" class="hsl-tabs mask-ops">
+                  <button v-for="op in MASK_OPS" :key="op" type="button" :class="{ active: c.op === op }"
+                    :title="t(`mask.op.${op}`)" @click="c.op = op">{{ t(`mask.op.${op}`) }}</button>
+                </div>
+                <button class="icon-mini" :class="{ 'is-on': c.invert }" type="button" :title="t('mask.invert')"
+                  :aria-pressed="c.invert" @click="c.invert = !c.invert">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z" /><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none" />
+                  </svg>
+                </button>
+                <button class="icon-mini" type="button" :title="t('mask.remove')" @click="g.components.splice(i, 1)">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
+                </button>
+              </div>
+              <template v-if="c.type === 'luminance'">
+                <SliderRow v-model="c.lo" :label="t('mask.range.lo')" :min="0" :max="100" />
+                <SliderRow v-model="c.hi" :label="t('mask.range.hi')" :min="0" :max="100" :reset-value="100" />
+                <SliderRow v-model="c.featherLo" :label="t('mask.range.featherLo')" :min="0" :max="100" />
+                <SliderRow v-model="c.featherHi" :label="t('mask.range.featherHi')" :min="0" :max="100" />
+              </template>
+              <template v-else-if="c.type === 'color'">
+                <!-- Stored in Oklab radians, shown in degrees. -->
+                <SliderRow :model-value="deg(c.hue)" @update:model-value="v => c.hue = rad(v)" :label="t('mask.color.hue')" :min="-180" :max="180" />
+                <SliderRow :model-value="deg(c.hueWidth)" @update:model-value="v => c.hueWidth = rad(v)" :label="t('mask.color.width')" :min="5" :max="120" :reset-value="35" />
+              </template>
+              <template v-else-if="c.type === 'radial'">
+                <SliderRow :model-value="Math.round(c.feather * 100)" @update:model-value="v => c.feather = v / 100" :label="t('mask.range.feather')" :min="0" :max="100" :reset-value="50" />
+                <SliderRow v-model="c.angle" :label="t('crop.angle')" :min="-180" :max="180" />
+              </template>
+            </div>
 
-          <div class="control-row mask-overlay-row">
-            <label class="control-label" for="mask-overlay">{{ t('mask.overlay') }}</label>
-            <label class="switch">
-              <input id="mask-overlay" type="checkbox" v-model="maskPreview" />
-              <span class="switch-track"><span class="switch-thumb" /></span>
-            </label>
-          </div>
-          <SliderRow v-for="sp in MASK_ADJUST_SLIDERS" :key="sp.key"
-            v-model="selectedGroup.adjust[sp.key]" :label="t(`slider.${sp.key}`)" :input-id="`m-${sp.key}`"
-            :min="sp.min" :max="sp.max" :step="sp.step" :track="WB_TRACK[sp.key as RecipeKey]" show-modified />
-        </template>
+            <div class="control-row mask-overlay-row">
+              <label class="control-label" for="mask-overlay">{{ t('mask.overlay') }}</label>
+              <label class="switch">
+                <input id="mask-overlay" type="checkbox" v-model="maskPreview" />
+                <span class="switch-track"><span class="switch-thumb" /></span>
+              </label>
+            </div>
+            <SliderRow v-for="sp in MASK_ADJUST_SLIDERS" :key="sp.key"
+              v-model="g.adjust[sp.key]" :label="t(`slider.${sp.key}`)" :input-id="`m-${sp.key}`"
+              :min="sp.min" :max="sp.max" :step="sp.step" :track="WB_TRACK[sp.key as RecipeKey]" show-modified />
+            </div>
+          </li>
+        </ol>
+        <SelectMenu :model-value="''" :options="maskAddOptions" :placeholder="t('mask.add')"
+          :aria-label="t('mask.add')" :disabled="masks.length >= MASK_GROUPS" @update:model-value="addMask" />
       </section>
       </div>
       </div>

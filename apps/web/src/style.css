@@ -2088,35 +2088,75 @@ input[type="range"]:focus::-moz-range-thumb {
 }
 
 .mask-row {
-  display: grid;
-  grid-template-columns: auto 1fr auto auto;
+  border-radius: var(--radius);
+  transition: background 120ms;
+}
+
+.mask-row.is-selected {
+  background: var(--control);
+  box-shadow: inset 0 0 0 0.5px var(--sep-strong);
+}
+
+/* The clickable header: chevron + name + per-group switches. */
+.mask-head {
+  display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 3px 6px;
-  border-radius: var(--radius-sm);
+  gap: 6px;
+  padding: 3px 6px 3px 4px;
+  border-radius: var(--radius);
   font-size: 13px;
   color: var(--text-dim);
   cursor: pointer;
   transition: background 120ms, color 120ms;
 }
 
-.mask-row:hover {
+.mask-head:hover {
   background: var(--card-hover);
   color: var(--text);
 }
 
-.mask-row.is-selected {
-  background: var(--accent-soft);
+.mask-row.is-selected .mask-head {
   color: var(--text);
+}
+
+.mask-chevron {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  color: var(--text-mute);
+  transition: transform 160ms;
+}
+
+.mask-row.is-selected .mask-chevron {
+  transform: rotate(90deg);
+  color: var(--accent);
+}
+
+/* The name is text until you reach for it, like the slider values. */
+.mask-name {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  padding: 2px 5px;
+  cursor: text;
+  transition: border-color 120ms, background 120ms;
+}
+
+.mask-name:hover,
+.mask-name:focus {
+  border-color: var(--sep-strong);
+  background: var(--bg);
+  outline: none;
 }
 
 .mask-row.is-off .mask-name { color: var(--text-mute); }
 
-.mask-name {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.mask-body {
+  padding: 2px 8px 10px;
 }
 
 .icon-mini.is-on { color: var(--accent); }
