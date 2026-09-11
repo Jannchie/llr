@@ -651,7 +651,7 @@ void main() {
     float pLum = srgbEncode(clamp(ppLuma(cSel) * exp2(u_exposure), 0.0, 1.0));
     vec3 labSel = proPhotoToOklab(cSel);
     vec2 pImg = (u_imgFromTex * vec3(v_texCoord, 1.0)).xy;
-    mat3 dWb = mat3(0.0);
+    mat3 dWb = mat3(0.0); vec3 dTint = vec3(0.0);
     for (int g = 0; g < u_maskGroups; g++) {
       int base = g * MASK_STRIDE; vec4 hdr = m[base]; float w = 0.0;
       for (int k = 0; k < int(hdr.x); k++) {
@@ -664,9 +664,19 @@ void main() {
       dExpo += w * A.x; dHi += w * A.y; dSh += w * A.z; dClar += w * A.w;
       dHaze += w * B.x; dSat += w * B.y; dVib += w * B.z; dHue += w * B.w;
       dWb += w * mat3(m[base + 3].xyz, m[base + 4].xyz, m[base + 5].xyz);   // packed column-major
+      dTint += w * vec3(m[base + 3].w, m[base + 4].w, m[base + 5].w);
     }
     // --- White Balance, with the blended local delta ---
     c = max((u_wbMatrix + dWb) * c, 0.0);
+    // --- Local colour cast: the grading tint multiply, luma-renormalised the
+    // same way (and capped for the same reason), on scene-linear values ---
+    if (dTint != vec3(0.0)) {
+      float lg = ppLuma(c);
+      vec3 t = c * (1.0 + dTint);
+      float lt = ppLuma(t);
+      if (lt > 1e-6) t *= min(lg / lt, GRAD_RENORM_CAP);
+      c = max(t, 0.0);
+    }
   } else {
     // --- White Balance (Bradford adaptation, identity at temp=6500 / tint=0) ---
     c = max(u_wbMatrix * c, 0.0);

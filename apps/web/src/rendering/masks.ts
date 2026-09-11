@@ -13,6 +13,7 @@
  */
 
 import { computeWbMatrix, smoothstep, type Mat3 } from "./color-spaces";
+import { gradingTint } from "./grading";
 import { HSL_CENTERS, HSL_SEL_L_FLOOR, SKIN_HUE, SKIN_HUE_HALF, hueWindow } from "./hsl-bands";
 import { imageDims, sourceNormToImageNorm, type CropState } from "./crop";
 
@@ -34,6 +35,9 @@ export type MaskType = MaskComponent["type"];
 export type MaskAdjust = {
   exposure: number; temperature: number; tint: number; saturation: number; vibrance: number;
   highlights: number; shadows: number; clarity: number; dehaze: number; hue: number;
+  // A colour cast for the selection (Lightroom's local "Color"): wheel hue in
+  // degrees and strength 0..100, built into a tint by grading.ts gradingTint.
+  tintHue: number; tintSat: number;
   contrast?: number; blacks?: number;
 };
 export type MaskGroup = {
@@ -43,7 +47,7 @@ export type MaskGroup = {
 
 export const MASK_GROUPS = 8;
 export const MASK_COMPS = 4;
-/** vec4 rows per group: hdr + adjA + adjB + ΔWB×3 + MASK_COMPS×3. */
+/** vec4 rows per group: hdr + adjA + adjB + (ΔWB column | tint−1)×3 + MASK_COMPS×3. */
 export const GROUP_STRIDE = 6 + MASK_COMPS * 3;
 const ROWS = MASK_GROUPS * GROUP_STRIDE;
 export const MASK_UBO_BYTES = ROWS * 16;
@@ -73,13 +77,14 @@ export const MASK_SKIN_C1 = 0.10;
 const EPS = 1e-3;
 
 export function defaultAdjust(): MaskAdjust {
-  return { exposure: 0, temperature: 0, tint: 0, saturation: 0, vibrance: 0, highlights: 0, shadows: 0, clarity: 0, dehaze: 0, hue: 0 };
+  return { exposure: 0, temperature: 0, tint: 0, saturation: 0, vibrance: 0, highlights: 0, shadows: 0, clarity: 0, dehaze: 0, hue: 0, tintHue: 0, tintSat: 0 };
 }
 
 export const ADJUST_KEYS = Object.keys(defaultAdjust()) as (keyof MaskAdjust)[];
 
 function adjustIsZero(a: MaskAdjust): boolean {
-  return ADJUST_KEYS.every(k => !a[k]);
+  // tintHue alone selects a colour but applies nothing: strength is the gate.
+  return ADJUST_KEYS.every(k => k === "tintHue" || !a[k]);
 }
 
 /** A fresh component of the given type, framed on the image centre. */
@@ -184,12 +189,17 @@ export function packMasks(
     masks.set([comps.length, g.invert ? 1 : 0, 0, 0], base);
     masks.set([a.exposure, a.highlights / 100, a.shadows / 100, a.clarity / 100], base + 4);
     masks.set([a.dehaze / 100, a.saturation / 100, a.vibrance / 100, (a.hue / 100) * MASK_HUE_RAD], base + 8);
-    if (a.temperature || a.tint) {
-      const t = Math.min(Math.max(wb.temperature + a.temperature * MASK_TEMP_PER_UNIT, 2000), 12000);
-      const mg = computeWbMatrix(t, wb.tint + a.tint);
-      const d = deltaWb(mg, m0);
+    if (a.temperature || a.tint || a.tintSat) {
+      let d: Mat3 = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+      if (a.temperature || a.tint) {
+        const t = Math.min(Math.max(wb.temperature + a.temperature * MASK_TEMP_PER_UNIT, 2000), 12000);
+        d = deltaWb(computeWbMatrix(t, wb.tint + a.tint), m0);
+      }
+      // The colour cast rides the ΔWB rows' spare .w: tint − 1 per channel, so
+      // an unset cast is the same zero as an unset matrix.
+      const tint = a.tintSat ? gradingTint(a.tintHue, a.tintSat / 100) : [1, 1, 1];
       // Column-major: the shader rebuilds mat3(col0, col1, col2).
-      for (let col = 0; col < 3; col++) masks.set([d[0][col], d[1][col], d[2][col], 0], base + 12 + col * 4);
+      for (let col = 0; col < 3; col++) masks.set([d[0][col], d[1][col], d[2][col], tint[col] - 1], base + 12 + col * 4);
     }
     comps.forEach((c, k) => masks.set(componentRows(c), base + 24 + k * 12));
     if (a.exposure) use |= MASK_USE.exposure;

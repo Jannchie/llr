@@ -53,7 +53,7 @@ type SliderGroup = { title: "tone" | "presence" | "color" | "lens"; tab: EditTab
 // The rail shows one group at a time, picked from the icon strip along its
 // outer edge. Nine always-open panels stacked to 2400px — reaching the curve
 // meant scrolling two and a half screens past controls nobody was using.
-type EditTab = "light" | "color" | "curve" | "masks" | "detail" | "look" | "crop" | "assistant" | "history" | "settings";
+type EditTab = "light" | "color" | "masks" | "detail" | "look" | "crop" | "assistant" | "history" | "settings";
 
 // Distortion correction defaults to fully applied (mirrorless glass is designed
 // around it — uncorrected geometry reads as broken). Vignetting stays off by
@@ -465,7 +465,17 @@ const MASK_ADJUST_SLIDERS: { key: MaskSliderKey; min: number; max: number; step:
   { key: "exposure", min: -5, max: 5, step: 0.05 },
   ...(["temperature", "tint", "highlights", "shadows", "saturation", "vibrance", "hue", "clarity", "dehaze"] as const)
     .map(key => ({ key, min: -100, max: 100, step: 1 })),
+  { key: "tintHue", min: -180, max: 180, step: 1 },
+  { key: "tintSat", min: 0, max: 100, step: 1 },
 ];
+// The cast's hue slider shows the wheel it picks from; the strength slider the
+// colour it lands on.
+const HUE_TRACK = "linear-gradient(to right, #f0f, #00f, #0ff, #0f0, #ff0, #f00, #f0f)";
+function maskTintTrack(key: MaskSliderKey, adjust: MaskAdjust): string | undefined {
+  if (key === "tintHue") return HUE_TRACK;
+  if (key === "tintSat") return `linear-gradient(to right, #888, hsl(${gradingHueDeg(adjust.tintHue)}, 100%, 50%))`;
+  return WB_TRACK[key as RecipeKey];
+}
 // The Add menu: presets first (the common cases), then a bare component of
 // each type. Its model never matches an option, so it always reads "Add…".
 const maskAddOptions = computed(() => [
@@ -947,7 +957,6 @@ const visibleGroups = computed(() =>
 const EDIT_TABS: { key: EditTab; icon: string[] }[] = [
   { key: "light", icon: ["M12 3a9 9 0 0 0 0 18z", "M12 3a9 9 0 0 1 0 18"] },
   { key: "color", icon: ["M12 3a9 9 0 1 0 0 18c1.1 0 1.6-.9 1.6-1.7 0-1.6-1.4-1.9-1.4-3 0-.9.7-1.6 1.7-1.6H16a5 5 0 0 0 5-5c0-3.7-4-6.7-9-6.7z", "M7.5 12.5h.01", "M9.5 8.5h.01", "M14.5 8h.01"] },
-  { key: "curve", icon: ["M4 20c6.5 0 5-16 16-16"] },
   { key: "masks", icon: ["M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z", "M12 3v18", "M12 7.5h5.5", "M12 12h8.5", "M12 16.5h5.5"] },
   { key: "detail", icon: ["M12 4v16", "M4 12h16", "M6.3 6.3l11.4 11.4", "M17.7 6.3L6.3 17.7"] },
   { key: "look", icon: ["M21 19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h3l1.5-2.5h5L16 7h3a2 2 0 0 1 2 2z", "M12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8z"] },
@@ -981,9 +990,8 @@ const denoiseEdited = computed(() => {
 // The accent dot on a tab: which groups hold a non-default value, so an edit
 // buried in a closed tab is still visible.
 const tabEdited = computed<Record<EditTab, boolean>>(() => ({
-  light: groups.some(g => g.tab === "light" && groupEdited(g)),
+  light: groups.some(g => g.tab === "light" && groupEdited(g)) || curveEdited.value,
   color: groups.some(g => g.tab === "color" && groupEdited(g)) || hslEdited.value || gradingEdited.value,
-  curve: curveEdited.value,
   masks: masks.length > 0,
   detail: groups.some(g => g.tab === "detail" && groupEdited(g)) || denoiseEdited.value,
   look: lookEdited.value,
@@ -1010,7 +1018,7 @@ watch(editTab, v => {
   if (v !== "crop") localStorage.setItem("llr.tab", v);
   // The curve panel is v-if'd, so its canvas is a fresh element each time the
   // tab opens and has to be redrawn once it's in the DOM.
-  if (v === "curve") void nextTick(renderCurveCanvas);
+  if (v === "light") void nextTick(renderCurveCanvas);
 });
 watch(availableTabs, list => {
   if (list.length && !list.some(tb => tb.key === editTab.value)) editTab.value = list[0].key;
@@ -2842,7 +2850,7 @@ const vWheelAdjust = {
         <SliderRow v-model="grading.balance" :label="t('grading.balance')" :min="-100" :max="100" />
       </section>
 
-      <section class="panel" v-if="editTab === 'curve' && activeSource">
+      <section class="panel" v-if="editTab === 'light' && activeSource">
         <header class="panel-head">
           <span>{{ t('panel.curve') }}</span>
           <button class="ghost" type="button" @click="resetCurve">{{ t('common.reset') }}</button>
@@ -2971,7 +2979,7 @@ const vWheelAdjust = {
             </div>
             <SliderRow v-for="sp in MASK_ADJUST_SLIDERS" :key="sp.key"
               v-model="g.adjust[sp.key]" :label="t(`slider.${sp.key}`)" :input-id="`m-${sp.key}`"
-              :min="sp.min" :max="sp.max" :step="sp.step" :track="WB_TRACK[sp.key as RecipeKey]" show-modified />
+              :min="sp.min" :max="sp.max" :step="sp.step" :track="maskTintTrack(sp.key, g.adjust)" show-modified />
             </div>
           </li>
         </ol>

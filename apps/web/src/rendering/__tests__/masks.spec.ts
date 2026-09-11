@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { gradingTint } from "../grading";
 import {
   ADJUST_KEYS, GROUP_STRIDE, MASK_COMPS, MASK_GLSL, MASK_GROUPS, MASK_PRESETS, MASK_TEMP_PER_UNIT, MASK_USE,
   componentWeight, defaultAdjust, defaultComponent, groupWeight, imgFromTex, packMasks, presetGroup,
@@ -80,6 +81,19 @@ describe("packMasks layout", () => {
     const r2 = rows(packMasks([g], defaultCrop(), W, H, WB).masks, 0);
     const mg2 = computeWbMatrix(6500 - 25 * MASK_TEMP_PER_UNIT, 5);
     expect(r2[12]).toBeCloseTo(mg2[0][0] - 1, 6);
+  });
+
+  it("packs the colour cast as tint − 1 in the ΔWB rows' .w, zero without strength", () => {
+    const g = group([lum(0, 50)], { tintHue: 30, tintSat: 60 });
+    const r = rows(packMasks([g], defaultCrop(), W, H, WB).masks, 0);
+    const tint = gradingTint(30, 0.6);
+    for (let col = 0; col < 3; col++) {
+      expect(r[15 + col * 4]).toBeCloseTo(tint[col] - 1, 6);
+      expect(r[12 + col * 4 + col]).toBe(0);   // no WB delta alongside
+    }
+    // Hue alone is a choice, not an adjustment: the group packs nothing.
+    const idle = group([lum(0, 50)], { tintHue: 30 });
+    expect(packMasks([idle], defaultCrop(), W, H, WB).maskGroups).toBe(0);
   });
 
   it("never emits a zero-width smoothstep", () => {
