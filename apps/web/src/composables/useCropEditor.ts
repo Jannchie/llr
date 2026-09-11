@@ -317,13 +317,26 @@ export function useCropEditor(opts: {
       }
     }
 
-    // Constrain to the image. At angle 0 clamp edges exactly; otherwise reject if
-    // the rotated box would leave the image (the handle stops at the boundary).
+    // Constrain to the image. At angle 0 clamp edges exactly; otherwise a box
+    // that would leave the image lands on the boundary: bisect between the
+    // current (valid) box and the target, so a fast drag that overshoots does
+    // not stall wherever the last in-bounds mousemove happened to be.
     if (Math.abs(crop.angle) < 1e-3 && ratio == null) {
       l = Math.max(0, l); t = Math.max(0, t); r = Math.min(iw, r); b = Math.min(ih, b);
     }
-    const cand: CropState = { ...crop, cx: (l + r) / 2 / iw, cy: (t + b) / 2 / ih, w: (r - l) / iw, h: (b - t) / ih };
-    if (cornersInsideImage(cand, iw, ih)) Object.assign(crop, cand);
+    const f = cropBoxRect.value;
+    const at = (m: number): CropState => {
+      const L = f.x + (l - f.x) * m, T = f.y + (t - f.y) * m;
+      const R = f.x + f.w + (r - f.x - f.w) * m, B = f.y + f.h + (b - f.y - f.h) * m;
+      return { ...crop, cx: (L + R) / 2 / iw, cy: (T + B) / 2 / ih, w: (R - L) / iw, h: (B - T) / ih };
+    };
+    let m = 1;
+    if (!cornersInsideImage(at(1), iw, ih)) {
+      let lo = 0, hi = 1;
+      for (let i = 0; i < 20; i++) { const mid = (lo + hi) / 2; if (cornersInsideImage(at(mid), iw, ih)) lo = mid; else hi = mid; }
+      m = lo;
+    }
+    Object.assign(crop, at(m));
   }
 
   return {
