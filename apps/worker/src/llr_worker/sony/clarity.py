@@ -42,13 +42,17 @@ CLARITY_CALIBRATION_BODY = "ILCE-7CM2"
 CLARITY_AMP = (0, 32, 108, 184, 260, 336, 412, 488, 564, 646)
 CLARITY_AMP_SCALE = 1024.0
 
-# The range worth offering, which is the engine's own. The tag runs -9..+9 like
-# the other tweaks, but `clr = max(0, 10 * clarity)` makes every negative
-# setting render exactly like 0 — Clarity does not soften, it only stops — so
-# the bottom is 0 and a stop that cannot change a pixel is never offered. The
-# top is the table's, the way the other tweaks' tops are (TWEAK_RANGES).
+# The range offered is Edit's own 清晰 slider: 0..100, and its value *is* the
+# engine's `clr` (settings +0x2c0 holds it as typed; the camera's tag lands
+# there as `10 * clarity`, measured in sony_repro/notes/panel-sliders.md). The
+# table above is indexed at clr/10 and interpolated between entries — the
+# camera's stops never needed that, Edit's units in between do. The tag's
+# negative side is not offered: `max(0, ...)` renders it exactly like 0, so it
+# would be stops that cannot change a pixel. Past the table's last entry (90)
+# the amount holds — the engine's own behaviour there was not measured.
 CLARITY_MIN = 0
-CLARITY_MAX = len(CLARITY_AMP) - 1
+CLARITY_MAX = 100
+CLARITY_PANEL_PER_STOP = 10
 
 # calib[0x1174]: the range threshold of the edge-aware mean, on the engine's
 # 16-bit plane. Samples further than this from the centre are dropped, which is
@@ -70,17 +74,22 @@ CLARITY_DOWNSAMPLE = 8
 CLARITY_ROLLOFF_KNEE = 0.125
 
 
-def clamp_clarity(value: int) -> int:
-    """Into the offered range. A negative — from an older file, or a request
-    written by hand — lands on 0, which is what it rendered as anyway."""
+def clamp_clarity(value: float) -> int:
+    """Into the offered range, on Edit's 0..100 scale. A negative — from an
+    older file, or a request written by hand — lands on 0, which is what it
+    rendered as anyway."""
     return max(CLARITY_MIN, min(CLARITY_MAX, int(value)))
 
 
-def clarity_amount(clarity: int) -> float:
-    """The detail gain for a setting, as the shader wants it (0 = no-op).
+def clarity_amount(clarity: float) -> float:
+    """The detail gain for a 清晰 value (0..100), as the shader wants it (0 = no-op).
 
-    Mirrors the engine's own lookup: `clr = max(0, 10 * clarity)` selects the
-    table entry, and the interpolation between entries collapses because `clr`
-    lands exactly on one — which leaves the setting itself as the index.
+    Mirrors the engine's own lookup: `clr` indexes the table at clr/10 and
+    blends the two entries either side. The camera's stops (multiples of ten)
+    land exactly on an entry; Edit's units in between do not.
     """
-    return CLARITY_AMP[clamp_clarity(clarity)] / CLARITY_AMP_SCALE
+    x = clamp_clarity(clarity) / CLARITY_PANEL_PER_STOP
+    last = len(CLARITY_AMP) - 1
+    k = min(int(x), last - 1)
+    amp = CLARITY_AMP[k] + (CLARITY_AMP[k + 1] - CLARITY_AMP[k]) * min(x - k, 1.0)
+    return amp / CLARITY_AMP_SCALE

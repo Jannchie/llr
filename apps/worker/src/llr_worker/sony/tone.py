@@ -14,7 +14,8 @@ measurements had already given. Rebuilt this way, the curve matches what Frida
 dumps out of the running engine to within 8/16384 (0.05%) on all ten looks.
 
 On top of that baseline the engine applies the in-camera tweaks that ride on the
-curve: Highlights, Shadows and Contrast, each -9..+9. This is not a fit to
+curve: Highlights, Shadows and Contrast, each -9..+9 in the camera and +-20 stops
+from Edit's panel (profile.py has the panel scale). This is not a fit to
 measurements — it is the engine's own construction, read out of Edit.exe and
 checked against it (see apply_tuning). All three tweaks collapse into a single
 lookup over the curve's *output*, built from a family of 37 static curves that
@@ -64,15 +65,23 @@ CURVE_X_SCALE = 128.0         # tag 0x7805 units per LUT index
 TONE_OUTPUT_FULL = 16384.0    # the engine's LUT holds this as full scale
 CURVE_Y_FULL = 16.0 * TONE_OUTPUT_FULL  # tag 0x7806 units at full scale
 
-# The camera's own range. Edit.exe treats anything past it as no tweak at all —
-# +-10 renders identically to 0 — but that is input validation on a value the
-# body can never write, not a statement about the curve, so this pipeline
-# carries on past it (see apply_tuning).
+# The camera's own range, in stops. Edit.exe's panel goes five times further:
+# its sliders run -100..100 and one stop is five panel units (profile.py
+# PANEL_PER_STOP), so the engine is asked for up to +-20 stops. Measured against
+# the running engine on DSC02961 (sony_repro/notes/panel-sliders.md): every
+# panel value tried between -100 and +100, on all three sliders and in pairs,
+# comes out bit-identical to `panel / 5` fed through apply_tuning.
 TUNE_LIMIT = 9
+TUNE_STOP_LIMIT = 20
 
 # The engine's own tone-operator construction, read out of Edit.exe.
 TUNE_NEUTRAL_GAIN = 18.0      # family[18] is the identity
-TUNE_GAIN_MAX = 35.0          # the engine clamps here, and the family ends at 36
+# Beyond the family's two ends (rows 0 and 36) the engine does not clamp: it
+# keeps going along the last row pair, linearly. Panel +-100 lands at gains 38
+# and -2, and Contrast +100 with Highlights +100 at 58 — all of them came back
+# with zero difference against the extrapolation, and 179..311/16384 against
+# the clamp at 35 this used to apply.
+TUNE_GAIN_ROWS = 37
 TUNE_SPLIT = 471              # where the shadow gain hands over to the highlight one
 TUNE_TABLE_LEN = 1025
 TUNE_TABLE_TOP = TUNE_TABLE_LEN - 2   # last entry the engine will interpolate from
@@ -92,11 +101,22 @@ def _family() -> np.ndarray:
 
 
 def _segment(gain: float, lo: int, hi: int) -> np.ndarray:
-    """One stretch of the operator table, at one gain, blended out of the family."""
+    """One stretch of the operator table, at one gain, blended out of the family.
+
+    Inside the family it is a linear blend of the two rows either side; past
+    either end the same two-row line continues, which is what the engine does
+    (see TUNE_GAIN_ROWS). Rounding is the engine's: +0.5 and truncate, in float32.
+    """
     family = _family()
-    g = min(max(gain, 0.0), TUNE_GAIN_MAX)
-    k = int(g)
-    blend = np.float32(g - k)
+    last = TUNE_GAIN_ROWS - 1
+    if gain < 0.0:
+        k, blend = 0, gain
+    elif gain >= last:
+        k, blend = last - 1, gain - (last - 1)
+    else:
+        k = int(gain)
+        blend = gain - k
+    blend = np.float32(blend)
     mixed = family[k, lo:hi] + (family[k + 1, lo:hi] - family[k, lo:hi]) * blend
     return np.clip(np.trunc(mixed.astype(np.float32) + np.float32(0.5)),
                    0.0, TUNE_TABLE_MAX)
@@ -134,8 +154,8 @@ def base_curve(cal: LookCalibration, n: int = TONE_INDEX_WHITE + 1) -> np.ndarra
     )
 
 
-def apply_tuning(curve: np.ndarray, highlights: int = 0, shadows: int = 0,
-                 contrast: int = 0) -> np.ndarray:
+def apply_tuning(curve: np.ndarray, highlights: float = 0, shadows: float = 0,
+                 contrast: float = 0) -> np.ndarray:
     """Run the in-camera tone tweaks over a factory curve.
 
     This is the engine's own construction rather than a fit to it: one table
@@ -154,13 +174,12 @@ def apply_tuning(curve: np.ndarray, highlights: int = 0, shadows: int = 0,
     summed into a gain *before* a single table is built, so there is no order to
     get right and nothing for a second tweak to act on.
 
-    Out-of-range settings are the one deliberate divergence. Edit.exe refuses
-    them outright — +-10 renders identically to 0 — which is validation on a
-    number the body can never write, not a claim that the curve stops there. So
-    this passes them through, and the engine's own clamp on the gain is what
-    bounds them. Clamping the settings first would be worse than useless: the
-    three are summed, so a per-field cap lets a large pair cancel into no tweak
-    at all, which is the silent no-op this whole stage was rewritten to remove.
+    Settings are floats in stops: Edit's panel runs -100..100 at five units
+    per stop, so a fifth of a stop is an ordinary input here, and so is +-20.
+    Nothing is clamped on the way in — the three are summed, so a per-field
+    cap would let a large pair cancel into no tweak at all — and past the
+    family's ends the gain extrapolates rather than clamps (_segment), which is
+    the engine's own behaviour and was checked to the bit at panel +-100.
 
     A look does not come into it — the engine builds this table from the three
     settings alone — which is why there is no `style` here to get wrong.
@@ -181,8 +200,8 @@ def apply_tuning(curve: np.ndarray, highlights: int = 0, shadows: int = 0,
 
 
 def tone_curve(
-    cal: LookCalibration, highlights: int = 0, shadows: int = 0,
-    contrast: int = 0, n: int = TONE_INDEX_WHITE + 1,
+    cal: LookCalibration, highlights: float = 0, shadows: float = 0,
+    contrast: float = 0, n: int = TONE_INDEX_WHITE + 1,
 ) -> np.ndarray:
     """A look's complete display-encoded curve for one shot's settings.
 

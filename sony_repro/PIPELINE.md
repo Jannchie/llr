@@ -2554,6 +2554,19 @@ green(dst, detail, refOwn, refOther, tbl1, tbl4, limit, gain, offset, flagA, fla
 > `0x3a0c30` 的抽头装载逐条读出来(它把值预载进寄存器,不能只看内存操作数)。
 > 复现:`rawnr_kern_probe.py --kernel green` 抓真值。
 
+## 7.14 Edit 面板的创意外观滑块:量纲是 ±100,`opts` 里存的就是面板值(2026-09-11)
+
+面板上 对比度/高光/阴影/白色/黑色 ±100、褪色 0..100、色相/饱和度 ±100、清晰 0..100,
+引擎的编辑参数结构体 `opts` 原样存这些数;机内 −9..+9 档装载时换算:三个影调
+滑块 ×5、褪色/清晰 ×10、饱和度查 §7 那张 0,10,20,25,…,55 的表。三个影调滑块
+对 `tone.apply_tuning(面板/5)` **逐位 0 差**(±100 全程、两两叠加都是),并且
+family 表两端引擎**线性外推**而不是钳位。白色/黑色就是 §7.8 YGamma 里一直读到 0 的
+`bl/wl`(`opts+0x2ac/+0x2b0`),色相是 `opts+0x204` → `ZcTaskHueSaturation`。
+llr 的 look 面板已改成这套量纲并补上三个滑块。全部偏移、验证数据与驱动面板的
+坑(合成 WM_HSCROLL / BM_CLICK 会把 Edit 打崩,键盘消息才行)见
+**`notes/panel-sliders.md`**;工具 `tools/panel_sweep.py`(面板扫描)、
+`tools/opts_locate.py`(机内 tag → opts 偏移)、`tools/panel_fit.py`(对 llr 拟合)。
+
 ## 8. 3D-LUT:已定位、已抓到数据,但**默认路径不执行**
 
 字符串区 `+0x4dde28` 附近有五张 3D-LUT 的标识(紧邻着就是完整的创意外观名表:

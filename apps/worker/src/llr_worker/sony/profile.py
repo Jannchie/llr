@@ -53,10 +53,13 @@ import numpy as np
 from ..creative_style import normalize_style
 from ..dcp import D50_TO_D65, XYZ_D50_TO_PROPHOTO, XYZ_D65_TO_SRGB
 from .chroma import (
+    FADE_PANEL_PER_STOP,
     LUMA_CONTRAST_ADVANCED,
     LUMA_LUT_WIRE,
     SATURATION_STEPS,
     blend_params,
+    hue_degrees,
+    luma_levels,
     luma_terms,
     saturation_factor,
     unpack_params,
@@ -73,6 +76,7 @@ from .clarity import (
     CLARITY_EDGE_THRESHOLD,
     CLARITY_MAX,
     CLARITY_MIN,
+    CLARITY_PANEL_PER_STOP,
     CLARITY_ROLLOFF_KNEE,
     clarity_amount,
 )
@@ -89,13 +93,12 @@ from .sharpness import sharpness_block
 from .spica import spica_off
 from .sr2 import (
     DRO_LOG_CEILING,
-    FADE_STEPS,
     LookCalibration,
     look_calibrations,
     luma_lut_key_for,
     unpack_param_block,
 )
-from .tone import LOOK_ORDER, TUNE_LIMIT, look_index, tone_curve
+from .tone import LOOK_ORDER, TUNE_STOP_LIMIT, look_index, tone_curve
 
 _DATA = Path(__file__).resolve().parent / "data"
 
@@ -108,22 +111,53 @@ TONE_OUT_SCALE = 16384.0
 # LUT with a monotone spline; at 1024 the round trip costs under 0.05/255.
 TONE_CURVE_POINTS = 1024
 
-# The range each tweak can be rendered over, which is also the range the
-# frontend offers — it ships them (to_json's "lookRanges") rather than repeating
-# them, so no stop can appear on a slider that the engine will not honour.
-# tone.apply_tuning will happily extrapolate past its limit, but a value the
-# body cannot write is no longer a Creative Look setting — and Edit.exe refuses
-# those outright. Fade and Clarity have no negative side: for Fade the camera
-# writes none, and for Clarity the engine clamps at zero instead of inverting,
-# which would make every negative stop render like 0 (see clarity.py).
+# The tweaks are on Imaging Edge Edit's own panel scale, not the camera's.
+# Edit's 创意外观 panel (对比度/高光/阴影/白色/黑色/褪色, then 色相/饱和度,
+# then 清晰) runs every slider -100..100 — 褪色 and 清晰 0..100 — and its
+# settings struct holds those numbers as typed; the camera's -9..+9 stops are
+# converted on the way in (sony_repro/notes/panel-sliders.md, measured on the
+# running engine: one stop is five panel units on the three tone sliders, ten
+# on 褪色 and 清晰, and 饱和度's stops are chroma.SATURATION_STEPS). 白色, 黑色
+# and 色相 have no camera setting at all and start at 0 on every shot.
+#
+# The ranges ship with the profile (to_json's "lookRanges") so the frontend
+# offers exactly what the engine takes. 褪色 and 清晰 have no negative side:
+# Edit offers none, the camera writes none, and for 清晰 the engine clamps at
+# zero rather than inverting (clarity.py).
+PANEL_LIMIT = 100
+PANEL_PER_STOP = 5            # 对比度 / 高光 / 阴影
 TWEAK_RANGES: dict[str, tuple[int, int]] = {
-    "highlights": (-TUNE_LIMIT, TUNE_LIMIT),
-    "shadows": (-TUNE_LIMIT, TUNE_LIMIT),
-    "contrast": (-TUNE_LIMIT, TUNE_LIMIT),
-    "fade": (0, FADE_STEPS - 1),
-    "saturation": (-(len(SATURATION_STEPS) - 1), len(SATURATION_STEPS) - 1),
+    "contrast": (-PANEL_LIMIT, PANEL_LIMIT),
+    "highlights": (-PANEL_LIMIT, PANEL_LIMIT),
+    "shadows": (-PANEL_LIMIT, PANEL_LIMIT),
+    "white": (-PANEL_LIMIT, PANEL_LIMIT),
+    "black": (-PANEL_LIMIT, PANEL_LIMIT),
+    "fade": (0, PANEL_LIMIT),
+    "hue": (-PANEL_LIMIT, PANEL_LIMIT),
+    "saturation": (-PANEL_LIMIT, PANEL_LIMIT),
     "clarity": (CLARITY_MIN, CLARITY_MAX),
 }
+assert PANEL_LIMIT == PANEL_PER_STOP * TUNE_STOP_LIMIT
+
+
+def stops_to_panel(highlights: int = 0, shadows: int = 0, contrast: int = 0,
+                   fade: int = 0, saturation: int = 0, clarity: int = 0,
+                   ) -> dict[str, int]:
+    """The camera's own numbers, as MakerNotes writes them, on the panel scale.
+
+    Exactly what Edit shows when it opens the file: Highlights -6 is 高光 -30,
+    Clarity +1 is 清晰 10, Saturation +9 is 饱和度 55 (the table, not a
+    multiple). Only the six the camera has; the other three are 0.
+    """
+    i = min(abs(int(saturation)), len(SATURATION_STEPS) - 1)
+    return {
+        "highlights": int(highlights) * PANEL_PER_STOP,
+        "shadows": int(shadows) * PANEL_PER_STOP,
+        "contrast": int(contrast) * PANEL_PER_STOP,
+        "fade": int(fade) * FADE_PANEL_PER_STOP,
+        "saturation": SATURATION_STEPS[i] * (1 if int(saturation) >= 0 else -1),
+        "clarity": int(clarity) * CLARITY_PANEL_PER_STOP,
+    }
 
 
 def _clamp_tweak(field: str, value: Any) -> int:
@@ -136,24 +170,29 @@ def _clamp_tweak(field: str, value: Any) -> int:
 
 @dataclass(frozen=True)
 class LookTweaks:
-    """The six in-camera tweaks that ride on a Creative Look.
+    """The nine tweaks of Edit's Creative Look panel, on Edit's own scale
+    (TWEAK_RANGES says what that is and where it was measured).
 
     Not one of them touches a pixel on the way through the matrix: Highlights,
     Shadows and Contrast reshape the tone curve (tone.apply_tuning), Fade sets
-    YGamma's pivot and contrast, and Saturation scales the chroma either side of
-    the clamp. All six leave with the profile and are applied in the browser,
-    which is what lets the frontend re-request a profile for a moved slider
-    instead of re-decoding the frame.
+    YGamma's pivot and contrast, White and Black are YGamma's level pair
+    (chroma.luma_levels), Saturation scales the chroma either side of the
+    clamp and Hue turns it (chroma.rotate_chroma). All of them leave with the
+    profile and are applied in the browser, which is what lets the frontend
+    re-request a profile for a moved slider instead of re-decoding the frame.
 
     Clarity is the odd one out only in *how* the browser applies it: it is
     spatial, so it rides as a gain for the shader's own blur chain rather than
     as a reshaped curve. See clarity.py.
     """
 
+    contrast: int = 0
     highlights: int = 0
     shadows: int = 0
-    contrast: int = 0
+    white: int = 0
+    black: int = 0
     fade: int = 0
+    hue: int = 0
     saturation: int = 0
     clarity: int = 0
 
@@ -211,7 +250,14 @@ class SonyRenderInfo:
     # standard path, which is why there is no advanced one here.
     luma_lut_advanced: list[int] | None = None
     luma_contrast_advanced: float = LUMA_CONTRAST_ADVANCED
+    # YGamma's level pair from the 黑色/白色 sliders (chroma.luma_levels): the
+    # shader subtracts `black` and multiplies by `scale` between the table and
+    # the pivot line. (0, 1) on every camera-shot frame.
+    luma_black: float = 0.0
+    luma_scale: float = 1.0
     chroma_saturation: float = 1.0
+    # The 色相 slider as a rotation in degrees (chroma.hue_degrees); 0 is off.
+    chroma_hue: float = 0.0
     sepia: dict[str, Any] | None = None
     # What was applied, and what the body itself recorded. They differ only when
     # the client overrode a slider; shipping both lets the panel show the
@@ -295,6 +341,10 @@ class SonyRenderInfo:
             # along unconditionally so the browser's switch stays a redraw.
             "profileLumaLutAdvanced": self.luma_lut_advanced,
             "profileLumaContrastAdvanced": self.luma_contrast_advanced,
+            # The 黑色/白色 sliders, as YGamma applies them: y = (y - black) *
+            # scale after the table and before the pivot line.
+            "profileLumaBlack": self.luma_black,
+            "profileLumaScale": self.luma_scale,
             # ChromaSuppres, which runs just *before* YGamma and reads the luma
             # from before it: the mid-tones lose 1/256 of their chroma and the
             # highlights fade out above hiY. Null means the shot's four SR2 tags
@@ -307,6 +357,9 @@ class SonyRenderInfo:
             # this is the factor the shader multiplies back after the clamp,
             # which is where the setting's whole visible effect comes from.
             "profileChromaSaturation": self.chroma_saturation,
+            # The 色相 slider, in degrees, applied to (Cb, Cr) right after that
+            # multiply — ZcTaskHueSaturation's place. 0 skips the stage.
+            "profileChromaHue": self.chroma_hue,
             # Sepia's toning (ZcTaskEffect), null for the nine looks without it.
             "profileSepia": self.sepia,
             # The Creative Look tweaks this profile was built with, and the ones
@@ -534,10 +587,13 @@ def sepia_toning(style: str) -> dict[str, Any] | None:
 
 
 def tone_curve_points(
-    cal: LookCalibration, highlights: int = 0, shadows: int = 0,
-    contrast: int = 0, n: int = TONE_CURVE_POINTS,
+    cal: LookCalibration, highlights: float = 0, shadows: float = 0,
+    contrast: float = 0, n: int = TONE_CURVE_POINTS,
 ) -> list[list[float]]:
     """Sony's MainGamma LUT as (x, y) points in the frontend's contract.
+
+    The three tweaks are on Edit's panel scale (TWEAK_RANGES); tone.py works
+    in stops, so they are divided by PANEL_PER_STOP on the way in.
 
     x is scene-linear with Sony's white at 1.0; y is *display-linear*, not the
     engine's own output. The LUT bakes in the sRGB transfer function (its slope
@@ -549,7 +605,8 @@ def tone_curve_points(
     The curve saturates just under x = 1.0, so [0, 1] is its whole domain and no
     highlight rolloff is lost by clamping there.
     """
-    lut = tone_curve(cal, highlights, shadows, contrast)
+    lut = tone_curve(cal, highlights / PANEL_PER_STOP, shadows / PANEL_PER_STOP,
+                     contrast / PANEL_PER_STOP)
     x = np.linspace(0.0, 1.0, n)
     y = np.interp(x, np.linspace(0.0, 1.0, lut.size), lut)
     y = _srgb_decode(np.clip(y, 0.0, 1.0))
@@ -637,6 +694,7 @@ def look_render_info(
     # not passing anything to a shader, does both halves itself and so takes the
     # look's own gains — do not feed it these.
     sat = saturation_factor(tweaks.saturation)
+    luma_black, luma_scale = luma_levels(tweaks.black, tweaks.white)
     # As-shot is 1.0 exactly when the body applied DRO. A frame it rendered
     # without DRO still ships the table, so the control has something to scale,
     # but it starts at zero and the render is unchanged until someone moves it.
@@ -672,9 +730,12 @@ def look_render_info(
         chroma_cross=[float(x) for x in cross],
         chroma_gain=[float(x) / sat for x in gain],
         chroma_saturation=sat,
+        chroma_hue=hue_degrees(tweaks.hue),
         sepia=sepia_toning(style),
         luma_pivot=luma_pivot,
         luma_contrast=luma_contrast,
+        luma_black=luma_black,
+        luma_scale=luma_scale,
         luma_lut=[int(v) for v in ygamma_lut(cal)[:LUMA_LUT_WIRE]],
         luma_lut_advanced=[int(v) for v in ygamma_lut(cal, advanced=True)[:LUMA_LUT_WIRE]],
         luma_contrast_advanced=luma_contrast_advanced,

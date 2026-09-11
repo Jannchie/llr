@@ -57,11 +57,15 @@ _R_CR, _G_CR, _G_CB, _B_CB = 1.4020, 0.7141, 0.3441, 1.7720
 #     Y' = trunc(clamp(((max(0, lut[Y]) - black) * scale - pivot) * contrast
 #                      + pivot, 0, 16383))
 #
-# bl and wl read 0 on every frame measured, which drops black and scale. Pivot
-# and contrast do not: they are the *Fade* setting, read out of the RAW's two
-# ten-entry tables (sr2.LUMA_PIVOT_TAG / LUMA_CONTRAST_TAG). At Fade 0 the pivot
-# is 0 and the whole thing is a plain gain, which is why Fade looked absent for
-# so long — every frame in the sample corpus was shot at Fade 0.
+# bl and wl are Edit's own 黑色 and 白色 sliders (settings +0x2ac and +0x2b0,
+# each -100..100, stored as typed — measured by moving the panel and reading the
+# settings struct, sony_repro/notes/panel-sliders.md). The camera has no such
+# setting, so both read 0 on every frame ever shot and the two terms sat unused
+# in this comment until the panel was matched; luma_levels turns them into the
+# (black, scale) pair. Pivot and contrast are the *Fade* setting, read out of
+# the RAW's two ten-entry tables (sr2.LUMA_PIVOT_TAG / LUMA_CONTRAST_TAG). At
+# Fade 0 the pivot is 0 and the whole thing is a plain gain, which is why Fade
+# looked absent for so long — every frame in the sample corpus was shot at Fade 0.
 #
 # Checked against the engine's own in/out on whole frames: 100.0000% bit-exact
 # over 2M pixels at Fade 0 *and* at Fade 5, where the pivot is 10624 and the
@@ -169,21 +173,27 @@ def unpack_params(params: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 # The in-camera Saturation slider, -9..+9, as the engine sees it: the settings
 # object holds 10 per step up to 2 and 5 per step after that, and both stages
 # that use it read `1 + value/100`. Measured by dumping the settings struct at
-# every setting (sony_repro/tools/settings_probe.py).
+# every setting (sony_repro/tools/settings_probe.py). That settings value is
+# also exactly what Edit's own 饱和度 slider writes — it runs -100..100 and lands
+# in the struct as typed — so the panel value is the engine value and the
+# camera's stops are just the ten entries of this table (profile.py converts).
 SATURATION_STEPS = (0, 10, 20, 25, 30, 35, 40, 45, 50, 55)
+SATURATION_PANEL_LIMIT = 100
 
 
-def saturation_factor(setting: int) -> float:
-    """One Saturation setting -> the factor both halves of the stage use.
+def saturation_factor(value: float) -> float:
+    """One Saturation value, on Edit's -100..100 scale, -> the factor both halves
+    of the stage use.
 
     Sony applies this twice in opposite directions: RGB2YCC divides its gains by
     it, and ZcTaskSIMDHueSaturation multiplies both chroma planes back by it
     afterwards. The two nearly cancel, so the slider's whole visible effect is
-    what the clamp in between does — about 1% at +9, and about 5% at -9, where
-    the intermediate chroma is 2.3x larger and clips.
+    what the clamp in between does — about 1% at the camera's +9 (55 here), and
+    about 5% at -9, where the intermediate chroma is 2.3x larger and clips. At
+    -100 the factor is 0: the chroma is gone, and rgb_to_ycc says so explicitly
+    rather than dividing by it.
     """
-    i = min(abs(int(setting)), len(SATURATION_STEPS) - 1)
-    v = SATURATION_STEPS[i] * (1 if setting >= 0 else -1)
+    v = max(-SATURATION_PANEL_LIMIT, min(SATURATION_PANEL_LIMIT, float(value)))
     return 1.0 + v / 100.0
 
 
@@ -198,6 +208,12 @@ def rgb_to_ycc(rgb: np.ndarray, cross: np.ndarray, gain: np.ndarray,
     """
     r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
     y = (r * LUMA_WEIGHTS[0] + g * LUMA_WEIGHTS[1] + b * LUMA_WEIGHTS[2]) / LUMA_SHIFT
+    if saturation <= 0.0:
+        # 饱和度 -100: the multiply-back is by zero, so whatever the divided
+        # gains did the chroma leaves as nothing. Said outright, since the
+        # division below would otherwise be by zero.
+        z = np.zeros_like(y)
+        return y, z, z
     u, v = r - g, b - g
     v2 = np.where(u >= 0, cross[1], cross[3]) * u + v
     u2 = np.where(v >= 0, cross[0], cross[2]) * v + u
@@ -208,14 +224,55 @@ def rgb_to_ycc(rgb: np.ndarray, cross: np.ndarray, gain: np.ndarray,
     return y, cb, cr
 
 
-def luma_terms(cal: LookCalibration, fade: int = 0,
+# Edit's 色相 slider (settings +0x204, -100..100) is ZcTaskHueSaturation, read
+# out of Edit.exe (sony_repro/PIPELINE.md §7): the two chroma planes are turned
+# as a vector, by 0.7 degrees per unit above zero and 0.35 below it — the same
+# asymmetric convention as the in-camera tweaks — and the *output* angle is
+# snapped to the engine's 512-entry sine table, i.e. to steps of 360/512. The
+# stage is the identity at 0, which is why it was never on the measured path;
+# the rotation is implemented from the disassembly and has not been checked
+# against a live tile (the panel probe could not keep Edit alive long enough).
+HUE_DEGREES_PER_UNIT_POS = 0.7
+HUE_DEGREES_PER_UNIT_NEG = 0.35
+HUE_PANEL_LIMIT = 100
+HUE_TABLE_STEPS = 512
+
+
+def hue_degrees(value: float) -> float:
+    """One 色相 value on Edit's -100..100 scale -> the rotation in degrees."""
+    v = max(-HUE_PANEL_LIMIT, min(HUE_PANEL_LIMIT, float(value)))
+    return v * (HUE_DEGREES_PER_UNIT_POS if v >= 0 else HUE_DEGREES_PER_UNIT_NEG)
+
+
+def rotate_chroma(cb: np.ndarray, cr: np.ndarray, degrees: float,
+                  ) -> tuple[np.ndarray, np.ndarray]:
+    """ZcTaskHueSaturation's rotation: (Cb, Cr) turned by `degrees` and the
+    result's angle snapped to the sine table. Identity at 0, exactly."""
+    if degrees == 0.0:
+        return cb, cr
+    cb, cr = np.asarray(cb), np.asarray(cr)
+    mag = np.hypot(cb, cr)
+    ang = np.arctan2(cb, cr) + np.deg2rad(degrees)
+    step = 2.0 * np.pi / HUE_TABLE_STEPS
+    ang = np.round(ang / step) * step
+    return (mag * np.sin(ang)).astype(cb.dtype, copy=False), (mag * np.cos(ang)).astype(cr.dtype, copy=False)
+
+
+FADE_PANEL_PER_STOP = 10
+
+
+def luma_terms(cal: LookCalibration, fade: float = 0,
                advanced: bool = False) -> tuple[float, float]:
     """This shot's YGamma pivot and contrast, for its Fade setting.
 
-    The engine indexes both tables at Fade*10 and interpolates in tenths, so a
-    whole-number Fade — all the camera can write — lands exactly on an entry.
-    Out-of-range values clamp rather than extrapolate, matching the engine: past
-    90 it holds the last entry, and Fade has no negative side to begin with.
+    `fade` is on Edit's 褪色 scale, 0..100, ten units per camera stop; the
+    camera's stops land exactly on the tables' entries. Between entries the
+    contrast is interpolated, and past the last entry it continues along the
+    last pair — panel 100 asks for entry 10 of a ten-entry table and the engine
+    answered 9472/16384, one step beyond entry 9's 10112. The pivot is not
+    interpolated: panel 5 (half way from entry 0 to 1) already reads entry 1's
+    10624, so it takes the entry above. Both measured on the running engine
+    (sony_repro/notes/panel-sliders.md); a whole-number index is unchanged.
 
     `advanced` replaces the contrast with 高级's own, which is the one constant
     for every look rather than a per-look table entry. The *pivot* is left as the
@@ -223,15 +280,50 @@ def luma_terms(cal: LookCalibration, fade: int = 0,
     pivot is 0 either way, so there is no evidence that 高级 touches it and
     inventing one would silently move every faded frame.
     """
-    i = int(np.clip(fade, 0, cal.luma_pivot.size - 1))
-    contrast = (LUMA_CONTRAST_ADVANCED if advanced
-                else float(cal.luma_contrast[i]) / LUMA_CONTRAST_UNIT)
-    return float(cal.luma_pivot[i]) / LUMA_FULL_SCALE, contrast
+    x = max(0.0, float(fade)) / FADE_PANEL_PER_STOP
+    last = cal.luma_pivot.size - 1
+    pivot = float(cal.luma_pivot[min(last, int(np.ceil(x)))]) / LUMA_FULL_SCALE
+    if advanced:
+        return pivot, LUMA_CONTRAST_ADVANCED
+    table = cal.luma_contrast.astype(np.float64)
+    k = min(int(x), last - 1)
+    c = table[k] + (table[k + 1] - table[k]) * (x - k)
+    return pivot, float(c) / LUMA_CONTRAST_UNIT
+
+
+LEVEL_PANEL_LIMIT = 100
+LEVEL_UNIT = 0x200        # the engine's white point on the level scale
+LEVEL_TO_LUMA = 32767.0 / 512.0   # one level unit on the 16-bit luma plane
+
+
+def luma_levels(black: float = 0, white: float = 0) -> tuple[float, float]:
+    """Edit's 黑色 and 白色 sliders -> YGamma's (black, scale), the two terms
+    the header comment carries: both on the 0..16383 luma scale, normalised.
+
+        black_int = -trunc(bl / 4)         # the (bl + (bl>>31 & 3)) >> 2 dance
+        black     = black_int * 32767/512
+        scale     = 512 / ((512 - wl) - black_int)
+
+    Positive 黑色 makes `black` negative, which *lifts* the plane; positive 白色
+    shrinks the divisor and stretches it. Zero both is (0, 1). The arithmetic is
+    the disassembly's; the sliders' effect on a live tile has not been checked.
+    """
+    bl = int(max(-LEVEL_PANEL_LIMIT, min(LEVEL_PANEL_LIMIT, black)))
+    wl = int(max(-LEVEL_PANEL_LIMIT, min(LEVEL_PANEL_LIMIT, white)))
+    black_int = -int(bl / 4)          # int() truncates toward zero, as the shift pair does
+    black16 = black_int * LEVEL_TO_LUMA
+    scale = LEVEL_UNIT / ((LEVEL_UNIT - wl) - black_int)
+    return black16 / LUMA_FULL_SCALE, float(scale)
 
 
 def luma_gamma(y: np.ndarray, pivot: float, contrast: float,
-               lut: np.ndarray | None = None) -> np.ndarray:
-    """YGamma: table, then pull luma toward `pivot` by `contrast`, and clip.
+               lut: np.ndarray | None = None,
+               black: float = 0.0, scale: float = 1.0) -> np.ndarray:
+    """YGamma: table, levels, then pull luma toward `pivot` by `contrast`, and clip.
+
+    `black` and `scale` are luma_levels' pair: `(y - black) * scale` sits
+    between the table and the pivot line, exactly where the header comment has
+    it. Defaults are the identity, which is every camera-shot frame.
 
     Chroma is untouched — the engine's own two chroma planes come out of this
     stage bit-identical.
@@ -251,11 +343,14 @@ def luma_gamma(y: np.ndarray, pivot: float, contrast: float,
     if lut is not None:
         idx = np.clip(np.trunc(y * LUMA_FULL_SCALE), 0, len(lut) - 1).astype(np.intp)
         y = (np.asarray(lut)[idx] / LUMA_FULL_SCALE).astype(y.dtype, copy=False)
+    if black != 0.0 or scale != 1.0:
+        y = (y - black) * scale
     return np.clip((y - pivot) * contrast + pivot, 0.0, 1.0)
 
 
 def ygamma_planes(y16: np.ndarray, lut: np.ndarray,
-                  pivot16: int = 0, contrast: float = 1.0) -> np.ndarray:
+                  pivot16: int = 0, contrast: float = 1.0,
+                  black16: float = 0.0, scale: float = 1.0) -> np.ndarray:
     """The exact integer stage on an engine plane: int16 Y in, int16 Y out.
 
     Kept beside the float path for the same reason chromasuppres keeps one: it
@@ -268,7 +363,9 @@ def ygamma_planes(y16: np.ndarray, lut: np.ndarray,
     pixels and no more.
     """
     y = np.asarray(y16, np.int16).astype(np.int64)
-    v = np.asarray(lut, np.int64)[np.maximum(y, 0)]
+    v = np.asarray(lut, np.int64)[np.maximum(y, 0)].astype(np.float64)
+    if black16 != 0.0 or scale != 1.0:
+        v = (v - black16) * scale
     return np.trunc(np.clip((v - pivot16) * contrast + pivot16,
                             0.0, LUMA_FULL_SCALE)).astype(np.int16)
 
@@ -289,8 +386,14 @@ def apply_chroma(rgb: np.ndarray, cross: np.ndarray, gain: np.ndarray,
                  lut: np.ndarray | None = None,
                  lut3d: bool = False,
                  lut_advanced: np.ndarray | None = None,
-                 contrast_advanced: float | None = None) -> np.ndarray:
+                 contrast_advanced: float | None = None,
+                 hue: float = 0.0,
+                 black: float = 0.0, scale: float = 1.0) -> np.ndarray:
     """The whole YCC section: display-encoded RGB in, the same out.
+
+    `hue` is the 色相 rotation in degrees (hue_degrees), applied right after
+    the saturation multiply-back where ZcTaskHueSaturation sits; `black` and
+    `scale` are the 黑色/白色 pair (luma_levels) and go to YGamma.
 
     Grey does not survive this unchanged — YGamma moves it. That is the engine's
     behaviour, not a bug in the chroma maths: YGamma itself leaves both chroma
@@ -326,6 +429,7 @@ def apply_chroma(rgb: np.ndarray, cross: np.ndarray, gain: np.ndarray,
     The pivot is shared between the two settings — see luma_terms for why.
     """
     y, cb, cr = rgb_to_ycc(rgb, cross, gain, saturation)
+    cb, cr = rotate_chroma(cb, cr, hue)
     if suppress is not None:
         f = chroma_suppres_gain(y, suppress)
         cb, cr = cb * f, cr * f
@@ -334,7 +438,7 @@ def apply_chroma(rgb: np.ndarray, cross: np.ndarray, gain: np.ndarray,
             lut = lut_advanced
         if contrast_advanced is not None:
             contrast = contrast_advanced
-    y = luma_gamma(y, pivot, contrast, lut)
+    y = luma_gamma(y, pivot, contrast, lut, black, scale)
     if lut3d:
         y, cb, cr = apply_lut3d_float(y, cb, cr)
     return ycc_to_rgb(y, cb, cr)

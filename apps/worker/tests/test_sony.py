@@ -85,6 +85,7 @@ from llr_worker.sony.profile import (
     chroma_terms,
     look_render_info,
     sepia_toning,
+    stops_to_panel,
     tone_curve_points,
 )
 from llr_worker.sony.rawnr import (
@@ -132,6 +133,7 @@ from llr_worker.sony.tone import (
     LOOK_ORDER,
     TONE_OUTPUT_FULL,
     TUNE_LIMIT,
+    TUNE_STOP_LIMIT,
     apply_tuning,
     base_curve,
     tone_curve,
@@ -421,12 +423,17 @@ def test_saturation_is_applied_twice_and_nearly_cancels() -> None:
     is 2.3x larger and clips. Anything that applied only one half would be out
     by 55%, which is why both belong in one place.
     """
+    # The argument is Edit's 饱和度 value, which is the engine's own number: the
+    # camera's +9 is 55 there (stops_to_panel), and Edit's slider reaches 100.
     assert saturation_factor(0) == 1.0
-    assert saturation_factor(9) == pytest.approx(1.55)
-    assert saturation_factor(-9) == pytest.approx(0.45)
-    assert saturation_factor(2) == pytest.approx(1.20), "10 per step below 2"
-    assert saturation_factor(3) == pytest.approx(1.25), "5 per step above it"
-    assert saturation_factor(99) == saturation_factor(9), "clamped, not extrapolated"
+    assert saturation_factor(55) == pytest.approx(1.55)
+    assert saturation_factor(-55) == pytest.approx(0.45)
+    assert saturation_factor(100) == pytest.approx(2.0)
+    assert saturation_factor(-100) == 0.0, "the multiply-back is by zero: no chroma"
+    assert saturation_factor(999) == saturation_factor(100), "clamped to the panel"
+    assert stops_to_panel(saturation=2)["saturation"] == 20, "10 per step below 2"
+    assert stops_to_panel(saturation=3)["saturation"] == 25, "5 per step above it"
+    assert stops_to_panel(saturation=-9)["saturation"] == -55
 
     cross, gain = unpack_params(VV2_CHROMA)
     rng = np.random.default_rng(11)
@@ -434,13 +441,18 @@ def test_saturation_is_applied_twice_and_nearly_cancels() -> None:
     plain = apply_chroma(img, cross, gain, *FADE0)
     # rgb_to_ycc does both halves itself, so it takes the look's own gains — the
     # divided ones are only for the shader, which can only do the multiply.
-    for s in (3, 9, -3):
+    for s in (25, 55, -25):
         got = apply_chroma(img, cross, gain, *FADE0, saturation=saturation_factor(s))
         moved = np.abs(got - plain)
         # Identical wherever the intermediate chroma stayed inside the clamp,
         # and different only where it did not.
         assert np.median(moved) < 1e-6
         assert moved.max() > 1e-3
+    # -100 is the one value where nothing cancels: grey out, finite everywhere.
+    grey = apply_chroma(img, cross, gain, *FADE0, saturation=0.0)
+    assert np.isfinite(grey).all()
+    assert np.abs(grey[..., 0] - grey[..., 1]).max() < 1e-6
+    assert np.abs(grey[..., 2] - grey[..., 1]).max() < 1e-6
 
 
 def test_the_pair_is_deliberately_not_an_identity() -> None:
@@ -468,13 +480,25 @@ def test_fade_is_a_contrast_pull_toward_a_pivot() -> None:
     assert pivot0 == 0.0
     assert contrast0 > 1.0, "Fade 0 still applies a gain, it is not an identity"
 
-    pivot5, contrast5 = luma_terms(cal, 5)
+    # The argument is Edit's 褪色 value: ten units per camera stop.
+    pivot5, contrast5 = luma_terms(cal, 50)
     assert pivot5 > 0.5
     assert contrast5 < 1.0
-    # Monotone in the setting, and clamped rather than extrapolated past the end.
-    contrasts = [luma_terms(cal, f)[1] for f in range(10)]
+    # Monotone in the setting.
+    contrasts = [luma_terms(cal, f)[1] for f in range(0, 100, 10)]
     assert contrasts == sorted(contrasts, reverse=True)
-    assert luma_terms(cal, 99) == luma_terms(cal, 9)
+    # Between two stops the contrast is the blend of the entries either side
+    # and the pivot is already the upper entry's — measured on the engine at
+    # 褪色 5: pivot 10624, contrast (17280 + 15616) / 2 = 16448 on DSC02961.
+    pivot_half, contrast_half = luma_terms(cal, 5)
+    assert pivot_half == pivot5
+    assert contrast_half == pytest.approx((contrast0 + luma_terms(cal, 10)[1]) / 2)
+    # Past the last entry the contrast keeps going along the last pair rather
+    # than holding: 褪色 100 asked the engine for entry 10 of ten and it answered
+    # one step beyond entry 9.
+    c80, c90, c100 = (luma_terms(cal, f)[1] for f in (80, 90, 100))
+    assert c100 == pytest.approx(c90 + (c90 - c80))
+    assert luma_terms(cal, 100)[0] == pivot5
 
     # Below the pivot it lifts, above it it cuts. That crossover is what makes it
     # a fade rather than a brightness change.
@@ -660,20 +684,31 @@ def test_every_in_camera_tweak_reaches_the_shipped_curve() -> None:
 
     plain = curve()
     for field in ("highlights", "shadows", "contrast"):
-        assert curve(**{field: 5}) != plain, f"{field} never reached the curve"
-    for field in ("fade", "saturation"):
-        assert curve(**{field: 5}) == plain, f"{field} does not belong on the curve"
-    sat = apply_sony_profile(rgb, cal, "FL", LookTweaks(saturation=9))[1]
+        assert curve(**{field: 25}) != plain, f"{field} never reached the curve"
+    for field in ("fade", "saturation", "white", "black", "hue"):
+        assert curve(**{field: 25}) == plain, f"{field} does not belong on the curve"
+    sat = apply_sony_profile(rgb, cal, "FL", LookTweaks(saturation=55))[1]
     assert sat.chroma_saturation == pytest.approx(1.55)
     assert sat.chroma_gain == pytest.approx([g / 1.55 for g in apply_sony_profile(
         rgb, cal, "FL")[1].chroma_gain])
     # Fade drives YGamma, not the curve — so the curve must NOT move, and the
     # two luma terms must.
-    faded = apply_sony_profile(rgb, cal, "FL", LookTweaks(fade=5))[1]
+    faded = apply_sony_profile(rgb, cal, "FL", LookTweaks(fade=50))[1]
     assert [y for _, y in faded.tone_curve] == plain
     assert faded.luma_pivot > 0.5
     assert faded.luma_contrast < 1.0
     assert faded.to_json()["profileLumaPivot"] == faded.luma_pivot
+    # 白色/黑色 are YGamma's level pair and 色相 a rotation; each has to arrive
+    # as itself, and the shot's own numbers are the identity.
+    base_info = apply_sony_profile(rgb, cal, "FL")[1]
+    assert (base_info.luma_black, base_info.luma_scale, base_info.chroma_hue) == (0.0, 1.0, 0.0)
+    levels = apply_sony_profile(rgb, cal, "FL", LookTweaks(white=50, black=-20))[1]
+    assert levels.luma_black > 0.0 and levels.luma_scale > 1.0
+    j = levels.to_json()
+    assert (j["profileLumaBlack"], j["profileLumaScale"]) == (levels.luma_black, levels.luma_scale)
+    hued = apply_sony_profile(rgb, cal, "FL", LookTweaks(hue=-50))[1]
+    assert hued.chroma_hue == pytest.approx(-17.5)
+    assert hued.to_json()["profileChromaHue"] == hued.chroma_hue
 
 
 def test_an_override_only_replaces_the_fields_it_names() -> None:
@@ -681,21 +716,45 @@ def test_an_override_only_replaces_the_fields_it_names() -> None:
 
     The frontend sends the whole set today, but the contract is per-field: a
     request that names Highlights alone leaves the shot's own Fade and
-    Saturation in place. Values outside the camera's own range are clamped
-    rather than extrapolated — a number the body cannot write is not a setting.
+    Saturation in place. Values outside Edit's panel are clamped to it.
     """
-    as_shot = LookTweaks(highlights=-6, shadows=1, fade=3, saturation=2)
-    assert as_shot.merged({"highlights": 4}) == LookTweaks(
-        highlights=4, shadows=1, fade=3, saturation=2)
+    as_shot = LookTweaks(highlights=-30, shadows=5, fade=30, saturation=20)
+    assert as_shot.merged({"highlights": 20}) == LookTweaks(
+        highlights=20, shadows=5, fade=30, saturation=20)
     assert as_shot.merged({"shadows": None}) == as_shot
     assert as_shot.merged(None) == as_shot
-    assert as_shot.merged({"fade": -5, "contrast": 99}).fade == 0
-    assert as_shot.merged({"contrast": 99}).contrast == 9
+    assert as_shot.merged({"fade": -5, "contrast": 999}).fade == 0
+    assert as_shot.merged({"contrast": 999}).contrast == 100
     # Clarity's floor is zero for the same reason Fade's is: below it the engine
     # renders nothing different, so there is nothing there to set.
     assert as_shot.merged({"clarity": -4}).clarity == 0
-    assert LookTweaks.from_json({"highlights": "-6"}) == LookTweaks(highlights=-6)
+    assert as_shot.merged({"white": -150, "black": 150, "hue": 7}) == LookTweaks(
+        highlights=-30, shadows=5, fade=30, saturation=20, white=-100, black=100, hue=7)
+    assert LookTweaks.from_json({"highlights": "-30"}) == LookTweaks(highlights=-30)
     assert LookTweaks.from_json("nonsense") == LookTweaks()
+
+
+def test_the_camera_s_stops_land_where_edit_shows_them() -> None:
+    """MakerNotes -> Edit's panel, exactly as Edit fills its sliders in.
+
+    Read off Edit's own panel with DSC02961 open (Highlights -6, Shadows +1,
+    Clarity +1 in the file): 高光 -30, 阴影 5, 清晰 10 — five units per stop on
+    the three tone sliders, ten on 清晰 and 褪色, and 饱和度's stops are the
+    engine's own ladder (SATURATION_STEPS). The three sliders the camera does
+    not have are not in the answer at all, so merged() leaves them at zero.
+    """
+    assert stops_to_panel(highlights=-6, shadows=1, clarity=1) == {
+        "highlights": -30, "shadows": 5, "contrast": 0, "fade": 0,
+        "saturation": 0, "clarity": 10}
+    assert stops_to_panel(contrast=9, fade=9, saturation=9, clarity=9) == {
+        "highlights": 0, "shadows": 0, "contrast": 45, "fade": 90,
+        "saturation": 55, "clarity": 90}
+    got = LookTweaks().merged(stops_to_panel(highlights=-6))
+    assert (got.highlights, got.white, got.black, got.hue) == (-30, 0, 0, 0)
+    # The panel reaches further than the camera on every slider, so a stop is
+    # never at the end of its slider's range.
+    for lo, hi in TWEAK_RANGES.values():
+        assert lo <= 0 < hi and hi == 100
 
 
 @requires_sample
@@ -751,18 +810,18 @@ def test_the_look_profile_command_answers_without_decoding_anything() -> None:
     never changed. This command is the whole reason the split in
     look_render_info exists, so it has to agree with the render path exactly.
     """
-    request = {"input": str(SAMPLE_FL), "look": {"highlights": 4}}
+    request = {"input": str(SAMPLE_FL), "look": {"highlights": 20}}
     profile = daemon_look_profile(request, SAMPLES)["colorProfile"]
     assert profile is not None
     assert profile["creativeLook"] == "FL"
     # DSC01157 was shot at Highlights -6 / Shadows +1, and the panel is built
     # from this: as-shot is what it starts at and resets to.
-    assert profile["lookAsShot"]["highlights"] == -6
-    assert profile["lookTweaks"] == {**profile["lookAsShot"], "highlights": 4}
+    assert profile["lookAsShot"]["highlights"] == -30, "the camera's -6, on Edit's scale"
+    assert profile["lookTweaks"] == {**profile["lookAsShot"], "highlights": 20}
 
     cal = calibration_for(SAMPLE_FL, "FL")
     assert cal is not None
-    direct = look_render_info(cal, "FL", LookTweaks(highlights=4, shadows=1)).to_json()
+    direct = look_render_info(cal, "FL", LookTweaks(highlights=20, shadows=5)).to_json()
     assert profile["profileToneCurve"] == direct["profileToneCurve"]
     assert profile["profileChromaGain"] == direct["profileChromaGain"]
 
@@ -839,15 +898,15 @@ def test_a_borrowed_look_s_tweaks_are_not_silently_dead() -> None:
 
 @requires_sample
 def test_a_setting_past_the_camera_s_range_keeps_going() -> None:
-    """Edit.exe refuses out-of-range values; this pipeline carries on past them.
+    """Edit's panel reaches +-20 stops, and the engine follows it all the way.
 
-    The engine renders +-10 identically to 0, which is validation on a number
-    the body cannot write rather than the curve running out. The family it steps
-    along has room past +-9, so the setting keeps meaning something — and the
-    family does end, so a wild setting saturates instead of running away. That
-    bound is the engine's own clamp on the gain, and it has to be the only one:
-    the three settings are summed before the clamp, so capping each of them
-    first would let a large pair cancel back into no tweak at all.
+    The camera stops at +-9 but Edit's slider does not, and the engine does not
+    clamp the gain at the family's ends either: it continues the last two rows
+    as a line. Measured on the running engine at 高光/阴影/对比度 +-100 (gains
+    -2 and 38) and at 对比度 +100 with 高光 +100 (gain 58): zero difference
+    against the extrapolation, 179..311/16384 against a clamp. The settings are
+    summed before any of that, so capping each of them first would let a large
+    pair cancel back into no tweak at all.
     """
     cal = calibration_for(SAMPLE_FL, "FL")
     assert cal is not None
@@ -857,12 +916,18 @@ def test_a_setting_past_the_camera_s_range_keeps_going() -> None:
     beyond = apply_tuning(base, highlights=-(TUNE_LIMIT + 1))
     assert np.abs(beyond - base).max() > np.abs(at_limit - base).max(), "no longer ignored"
 
-    # The highlight gain is 18 + highlights and stops at 0, so -18 is the end.
-    capped = apply_tuning(base, highlights=-1000)
-    assert np.array_equal(capped, apply_tuning(base, highlights=-18))
-    assert capped.min() >= 0.0 and capped.max() <= 1.0
+    # Past the family's end the curve keeps moving, in the same direction, and
+    # stays inside [0, 1]: a fifth of a stop is a real input now.
+    end = apply_tuning(base, highlights=-18)
+    past = apply_tuning(base, highlights=-TUNE_STOP_LIMIT)
+    further = apply_tuning(base, highlights=-20.2)
+    assert not np.array_equal(past, end)
+    assert not np.array_equal(further, past)
+    assert (past[1024] < end[1024]) and (further[1024] < past[1024])
+    for curve in (past, further, apply_tuning(base, highlights=TUNE_STOP_LIMIT, contrast=TUNE_STOP_LIMIT)):
+        assert curve.min() >= 0.0 and curve.max() <= 1.0
 
-    # A per-field cap would make this pair cancel; the sum has to reach the clamp.
+    # A per-field cap would make this pair cancel; the sum has to survive.
     assert not np.array_equal(apply_tuning(base, contrast=100, shadows=50), base)
 
 
@@ -1471,21 +1536,26 @@ def test_clarity_follows_the_engines_own_ladder_and_offers_no_inert_stop() -> No
     Which is why the offered range starts at zero: a slider reaching further
     left would be handing the user nine stops that all render identically.
     """
-    for setting in range(CLARITY_MAX + 1):
-        assert clarity_amount(setting) == CLARITY_AMP[setting] / CLARITY_AMP_SCALE
-    # Monotone and strictly increasing past zero: an amp table that repeated a
-    # value would make two adjacent settings indistinguishable. Over the offered
-    # range that is the whole claim — every stop on it renders differently.
-    assert TWEAK_RANGES["clarity"] == (0, CLARITY_MAX)
+    # The argument is Edit's 清晰 value, which is the engine's `clr`: the camera's
+    # stops are its multiples of ten and land exactly on the table.
+    for stop, amp in enumerate(CLARITY_AMP):
+        assert clarity_amount(stop * 10) == amp / CLARITY_AMP_SCALE
+    # Between them the engine blends the two entries either side.
+    assert clarity_amount(15) == pytest.approx((CLARITY_AMP[1] + CLARITY_AMP[2]) / 2 / CLARITY_AMP_SCALE)
+    # Monotone over the offered range, strictly so up to the table's last entry
+    # (90); past it the amount holds, the engine's own answer there not having
+    # been measured.
+    assert TWEAK_RANGES["clarity"] == (0, CLARITY_MAX) == (0, 100)
     gains = [clarity_amount(n) for n in range(CLARITY_MAX + 1)]
     assert gains == sorted(gains)
-    assert len(set(gains)) == len(gains)
+    assert len(set(gains[:91])) == 91
+    assert clarity_amount(100) == clarity_amount(90)
     # Outside it the value clamps rather than running off the table, which is
     # what stops a hand-written request from raising IndexError. A negative one
     # still lands on zero, i.e. on what the engine would have rendered it as.
     for setting in range(-20, 0):
         assert clarity_amount(setting) == 0.0
-    assert clarity_amount(99) == clarity_amount(CLARITY_MAX)
+    assert clarity_amount(999) == clarity_amount(CLARITY_MAX)
 
 
 def test_the_profile_carries_clarity_as_the_shaders_own_constants() -> None:

@@ -17,11 +17,14 @@ export function isValidSourceId(sourceId: string): boolean {
   return SOURCE_ID_RE.test(sourceId);
 }
 
-// The in-camera Creative Look tweaks, on Sony's own scales. Sent only for the
-// fields the client is actually overriding: the worker fills the rest in from
-// what the body recorded, so a moved slider does not have to echo the others.
-// Ranges are the camera's and are enforced worker-side (sony/profile.py).
-export const LOOK_TWEAK_KEYS = ["highlights", "shadows", "contrast", "fade", "saturation", "clarity"] as const;
+// The Creative Look tweaks, on Imaging Edge Edit's own panel scale (every
+// slider -100..100, 褪色 and 清晰 0..100). Sent only for the fields the client
+// is actually overriding: the worker fills the rest in from what the body
+// recorded, so a moved slider does not have to echo the others. Ranges are the
+// panel's and are enforced worker-side (sony/profile.py TWEAK_RANGES).
+export const LOOK_TWEAK_KEYS = [
+  "contrast", "highlights", "shadows", "white", "black", "fade", "hue", "saturation", "clarity",
+] as const;
 export type LookTweaks = Partial<Record<(typeof LOOK_TWEAK_KEYS)[number], number>>;
 
 export interface RenderLinearBody {

@@ -18,6 +18,7 @@ from .profile import (
     can_render,
     is_borrowed,
     looks_in_file,
+    stops_to_panel,
 )
 
 __all__ = [
@@ -35,4 +36,5 @@ __all__ = [
     "is_borrowed",
     "looks_in_file",
     "scale_dro_gain",
+    "stops_to_panel",
 ]

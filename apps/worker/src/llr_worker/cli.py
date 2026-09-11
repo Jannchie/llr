@@ -44,6 +44,7 @@ from .sony import (
     calibration_for,
     looks_in_file,
     rawnr_simd,
+    stops_to_panel,
 )
 from .sony import can_render as sony_can_render
 from .sony import is_borrowed as sony_is_borrowed
@@ -1735,22 +1736,25 @@ def read_raw_metadata(input_path: Path, raw: rawpy.RawPy) -> RawMetadata:
 
 
 def look_from_exif(exif: dict[str, Any]) -> LookTweaks:
-    """The six Creative Look tweaks the body recorded for this shot.
+    """The Creative Look tweaks the body recorded for this shot, on Edit's
+    panel scale — the same numbers Edit shows when it opens the file
+    (sony/profile.py stops_to_panel). The three sliders the camera does not
+    have (白色/黑色/色相) start at zero.
 
     Through merged() rather than the constructor so a tag outside what the
     engine renders (a negative Clarity, which it clamps at zero) lands inside
     it: as-shot is the panel's reset target, and a slider has to be able to
     return to it.
     """
-    return NO_TWEAKS.merged({
-        "highlights": _exif_int(exif.get("Highlights")),
-        "shadows": _exif_int(exif.get("Shadows")),
-        "fade": _exif_int(exif.get("Fade")),
+    return NO_TWEAKS.merged(stops_to_panel(
+        highlights=_exif_int(exif.get("Highlights")),
+        shadows=_exif_int(exif.get("Shadows")),
+        fade=_exif_int(exif.get("Fade")),
         # exiftool prints Sony's zero for these as "Normal", not "0".
-        "contrast": _exif_int(exif.get("Contrast")),
-        "saturation": _exif_int(exif.get("Saturation")),
-        "clarity": _exif_int(exif.get("Clarity")),
-    })
+        contrast=_exif_int(exif.get("Contrast")),
+        saturation=_exif_int(exif.get("Saturation")),
+        clarity=_exif_int(exif.get("Clarity")),
+    ))
 
 
 def sharpness_from_exif(exif: dict[str, Any], input_path: Path) -> dict[str, Any]:
