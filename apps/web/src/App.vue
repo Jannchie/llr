@@ -39,7 +39,7 @@ import { useAssistant, modelKey, THINKING_LEVELS, type AssistantTool, type ToolC
 import { measureHint, measureHistogram, measurePixels } from "./rendering/histogram";
 import ModelSettings from "./components/ModelSettings.vue";
 import AssistantMessage from "./components/AssistantMessage.vue";
-import ChatIcon from "./components/ChatIcon.vue";
+import ChatIcon, { type ChatIconName } from "./components/ChatIcon.vue";
 import { extractRecipe, applyRecipe, serializeRecipe, parseRecipe, loadSavedRecipes, storeSavedRecipes, type SavedRecipe, type RecipeData } from "./rendering/recipes";
 
 // ── types ──
@@ -2287,6 +2287,13 @@ function thinkingLine(e: Thinking): string {
 }
 // Keep the newest message in view as the reply streams in.
 watch(chatEntries, () => { void nextTick(() => { const el = chatLogRef.value; if (el) el.scrollTop = el.scrollHeight; }); }, { deep: true });
+// The icon says what kind of thing the call is before the name is read; the
+// state's icon replaces it when the state is the thing worth noticing.
+const TOOL_ICONS: Record<string, ChatIconName> = { view_image: "eye", get_edit: "list", set_edit: "adjust", compare: "columns", measure: "chart" };
+function toolIcon(e: { name: string; done: boolean; error?: string }): ChatIconName {
+  return !e.done ? "loader" : e.error ? "alert" : TOOL_ICONS[e.name] ?? "tool";
+}
+const toolMeta = (e: { done: boolean; error?: string }): string => !e.done ? t("chat.tool.running") : e.error ?? "";
 function toolSummary(entry: { name: string; args: unknown }): string {
   if (entry.name !== "set_edit" || !entry.args || typeof entry.args !== "object") return "";
   return Object.keys(entry.args as object).join(", ");
@@ -2724,6 +2731,8 @@ const vWheelAdjust = {
           @update:models="v => chatModels = v" @close="modelSettingsOpen = false" />
         <div class="chat-log" ref="chatLogRef">
           <div class="chat-empty" v-if="!chatEntries.length">
+            <ChatIcon class="chat-empty-icon" name="chat" />
+            <p class="chat-empty-title">{{ t('chat.empty.title') }}</p>
             <p>{{ t('chat.empty') }}</p>
             <!-- Chips fill the box rather than send: the send key stays where the words become the user's own. -->
             <div class="chat-chips">
@@ -2731,7 +2740,10 @@ const vWheelAdjust = {
             </div>
           </div>
           <template v-for="(entry, i) in chatEntries" :key="i">
-            <div v-if="entry.kind === 'user'" class="chat-msg chat-user">{{ entry.text }}<span v-if="entry.steered" class="chat-steered">{{ t('chat.steered') }}</span></div>
+            <!-- Steered: the user talking over a run — a note at the margin, not a bubble. -->
+            <div v-if="entry.kind === 'user'" class="chat-msg chat-user" :class="{ 'is-steered': entry.steered }" :title="entry.steered ? t('chat.steered') : undefined">
+              <ChatIcon v-if="entry.steered" class="chat-steer-icon" name="steer" />{{ entry.text }}
+            </div>
             <div v-else-if="entry.kind === 'assistant'" class="chat-msg chat-assistant" :class="{ 'is-error': entry.error }">
               <!-- Reasoning folds to one line above the reply: the tail while it
                    streams, the opening line once it has settled. -->
@@ -2748,14 +2760,24 @@ const vWheelAdjust = {
               <span v-else-if="!entry.text && !entry.thinking && chatBusy" class="chat-typing">…</span>
               <span v-if="entry.usage" class="chat-usage">{{ usageLine(entry.usage) }}</span>
             </div>
-            <p v-else-if="entry.kind === 'status'" class="chat-status">{{ t(`chat.status.${entry.status}` as MessageKey) }}</p>
-            <details v-else class="chat-tool" :class="{ 'is-done': entry.done, 'is-error': entry.error }">
-              <summary>
-                <span class="chat-tool-name">{{ t(`chat.tool.${entry.name}` as MessageKey) }}</span>
-                <span class="chat-tool-args" v-if="toolSummary(entry)">{{ toolSummary(entry) }}</span>
-                <span class="chat-error" v-if="entry.error">{{ entry.error }}</span>
+            <!-- The run narrating itself, in the same row as the tool calls it happened among. -->
+            <div v-else-if="entry.kind === 'status'" class="chat-row chat-status">
+              <div class="chat-row-line is-static">
+                <ChatIcon class="chat-row-icon" :name="entry.status === 'stopped' ? 'stop' : 'info'" />
+                <span class="chat-row-detail">{{ t(`chat.status.${entry.status}` as MessageKey) }}</span>
+              </div>
+            </div>
+            <!-- A tool call: the argument gets the room, the outcome shares the
+                 line, and a click opens what the model sent or saw underneath. -->
+            <details v-else class="chat-row chat-tool" :class="{ 'is-running': !entry.done, 'is-failed': entry.error }">
+              <summary class="chat-row-line" :title="entry.error ?? toolSummary(entry)">
+                <ChatIcon class="chat-row-icon" :name="toolIcon(entry)" />
+                <span class="chat-row-label">{{ t(`chat.tool.${entry.name}` as MessageKey) }}</span>
+                <span class="chat-row-detail">{{ toolSummary(entry) }}</span>
+                <span class="chat-row-meta" v-if="toolMeta(entry)">{{ toolMeta(entry) }}</span>
               </summary>
-              <div class="chat-tool-body" v-if="toolDetail(entry)">
+              <pre class="chat-row-body chat-tool-error" v-if="entry.error">{{ entry.error }}</pre>
+              <div class="chat-row-body chat-tool-body" v-else-if="toolDetail(entry)">
                 <img v-if="toolDetail(entry)!.image" :src="toolDetail(entry)!.image" alt="" />
                 <template v-for="line in toolDetail(entry)!.lines" :key="line">{{ line }}<br /></template>
                 <table v-if="toolDetail(entry)!.rows">

@@ -1819,7 +1819,9 @@ input[type="range"]:focus::-moz-range-thumb {
 
 /* ---------- Assistant ----------
    The chat is the whole rail when its tab is open: the log takes the height
-   and scrolls on its own, the composer stays pinned beneath it. */
+   and scrolls on its own, the composer stays pinned beneath it. The transcript
+   follows preferred-harness: messages are prose, everything the agent does
+   between them is one flat activity row, and only a state colours anything. */
 
 .chat {
   flex: 1;
@@ -1857,34 +1859,107 @@ input[type="range"]:focus::-moz-range-thumb {
   padding: 10px 11px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 4px;
   font-size: 12.5px;
   line-height: 1.45;
 }
 
+/* An empty log: a mark, a line, and a few starting points. The chips fill
+   the box rather than send — the send key stays where the words become the
+   user's own. */
 .chat-empty {
   margin: auto 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px;
   color: var(--text-mute);
   text-align: center;
-  padding: 0 8px;
 }
 
+.chat-empty p {
+  margin: 0;
+}
+
+.chat-empty-icon {
+  width: 36px;
+  height: 36px;
+  color: var(--text-mute);
+  opacity: 0.6;
+}
+
+.chat-empty-title {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.chat-chips {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.chat-chip {
+  font: inherit;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  background: var(--control);
+  border: none;
+  border-radius: var(--radius-pill);
+  padding: 5px 12px;
+  cursor: pointer;
+  transition: background 120ms, color 120ms;
+}
+
+.chat-chip:hover {
+  background: var(--control-hover);
+  color: var(--text);
+}
+
+/* Messages get room around them; the rows between them sit close. */
 .chat-msg {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  max-width: 92%;
+  max-width: 85%;
+  margin: 4px 0;
 }
 
+/* The user's bubble is the one thing on the page that is theirs: a quiet
+   raised surface rather than the accent, which the log keeps for state. */
 .chat-user {
   align-self: flex-end;
-  background: var(--accent);
-  color: #fff;
+  background: var(--control);
+  color: var(--text);
+  padding: 7px 12px;
+  border-radius: 14px;
+}
+
+/* Sent while the model was working: a note at the margin, not a bubble. */
+.chat-user.is-steered {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  background: var(--accent-soft);
+  border-left: 2px solid var(--accent);
+  border-radius: 0 var(--radius) var(--radius) 0;
   padding: 6px 10px;
-  border-radius: 14px 14px 4px 14px;
+}
+
+.chat-steer-icon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--accent);
 }
 
 .chat-assistant {
   align-self: flex-start;
+  max-width: 100%;
   color: var(--text);
   white-space: normal;   /* markdown brings its own block spacing */
 }
@@ -1920,204 +1995,19 @@ input[type="range"]:focus::-moz-range-thumb {
   font-size: 11.5px;
 }
 
-/* A tool call: one quiet line, an accent dot that settles once the call has
-   returned — the log's version of a "working…" spinner. A <details>: the line
-   is its summary, and it opens on what the model actually sent or saw. */
-.chat-tool {
-  font-size: 11px;
-  color: var(--text-dim);
-  padding-left: 12px;
-  position: relative;
-}
-
-.chat-tool::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  top: 0.55em;
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--accent);
-  animation: chat-pulse 1s ease-in-out infinite;
-}
-
-.chat-tool.is-done::before {
-  animation: none;
-  background: var(--text-mute);
-}
-
-.chat-tool.is-error::before {
-  background: var(--error);
-}
-
-.chat-tool-args {
-  color: var(--text-mute);
-}
-
-@keyframes chat-pulse {
-  50% { opacity: 0.25; }
-}
-
-.chat-tool > summary {
-  display: flex;
-  align-items: baseline;
-  flex-wrap: wrap;
-  gap: 0 6px;
-  cursor: pointer;
-  list-style: none;
-}
-
-.chat-tool > summary::-webkit-details-marker {
-  display: none;
-}
-
-.chat-tool-body {
-  margin-top: 4px;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  font-size: 12px;
-}
-
-.chat-tool-body img {
-  max-width: 100%;
-  border-radius: var(--radius-sm);
-}
-
-.chat-tool-body table {
-  border-collapse: collapse;
-}
-
-.chat-tool-body td {
-  padding: 0 8px 0 0;
-  white-space: nowrap;
-}
-
-.chat-tool-body td + td {
-  color: var(--text);
-  font-variant-numeric: tabular-nums;
-}
-
-/* An empty log offers a few starting points; they fill the box, not send. */
-.chat-empty p {
-  margin: 0 0 10px;
-}
-
-.chat-chips {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: 6px;
-}
-
-.chat-chip {
-  font: inherit;
-  font-size: 12px;
-  color: var(--text-dim);
-  background: var(--control);
-  border: none;
-  border-radius: var(--radius-pill);
-  padding: 4px 10px;
-  cursor: pointer;
-}
-
-.chat-chip:hover {
-  color: var(--text);
-}
-
-/* Model and thinking pickers under the box, the send button on the right. */
-.chat-compose-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.chat-compose-row > .control-select {
-  width: auto;
-  flex: 1 1 0;
-}
-
-.chat-compose-row > .chat-send {
-  margin-left: auto;
-}
-
-/* Tokens and cost of the turn, under the reply. */
+/* Tokens and cost of the turn, under the reply, said once the pointer asks. */
 .chat-usage {
   display: block;
   margin-top: 4px;
   font-size: 11px;
   color: var(--text-mute);
+  opacity: 0;
+  transition: opacity 120ms;
 }
 
-/* A message that went in while the model was working. */
-.chat-steered {
-  display: block;
-  font-size: 11px;
-  opacity: 0.7;
-}
-
-/* A quiet line in the log about the run itself — stopped, nudged — not a bubble. */
-.chat-status {
-  font-size: 12px;
-  color: var(--text-mute);
-  padding-left: 12px;
-}
-
-.chat-compose {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 8px 11px 10px;
-  border-top: 1px solid var(--sep);
-}
-
-.chat-input {
-  flex: 1;
-  resize: none;
-  font: inherit;
-  font-size: 12.5px;
-  line-height: 1.4;
-  color: var(--text);
-  background: var(--control);
-  border: none;
-  border-radius: var(--radius);
-  padding: 7px 10px;
-}
-
-.chat-input::placeholder {
-  color: var(--text-mute);
-}
-
-.chat-send {
-  flex-shrink: 0;
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  background: var(--accent);
-  color: #fff;
-  display: grid;
-  place-items: center;
-  transition: background 120ms, opacity 120ms;
-}
-
-.chat-send svg {
-  width: 15px;
-  height: 15px;
-}
-
-.chat-send:hover:not(:disabled) {
-  background: var(--accent-strong);
-}
-
-.chat-send:disabled {
-  opacity: 0.35;
-  cursor: default;
-}
-
-.chat-send.is-stop {
-  background: var(--control);
-  color: var(--text);
+.chat-assistant:hover .chat-usage,
+.chat-assistant:focus-within .chat-usage {
+  opacity: 1;
 }
 
 /* ---------- Activity rows ----------
@@ -2150,15 +2040,19 @@ input[type="range"]:focus::-moz-range-thumb {
   background: var(--card-hover);
 }
 
+/* A row that opens nothing is read, not pressed. */
+.chat-row-line.is-static {
+  cursor: default;
+}
+
+.chat-row-line.is-static:hover {
+  background: none;
+}
+
 .chat-row-icon {
   width: 14px;
   height: 14px;
   flex-shrink: 0;
-}
-
-.chat-row.is-running .chat-row-icon {
-  color: var(--accent);
-  animation: chat-spin 1s linear infinite;
 }
 
 .chat-row-label {
@@ -2172,7 +2066,6 @@ input[type="range"]:focus::-moz-range-thumb {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--text-mute);
 }
 
 /* Open, the body shows the whole thing; the elided line would say it twice. */
@@ -2186,7 +2079,28 @@ input[type="range"]:focus::-moz-range-thumb {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  text-align: right;
   font-variant-numeric: tabular-nums;
+}
+
+/* Running is the accent, failed is the error colour, a note about the run
+   is muted; done wears no colour at all. */
+.chat-row.is-running .chat-row-icon {
+  color: var(--accent);
+  animation: chat-spin 1s linear infinite;
+}
+
+.chat-row.is-running .chat-row-meta {
+  color: var(--accent);
+}
+
+.chat-row.is-failed .chat-row-icon,
+.chat-row.is-failed .chat-row-meta {
+  color: var(--error);
+}
+
+.chat-status .chat-row-icon {
+  color: var(--text-mute);
 }
 
 /* Hung off a rule down the row's left edge: it belongs to the line above, not
@@ -2208,8 +2122,144 @@ input[type="range"]:focus::-moz-range-thumb {
   line-height: inherit;
 }
 
+/* What the model sent or saw: the picture, the fields changed, the numbers. */
+.chat-tool-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+}
+
+.chat-tool-body img {
+  max-width: 100%;
+  border-radius: var(--radius-sm);
+}
+
+.chat-tool-body table {
+  border-collapse: collapse;
+}
+
+.chat-tool-body td {
+  padding: 0 8px 0 0;
+  white-space: nowrap;
+}
+
+.chat-tool-body td + td {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+/* A failure in full and selectable: the next thing done with it is a paste. */
+.chat-tool-error {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 160px;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--error);
+}
+
 @keyframes chat-spin {
   to { transform: rotate(360deg); }
+}
+
+/* ---------- Composer ----------
+   One shell holding the field and the settings that describe it: which model
+   answers and how long it thinks are decided while writing, so they sit under
+   the words — settings left, send right. */
+
+.chat-compose {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0 9px 9px;
+  padding: 6px;
+  background: var(--control);
+  border-radius: 14px;
+  transition: box-shadow 120ms;
+}
+
+.chat-compose:focus-within {
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+
+.chat-input {
+  resize: none;
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--text);
+  background: transparent;
+  border: none;
+  outline: none;
+  padding: 5px 8px;
+}
+
+.chat-input::placeholder {
+  color: var(--text-mute);
+}
+
+.chat-compose-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* The pickers are pills on the shell's ground; the shell is their box. */
+.chat-compose-row > .control-select {
+  width: auto;
+  flex: 0 1 auto;
+  background: transparent;
+  border-radius: var(--radius-pill);
+  padding: 4px 8px;
+  color: var(--text-dim);
+}
+
+.chat-compose-row > .control-select:hover:not(:disabled) {
+  background-color: var(--control-hover);
+  color: var(--text);
+}
+
+.chat-compose-row > .chat-send {
+  margin-left: auto;
+}
+
+.chat-send {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  display: grid;
+  place-items: center;
+  transition: background 120ms, color 120ms, opacity 120ms;
+}
+
+.chat-send svg {
+  width: 15px;
+  height: 15px;
+}
+
+.chat-send:hover:not(:disabled) {
+  background: var(--accent-strong);
+}
+
+.chat-send:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* Stop is a ghost beside the field, red only once the pointer asks. */
+.chat-send.is-stop {
+  background: transparent;
+  color: var(--text-dim);
+}
+
+.chat-send.is-stop:hover {
+  background: var(--control-hover);
+  color: var(--error);
 }
 
 /* ---------- Recipes ---------- */
