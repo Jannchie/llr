@@ -2164,11 +2164,13 @@ const textContent = (v: unknown): ToolContent[] => [{ type: "text", text: JSON.s
 const imageContent = async (blob: Promise<Blob>): Promise<ToolContent[]> => [{ type: "image", data: await blobToBase64(await blob), mimeType: "image/jpeg" }];
 const assistantTools: Record<string, AssistantTool> = {
   view_image: {
+    role: "inspect",
     description: "Render the photo with the current edit and return it as a JPEG (long edge ~768px). This is for the first look; prefer compare after set_edit.",
     parameters: { type: "object", properties: {} },
     run: () => imageContent(captureFrame(null, 768)),
   },
   compare: {
+    role: "inspect",
     description: "Before/after side by side (two ~512px halves, labelled). Call it after set_edit to judge the change: too much, too little, anything clipped? `against` picks the before: the edit when this turn started (default) or the edit just before your last set_edit.",
     parameters: { type: "object", properties: { against: { type: "string", enum: ["turn_start", "previous_edit"] } } },
     run: (args) => {
@@ -2177,6 +2179,7 @@ const assistantTools: Record<string, AssistantTool> = {
     },
   },
   measure: {
+    role: "inspect",
     description: "Numbers about the current render, display-encoded 0..255: luminance percentiles and mean, clipped shadow/highlight percentages with the railed channels, mean luminance of the top/middle/bottom thirds, mean chroma, and a hint when something trips a threshold.",
     parameters: { type: "object", properties: {} },
     run: async () => textContent(await measureFrame()),
@@ -2187,6 +2190,7 @@ const assistantTools: Record<string, AssistantTool> = {
     run: () => { requireImage(); return textContent(describeEdit()); },
   },
   set_edit: {
+    role: "mutate",
     description: "Apply adjustments. Every field is optional and absolute; omitted fields are left as they are. Returns only what changed, as {field: {from, to}}.",
     parameters: SET_EDIT_SCHEMA,
     run: async (args) => {
@@ -2634,7 +2638,7 @@ const vWheelAdjust = {
         <div class="chat-log" ref="chatLogRef">
           <p class="chat-empty" v-if="!chatEntries.length">{{ t('chat.empty') }}</p>
           <template v-for="(entry, i) in chatEntries" :key="i">
-            <div v-if="entry.kind === 'user'" class="chat-msg chat-user">{{ entry.text }}</div>
+            <div v-if="entry.kind === 'user'" class="chat-msg chat-user">{{ entry.text }}<span v-if="entry.steered" class="chat-steered">{{ t('chat.steered') }}</span></div>
             <div v-else-if="entry.kind === 'assistant'" class="chat-msg chat-assistant" :class="{ 'is-error': entry.error }">
               <span v-if="entry.text">{{ entry.text }}</span>
               <span v-if="entry.error" class="chat-error">{{ entry.error }}</span>

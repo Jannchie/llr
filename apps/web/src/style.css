@@ -1977,6 +1977,13 @@ input[type="range"]:focus::-moz-range-thumb {
   font-variant-numeric: tabular-nums;
 }
 
+/* A message that went in while the model was working. */
+.chat-steered {
+  display: block;
+  font-size: 11px;
+  opacity: 0.7;
+}
+
 /* A quiet line in the log about the run itself — stopped, nudged — not a bubble. */
 .chat-status {
   font-size: 12px;

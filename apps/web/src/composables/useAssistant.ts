@@ -12,6 +12,9 @@ export type ToolContent = { type: "text"; text: string } | { type: "image"; data
 export type AssistantTool = {
   description: string;
   parameters: Record<string, unknown>;  // JSON schema (object)
+  // Whether the tool changes the photo or looks at it — the API's nudge
+  // ("you edited but never looked") needs only this, not the tool names.
+  role?: "mutate" | "inspect";
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   run: (args: any) => Promise<ToolContent[]> | ToolContent[];
 };
@@ -43,12 +46,13 @@ function loadModels(): ModelSpec[] {
 }
 
 export type ChatEntry =
-  | { kind: "user"; text: string }
+  // `steered`: sent while the model was working, so it reached it mid-run.
+  | { kind: "user"; text: string; steered?: boolean }
   | { kind: "assistant"; text: string; error?: string }
   // `result` is what went back to the model, kept so the log can show it.
   | { kind: "tool"; name: string; args: unknown; done: boolean; error?: string; result?: ToolContent[] }
   // A line about the run itself, not something anyone said.
-  | { kind: "status"; status: "stopped" };
+  | { kind: "status"; status: "stopped" | "nudge" };
 
 type Chat = { session: string; entries: ChatEntry[]; busy: boolean };
 
@@ -118,11 +122,18 @@ export function useAssistant(opts: {
   async function send(text: string): Promise<void> {
     text = text.trim();
     const chat = current.value;
-    if (!text || chat.busy) return;
+    if (!text) return;
+    // Mid-run, the message is steered into the model's next LLM call rather
+    // than queued behind it; the bubble goes up now, marked as such.
+    if (chat.busy) {
+      chat.entries.push({ kind: "user", text, steered: true });
+      void post(chat.session, "steer", { text });
+      return;
+    }
     chat.busy = true;
     opts.onTurnStart?.();
     chat.entries.push({ kind: "user", text });
-    const tools = Object.entries(opts.tools()).map(([name, t]) => ({ name, description: t.description, parameters: t.parameters }));
+    const tools = Object.entries(opts.tools()).map(([name, t]) => ({ name, description: t.description, parameters: t.parameters, role: t.role }));
     let reply: (ChatEntry & { kind: "assistant" }) | null = null;
     const toolEntries = new Map<string, ChatEntry & { kind: "tool" }>();
     const toolRuns: Promise<void>[] = [];
@@ -135,6 +146,9 @@ export function useAssistant(opts: {
         switch (ev.type) {
           case "message_start":
             if (ev.message.role === "assistant") { reply = { kind: "assistant", text: "" }; chat.entries.push(reply); }
+            // The API's own follow-up (edited without looking) — a status
+            // line, not a user bubble. Other user messages are already shown.
+            else if (ev.nudge) chat.entries.push({ kind: "status", status: "nudge" });
             break;
           case "message_update":
             if (ev.event.type === "text_delta" && reply) reply.text += ev.event.delta;

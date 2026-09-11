@@ -7,10 +7,13 @@
 // and settles the promise the loop is waiting on.
 import type { ServerResponse } from "node:http";
 
-import { Agent, type AgentEvent, type AgentTool, type AgentToolResult } from "@mariozechner/pi-agent-core";
+import { Agent, type AgentEvent, type AgentMessage, type AgentTool, type AgentToolResult } from "@mariozechner/pi-agent-core";
 import { getEnvApiKey, getModel, getModels, getProviders, type Api, type ImageContent, type KnownProvider, type Model, type TextContent, type TSchema } from "@mariozechner/pi-ai";
 
-export type ToolSpec = { name: string; description: string; parameters: Record<string, unknown> };
+// `role` is all the API knows about a tool: whether it changes the photo or
+// looks at it, so the nudge below can tell "edited and never looked" without
+// knowing any tool by name.
+export type ToolSpec = { name: string; description: string; parameters: Record<string, unknown>; role?: "mutate" | "inspect" };
 export type ModelSpec = { provider: string; id: string };
 export type PromptBody = {
   session: string;
@@ -86,8 +89,10 @@ function browserTools(s: Session, specs: ToolSpec[]): AgentTool[] {
 
 // What the browser needs of each event. `partial`/full messages are dropped
 // from the stream deltas (the browser rebuilds text from the deltas), and tool
-// results are not echoed back — the browser produced them.
-function serialize(event: AgentEvent): unknown {
+// results are not echoed back — the browser produced them. The nudge (see
+// handleAgentPrompt) is flagged so the browser shows it as a status line, not
+// as something the user said.
+function serialize(event: AgentEvent, nudge: AgentMessage | null): unknown {
   switch (event.type) {
     case "message_update": {
       const { partial: _p, ...rest } = event.assistantMessageEvent as { partial?: unknown } & Record<string, unknown>;
@@ -95,7 +100,7 @@ function serialize(event: AgentEvent): unknown {
     }
     case "message_start":
     case "message_end":
-      return event.message.role === "toolResult" ? null : event;
+      return event.message.role === "toolResult" ? null : event.message === nudge ? { ...event, nudge: true } : event;
     case "agent_end":
       return { type: event.type };
     case "turn_end":
@@ -116,8 +121,26 @@ export async function handleAgentPrompt(body: PromptBody, response: ServerRespon
   s.agent.state.tools = browserTools(s, body.tools);
   response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store", connection: "keep-alive" });
 
+  // The prompt tells the model to look at every edit before answering; this
+  // is the backstop for a model that edits and declares success anyway. Once
+  // per prompt: when a turn ends with no tool calls while an edit is still
+  // unseen, a follow-up asks it to look. The loop awaits turn_end listeners
+  // before polling the follow-up queue, so the message lands in this run.
+  const roles = new Map(body.tools.map(t => [t.name, t.role]));
+  let editedSinceLook = false;
+  let nudge: AgentMessage | null = null;
   const unsubscribe = s.agent.subscribe(event => {
-    const out = serialize(event);
+    if (event.type === "tool_execution_start") {
+      const role = roles.get(event.toolName);
+      if (role === "mutate") editedSinceLook = true;
+      else if (role === "inspect") editedSinceLook = false;
+    } else if (event.type === "turn_end" && event.message.role === "assistant" && event.message.stopReason === "stop"
+      && editedSinceLook && !nudge && !event.message.content.some(c => c.type === "toolCall")) {
+      nudge = { role: "user", timestamp: Date.now(), content: [{ type: "text",
+        text: "You changed the edit but did not look at the result. Call compare, judge it, refine if needed, then answer." }] };
+      s.agent.followUp(nudge);
+    }
+    const out = serialize(event, nudge);
     if (out && !response.writableEnded) response.write(`data: ${JSON.stringify(out)}\n\n`);
   });
   // The browser walked away mid-run: nothing will ever answer the pending tool
@@ -145,6 +168,12 @@ export function handleAgentToolResult(body: ToolResultBody): boolean {
   if (body.error) p.reject(new Error(body.error));
   else p.resolve({ content: body.content ?? [], details: undefined });
   return true;
+}
+
+// A word in edgeways while the model is working: injected before its next
+// LLM call, after the tool calls in flight have returned.
+export function handleAgentSteer(session: string, text: string): void {
+  sessions.get(session)?.agent.steer({ role: "user", content: [{ type: "text", text }], timestamp: Date.now() });
 }
 
 export function handleAgentAbort(session: string): void {

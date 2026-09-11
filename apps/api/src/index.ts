@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import {
   agentProviders,
   handleAgentAbort,
+  handleAgentSteer,
   handleAgentPrompt,
   handleAgentReset,
   handleAgentToolResult,
@@ -204,6 +205,12 @@ async function routeAgent(action: string, method: string, request: IncomingMessa
     case "tool-result":
       if (typeof body.toolCallId !== "string") throw new HttpError(400, "Expected toolCallId");
       if (!handleAgentToolResult(body)) throw new HttpError(404, "No pending tool call");
+      sendJson(response, { ok: true });
+      return;
+    case "steer":
+      if (typeof body.text !== "string" || !body.text.trim()) throw new HttpError(400, "Expected text");
+      if (!isSessionBusy(body.session)) throw new HttpError(409, "Assistant is idle");
+      handleAgentSteer(body.session, body.text);
       sendJson(response, { ok: true });
       return;
     case "abort":
