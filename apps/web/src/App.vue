@@ -18,7 +18,6 @@ import { API, fetchLinear, fetchLookProfile, type ColorProfileMeta, type Denoise
 import { type PersistedEdit } from "./persistence";
 import { gradingTint, gradingHueDeg } from "./rendering/grading";
 import { parseLensCorr, mixLensTable, LENS_IDENTITY, type LensCorr } from "./rendering/lens";
-import { hsatRangeToL0 } from "./rendering/highlight-sat";
 import { trackFill, formatBytes, clamp, IMPORT_ACCEPT, IMPORT_FORMAT_HINT } from "./ui";
 import { t, locale, setLocale, LOCALES, type MessageKey } from "./i18n";
 import SliderRow from "./components/SliderRow.vue";
@@ -36,7 +35,7 @@ import ModelSettings from "./components/ModelSettings.vue";
 
 // ── types ──
 
-type RecipeKey = "exposure"|"contrast"|"highlights"|"shadows"|"whites"|"blacks"|"vibrance"|"saturation"|"temperature"|"tint"|"clarity"|"dehaze"|"highlightSat"|"highlightSatRange"|"lensDistortion"|"lensVignetting";
+type RecipeKey = "exposure"|"contrast"|"highlights"|"shadows"|"whites"|"blacks"|"vibrance"|"saturation"|"temperature"|"tint"|"clarity"|"dehaze"|"lensDistortion"|"lensVignetting";
 type Recipe = Record<RecipeKey, number>;
 // Labels are not stored: a slider's caption is always `slider.<key>` and a
 // group's is `panel.<title>`, so the catalog can't drift from the controls.
@@ -59,7 +58,6 @@ const defaultRecipe = (): Recipe => ({
   exposure: 0, contrast: 0, highlights: 0, shadows: 0,
   whites: 0, blacks: 0, vibrance: 0, saturation: 0,
   temperature: 6500, tint: 0, clarity: 0, dehaze: 0,
-  highlightSat: 0, highlightSatRange: 50,
   lensDistortion: 100, lensVignetting: 0,
 });
 
@@ -81,8 +79,6 @@ const groups: SliderGroup[] = [
     { key: "tint", min: -100, max: 100, step: 1 },
     { key: "vibrance", min: -100, max: 100, step: 1 },
     { key: "saturation", min: -100, max: 100, step: 1 },
-    { key: "highlightSat", min: -100, max: 100, step: 1 },
-    { key: "highlightSatRange", min: 0, max: 100, step: 1 },
   ]},
   { title: "lens", tab: "detail", needsLensCorr: true, items: [
     { key: "lensDistortion", min: 0, max: 100, step: 1 },
@@ -435,10 +431,6 @@ const GRADING_BANDS = [
 // exportStripPrivate: exports copy the RAW's full EXIF by default; 1 opts into
 // stripping GPS/serials/owner/maker notes for exports meant to be shared.
 const viewSettings = reactive({ displayGamut: 0, exportStripPrivate: 0 });
-// "Show affected range" for Highlight Saturation: the shader draws its weight
-// as grey instead of the photo. View-only, like displayGamut — never persisted,
-// and never on for export or the assistant's view_image (see buildPipelineParams).
-const hsatPreview = ref(false);
 
 // ── Crop & Straighten ──
 //
@@ -1152,9 +1144,6 @@ function buildPipelineParams(s?: Snapshot): Partial<EditParams> {
     gradHlTint: gradingTint(g.hlH, g.hlS / 100),
     gradBlend: g.blend / 100,
     gradBalance: g.balance / 100,
-    hsatAmount: r.highlightSat / 100,
-    hsatLo: hsatRangeToL0(r.highlightSatRange),
-    hsatPreview: !s && hsatPreview.value ? 1 : 0,
     displayGamut: viewSettings.displayGamut,
     // Not read off the snapshot: the match is a global profile setting, like the
     // display gamut, not a per-image edit that undo should travel with.
@@ -1627,7 +1616,6 @@ watch([recipe, hslHue, hslSat, hslLum, grading], () => {
   schedulePersist();
 }, { deep: true });
 watch(viewSettings, () => { scheduleWebGLDraw(); schedulePersist(); }, { deep: true });
-watch(hsatPreview, scheduleWebGLDraw);
 
 // Zoom/fit only move CSS pixels; the drawing buffer is rendered at the on-screen
 // scale, so re-rasterise when it changes to stay crisp (zoom in) or shed fragments
@@ -1972,7 +1960,7 @@ function assistantSystemPrompt(): string {
   return [
     "You are the editing assistant inside LLR, a RAW photo editor with Lightroom-style controls. The user has a photo open; you edit it by calling tools, and every change shows up live and can be undone.",
     "Workflow: look at the photo with view_image (and get_edit for the current values) before deciding, apply changes with set_edit, then view_image again to judge the result and refine if needed. Values are absolute, not deltas.",
-    "Slider semantics: exposure in stops; contrast, highlights, shadows, whites, blacks, clarity, dehaze, vibrance, saturation in -100..100; highlightSat -100..100 scales chroma only in the highlights without tinting white (use it when bright areas look washed out or undersaturated), highlightSatRange 0..100 sets how bright a pixel must be to count (higher = only the brightest); temperature in Kelvin (higher = warmer rendering), tint negative = green, positive = magenta. Keep adjustments natural and proportionate unless the user asks for a strong look. For crops, think about composition (subject placement, horizon, distractions at the edges) and use angle to straighten.",
+    "Slider semantics: exposure in stops; contrast, highlights, shadows, whites, blacks, clarity, dehaze, vibrance, saturation in -100..100; temperature in Kelvin (higher = warmer rendering), tint negative = green, positive = magenta. Keep adjustments natural and proportionate unless the user asks for a strong look. For crops, think about composition (subject placement, horizon, distractions at the edges) and use angle to straighten.",
     `Answer briefly, in the user's language (UI locale: ${locale.value}). Say what you changed and why; do not list every value.`,
   ].join("\n");
 }
@@ -2594,13 +2582,6 @@ const vWheelAdjust = {
           v-model="recipe[spec.key]" :label="t(`slider.${spec.key}`)" :input-id="`s-${spec.key}`"
           :min="spec.min" :max="spec.max" :step="spec.step"
           :reset-value="SLIDER_DEFAULTS[spec.key]" :track="WB_TRACK[spec.key]" show-modified />
-        <div class="control-row" v-if="group.title === 'color'">
-          <label class="control-label" for="hsat-preview">{{ t('color.hsatPreview') }}</label>
-          <label class="switch">
-            <input id="hsat-preview" type="checkbox" v-model="hsatPreview" />
-            <span class="switch-track"><span class="switch-thumb" /></span>
-          </label>
-        </div>
       </section>
 
       <section class="panel" v-if="editTab === 'detail' && activeSource && isRawSource">

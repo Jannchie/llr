@@ -35,9 +35,6 @@ export interface EditParams {
   gradMdTint: [number, number, number];
   gradHlTint: [number, number, number];
   gradBlend: number; gradBalance: number;
-  // Highlight Saturation (highlight-sat.ts): chroma gain [-1, 1], Oklab L
-  // threshold, and the view-only weight preview (never set for export).
-  hsatAmount: number; hsatLo: number; hsatPreview: number;
   // Display gamut: 0 = sRGB, 1 = P3.
   displayGamut: number;
   // Lens corrections: canonical 16-knot factor tables with the slider amounts
@@ -428,7 +425,6 @@ export const DEFAULT_PARAMS: EditParams = {
   hslH: [...HSL_ZERO], hslS: [...HSL_ZERO], hslL: [...HSL_ZERO],
   gradShTint: [1, 1, 1], gradMdTint: [1, 1, 1], gradHlTint: [1, 1, 1],
   gradBlend: 0, gradBalance: 0,
-  hsatAmount: 0, hsatLo: 0.75, hsatPreview: 0,
   displayGamut: 0,
   lensDist: [...LENS_IDENTITY], lensVig: [...LENS_IDENTITY],
   cameraMatch: 1,
@@ -2238,7 +2234,6 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     v3("u_grad_md_tint", p.gradMdTint ?? [1, 1, 1]);
     v3("u_grad_hl_tint", p.gradHlTint ?? [1, 1, 1]);
     s("u_grad_blend", p.gradBlend ?? 0); s("u_grad_balance", p.gradBalance ?? 0);
-    s("u_hsatAmount", p.hsatAmount); s("u_hsatLo", p.hsatLo); i("u_hsatPreview", p.hsatPreview);
     // Lens corrections: skip the per-knot uploads entirely at identity — the
     // shader never reads the tables when u_lensActive is 0.
     const lensActive = (p.lensDist?.some((v) => v !== 1) ?? false)
