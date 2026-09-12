@@ -112,7 +112,7 @@ _DRO_UNIT = 1024.0
 DRO_LOG_CEILING = 12.999823410347818
 
 # TIFF field type -> bytes per unit
-_TYPE_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8}
+_TYPE_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8, 13: 4}
 
 
 @dataclass(frozen=True)
@@ -251,6 +251,73 @@ def _decrypted_sr2(path: str | Path) -> tuple[bytes, int, str]:
         got[t] = struct.unpack_from(endian + "I", buf, vpos)[0]
 
     return decrypt(buf, got[0x7200], got[0x7201], got[0x7221]), got[0x7200], endian
+
+
+# The M/S-size frames ("Lossless Compressed RAW 2" at 3584x2560 on the
+# ILCE-7CM2) store a demosaiced 15-bit YCbCr image rather than a mosaic, and
+# their raw SubIFD carries one tag the full-size mosaic never does: 0x7039,
+# RATIONAL[3]. Each entry is WB_RGGBLevels' R/G/B over another set of levels
+# (1823/1497, 1024/1024, 2721/3322 on DSC00062), and Imaging Edge renders these
+# frames with the camera's multipliers *times* this ratio. LibRaw's YCbCr decode
+# (sonycc.cpp) applies no white balance of its own and knows nothing of the tag,
+# so a decode on camera_whitebalance alone comes out too neutral indoors —
+# measured Edit/LLR R/G,B/G of 1.32,0.78 (IN, tungsten) and 0.94,1.23 (VV2)
+# became 1.03,1.00 and 0.99,0.99 once the ratio went into the multipliers
+# (tmp/nas/agents/wb.md §1). Daylight frames write (1, 1, 1), which is why the
+# gap only ever showed indoors.
+YCC_WB_SCALE_TAG = 0x7039
+SUBIFDS_TAG = 0x014A
+_RATIONAL = 5
+
+
+def _read_ycc_wb_scale(path: str | Path) -> tuple[float, float, float] | None:
+    buf = Path(path).read_bytes()
+    if buf[:2] == b"II":
+        endian = "<"
+    elif buf[:2] == b"MM":
+        endian = ">"
+    else:
+        return None
+    (ifd0,) = struct.unpack_from(endian + "I", buf, 4)
+    subs = _find_tag(buf, ifd0, endian, SUBIFDS_TAG)
+    if subs is None:
+        return None
+    _, count, vpos, _ = subs
+    for pos in struct.unpack_from(f"{endian}{count}I", buf, vpos):
+        e = _find_tag(buf, pos, endian, YCC_WB_SCALE_TAG)
+        if e is None:
+            continue
+        typ, cnt, tpos, _ = e
+        if typ != _RATIONAL or cnt < 3:
+            return None
+        v = struct.unpack_from(f"{endian}6I", buf, tpos)
+        if 0 in v[1::2]:
+            return None
+        return (v[0] / v[1], v[2] / v[3], v[4] / v[5])
+    return None
+
+
+@lru_cache(maxsize=8)
+def _cached_ycc_wb_scale(path: str, size: int, mtime: int) -> tuple[float, float, float] | None:
+    try:
+        return _read_ycc_wb_scale(path)
+    except (OSError, struct.error):
+        return None
+
+
+def ycc_wb_scale(path: str | Path) -> tuple[float, float, float] | None:
+    """The M/S-size frame's white-balance ratio (R, G, B), or None.
+
+    None for every mosaic frame — the tag is only written beside the YCbCr
+    image — and for anything that is not a TIFF container. Cached on the file's
+    identity like the calibrations: the decode asks once per open, the fitter
+    once per file.
+    """
+    try:
+        st = Path(path).stat()
+    except OSError:
+        return None
+    return _cached_ycc_wb_scale(str(path), st.st_size, int(st.st_mtime_ns))
 
 
 def read_sr2_tag(path: str | Path, tag: int = SR2_PARAM_TAG) -> bytes:

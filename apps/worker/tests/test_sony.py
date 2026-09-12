@@ -57,6 +57,7 @@ from llr_worker.sony.dro import (
     DRO_FINE_X,
     DRO_FINE_Y,
     DRO_GRID_BINS,
+    DRO_GRID_LUMA_WHITE,
     DRO_GRID_NX,
     DRO_GRID_NY,
     DRO_LUMA_WHITE,
@@ -1278,6 +1279,23 @@ def test_dro_lifts_shadows_and_leaves_white_alone() -> None:
     assert np.array_equal(apply_dro(dark, SAMPLE_IN, 0.0), dark)
 
 
+def test_dro_puts_white_one_stop_below_the_curves_ceiling_on_both_paths() -> None:
+    """Sensor white enters the curve at log2(4096) = 12.0, on the grid path too.
+
+    The stage reads the engine's demosaic output (white 8192) halved, so its
+    Ylog for normalised white is 12.0, not the top of the axis. Measured on
+    three ILCE-7CM2 exports: the stage's input plane is 4064..4153x our linear
+    luma in every band, and its per-pixel gain is reproduced to 0.009..0.020
+    RMS (log2) with this constant against 0.20..0.27 with the 16383 the grid
+    path used to assume — which lifted DSC06263's midtones x1.40 too little.
+    Two names only because the wire carries both; they must not drift apart,
+    or the grid path indexes the curve on a different axis from the mean it
+    slices out of the grid.
+    """
+    assert np.log2(DRO_LUMA_WHITE) == 12.0
+    assert DRO_GRID_LUMA_WHITE == DRO_LUMA_WHITE
+
+
 def test_the_dro_grid_builder_weights_green_like_the_engine_not_like_luma() -> None:
     """The grid's luma is not BT.601, and that is deliberate.
 
@@ -1953,3 +1971,111 @@ def test_spica_iso_ramps_reproduce_the_engines_config(iso, gain, shift) -> None:
 def test_spica_off_carries_the_base_iso_ramps() -> None:
     off = spica_off()
     assert off["gainScale"] == SPICA_GAIN_SCALE and off["rangeShift"] == 0.0
+
+
+# ── The M/S-size frames' white balance ─────────────────────────────────────
+
+
+def _tiff_with_subifd(entries: list[tuple[int, int, int, bytes]], subifd_extra: bytes = b"") -> bytes:
+    """A little-endian TIFF: IFD0 holding only SubIFDs (0x14a), pointing at one
+    SubIFD built from `entries` = [(tag, type, count, value bytes)]; values longer
+    than four bytes go out of line, as the real file writes 0x7039."""
+    ifd0_pos = 8
+    ifd0 = struct.pack("<H", 1) + struct.pack("<HHII", 0x014A, 4, 1, 0) + struct.pack("<I", 0)
+    sub_pos = ifd0_pos + len(ifd0)
+    n = len(entries)
+    body_pos = sub_pos + 2 + 12 * n + 4
+    dir_bytes, body = b"", b""
+    for tag, typ, cnt, val in entries:
+        if len(val) <= 4:
+            dir_bytes += struct.pack("<HHI", tag, typ, cnt) + val.ljust(4, b"\0")
+        else:
+            dir_bytes += struct.pack("<HHII", tag, typ, cnt, body_pos + len(body))
+            body += val
+    sub = struct.pack("<H", n) + dir_bytes + struct.pack("<I", 0) + body
+    ifd0 = struct.pack("<H", 1) + struct.pack("<HHII", 0x014A, 4, 1, sub_pos) + struct.pack("<I", 0)
+    return b"II*\0" + struct.pack("<I", ifd0_pos) + ifd0 + sub + subifd_extra
+
+
+def test_the_ycc_frame_s_wb_ratio_is_read_as_three_rationals(tmp_path: Path) -> None:
+    """DSC00062's own numbers: WB_RGGBLevels over another set of levels."""
+    from llr_worker.sony.sr2 import ycc_wb_scale
+
+    ratio = struct.pack("<6I", 1823, 1497, 1024, 1024, 2721, 3322)
+    path = tmp_path / "m.arw"
+    path.write_bytes(_tiff_with_subifd([(0x7000, 4, 1, struct.pack("<I", 4)), (0x7039, 5, 3, ratio)]))
+    got = ycc_wb_scale(path)
+    assert got is not None
+    assert got == pytest.approx((1823 / 1497, 1.0, 2721 / 3322))
+
+
+def test_a_mosaic_frame_has_no_wb_ratio(tmp_path: Path) -> None:
+    """The tag is only written beside the YCbCr image; absent means None, not 1."""
+    from llr_worker.sony.sr2 import ycc_wb_scale
+
+    path = tmp_path / "l.arw"
+    path.write_bytes(_tiff_with_subifd([(0x7000, 4, 1, struct.pack("<I", 4))]))
+    assert ycc_wb_scale(path) is None
+    junk = tmp_path / "junk.bin"
+    junk.write_bytes(b"not a tiff at all")
+    assert ycc_wb_scale(junk) is None
+    assert ycc_wb_scale(tmp_path / "missing.arw") is None
+
+
+class _FakeRaw:
+    def __init__(self) -> None:
+        self.camera_whitebalance = [1823.0, 1024.0, 2721.0, 1024.0]
+
+
+def test_the_ratio_multiplies_the_camera_s_multipliers() -> None:
+    """Edit's WB for these frames is camera WB times the ratio, G2 riding with G;
+    without a ratio (or a unit one) the decode is LibRaw's use_camera_wb exactly."""
+    from llr_worker.fit_profile import libraw_wb_kwargs
+
+    assert libraw_wb_kwargs(_FakeRaw(), None) == {"use_camera_wb": True}
+    assert libraw_wb_kwargs(_FakeRaw(), (1.0, 1.0, 1.0)) == {"use_camera_wb": True}
+    got = libraw_wb_kwargs(_FakeRaw(), (1.2, 1.0, 0.8))
+    assert list(got) == ["user_wb"]
+    assert got["user_wb"] == pytest.approx([1823 * 1.2, 1024.0, 2721 * 0.8, 1024.0])
+
+
+# ── Creative Look "Off" ────────────────────────────────────────────────────
+
+
+@requires_sample
+def test_the_file_s_own_stamp_names_the_shot_s_look() -> None:
+    """The top-level chroma block is a copy of the as-shot look's, so the file
+    can say which look it was — the route an "Off" frame takes to Standard."""
+    from llr_worker.sony import as_shot_look
+
+    assert as_shot_look(SAMPLE_FL) == "FL"
+    assert as_shot_look(SAMPLE_IN) == "IN"
+
+
+def test_a_file_without_calibration_has_no_stamp(tmp_path: Path) -> None:
+    from llr_worker.sony import as_shot_look
+
+    path = tmp_path / "not-a-raw.bin"
+    path.write_bytes(b"nothing to see here")
+    assert as_shot_look(path) is None
+
+
+@requires_sample
+def test_off_resolves_to_the_look_the_file_stamps() -> None:
+    """A look the file carries is taken at its word; "Off" is not one, so the
+    stamp answers; nothing at all stays nothing."""
+    from llr_worker.cli import resolve_as_shot_style
+
+    assert resolve_as_shot_style("FL", SAMPLE_FL) == "FL"
+    assert resolve_as_shot_style("VV2", SAMPLE_FL) == "VV2"
+    assert resolve_as_shot_style("Off", SAMPLE_FL) == "FL"
+    assert resolve_as_shot_style(None, SAMPLE_FL) is None
+
+
+def test_off_stays_off_when_the_file_cannot_say(tmp_path: Path) -> None:
+    """Keeps the exif code so the DCP selection downstream still sees it."""
+    from llr_worker.cli import resolve_as_shot_style
+
+    path = tmp_path / "not-a-raw.bin"
+    path.write_bytes(b"nothing to see here")
+    assert resolve_as_shot_style("Off", path) == "OFF"

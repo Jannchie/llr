@@ -408,11 +408,10 @@ class SonyRenderInfo:
             # in the shader. Off is spelled by spica_off, not by running the
             # formula on absent tags — see there for why they differ.
             "profileSpica": self.spica or spica_off(),
-            # What the engine's own luma is worth on normalised RGB: it forms
-            # BT.601 over a 14-bit plane, so white enters the grid's luma axis
-            # at log2(16383) and clamps. Only the grid path uses this — the
-            # global fallback deliberately puts white on droLumaWhite instead,
-            # so that it leaves white alone rather than dimming it.
+            # What the engine's own luma is worth on normalised RGB for the
+            # grid path. The same number as droLumaWhite now that both are
+            # measured against the stage's real input plane (sony/dro.py);
+            # still sent so an older page keeps its own fallback rule.
             "droGridLumaWhite": DRO_GRID_LUMA_WHITE,
         }
 
@@ -549,6 +548,33 @@ def looks_in_file(raw_path: Path) -> list[str]:
         return []
     present = [_code_of(cal) for cal in looks]
     return present + [c for c in _borrowed() if c not in present]
+
+
+def as_shot_look(raw_path: Path) -> str | None:
+    """The look whose calibration the body stamped on this shot, from the file
+    alone — for when the exif name is not a look the file carries.
+
+    Creative Look "Off" is the case: 33 frames in the library, shot with a
+    Picture Profile set. The exif says Off, the top-level 0x7770 says Off, and
+    neither is one of the ten SR2DataIFDs — so by name there is nothing to
+    render and the shot fell to the DCP path. But the top-level chroma block
+    (0x7842 / 0x7841) is still a copy of one look's, and for these frames it is
+    Standard's; rendered as Standard, DSC00048 lands closest to Edit's own
+    export of it (low-res dE76 median 4.8 against 5.9 Neutral, 6.2 Portrait,
+    8.4 Vivid — tmp/nas/agents/wb.md §2). The match is on the base rather than
+    the name for the same reason look_calibrations makes it: the base is what
+    the block *is*. Portrait and Sepia share Standard's base, so file order
+    decides, and Standard is written first. None when no look's base matches
+    (a Picture Profile with its own calibration, DSC05334) — the DCP fallback
+    is then still the honest answer.
+    """
+    looks = _calibrations_or_none(raw_path)
+    if not looks:
+        return None
+    for cal in looks:
+        if cal.chroma_final is not None:
+            return _code_of(cal)
+    return None
 
 
 def is_borrowed(raw_path: Path, style: str) -> bool:

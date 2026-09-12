@@ -34,7 +34,7 @@ from .denoise import (
     get_denoiser,
     model_uses_chroma,
 )
-from .fit_profile import camera_match_path, postprocess_camera_native
+from .fit_profile import camera_match_path, libraw_wb_kwargs, postprocess_camera_native
 from .imported import decode_image_linear
 from .sony import (
     NO_TWEAKS,
@@ -46,6 +46,7 @@ from .sony import (
     rawnr_simd,
     stops_to_panel,
 )
+from .sony import as_shot_look as sony_as_shot_look
 from .sony import can_render as sony_can_render
 from .sony import is_borrowed as sony_is_borrowed
 from .sony import itp as sony_itp
@@ -64,7 +65,7 @@ from .sony.sharpness import (
     sharpness_calibration,
 )
 from .sony.spica import spica_block, spica_gain_scale, spica_iso_gain, spica_range_shift
-from .sony.sr2 import LookCalibration, dro_strength
+from .sony.sr2 import LookCalibration, dro_strength, ycc_wb_scale
 
 RAW_EXTENSIONS = {".arw", ".srf", ".sr2", ".dng", ".cr2", ".cr3", ".nef", ".raf", ".rw2", ".orf"}
 LOCAL_CAMERA_PROFILE_ROOT = Path("vendor/adobe-camera-profiles/Camera")
@@ -126,6 +127,11 @@ class RawMetadata:
     # curve to index with it. None means the shader falls back to the global
     # approximation.
     dro_grid: dict[str, Any] | None = None
+    # The M/S-size YCbCr frame's white-balance ratio (sony/sr2.ycc_wb_scale),
+    # which Imaging Edge multiplies into the camera's WB and LibRaw does not
+    # know about. None for a mosaic frame. Read here because the tag is the
+    # file's, and every LibRaw decode of the file has to see the same one.
+    wb_scale: tuple[float, float, float] | None = None
 
 
 @dataclass
@@ -900,7 +906,7 @@ def daemon_look_profile(request: dict[str, Any], root: Path) -> dict[str, Any]:
     """
     input_path = resolve_path(root, request["input"])
     exif = read_exiftool_metadata(input_path)
-    as_shot_style = normalize_style(exif.get("CreativeStyle"))
+    as_shot_style = resolve_as_shot_style(exif.get("CreativeStyle"), input_path)
     style = normalize_style(request.get("style")) or as_shot_style
     cal = calibration_for(input_path, style) if sony_can_render(style, input_path) else None
     if cal is None and style != as_shot_style:
@@ -1411,7 +1417,7 @@ def resolve_color_renderer(
     an explicit --dcp, falls through to the DCP lookup.
     """
     if not disable_dcp and dcp_arg is None and recipe.get("profileId") == "sony":
-        style = normalize_style(metadata.creative_style)
+        style = resolve_as_shot_style(metadata.creative_style, input_path)
         look = calibration_for(input_path, style) if sony_can_render(style) else None
         if look is not None:
             return ColorRenderer(sony_look=look, sony_style=style)
@@ -1575,9 +1581,9 @@ def prepare_linear(
             # would leave a second full-resolution copy live.
             linear = np.divide(
                 raw.postprocess(
-                    use_camera_wb=True,
                     no_auto_bright=True,
                     output_color=rawpy.ColorSpace.ProPhoto,
+                    **libraw_wb_kwargs(raw, metadata.wb_scale),
                     gamma=(1, 1),
                     output_bps=16,
                     half_size=half_size,
@@ -1632,7 +1638,7 @@ def decode_camera_rgb_for_render(
             and sony_itp.supports(raw)):
         sys.stderr.write(f"demosaic {input_path.name}: sony itp\n")
         return sony_itp.demosaic_rawpy(raw, half_size=half_size)
-    return postprocess_camera_native(raw, half_size=half_size)
+    return postprocess_camera_native(raw, half_size=half_size, wb_scale=metadata.wb_scale)
 
 
 def prepare_rendered_image(
@@ -1820,7 +1826,26 @@ def read_raw_metadata(input_path: Path, raw: rawpy.RawPy) -> RawMetadata:
         dro_active=dro_from_exif(exif, input_path),
         dro_gain=dro_gain,
         dro_grid=grid,
+        # Only the YCbCr frames carry the tag, and only they lack a CFA pattern;
+        # a mosaic file is not worth the read.
+        wb_scale=ycc_wb_scale(input_path) if getattr(raw, "raw_pattern", None) is None else None,
     )
+
+
+def resolve_as_shot_style(creative_style: str | None, input_path: Path) -> str | None:
+    """The look the body rendered this shot with, as a code this path can render.
+
+    Normally the exif CreativeStyle, normalised. When that names a look the file
+    does not carry — "Off", which a body writes whenever a Picture Profile is
+    set — the file's own stamp decides (sony.as_shot_look): Edit opens those
+    frames as Standard, and until this fell through they took the DCP path with
+    an 11 dE gap to Edit's export. The exif code is kept when the file has no
+    answer either, so the DCP selection downstream still sees what the body said.
+    """
+    style = normalize_style(creative_style)
+    if style is None or sony_can_render(style, input_path):
+        return style
+    return sony_as_shot_look(input_path) or style
 
 
 def look_from_exif(exif: dict[str, Any]) -> LookTweaks:

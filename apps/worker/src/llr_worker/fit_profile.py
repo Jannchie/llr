@@ -32,16 +32,17 @@ import numpy as np
 import rawpy
 
 from .dcp import (
-    DcpHueSatMap,
-    DcpProfile,
     ENCODING_SRGB,
     XYZ_D50_TO_PROPHOTO,
+    DcpHueSatMap,
+    DcpProfile,
     apply_hsv_table,
     camera_to_xyz_matrix,
     rgb_to_hsv,
     select_hue_sat_map,
     srgb_encode_float,
 )
+from .sony.sr2 import ycc_wb_scale
 
 # Grid resolution. Hue gets the most cells because hue error is the dominant
 # residual; value gets the fewest because the inverse tone curve makes the
@@ -132,17 +133,39 @@ def dcp_base_linear(camera_rgb: np.ndarray, profile: DcpProfile) -> np.ndarray:
     return linear
 
 
-def postprocess_camera_native(raw: Any, half_size: bool = True) -> np.ndarray:
+def libraw_wb_kwargs(raw: Any, wb_scale: tuple[float, float, float] | None) -> dict[str, Any]:
+    """The white-balance argument for a LibRaw postprocess of this frame.
+
+    The camera's own multipliers, as before — except on Sony's M/S-size YCbCr
+    frames, where Imaging Edge scales them by the SubIFD's 0x7039 ratio
+    (sony/sr2.ycc_wb_scale). Passing camera_whitebalance back as user_wb is
+    bit-identical to use_camera_wb (checked on a full frame), so the two
+    branches differ only by the ratio. G2 rides with G: the ratio has three
+    entries and the second green is the same green.
+    """
+    if wb_scale is None or all(abs(s - 1.0) < 1e-9 for s in wb_scale):
+        return {"use_camera_wb": True}
+    cam = [float(v) for v in raw.camera_whitebalance]
+    r, g, b = (float(s) for s in wb_scale)
+    return {"user_wb": [cam[0] * r, cam[1] * g, cam[2] * b, cam[3] * g]}
+
+
+def postprocess_camera_native(
+    raw: Any, half_size: bool = True, wb_scale: tuple[float, float, float] | None = None,
+) -> np.ndarray:
     """Camera-native linear RGB from an open rawpy handle.
 
     This is the exact input the DCP chain trains and renders against, so the
     fitter and the renderer must decode identically — both go through here so
     the parameter set cannot silently drift apart in one and not the other.
+    `wb_scale` is the M/S-size ratio (libraw_wb_kwargs); both callers read it
+    off the same file, so it cannot drift either.
     """
     return np.divide(
         raw.postprocess(
-            use_camera_wb=True, no_auto_bright=True, output_color=rawpy.ColorSpace.raw,
+            no_auto_bright=True, output_color=rawpy.ColorSpace.raw,
             gamma=(1, 1), output_bps=16, half_size=half_size,
+            **libraw_wb_kwargs(raw, wb_scale),
         ),
         65535.0, dtype=np.float32,
     )
@@ -150,7 +173,7 @@ def postprocess_camera_native(raw: Any, half_size: bool = True) -> np.ndarray:
 
 def decode_camera_rgb(raw_path: Path, half_size: bool = True) -> np.ndarray:
     with rawpy.imread(str(raw_path)) as raw:
-        return postprocess_camera_native(raw, half_size)
+        return postprocess_camera_native(raw, half_size, ycc_wb_scale(raw_path))
 
 
 CAMERA_MATCH_ROOT = Path("vendor/camera-match")
