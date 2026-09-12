@@ -1769,7 +1769,7 @@ watch(crop, () => {
 // History/persist for the edit state not covered above (redraws handled by
 // their own paths: curve LUT bake, dcp/denoise re-decode; aspect is snapshot
 // state but changes no pixels by itself).
-watch([toneCurve, dcpCode, profileId, denoise, cropAspect, look, sonyAdvancedColour],
+watch([toneCurve, dcpCode, profileId, denoise, cropAspect, look, lookStyle, droStrength, droLevel, sonyAdvancedColour],
   () => { scheduleHistoryCommit(); schedulePersist(); }, { deep: true });
 
 // Sony's advanced colour reproduction. The same trade the camera-match toggle
@@ -1938,6 +1938,19 @@ function describeEdit(): unknown {
         : c.type === "radial" ? { ...c, feather: Math.round(c.feather * 100) }
         : c),
     })),
+    // Sony renders only: the look, its tweaks on the panel scale, and DRO.
+    // Null says the engine has no such stage rather than that it is off.
+    look: lookAsShot.value ? {
+      style: effectiveLookStyle.value, asShotStyle: lookAsShotStyle.value, available: availableLooks.value,
+      tweaks: Object.fromEntries(lookSliders.value.map(sp =>
+        [sp.key, { value: effectiveLook.value[sp.key], min: sp.min, max: sp.max, asShot: lookAsShot.value![sp.key] }])),
+      advancedColour: sonyAdvancedColour.value,
+      dro: droAvailable.value ? {
+        mode: droMode.value, level: droLevel.value < 0 ? null : droLevels.value.indexOf(droLevel.value) + 1,
+        levels: droLevels.value.length, strength: effectiveDro.value, asShotStrength: droAsShot.value, maxStrength: DRO_MAX,
+      } : null,
+    } : null,
+    denoise: isRawSource.value ? { ...denoise } : null,
   };
 }
 
@@ -2008,6 +2021,11 @@ function flattenEdit(s: Snapshot): Record<string, unknown> {
   for (const k of ["cx", "cy", "w", "h", "angle", "orientation", "flipH", "flipV"] as const) out[`crop.${k}`] = s.crop[k];
   out["crop.aspect"] = s.aspect;
   out.masks = JSON.stringify(s.masks ?? []);
+  out["look.style"] = s.lookStyle ?? lookAsShotStyle.value;
+  for (const k of LOOK_TWEAK_ORDER) out[`look.${k}`] = (s.look ?? lookAsShot.value)?.[k];
+  out["look.advancedColour"] = s.sonyAdvancedColour ?? false;
+  out["dro.strength"] = s.dro ?? droAsShot.value; out["dro.level"] = s.droLevel ?? DRO_AUTO;
+  for (const k of ["enabled", "auto", "amount", "edge", "chroma"] as const) out[`denoise.${k}`] = s.denoise?.[k];
   return out;
 }
 function diffEdit(before: Snapshot, after: Snapshot): Record<string, { from: unknown; to: unknown }> {
@@ -2080,6 +2098,23 @@ const SET_EDIT_SCHEMA = {
         adjust: { type: "object", properties: Object.fromEntries(MASK_ADJUST_SLIDERS.map(sp => [sp.key, num(sp.min, sp.max)])) },
       } },
     },
+    look: {
+      type: "object", description: "Sony Creative Look — only when get_edit reports a look (Sony engine). style: a code from look.available. tweaks: absolute values on the camera's panel scale, ranges in get_edit. dro: Sony's Dynamic Range Optimizer (local shadow lift / highlight hold, like the camera JPEG).",
+      properties: {
+        style: { type: "string" },
+        tweaks: { type: "object", properties: Object.fromEntries(LOOK_TWEAK_ORDER.map(k => [k, num(-100, 100)])) },
+        advancedColour: { type: "boolean", description: "Imaging Edge's advanced colour reproduction (3-D LUT), how the camera renders its own JPEG" },
+        dro: { type: "object", properties: {
+          mode: { type: "string", enum: ["off", "auto", "level"], description: "auto = the curve the camera chose; level = one of the built-in curves" },
+          level: { type: "integer", minimum: 1, description: "1..levels, with mode 'level'" },
+          strength: num(0, DRO_MAX, "auto only; 1 = what the camera applied"),
+        } },
+      },
+    },
+    denoise: {
+      type: "object", description: "RAW-domain noise reduction (re-decodes, ~seconds). auto follows the shot's ISO like the camera; amount applies when auto is off. edge/chroma: 50 is neutral.",
+      properties: { enabled: { type: "boolean" }, auto: { type: "boolean" }, amount: num(0, 100), edge: num(0, 100), chroma: num(0, 100) },
+    },
   },
 };
 
@@ -2095,9 +2130,9 @@ function aspectKeyFor(spec: string): string | null {
 const numOr = (v: unknown, fallback: number, min: number, max: number) => typeof v === "number" && Number.isFinite(v) ? clamp(v, min, max) : fallback;
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function applyAssistantEdit(args: any): void {
+async function applyAssistantEdit(args: any): Promise<void> {
   requireImage();
-  if (args.reset) { resetRecipe(); resetCrop(); }
+  if (args.reset) { resetRecipe(); resetCrop(); if (lookAsShot.value) resetLook(); }
   for (const sp of SLIDER_SPECS) recipe[sp.key] = numOr(args.sliders?.[sp.key], recipe[sp.key], sp.min, sp.max);
   HSL_RANGES.forEach((r, i) => {
     const band = args.hsl?.[r.key];
@@ -2179,6 +2214,45 @@ function applyAssistantEdit(args: any): void {
     }));
     selectedMask.value = masks[masks.length - 1]?.id ?? null;
   }
+  if (args.look && lookAsShot.value) {
+    const L = args.look;
+    if (typeof L.style === "string" && availableLooks.value.includes(L.style)) lookStyle.value = L.style;
+    if (L.tweaks) {
+      const next = { ...effectiveLook.value };
+      for (const sp of lookSliders.value) next[sp.key] = numOr(L.tweaks[sp.key], next[sp.key], sp.min, sp.max);
+      look.value = next;
+    }
+    if (typeof L.advancedColour === "boolean") sonyAdvancedColour.value = L.advancedColour;
+    if (L.dro && droAvailable.value) {
+      const lv = droLevels.value[Math.trunc(numOr(L.dro.level, 1, 1, droLevels.value.length)) - 1];
+      if (L.dro.mode === "off") droStrength.value = 0;
+      else if (L.dro.mode === "auto" || L.dro.mode === "level") {
+        if (effectiveDro.value <= 0) droStrength.value = 1;
+        droLevel.value = L.dro.mode === "auto" ? DRO_AUTO : lv;
+      }
+      if (typeof L.dro.strength === "number") droStrength.value = clamp(L.dro.strength, 0, DRO_MAX);
+    }
+    // Let the look watcher's own reload go first, then win over it: the newest
+    // sequence number is the one that lands, and the model's next compare has
+    // to see the profile already on the GPU.
+    await nextTick();
+    await reloadLookProfile();
+  }
+  if (args.denoise && isRawSource.value) {
+    const d = args.denoise;
+    if (typeof d.enabled === "boolean") denoise.enabled = d.enabled;
+    if (typeof d.auto === "boolean") denoise.auto = d.auto;
+    denoise.amount = numOr(d.amount, denoise.amount, 0, 100);
+    denoise.edge = numOr(d.edge, denoise.edge, 0, 100);
+    denoise.chroma = numOr(d.chroma, denoise.chroma, 0, 100);
+    // A re-decode behind the watcher's debounce; the compare that follows
+    // must not measure the old pixels.
+    await new Promise(r => setTimeout(r, 300));
+    await new Promise<void>(r => {
+      if (!denoiseBusy.value) return r();
+      const stop = watch(denoiseBusy, b => { if (!b) { stop(); r(); } });
+    });
+  }
 }
 
 const textContent = (v: unknown): ToolContent[] => [{ type: "text", text: JSON.stringify(v) }];
@@ -2206,7 +2280,7 @@ const assistantTools: Record<string, AssistantTool> = {
     run: async () => textContent(await measureFrame()),
   },
   get_edit: {
-    description: "The current edit: every slider with its range and default, HSL, colour grading, tone curve, crop, masks, and the image dimensions.",
+    description: "The current edit: every slider with its range and default, HSL, colour grading, tone curve, crop, masks, the Sony Creative Look / DRO when the shot renders through the Sony engine, denoise, and the image dimensions.",
     parameters: { type: "object", properties: {} },
     run: () => { requireImage(); return textContent(describeEdit()); },
   },
@@ -2221,7 +2295,7 @@ const assistantTools: Record<string, AssistantTool> = {
       // the watchers have seen it.
       flushPendingHistory();
       editBaseline = captureSnapshot();
-      applyAssistantEdit(args);
+      await applyAssistantEdit(args);
       await nextTick();
       flushPendingHistory(t("history.assistant"));
       const changed = diffEdit(editBaseline, captureSnapshot());
@@ -2241,6 +2315,7 @@ function assistantSystemPrompt(): string {
     "Strength calibration (Lightroom semantics): exposure ±0.3 EV is one visible step, ±1 EV is dramatic. On -100..100 sliders, ±10 is subtle (visible only in compare), ±30 clearly visible, ±60 strong, beyond that is a special effect. Temperature: ±300 K subtle, ±1000 K obviously warm/cool. Start at the subtle-to-visible end and increase only if compare shows too little.",
     "Slider semantics: exposure in stops; contrast, highlights, shadows, whites, blacks, clarity, dehaze, vibrance, saturation in -100..100; temperature in Kelvin (higher = warmer rendering), tint negative = green, positive = magenta. For crops, think about composition (subject placement, horizon, distractions at the edges) and use angle to straighten.",
     "masks: use presets (sky needs a blue sky; for grey skies use highlights or a linear gradient from the top); adjust values are local deltas added to the global sliders.",
+    "look (Sony shots only): the camera's own rendering — pick a style for a wholesale character change (VV vivid, PT portrait skin, FL film), and prefer its tweaks over the Basic sliders when the user asks for 'the camera's look' or an in-camera style. DRO already lifts shadows on many frames: check it before adding shadows/exposure, and turn it off when the user wants the flat decode.",
     `Answer briefly, in the user's language (UI locale: ${locale.value}). Say what you changed and why; do not list every value.`,
   ].join("\n");
 }
