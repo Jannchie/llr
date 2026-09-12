@@ -1102,6 +1102,39 @@ pass),UI 作为 Creative Look 的第六个滑块。`tools/clarity_check.py` 把�
 > 给主管线加 YGamma 时忘了同步它,于是这套工具量出来的亮度整体偏 +0.021,
 > 看着像"复刻偏暗",其实只是工具没跟上。
 
+### 7.9.6 成品对成品:web 导出 vs Edit 导出 vs 机内 JPEG(2026-09-12)
+
+上面是离线链对引擎中间平面;这一节是**用户拿到的东西**——web 端全分辨率导出——
+对 Edit 的 JPEG 导出和机内 JPEG,两帧 α7C II(FL,DRO 自动),1/4 尺寸 CIEDE2000,
+表和方法在 `docs/readme/colour-fidelity.md`,工具 `docs/readme/tools/quant.py`。
+
+| 对照 | DSC03633 ΔE00 均值 | DSC03630 |
+|---|---|---|
+| LLR(高级)vs Edit(高级) | 1.47 | 0.82 |
+| LLR(高级)vs 机内 JPEG | 1.66 | 1.98 |
+| Edit(高级)vs 机内 JPEG | 2.18 | 1.82 |
+| Edit(标准)vs 机内 JPEG | 2.38 | 2.03 |
+
+三条结论:
+
+1. **Edit 自己也不是机内 JPEG**:高级档中性区比机内亮 +2 L\*,标准档 +3~4 L\*。
+   用户看到"llr 比直出亮"时,这一部分是 Sony 桌面端固有的,别往复刻缺口里找。
+2. **LLR 对 Edit 同档位**:DSC03630 全影调 ≤0.9 L\*;DSC03633 中间调(L\* 30–70)
+   比 Edit 暗 2.5 L\*,两边都关 DRO 后收到 ≤0.5 L\* —— 残差全是 **DRO 自动档的档位**:
+   llr 按 ARW 里相机写的增益网格走(所以贴机内,红衣 +0.1 L\*),Edit 的自动在这帧选了
+   更强的提亮。不是复刻错,是两个"自动"不一样。
+3. **高级色彩复制已改为新导入默认开**(`App.vue sonyAdvancedColour`):对机内 JPEG
+   整幅更近(1.66 vs 1.73、1.98 vs 2.25),高光/中性区收益 0.8–0.9 ΔE;代价是深阴影
+   (L\*<20)+0.5 ΔE、极饱和色多丢 0.3 单位色度。**阴影那 0.5 里 LLR 高级档比 Edit 高级档
+   色度高约 0.5**,可能是 3DLut 暗部的小缺口,待查。
+
+几何顺带闭合:块匹配 web 导出对机内 JPEG,两帧全部半径段 ≤0.13 px(修前 2.6 px)——
+Sony `DistortionCorrParams` 的 16 个结点在半对角线的 **`i/15.2`** 处、第一个在中心、
+线性插值,8 帧 50–150mm 桶形/枕形实测 ≤0.3 px(`(i+0.5)/16` 与 darktable 的
+`(i+0.5)/15` 都差 1–2.5 px;15.2 的来历未解)。Edit 自己的导出几何比机内差 0.6–0.9 px,
+所以就算把 Edit 的 `GeometricTransformCorrection` 逆向出来也不会是机内那条。
+实现在 worker `sony_lens_corrections` / web `lens.ts`。
+
 ## 7.10 DRO = `ZcTaskVatr`(逐像素公式与曲线已解出,只剩双边网格的建法)
 
 **怎么定位的:拿两张图做执行普查对照。** 65 张素材里只有 2 张
