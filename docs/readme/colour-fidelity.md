@@ -19,7 +19,6 @@ the region boxes are in `docs/readme/tools/regions{1,2}.json`.
 |---|---|---|---|---|---|---|
 | LLR · Sony | 1.80 | 1.74 | 3.18 | 1.21 / -0.5° / -1.1 / +0.1 | 1.27 / +0.8° / -0.6 / +0.4 | 2.42 / +3.2 |
 | Lightroom Classic · Camera FL | 2.92 | 2.76 | 5.29 | 2.47 / +0.3° / -5.9 / -0.9 | 3.62 / -4.6° / -4.5 / -2.3 | 3.22 / +4.1 |
-| LLR · Adobe DCP | 3.24 | 2.74 | 6.48 | 4.20 / +0.4° / -8.5 / +0.3 | 5.22 / -6.6° / -6.6 / -3.3 | 2.71 / +2.6 |
 
 ## DSC03630 — can under leaves
 
@@ -27,16 +26,11 @@ the region boxes are in `docs/readme/tools/regions{1,2}.json`.
 |---|---|---|---|---|---|---|
 | LLR · Sony | 2.37 | 2.41 | 3.87 | 2.00 / +0.5° / +0.0 / +2.1 | 2.60 / +3.2 | 2.57 / +3.4 |
 | Lightroom Classic · Camera FL | 5.64 | 4.80 | 12.79 | 3.80 / -3.0° / -3.3 / +3.6 | 2.46 / +2.2 | 4.63 / +6.1 |
-| LLR · Adobe DCP | 3.02 | 2.55 | 5.83 | 3.84 / -4.7° / -7.0 / +0.4 | 3.07 / +2.3 | 2.10 / +2.6 |
 
 What the numbers say: the Sony path lands within a degree of hue and a unit of
 chroma on every coloured region, and its residual is a uniform ~+3 L\* on
-neutrals. A Camera Matching DCP keeps hue on the red but loses 6–8 units of
-chroma, and turns greens 3–7° toward blue while dropping 3–7 units of chroma —
-the "Lightroom look" of foliage.
-
-Lightroom Classic (process version 15.4, profile Camera FL, everything else at
-default) drifts the same way LLR's own DCP render does. On the first frame it
-goes a little less far (the two agree to a mean ΔE00 of 3.0); on the second its
-larger error is tone rather than colour — the whole frame comes out ~+6 L\*
-brighter than the camera, which the DRO-aware Sony path does not do.
+neutrals. Lightroom keeps hue on the red but loses 6 units of chroma, and turns
+greens 3–5° toward blue while dropping 3–4 units of chroma — the "Lightroom
+look" of foliage. On the second frame its larger error is tone rather than
+colour: the whole frame comes out ~+6 L\* brighter than the camera, which the
+DRO-aware Sony path does not do.

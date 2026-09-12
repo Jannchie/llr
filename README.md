@@ -26,7 +26,6 @@ over the coloured pixels of that region; [method and full tables](docs/readme/co
 |---|---|---|---|---|
 | LLR · Sony engine | 1.80 / 2.37 | −1.1 | +0.8° / −0.6 | +0.5° / 0.0 |
 | Lightroom Classic · Camera FL | 2.92 / 5.64 | −5.9 | −4.6° / −4.5 | −3.0° / −3.3 |
-| LLR · Adobe DCP (Camera FL) | 3.24 / 3.02 | −8.5 | −6.6° / −6.6 | −4.7° / −7.0 |
 
 Every ARW carries the calibration Imaging Edge renders from: the body's
 hue-segmented colour matrix, the tone curve and chroma terms of each Creative
