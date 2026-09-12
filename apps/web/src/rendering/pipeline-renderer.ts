@@ -11,6 +11,7 @@ import {
   MASK_BLUR_SHADER, MASK_DOWNSAMPLE_SHADER, MASK_VERTEX_SHADER, PASSES, VERTEX_SHADER,
 } from "./passes";
 import { type MarbleUniforms, type ProfileMarble, marbleUniforms } from "./sony-marble";
+import type { ProfileCameraMatch } from "./camera-match";
 import {
   SPICA_CODE_COUNT, SPICA_LUT, SPICA_TABLE_COUNT, SPICA_TAP_COUNT, SPICA_WEIGHTS,
 } from "./spica-tables";
@@ -237,6 +238,14 @@ type SonyPostTargets = {
     // partial 4x4 block at the far edge still gets a texel, as the engine's does.
     w: number; h: number;
   } | null;
+  // Camera match (passes.ts CAMERA_MATCH_SHADER), the stage after Marble: it
+  // reads the frame the chain finished and writes the destination. Null when
+  // the stage is off. `buffer` is the one case where it needs a buffer of its
+  // own — sharpening or Clarity on, Spica and Marble off — because the compose
+  // then reads `scene` and has nowhere else to land; in every other case the
+  // chain has a buffer it is done reading by then (see runSonyPost), and with
+  // nothing in front of it the match reads `scene` directly.
+  match: { buffer: RenderTarget | null } | null;
   // Render texels per source pixel, capped at 1. Sharpening and Spica step in
   // scene texels, so at a reduced preview scale their kernel reaches across
   // several sensor pixels instead of three and they hit far harder than the
@@ -254,6 +263,11 @@ export type ProfileCurve =
     // sony-marble.ts; null — the default — leaves the post chain exactly as it
     // was before the stage existed.
     marble?: (ProfileMarble & { slider: number }) | null;
+    // Camera match: the residual against the body's own JPEG, fitted per body
+    // and look (camera-match.ts). The table alone — whether it runs is the
+    // switch (setSonyCameraMatch), which is a per-image edit rather than part
+    // of the profile. Null when the worker has no table for this body.
+    cameraMatch?: ProfileCameraMatch | null;
   }
   | null;
 
@@ -561,6 +575,11 @@ export class PipelineRenderer {
   // the profile and the colour-NR slider once per profile rebuild rather than
   // per frame. Null — the default — means the chain below is unchanged.
   private sonyMarble: MarbleUniforms | null = null;
+  // Camera match: the table the profile carries, and whether the switch is
+  // on. Both have to hold for the stage to run (cameraMatchOn); the table
+  // stays put while the switch is off so flipping it back is a redraw.
+  private sonyCameraMatch: ProfileCameraMatch | null = null;
+  private sonyCameraMatchWanted = false;
   // Its four buffers, cached together under one size key as
   // [down, mean, blur, out]. One entry rather than four maps because they are
   // allocated and dropped as a unit, and stored as an array so evictOldest frees
@@ -923,6 +942,9 @@ export class PipelineRenderer {
     const marble = curve?.marble ?? null;
     const uniforms = marble ? marbleUniforms(marble, marble.slider) : null;
     this.sonyMarble = uniforms && uniforms.amount > 0 ? uniforms : null;
+    // The match's three tables are uniforms too, so a look change — which
+    // re-keys the table — is the same upload as everything else here.
+    this.sonyCameraMatch = curve?.cameraMatch ?? null;
     this.uploadSonyPostUniforms();
   }
 
@@ -1118,6 +1140,21 @@ export class PipelineRenderer {
   }
 
   /**
+   * The camera-match switch. Synchronous, unlike the one above: the table
+   * came with the profile, so there is nothing to fetch — the next draw either
+   * runs the stage or leaves the post chain exactly as it was. Off with no
+   * table is the same as off, and on with no table does nothing, which is how
+   * a body the fit never saw renders whatever the switch says.
+   */
+  setSonyCameraMatch(on: boolean): void {
+    this.sonyCameraMatchWanted = on;
+  }
+
+  private cameraMatchOn(): boolean {
+    return this.sonyCameraMatchWanted && this.sonyCameraMatch !== null;
+  }
+
+  /**
    * The 3-D LUT as an RGB16I texture, read with texelFetch and never filtered:
    * the shader reproduces the engine's own integer trilinear weights, so the
    * hardware must hand it the grid points untouched.
@@ -1202,7 +1239,11 @@ export class PipelineRenderer {
     // With either post stage on, the main pass renders into a scene target and
     // the chain below composes from it into `fbo` instead.
     const xform = texXform ?? this.texXform;
-    const post = this.sonyClarity || this.sonySharpen || this.sonySpica
+    // Marble and the match are listed here as well as in prepareSonyPost's
+    // own gate: a profile with sharpening unreadable (amount 0) still carries
+    // Marble, and the match runs on whatever the chain leaves — with nothing
+    // else on, it reads the main pass's scene directly.
+    const post = this.sonyClarity || this.sonySharpen || this.sonySpica || this.sonyMarble || this.cameraMatchOn()
       ? this.prepareSonyPost(w, h, xform)
       : null;
     gl.bindFramebuffer(gl.FRAMEBUFFER, post ? post.scene.fbo : fbo);
@@ -1292,7 +1333,7 @@ export class PipelineRenderer {
    */
   private prepareSonyPost(w: number, h: number, xform: Float32Array): SonyPostTargets | null {
     if (!this.sonyPostSupported) return null;
-    if (!this.sonyClarity && !this.sonySharpen && !this.sonySpica && !this.sonyMarble) return null;
+    if (!this.sonyClarity && !this.sonySharpen && !this.sonySpica && !this.sonyMarble && !this.cameraMatchOn()) return null;
     if (!this.postProgram("compose")) return null;
 
     const float = this.sceneNeedsFloat();
@@ -1316,7 +1357,18 @@ export class PipelineRenderer {
       && this.postProgram("marbleBlur") && this.postProgram("marbleCompose")) {
       marble = this.cachedMarbleTargets(w, h);
     }
-    if (!this.sonyClarity) return { scene, base: null, mid, marble, detailScale };
+    // The match, last. It needs a buffer of its own only when the compose
+    // would otherwise be reading `scene` while writing the match's input —
+    // Spica's intermediate is idle then and does the job (runSonyPost). Like
+    // Spica and Marble it drops out alone if that will not allocate.
+    let match: SonyPostTargets["match"] = null;
+    if (this.cameraMatchOn() && this.postProgram("cameraMatch")) {
+      const detail = this.sonyClarity || this.sonySharpen || this.sonySpica;
+      const own = !!detail && !mid && !marble;
+      const buffer = own ? this.cachedMidTarget(w, h, float) : null;
+      if (!own || buffer) match = { buffer };
+    }
+    if (!this.sonyClarity) return { scene, base: null, mid, marble, match, detailScale };
     if (!this.postProgram("down") || !this.postProgram("edge") || !this.postProgram("blur")) return null;
 
     const down = this.sonyClarity.downsample;
@@ -1324,7 +1376,7 @@ export class PipelineRenderer {
     const bh = Math.max(1, Math.min(h, Math.round((this.texHeight * zoom) / down)));
     const pair = this.cachedBasePair(bw, bh);
     if (!pair) return null;
-    return { scene, base: { pair, w: bw, h: bh }, mid, marble, detailScale };
+    return { scene, base: { pair, w: bw, h: bh }, mid, marble, match, detailScale };
   }
 
   /**
@@ -1579,9 +1631,16 @@ export class PipelineRenderer {
   private runSonyPost(t: SonyPostTargets, fbo: WebGLFramebuffer | null, w: number, h: number): void {
     const gl = this.gl;
     const compose = this.sonyPostProgs.get("compose")!;
-    const { scene, base, mid } = t;
+    const { scene, base, mid, match } = t;
 
     gl.bindVertexArray(this.unitQuadVao());
+    // The match with nothing in front of it reads the scene itself — one draw,
+    // no compose blit to make a copy for it.
+    if (match && !this.sonyClarity && !this.sonySharpen && !this.sonySpica && !t.marble) {
+      gl.viewport(0, 0, w, h);
+      this.runCameraMatch(scene.tex, fbo);
+      return;
+    }
     if (base) {
       const down = this.sonyPostProgs.get("down")!;
       const edge = this.sonyPostProgs.get("edge")!;
@@ -1646,10 +1705,16 @@ export class PipelineRenderer {
       src = dst;
     }
 
+    // Where the chain lands. Without the match it is `fbo`, as it always was.
+    // With it, a buffer the chain has finished reading by then: with Marble,
+    // `scene` (its passes read `out`); with Spica, whichever of scene and mid
+    // the compose is not reading; otherwise the match's own (prepareSonyPost).
+    const last = !match ? null : t.marble ? scene : mid ? (src === scene ? mid : scene) : match.buffer!;
+    const finalDst = last ? last.fbo : fbo;
     // With Marble on, the compose lands in its own buffer so there is something
-    // for it to read; with it off this is `fbo` and the line below is the same
-    // draw it always was.
-    const composeDst = t.marble ? t.marble.out.fbo : fbo;
+    // for it to read; with it off this is the final destination and the line
+    // below is the same draw it always was.
+    const composeDst = t.marble ? t.marble.out.fbo : finalDst;
     this.blitQuad(compose.prog, src.tex, composeDst, () => {
       // The sharpen kernel steps in scene texels — three of them either way,
       // which is what the engine's three sensor pixels become here.
@@ -1668,7 +1733,20 @@ export class PipelineRenderer {
       gl.activeTexture(gl.TEXTURE0);
     });
 
-    if (t.marble && this.sonyMarble) this.runMarble(t.marble, this.sonyMarble, fbo, w, h);
+    if (t.marble && this.sonyMarble) this.runMarble(t.marble, this.sonyMarble, finalDst, w, h);
+    if (last) this.runCameraMatch(last.tex, fbo);
+  }
+
+  /**
+   * Camera match, the chain's last stage: the finished display-encoded frame
+   * through the fitted CIELAB tables and back (passes.ts CAMERA_MATCH_SHADER,
+   * reference in sony_repro/tools/camera_match_fit.py, mirror in
+   * camera-match.ts). The tables are per-profile uniforms, set in
+   * uploadSonyPostUniforms; nothing here varies per draw but the buffers.
+   */
+  private runCameraMatch(src: WebGLTexture, dst: WebGLFramebuffer | null): void {
+    const prog = this.sonyPostProgs.get("cameraMatch")!;
+    this.blitQuad(prog.prog, src, dst);
   }
 
   /**
@@ -1797,6 +1875,16 @@ export class PipelineRenderer {
       gl.uniform1i(spica.u["u_scene"]!, 0);
       gl.uniform1i(spica.u["u_weights"]!, 1);
       gl.uniform1i(spica.u["u_lut"]!, 2);
+    }
+    // The match's three tables. Written only when there is a table: the stage
+    // is gated on cameraMatchOn, so a program built before a table arrived is
+    // never drawn with its zeros.
+    const match = this.sonyPostProgs.get("cameraMatch");
+    if (match && this.sonyCameraMatch) {
+      gl.useProgram(match.prog);
+      gl.uniform1fv(match.u["u_cmL"]!, this.sonyCameraMatch.dL);
+      gl.uniform1fv(match.u["u_cmC"]!, this.sonyCameraMatch.cr);
+      gl.uniform1fv(match.u["u_cmH"]!, this.sonyCameraMatch.hs);
     }
     const compose = this.sonyPostProgs.get("compose");
     if (!compose) return;

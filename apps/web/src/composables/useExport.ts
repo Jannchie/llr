@@ -33,6 +33,9 @@ export interface ExportPlan {
    * renderer, so it has to be handed over explicitly or the exported file would
    * silently disagree with the preview. */
   sonyAdvancedColour: boolean;
+  /** Camera match, the post chain's last stage. Render-time and per-image like
+   * the switch above, and handed over for the same reason. */
+  sonyCameraMatch: boolean;
   params: Partial<EditParams>;
   curveLUT: Float32Array;
   profileLUT: (meta: LinearMeta) => ProfileCurve;
@@ -87,6 +90,7 @@ export function useExport(opts: {
       // Awaited, unlike the preview's fire-and-redraw: this renderer draws once
       // and is thrown away, so the table has to be resident before it does.
       await renderer.setSonyAdvancedColour(plan.sonyAdvancedColour);
+      renderer.setSonyCameraMatch(plan.sonyCameraMatch);
       const out = plan.output(meta);
       renderer.setOutput(out.width, out.height, out.texXform, plan.background);
       renderer.draw(plan.params);

@@ -211,6 +211,8 @@ const en = {
   // this one is off at. Both halves of what Advanced changes are behind it.
   "look.advancedColour": "Advanced colour reproduction",
   "look.advancedColourHint": "Imaging Edge's own Advanced setting: the engine's tone stage switches to its Advanced curve and a 3-D lookup table runs after it. Bright saturated colour loses brightness and saturation, highlights come down, and the brightest colour goes neutral — which is how the camera renders its own JPEG. On by default (Imaging Edge itself defaults to Standard).",
+  "look.cameraMatch": "Camera match",
+  "look.cameraMatchHint": "A small correction toward the camera's own JPEG, fitted per body and Creative Look on the residual the engine's rendering still leaves: up to ±3 L* of lightness, ±5% of chroma and ±2° of hue, applied to the finished frame. Only offered on bodies the correction was fitted for.",
   "look.sharpening": "Sharpening",
   "look.sharpeningValue": "{level} · range {range}",
   "look.droOff": "Off",
@@ -524,6 +526,8 @@ const zh: Record<MessageKey, string> = {
   "look.borrowedHint": "该外观比这台机身新。色调曲线是索尼原厂的（跨机身逐字节一致），色彩取自搭载它的机身。",
   "look.advancedColour": "高级色彩复制",
   "look.advancedColourHint": "Imaging Edge 的「色彩复制 = 高级」：色调那一级换成高级档自己的曲线，之后再过一张三维查找表。明亮的高饱和色会被压暗、压饱和，高光整体下压，最亮处的色彩直接收回中性——机内 JPEG 就是这么出片的。默认开（Imaging Edge 自己默认是标准）。",
+  "look.cameraMatch": "贴近机内直出",
+  "look.cameraMatchHint": "按机身和创意外观拟合的机内 JPEG 残差修正：引擎复刻之后仍剩下的那一点差异，亮度 ±3 L*、色度 ±5%、色相 ±2°，作用在最终成片上。只在拟合过的机身上可用。",
   "look.sharpening": "机内锐化",
   "look.sharpeningValue": "{level} · 范围 {range}",
   "look.droOff": "关",

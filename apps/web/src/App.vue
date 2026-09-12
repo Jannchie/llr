@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { PipelineRenderer, parseDcpTables, type EditParams, type ProfileCurve, type ViewWindow } from "./rendering/pipeline-renderer";
 import { sonyChromaNrSlider } from "./rendering/sony-denoise";
+import { parseCameraMatch } from "./rendering/camera-match";
 import {
   curveToLUT, buildToneCurveLUT, defaultToneCurve, normalizeToneCurve,
   DEFAULT_BASIC, sameBasic,
@@ -369,6 +370,15 @@ const hasCameraMatch = ref(false);
 // redraw. It still belongs in the snapshot — it is a per-image choice the way
 // the Creative Look tweaks are, and undo has to travel with it.
 const sonyAdvancedColour = ref(true);
+// Camera match, the post chain's last stage: the residual the Sony engine's
+// own export still has against the body's JPEG, fitted per body and Creative
+// Look (worker sony/profile.py camera_match_table) and applied in CIELAB on
+// the finished frame. The same trade as the switch above — a table in
+// uniforms, so a redraw — and in the snapshot for the same reason. Offered
+// only when the worker has a table for this body (hasSonyCameraMatch): one
+// fitted on another body would be a guess, so the row hides instead.
+const sonyCameraMatch = ref(true);
+const hasSonyCameraMatch = ref(false);
 const defaultDenoise = () => ({
   enabled: true, auto: true, amount: 100, edge: 50, chroma: 50,
 });
@@ -691,6 +701,9 @@ type Snapshot = {
   // Sony's advanced colour reproduction (ZcTask3DLut). Absent in older
   // sessions, which rendered with it off; a new snapshot starts with it on.
   sonyAdvancedColour?: boolean;
+  // Camera match (the fitted correction toward the body's JPEG). Absent in
+  // older sessions, which rendered without it; a new snapshot starts with it on.
+  sonyCameraMatch?: boolean;
   // Local adjustments; absent in sessions that predate them, which is empty.
   masks?: MaskGroup[];
 };
@@ -726,6 +739,7 @@ function defaultSnapshot(name?: string): Snapshot {
     dro: null,
     droLevel: DRO_AUTO,
     sonyAdvancedColour: true,
+    sonyCameraMatch: true,
     masks: [],
   };
 }
@@ -758,6 +772,7 @@ function captureSnapshot(): Snapshot {
     dro: droStrength.value,
     droLevel: droLevel.value,
     sonyAdvancedColour: sonyAdvancedColour.value,
+    sonyCameraMatch: sonyCameraMatch.value,
     masks: cloneMasks(masks),
   };
 }
@@ -790,6 +805,8 @@ function setEditState(s: Snapshot): void {
   droLevel.value = s.droLevel ?? DRO_AUTO;
   // Absent in a snapshot predating the switch, and off is what it rendered as.
   sonyAdvancedColour.value = s.sonyAdvancedColour ?? false;
+  // Same rule: a snapshot from before the stage existed was rendered without it.
+  sonyCameraMatch.value = s.sonyCameraMatch ?? false;
   masks.splice(0, masks.length, ...cloneMasks(s.masks ?? []));
   if (selectedMask.value && !masks.some(g => g.id === selectedMask.value)) selectedMask.value = null;
   dcpCode.value = s.dcp;
@@ -831,7 +848,8 @@ function describeStep(prev: Snapshot, next: Snapshot): string {
   if (prev.dcp !== next.dcp || prev.profile !== next.profile) parts.push(t("settings.engine"));
   if (!same(prev.denoise, next.denoise)) parts.push(t("panel.detail"));
   if (!same(prev.look, next.look) || prev.lookStyle !== next.lookStyle || prev.dro !== next.dro || prev.droLevel !== next.droLevel
-    || prev.sonyAdvancedColour !== next.sonyAdvancedColour) parts.push(t("panel.creativeLook"));
+    || prev.sonyAdvancedColour !== next.sonyAdvancedColour
+    || prev.sonyCameraMatch !== next.sonyCameraMatch) parts.push(t("panel.creativeLook"));
   if (!same(prev.masks ?? [], next.masks ?? [])) parts.push(t("panel.masks"));
   if (!parts.length) return t("history.edit");
   return parts.length > 3 ? `${parts.slice(0, 3).join(", ")} +${parts.length - 3}` : parts.join(", ");
@@ -1172,6 +1190,8 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     webglRenderer.uploadProfileCurveLUT(profileCurveLUT);
     webglRenderer.uploadDcpTables(parseDcpTables(linMeta.colorProfile));
     applySonyAdvancedColour();
+    hasSonyCameraMatch.value = parseCameraMatch(linMeta.colorProfile?.profileCameraMatch) !== null;
+    applySonyCameraMatch();
     // Apply the current crop/straighten (sets output dims, fit, draws, histogram).
     applyCropRender();
     src.invalid = false;
@@ -1206,6 +1226,10 @@ async function reloadLookProfile(): Promise<void> {
     if (seq !== lookProfileSeq || !profile || !webglRenderer) return;
     lookBorrowed.value = profile.lookBorrowed === true;
     sharpening.value = readSharpening(profile);
+    // The table is per look, so the rebuilt profile carries the one for the
+    // look it was asked for — and whether there is one at all can only change
+    // with the body, which is the same on both sides of a look change.
+    hasSonyCameraMatch.value = parseCameraMatch(profile.profileCameraMatch) !== null;
     profileCurveLUT = buildProfileLUT(profile);
     webglRenderer.uploadProfileCurveLUT(profileCurveLUT);
     scheduleWebGLDraw();
@@ -1357,6 +1381,10 @@ function buildProfileLUT(cp: ColorProfileMeta | null | undefined): ProfileCurve 
     marble: cp?.profileMarble && denoise.enabled
       ? { ...cp.profileMarble, slider: sonyChromaNrSlider(denoise.chroma, denoise.auto) }
       : null,
+    // Camera match, after Marble. The table alone travels here; whether it runs
+    // is the switch, pushed at the renderer by applySonyCameraMatch. Null for a
+    // body the fit never saw and for an older response.
+    cameraMatch: parseCameraMatch(cp?.profileCameraMatch),
   };
 }
 
@@ -1421,6 +1449,14 @@ function applySonyAdvancedColour(): void {
   void renderer.setSonyAdvancedColour(sonyAdvancedColour.value).then(() => {
     if (webglRenderer === renderer) scheduleWebGLDraw();
   });
+}
+
+/**
+ * Push the camera-match switch at the renderer. Synchronous, unlike the one
+ * above — the table came with the profile — so the caller schedules the draw.
+ */
+function applySonyCameraMatch(): void {
+  webglRenderer?.setSonyCameraMatch(sonyCameraMatch.value);
 }
 
 function scheduleWebGLDraw(): void {
@@ -1770,7 +1806,7 @@ watch(crop, () => {
 // History/persist for the edit state not covered above (redraws handled by
 // their own paths: curve LUT bake, dcp/denoise re-decode; aspect is snapshot
 // state but changes no pixels by itself).
-watch([toneCurve, dcpCode, profileId, denoise, cropAspect, look, lookStyle, droStrength, droLevel, sonyAdvancedColour],
+watch([toneCurve, dcpCode, profileId, denoise, cropAspect, look, lookStyle, droStrength, droLevel, sonyAdvancedColour, sonyCameraMatch],
   () => { scheduleHistoryCommit(); schedulePersist(); }, { deep: true });
 
 // Sony's advanced colour reproduction. The same trade the camera-match toggle
@@ -1779,6 +1815,14 @@ watch([toneCurve, dcpCode, profileId, denoise, cropAspect, look, lookStyle, droS
 watch(sonyAdvancedColour, () => {
   if (!currentSourceId) return;
   applySonyAdvancedColour();
+});
+
+// Camera match: the table is already in the renderer's uniforms, so the
+// switch is a flag and a redraw.
+watch(sonyCameraMatch, () => {
+  if (!currentSourceId) return;
+  applySonyCameraMatch();
+  scheduleWebGLDraw();
 });
 
 // The Creative Look: style, sliders and DRO. Not a re-decode: reloadLookProfile
@@ -1950,6 +1994,9 @@ function describeEdit(): unknown {
       tweaks: Object.fromEntries(lookSliders.value.map(sp =>
         [sp.key, { value: effectiveLook.value[sp.key], min: sp.min, max: sp.max, asShot: lookAsShot.value![sp.key] }])),
       advancedColour: sonyAdvancedColour.value,
+      // Null when the worker has no fitted table for this body: the switch
+      // is not offered, so there is nothing to report or to set.
+      cameraMatch: hasSonyCameraMatch.value ? sonyCameraMatch.value : null,
       dro: droAvailable.value ? {
         mode: droMode.value, level: droLevel.value < 0 ? null : droLevels.value.indexOf(droLevel.value) + 1,
         levels: droLevels.value.length, strength: effectiveDro.value, asShotStrength: droAsShot.value, maxStrength: DRO_MAX,
@@ -2029,6 +2076,7 @@ function flattenEdit(s: Snapshot): Record<string, unknown> {
   out["look.style"] = s.lookStyle ?? lookAsShotStyle.value;
   for (const k of LOOK_TWEAK_ORDER) out[`look.${k}`] = (s.look ?? lookAsShot.value)?.[k];
   out["look.advancedColour"] = s.sonyAdvancedColour ?? false;
+  out["look.cameraMatch"] = s.sonyCameraMatch ?? false;
   out["dro.strength"] = s.dro ?? droAsShot.value; out["dro.level"] = s.droLevel ?? DRO_AUTO;
   for (const k of Object.keys(defaultDenoise()) as (keyof typeof denoise)[]) out[`denoise.${k}`] = s.denoise?.[k];
   return out;
@@ -2109,6 +2157,7 @@ const SET_EDIT_SCHEMA = {
         style: { type: "string" },
         tweaks: { type: "object", properties: Object.fromEntries(LOOK_TWEAK_ORDER.map(k => [k, num(-100, 100)])) },
         advancedColour: { type: "boolean", description: "Imaging Edge's advanced colour reproduction (3-D LUT), how the camera renders its own JPEG" },
+        cameraMatch: { type: "boolean", description: "Camera match: a small per-body, per-look correction (a few L*, a few % chroma, a degree or two of hue) fitted against the camera's own JPEGs. Only when get_edit reports it non-null" },
         dro: { type: "object", properties: {
           mode: { type: "string", enum: ["off", "auto", "level"], description: "auto = the curve the camera chose; level = one of the built-in curves" },
           level: { type: "integer", minimum: 1, description: "1..levels, with mode 'level'" },
@@ -2228,6 +2277,7 @@ async function applyAssistantEdit(args: any): Promise<void> {
       look.value = next;
     }
     if (typeof L.advancedColour === "boolean") sonyAdvancedColour.value = L.advancedColour;
+    if (typeof L.cameraMatch === "boolean" && hasSonyCameraMatch.value) sonyCameraMatch.value = L.cameraMatch;
     if (L.dro && droAvailable.value) {
       if (["off", "auto", "level"].includes(L.dro.mode)) {
         setDroMode(L.dro.mode, droLevels.value[Math.trunc(numOr(L.dro.level, 1, 1, droLevels.value.length)) - 1]);
@@ -2487,6 +2537,7 @@ function buildExportPlan(): ExportPlan | null {
     lookStyle: settings.lookStyle ?? undefined,
     dro: settings.dro ?? undefined,
     sonyAdvancedColour: settings.sonyAdvancedColour ?? false,
+    sonyCameraMatch: settings.sonyCameraMatch ?? false,
     params: buildPipelineParams(settings),
     curveLUT: buildToneCurveLUT(settings.curve, currentBasic(settings.recipe)),
     profileLUT: (meta) => buildProfileLUT(meta.colorProfile),
@@ -3090,6 +3141,18 @@ const vWheelAdjust = {
             :title="t('look.advancedColourHint')">{{ t('look.advancedColour') }}</label>
           <label class="switch">
             <input id="sony-advanced-colour" type="checkbox" v-model="sonyAdvancedColour" />
+            <span class="switch-track"><span class="switch-thumb" /></span>
+          </label>
+        </div>
+        <!-- Camera match: the residual the engine's own export still has
+             against the body's JPEG, fitted per body and look and applied as
+             the post chain's last stage. Only where the worker has a table for
+             this body — one fitted on another body is not offered. -->
+        <div class="control-row" v-if="activeProfileKind === 'sony' && hasSonyCameraMatch">
+          <label class="control-label" for="sony-camera-match"
+            :title="t('look.cameraMatchHint')">{{ t('look.cameraMatch') }}</label>
+          <label class="switch">
+            <input id="sony-camera-match" type="checkbox" v-model="sonyCameraMatch" />
             <span class="switch-track"><span class="switch-thumb" /></span>
           </label>
         </div>

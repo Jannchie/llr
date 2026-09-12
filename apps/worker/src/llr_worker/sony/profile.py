@@ -42,6 +42,7 @@ browser, so they ride out on the profile as constants.
 
 from __future__ import annotations
 
+import json
 import struct
 from dataclasses import dataclass
 from functools import lru_cache
@@ -312,6 +313,12 @@ class SonyRenderInfo:
     # (0.5 at ISO 100, 1.0 from ISO 1600), and the body's threshold calibration.
     # None for a profile built without exif, which renders with the stage off.
     marble: dict[str, Any] | None = None
+    # The exif Model, which keys the camera-match table (camera_match_table):
+    # the residual between this pipeline's finished frame and the body's own
+    # JPEG was fitted per body and per look, and a table fitted on one body
+    # must not be handed to another. None when no exif was read, which means
+    # no table and the stage off.
+    body: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -353,6 +360,16 @@ class SonyRenderInfo:
             # Marble's chroma cleanup (sony/marble.py): ISO for the blend
             # amount and the threshold calibration. Null renders it off.
             "profileMarble": self.marble,
+            # The body, so a rebuild for another look (apply_look_overrides)
+            # can re-key the table below without reading the file again.
+            "cameraBody": self.body,
+            # Camera match: the fitted residual between this chain's finished
+            # sRGB frame and the body's own JPEG, per body and look, as three
+            # small CIELAB tables the browser applies as its last stage. Null
+            # when no table was fitted for this body — the switch then has
+            # nothing to do and the panel hides it. Re-derived here on every
+            # rebuild because it is per-look, like the YGamma table.
+            "profileCameraMatch": camera_match_table(self.body, self.style),
             # The Saturation slider. The gains above are already divided by it;
             # this is the factor the shader multiplies back after the clamp,
             # which is where the setting's whole visible effect comes from.
@@ -612,6 +629,58 @@ def sepia_toning(style: str) -> dict[str, Any] | None:
     return {"weights": weights, "lut": lut}
 
 
+# Camera match: what the body's own JPEG does on top of this whole chain, as a
+# small display-referred transform in CIELAB fitted per body and per Creative
+# Look (sony_repro/tools/camera_match_fit.py, whose apply() is the reference
+# the shader mirrors). Fitted on 116 ARW + in-camera JPEG pairs from one
+# ILCE-7CM2: the residual is a fixed few L* in the mid-tones, a few percent of
+# chroma and a degree or two of hue, and it is stable enough across frames to
+# be worth a table — held-out dE00 mean 2.11 -> 1.97, median 1.95 -> 1.81.
+#
+# Ten L* bands (centres 5, 15, ..., 95) for the lightness offset `dL` and the
+# chroma ratio `cr`, twelve hue sectors (centres 15, 45, ..., 345) for the hue
+# shift `hs`; linear between centres, clamped at the ends of the L* axis and
+# periodic in hue. Keyed by the exif Model first — a table fitted on one body
+# says nothing about another, so an unknown body gets no table at all rather
+# than the nearest one — then by look, with "*" the pooled table for a look the
+# fit had too few frames of.
+CAMERA_MATCH_DATA = _DATA / "camera_match.json"
+CAMERA_MATCH_POOLED = "*"
+CAMERA_MATCH_L_BANDS = 10
+CAMERA_MATCH_H_SECTORS = 12
+
+
+@lru_cache(maxsize=1)
+def _camera_match_tables() -> dict[str, dict[str, dict[str, Any]]]:
+    if not CAMERA_MATCH_DATA.exists():
+        return {}
+    with CAMERA_MATCH_DATA.open(encoding="utf-8") as f:
+        return json.load(f)
+
+
+def camera_match_table(body: str | None, style: str | None) -> dict[str, list[float]] | None:
+    """The fitted correction for this body and look in wire form, or None.
+
+    None both for a body the fit never saw and for a profile built without
+    exif: either way there is nothing honest to apply, and the frontend hides
+    the switch. A look the fit has no table of its own for takes the pooled
+    one — that is what "*" is, the median over every frame of the body.
+    """
+    if not body:
+        return None
+    looks = _camera_match_tables().get(body.strip())
+    if not looks:
+        return None
+    table = looks.get(style or "") or looks.get(CAMERA_MATCH_POOLED)
+    if table is None:
+        return None
+    return {
+        "dL": [float(v) for v in table["dL"]],
+        "cr": [float(v) for v in table["cr"]],
+        "hs": [float(v) for v in table["hs"]],
+    }
+
+
 def tone_curve_points(
     cal: LookCalibration, highlights: float = 0, shadows: float = 0,
     contrast: float = 0, n: int = TONE_CURVE_POINTS,
@@ -698,6 +767,7 @@ def look_render_info(
     dro_grid: dict[str, Any] | None = None, dro_level: int = DRO_LEVEL_AUTO,
     sharpen: dict[str, Any] | None = None, spica: dict[str, Any] | None = None,
     chroma_suppres: dict[str, Any] | None = None, marble: dict[str, Any] | None = None,
+    body: str | None = None,
 ) -> SonyRenderInfo:
     """Everything about a shot's rendering that runs in the browser.
 
@@ -794,6 +864,7 @@ def look_render_info(
         spica=spica,
         chroma_suppres=chroma_suppres,
         marble=marble,
+        body=body,
         # Every Sony RAW can take a manual level, because the preset curves are
         # the engine's rather than the file's — and this function only ever runs
         # on a Sony RAW, since it needs one for its calibration. Auto is the part
@@ -808,6 +879,7 @@ def apply_sony_profile(
     dro_gain: list[float] | None = None, dro_grid: dict[str, Any] | None = None,
     sharpen: dict[str, Any] | None = None, spica: dict[str, Any] | None = None,
     chroma_suppres: dict[str, Any] | None = None, marble: dict[str, Any] | None = None,
+    body: str | None = None,
 ) -> tuple[np.ndarray, SonyRenderInfo]:
     """Camera RGB -> scene-linear ProPhoto (D50), plus the matching tone curve.
 
@@ -832,7 +904,7 @@ def apply_sony_profile(
     return linear_prophoto, look_render_info(cal, style, tweaks, dro=dro, dro_gain=dro_gain,
                                              dro_grid=dro_grid, sharpen=sharpen,
                                              spica=spica, chroma_suppres=chroma_suppres,
-                                             marble=marble)
+                                             marble=marble, body=body)
 
 
 def apply_look_overrides(
@@ -903,7 +975,10 @@ def apply_look_overrides(
         sharpen=profile.get("profileSharpness"),
         spica=profile.get("profileSpica"),
         chroma_suppres=profile.get("profileChromaSuppres"),
-        marble=profile.get("profileMarble")).to_json()}
+        marble=profile.get("profileMarble"),
+        # The body rides forward too: it keys the camera-match table, which is
+        # per-look and so has to be re-picked for the look this rebuild is for.
+        body=profile.get("cameraBody")).to_json()}
     # The notes follow the request, not the decode: _limitations was handed this
     # rebuild's own borrowed/DRO state, so rebuilt already carries the right list
     # in the right order. It is the only producer of them for a sony profile.

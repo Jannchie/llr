@@ -146,6 +146,12 @@ export type ColorProfileMeta = {
   // amount rather than using amountAuto, because only it knows where the
   // colour-NR slider sits. Null for a render with no Marble to reproduce.
   profileMarble?: ProfileMarble | null;
+  // Camera match, the stage after Marble (worker sony/profile.py
+  // camera_match_table): three small CIELAB tables fitted per body and
+  // Creative Look against the camera's own JPEG. Null when no table was
+  // fitted for this body, which hides the switch — a table from another body
+  // is never substituted. Shape in rendering/camera-match.ts parseCameraMatch.
+  profileCameraMatch?: unknown;
   // What the tone curve and chroma terms above were built with, and what the
   // body itself recorded. The Creative Look panel starts at lookAsShot, which
   // is also what a double-click resets a slider to.

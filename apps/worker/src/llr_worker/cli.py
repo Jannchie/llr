@@ -54,7 +54,7 @@ from .sony.chromasuppres import chroma_suppres_from_file
 from .sony.dro import dro_gain_table, dro_grid, dro_grid_json
 from .sony.dro_presets import DRO_LEVEL_AUTO, DRO_LEVEL_MAX
 from .sony.marble import marble_block
-from .sony.profile import look_render_info
+from .sony.profile import camera_match_table, look_render_info
 from .sony.rawnr import detail_restore as sony_detail_restore
 from .sony.rawnr import noise_model as sony_noise_model
 from .sony.rawnr_simd import iso_strength, manual_strength
@@ -618,6 +618,14 @@ def _stamp_look_choices(profile: dict[str, Any], input_path: Path) -> dict[str, 
         return profile
     profile["availableLooks"] = looks_in_file(input_path)
     profile.setdefault("lookAsShotStyle", profile.get("creativeLook"))
+    # The body and its camera-match table are the same kind of fact, and a
+    # decode cached before the table existed carries neither (the disk tier
+    # has no version). The exif read is memoised, so this costs nothing on a
+    # profile that already has them.
+    if not profile.get("cameraBody"):
+        profile["cameraBody"] = camera_body_from_exif(read_exiftool_metadata(input_path))
+    profile.setdefault("profileCameraMatch",
+                       camera_match_table(profile["cameraBody"], profile.get("creativeLook")))
     return profile
 
 
@@ -929,7 +937,10 @@ def daemon_look_profile(request: dict[str, Any], root: Path) -> dict[str, Any]:
                             sharpen=sharpness_from_exif(exif, input_path),
                             spica=spica_from_exif(exif),
                             chroma_suppres=chroma_suppres_block(input_path),
-                            marble=marble_from_exif(exif))
+                            marble=marble_from_exif(exif),
+                            # Keys the camera-match table, which is per look and
+                            # so has to follow a look change through here.
+                            body=camera_body_from_exif(exif))
     profile = info.to_json()
     # Which looks this particular file can offer, and which one the body chose.
     # Read from the RAW rather than from a constant so a body shipping more than
@@ -1444,6 +1455,9 @@ def render_color(
             dro_grid=metadata.dro_grid, sharpen=metadata.sharpen,
             spica=metadata.spica, chroma_suppres=metadata.chroma_suppres,
             marble=metadata.marble,
+            # The exif Model keys the camera-match table (sony/profile.py
+            # camera_match_table); a body the fit never saw gets none.
+            body=camera_body_from_exif({"Model": metadata.model}),
         )
         return linear, info.to_json()
 
@@ -1906,6 +1920,13 @@ def marble_from_exif(exif: dict[str, Any]) -> dict[str, Any] | None:
     if not iso:
         return None
     return marble_block(int(iso))
+
+
+def camera_body_from_exif(exif: dict[str, Any]) -> str | None:
+    """The exif Model as the camera-match table is keyed by it ("ILCE-7CM2"),
+    or None when the tag is missing — which means no table, not a guess."""
+    model = exif.get("Model")
+    return str(model).strip() or None if model else None
 
 
 def spica_from_exif(exif: dict[str, Any]) -> dict[str, Any]:

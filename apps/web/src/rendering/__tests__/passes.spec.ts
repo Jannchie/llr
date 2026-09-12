@@ -55,7 +55,9 @@ describe("PROCESS_SHADER uniform registry", () => {
 describe("Sony post-chain uniform registry", () => {
   for (const [name, def] of Object.entries(SONY_POST_PROGRAMS)) {
     const declared = new Set<string>();
-    for (const m of (def.fsSource + MASK_VERTEX_SHADER).matchAll(/^uniform\s+\w+\s+(\w+);/gm)) {
+    // An array uniform is registered by its bare name (cameraMatch's tables):
+    // the location of that name is element 0, and uniform1fv fills the rest.
+    for (const m of (def.fsSource + MASK_VERTEX_SHADER).matchAll(/^uniform\s+\w+\s+(\w+)(?:\[\d+\])?;/gm)) {
       declared.add(m[1]);
     }
     const registered = new Set<string>(def.uniforms);

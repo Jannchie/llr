@@ -9,6 +9,11 @@
 
 import { COLOR_GLSL, PROPHOTO_Y, REC709_Y, glslFloat } from "./color-spaces";
 import { LENS_KNOTS, LENS_KNOT_SPAN } from "./lens";
+import {
+  CAMERA_MATCH_H_ORIGIN, CAMERA_MATCH_H_PITCH, CAMERA_MATCH_H_SECTORS,
+  CAMERA_MATCH_L_BANDS, CAMERA_MATCH_L_ORIGIN, CAMERA_MATCH_L_PITCH,
+  LAB_WHITE, SRGB_TO_XYZ, XYZ_TO_SRGB,
+} from "./camera-match";
 import { LUT_GLSL } from "./curve";
 import { HSL_GLSL } from "./hsl-bands";
 import { TONAL_GLSL } from "./tonal-model";
@@ -1541,6 +1546,95 @@ void main() {
   outColor = vec4(marbleGamutInv(marbleYccToRgb(vec3(own.x, cc))), 1.0);
 }`;
 
+// ===== Camera match =====
+// The last stage of the chain, after Marble: the fitted residual between this
+// pipeline's finished sRGB frame and the body's own JPEG, per body and
+// Creative Look (worker sony/profile.py camera_match_table, data from
+// sony_repro/tools/camera_match_fit.py). It is not an engine stage — it is
+// what the engine's export still differs from the camera by, measured on 116
+// frames and small enough (a few L*, a few percent of chroma, a degree or two
+// of hue) to be a fixed table. It runs on the display-encoded frame because
+// that is what the fit measured: the tables are in CIELAB over sRGB, and the
+// maths here is the transcription of camera-match.ts, which is the tested
+// mirror.
+
+/** A row-major 3x3 as a GLSL constructor, which takes its columns. */
+function glslMat3(m: readonly number[]): string {
+  return `mat3(${[0, 1, 2].map(c => [0, 1, 2].map(r => glslFloat(m[3 * r + c])).join(", ")).join(", ")})`;
+}
+
+export const CAMERA_MATCH_SHADER = `#version 300 es
+precision highp float;
+out vec4 outColor;
+uniform sampler2D u_scene;                          // the finished frame, display-encoded sRGB
+uniform float u_cmL[${CAMERA_MATCH_L_BANDS}];       // dL: L* offset per L* band
+uniform float u_cmC[${CAMERA_MATCH_L_BANDS}];       // cr: chroma ratio per L* band
+uniform float u_cmH[${CAMERA_MATCH_H_SECTORS}];     // hs: hue shift in degrees per hue sector
+const int NL = ${CAMERA_MATCH_L_BANDS};
+const int NH = ${CAMERA_MATCH_H_SECTORS};
+const float L_ORIGIN = ${glslFloat(CAMERA_MATCH_L_ORIGIN)};
+const float L_PITCH = ${glslFloat(CAMERA_MATCH_L_PITCH)};
+const float H_ORIGIN = ${glslFloat(CAMERA_MATCH_H_ORIGIN)};
+const float H_PITCH = ${glslFloat(CAMERA_MATCH_H_PITCH)};
+// sRGB (D65) <-> XYZ and the Lab white, the pair every dE00 in this repo was
+// measured with (docs/readme/tools/quant.py srgb_to_lab).
+const mat3 SRGB_TO_XYZ = ${glslMat3(SRGB_TO_XYZ)};
+const mat3 XYZ_TO_SRGB = ${glslMat3(XYZ_TO_SRGB)};
+const vec3 WHITE = vec3(${LAB_WHITE.map(glslFloat).join(", ")});
+const float LAB_EPS = 0.008856;
+const float LAB_KAPPA = 7.787;
+const float LAB_OFFSET = 16.0 / 116.0;
+
+// Both branches of a mix() are evaluated, so every pow() gets a non-negative
+// base or the unselected branch's NaN would poison the result.
+vec3 srgbEotf3(vec3 u) {
+  return mix(u / 12.92, pow((u + 0.055) / 1.055, vec3(2.4)), step(0.04045, u));
+}
+vec3 srgbOetf3(vec3 u) {
+  return mix(u * 12.92, 1.055 * pow(u, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, u));
+}
+vec3 labF3(vec3 t) {
+  return mix(LAB_KAPPA * t + LAB_OFFSET, pow(max(t, 0.0), vec3(1.0 / 3.0)), step(LAB_EPS, t));
+}
+vec3 labFInv3(vec3 f) {
+  vec3 c = f * f * f;
+  return mix((f - LAB_OFFSET) / LAB_KAPPA, c, step(LAB_EPS, c));
+}
+
+void main() {
+  vec3 rgb = clamp(texelFetch(u_scene, ivec2(gl_FragCoord.xy), 0).rgb, 0.0, 1.0);
+  vec3 f = labF3((SRGB_TO_XYZ * srgbEotf3(rgb)) / WHITE);
+  float L = 116.0 * f.y - 16.0;
+  float a = 500.0 * (f.x - f.y);
+  float b = 200.0 * (f.y - f.z);
+  float C = length(vec2(a, b));
+  // atan(0, 0) is undefined here where numpy says 0; a neutral's hue is moot
+  // either way since its chroma stays zero, but a NaN would not stay anything.
+  float h = C > 0.0 ? degrees(atan(b, a)) : 0.0;
+  h -= 360.0 * floor(h / 360.0);
+
+  // The band tables: linear between centres, held at the ends (np.interp).
+  float t = clamp((L - L_ORIGIN) / L_PITCH, 0.0, float(NL - 1));
+  int i = min(int(floor(t)), NL - 2);
+  float ft = t - float(i);
+  float dL = mix(u_cmL[i], u_cmL[i + 1], ft);
+  float cr = mix(u_cmC[i], u_cmC[i + 1], ft);
+  // The sector table, periodic: the last sector runs into the first at 360.
+  float th = (h - H_ORIGIN) / H_PITCH;
+  th -= float(NH) * floor(th / float(NH));
+  int j = min(int(floor(th)), NH - 1);
+  float hs = mix(u_cmH[j], u_cmH[(j + 1) % NH], th - float(j));
+
+  // L' = L + dL(L); C' = C * cr(L), on the original L; h' = h + hs(h).
+  float C2 = C * cr;
+  float h2 = radians(h + hs);
+  vec3 lab = vec3(L + dL, C2 * cos(h2), C2 * sin(h2));
+  float fy = (lab.x + 16.0) / 116.0;
+  vec3 xyz = labFInv3(vec3(fy + lab.y / 500.0, fy, fy - lab.z / 200.0)) * WHITE;
+  vec3 lin = clamp(XYZ_TO_SRGB * xyz, 0.0, 1.0);
+  outColor = vec4(srgbOetf3(lin), 1.0);
+}`;
+
 /**
  * The offscreen programs of Sony's post chain, each with the uniforms the
  * renderer resolves for it. The list lives beside the shaders rather than in
@@ -1572,6 +1666,9 @@ export const SONY_POST_PROGRAMS = {
     fsSource: MARBLE_COMPOSE_SHADER,
     uniforms: ["u_scene", "u_blur", "u_protect", "u_strength", "u_amount"],
   },
+  // The arrays are registered by their bare name: that location addresses
+  // element 0, and uniform1fv from it fills the whole table.
+  cameraMatch: { fsSource: CAMERA_MATCH_SHADER, uniforms: ["u_scene", "u_cmL", "u_cmC", "u_cmH"] },
 } as const;
 
 export type SonyPostProgramName = keyof typeof SONY_POST_PROGRAMS;
