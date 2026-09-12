@@ -699,7 +699,14 @@ let isRestoring = false;
 // source explicitly (switching images / restoring) to avoid a double decode.
 let suppressDcpReload = false;
 
-function defaultSnapshot(): Snapshot {
+// Sony's own engine for Sony's own files: ARW (and the older SRF/SR2) carry the
+// calibration it renders from, and the worker falls back to the DCP when a shot
+// has none. Anything else has only the DCP, so Adobe is the honest default.
+function defaultProfile(name?: string): ProfileId {
+  return /\.(arw|srf|sr2)$/i.test(name ?? "") ? "sony" : "standard";
+}
+
+function defaultSnapshot(name?: string): Snapshot {
   return {
     recipe: defaultRecipe(),
     hslHue: [0, 0, 0, 0, 0, 0, 0, 0],
@@ -710,7 +717,7 @@ function defaultSnapshot(): Snapshot {
     crop: defaultCrop(),
     aspect: DEFAULT_ASPECT,
     dcp: "",
-    profile: "standard",
+    profile: defaultProfile(name),
     denoise: defaultDenoise(),
     look: null,
     lookScale: LOOK_SCALE,
@@ -859,7 +866,7 @@ function applyStoredEdit(e: ImageEdit | null): void {
     history.value = e.history.map(s => ({ ...s }));
     historyIndex.value = Math.min(Math.max(0, e.historyIndex), history.value.length - 1);
   } else {
-    setEditState(defaultSnapshot());
+    setEditState(defaultSnapshot(activeSource.value?.name));
     history.value = [captureSnapshot()];
     historyIndex.value = 0;
   }
@@ -877,7 +884,7 @@ const {
   api: API,
   status, errorMessage, cropMode,
   captureEdit: () => ({ snapshot: captureSnapshot(), history: history.value.slice(), historyIndex: historyIndex.value }),
-  defaultEdit: () => { const snap = defaultSnapshot(); return { snapshot: snap, history: [snap], historyIndex: 0 }; },
+  defaultEdit: (src) => { const snap = defaultSnapshot(src.name); return { snapshot: snap, history: [snap], historyIndex: 0 }; },
   loadEdit: (e) => applyStoredEdit(e),
   loadPixels: (id, o) => loadSource(id, o),
   flushPendingHistory: () => flushPendingHistory(),

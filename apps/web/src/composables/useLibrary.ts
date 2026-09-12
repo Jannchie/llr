@@ -28,7 +28,7 @@ export function useLibrary<S, V>(opts: {
   /** Snapshot the live edit (snapshot + history) for stashing/persisting. */
   captureEdit: () => PersistedEdit<S>;
   /** Fresh edit for a new import. */
-  defaultEdit: () => PersistedEdit<S>;
+  defaultEdit: (source: Source) => PersistedEdit<S>;
   /** Push an edit (null = defaults) into the live reactive state. */
   loadEdit: (e: PersistedEdit<S> | null) => void;
   /** Decode + render `id`'s pixels (the caller's loadSource). */
@@ -229,7 +229,7 @@ export function useLibrary<S, V>(opts: {
         const source = await res.json() as Source;
         sources.value = [...sources.value, source];
         // Each new import starts from a fresh, independent edit.
-        edits.set(source.id, opts.defaultEdit());
+        edits.set(source.id, opts.defaultEdit(source));
         dirtyEditIds.add(source.id);
         void cacheThumb(source);
         lastId = source.id;
