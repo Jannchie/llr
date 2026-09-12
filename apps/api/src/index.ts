@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
-import { access, mkdir, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
@@ -127,7 +127,7 @@ server.listen(port, host, () => {
   console.log(`Cache root: ${cacheRoot}`);
 });
 
-void migrateLegacySessions().then(cleanupSessions);
+void cleanupSessions();
 setInterval(() => void cleanupSessions(), 60 * 60 * 1000).unref();
 
 async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -401,16 +401,6 @@ async function handleExport(request: IncomingMessage, response: ServerResponse):
   } finally {
     await rm(exportPath, { force: true });
   }
-}
-
-// Sessions used to live in the checkout at tmp/sessions; carry them across once
-// so the libraries the browser persisted keep resolving.
-async function migrateLegacySessions(): Promise<void> {
-  const legacy = resolve(repoRoot, "tmp/sessions");
-  if (existsSync(sessionsRoot) || !existsSync(legacy)) return;
-  await mkdir(cacheRoot, { recursive: true });
-  await rename(legacy, sessionsRoot);
-  console.log(`Moved ${legacy} -> ${sessionsRoot}`);
 }
 
 async function cleanupSessions(): Promise<void> {

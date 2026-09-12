@@ -554,17 +554,20 @@ def _disk_cache_path(cache_key: tuple[Any, ...], output_path: Path) -> Path:
     return output_path.with_name(f"cache-{digest}.f16")
 
 
+def _link_or_copy(src: Path, dst: Path) -> None:
+    dst.unlink(missing_ok=True)
+    try:
+        os.link(src, dst)
+    except OSError:  # another filesystem
+        shutil.copyfile(src, dst)
+
+
 def _read_disk_cache(disk: Path, output_path: Path) -> dict[str, Any] | None:
     """The sidecar of a cached decode, with its pixels linked into output_path."""
-    sidecar = disk.with_suffix(".json")
     try:
-        meta = json.loads(sidecar.read_text())
+        meta = json.loads(disk.with_suffix(".json").read_text())
         os.utime(disk)  # recency for eviction
-        output_path.unlink(missing_ok=True)
-        try:
-            os.link(disk, output_path)
-        except OSError:
-            shutil.copyfile(disk, output_path)
+        _link_or_copy(disk, output_path)
         meta["bytesWritten"] = disk.stat().st_size
         return meta
     except (OSError, ValueError):
@@ -577,21 +580,22 @@ def _write_disk_cache(linear_arr: np.ndarray, meta: dict[str, Any], disk: Path, 
     n = _write_linear_f16(linear_arr, tmp)
     os.replace(tmp, disk)
     disk.with_suffix(".json").write_text(json.dumps(meta))
-    try:
-        os.link(disk, output_path)
-    except OSError:
-        shutil.copyfile(disk, output_path)
+    _link_or_copy(disk, output_path)
     # ponytail: whole-tree stat on every decode; sessions/<id>/ is the layout the API keeps
-    entries = []
+    # An entry can carry two names (the DCP alias below), so count and evict by inode.
+    by_inode: dict[int, tuple[float, int, list[Path]]] = {}
     for f in disk.parent.parent.glob("*/cache-*.f16"):
         with suppress(OSError):  # swept by the API meanwhile
-            entries.append((f.stat().st_mtime, f.stat().st_size, f))
-    total = sum(e[1] for e in entries)
-    for _, size, f in sorted(entries):
-        if total <= _DISK_CACHE_BYTES_MAX or f == disk:
+            st = f.stat()
+            by_inode.setdefault(st.st_ino, (st.st_mtime, st.st_size, []))[2].append(f)
+    keep = disk.stat().st_ino
+    total = sum(size for _, size, _ in by_inode.values())
+    for ino, (_, size, names) in sorted(by_inode.items(), key=lambda kv: kv[1][0]):
+        if total <= _DISK_CACHE_BYTES_MAX or ino == keep:
             continue
-        f.unlink(missing_ok=True)
-        f.with_suffix(".json").unlink(missing_ok=True)
+        for f in names:
+            f.unlink(missing_ok=True)
+            f.with_suffix(".json").unlink(missing_ok=True)
         total -= size
     return n
 
@@ -717,20 +721,32 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     dro_level_override = (None if request.get("droLevel") is None
                           else dro_level_from_request(request))
 
-    # Check processed sRGB cache first
     cache_key = _linear_cache_key(input_path, profile_id, half_size, max_size, dcp_code, dn_model, dn_amount, (dn_edge, dn_chroma), dn_strength)
+
+    # What is cached is always the camera's own rendering; this request's
+    # overrides are layered on the way out, so they never outlive it. Stamped
+    # first so lookAsShotStyle captures the look the body chose.
+    def finish(color_profile: dict[str, Any]) -> dict[str, Any]:
+        return apply_look_overrides(_stamp_look_choices(color_profile, input_path), input_path, look_overrides,
+                                    look_style, dro_override, dro_level_override)
+
+    # Disk tier first: a hit is a hardlink, cheaper than re-encoding the memory
+    # tier's float32. Read regardless of purpose (an export wants the same pixels
+    # a preview cached), written only below where store_cache says so.
+    disk = _disk_cache_path(cache_key, output_path)
+    cached_meta = _read_disk_cache(disk, output_path)
+    if cached_meta is not None:
+        cached_meta["colorProfile"] = finish(cached_meta["colorProfile"])
+        cached_meta["output"] = str(output_path)
+        return cached_meta
+
     with _CACHE_LOCK:
         cached_linear = _LINEAR_CACHE.get(cache_key)
         if cached_linear is not None:
             _LINEAR_CACHE.move_to_end(cache_key)
     if cached_linear is not None:
         linear_arr, color_profile = cached_linear
-        # Stamped before the overrides so lookAsShotStyle captures the look the
-        # body chose — what is cached is always the camera's own rendering, and
-        # after an override creativeLook is the client's pick instead.
-        color_profile = _stamp_look_choices(color_profile, input_path)
-        color_profile = apply_look_overrides(color_profile, input_path, look_overrides, look_style, dro_override,
-                                             dro_level_override)
+        color_profile = finish(color_profile)
         bytes_written = _write_linear_f16(linear_arr, output_path)
         return {
             "width": linear_arr.shape[1],
@@ -743,17 +759,6 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
             "bytesWritten": bytes_written,
             "denoiseUsesChroma": dn_uses_chroma,
         }
-
-    # Disk tier: read regardless of purpose (an export wants the same pixels a
-    # preview cached), written only below where store_cache says so.
-    disk = _disk_cache_path(cache_key, output_path)
-    cached_meta = _read_disk_cache(disk, output_path) if disk.with_suffix(".json").exists() else None
-    if cached_meta is not None:
-        color_profile = _stamp_look_choices(cached_meta["colorProfile"], input_path)
-        cached_meta["colorProfile"] = apply_look_overrides(color_profile, input_path, look_overrides, look_style,
-                                                           dro_override, dro_level_override)
-        cached_meta["output"] = str(output_path)
-        return cached_meta
 
     recipe = merge_recipe(PROFILES[profile_id], {})
     if dcp_code:
@@ -871,10 +876,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     return {
         **meta,
         "output": str(output_path),
-        # After the cache insert, so what is cached stays the camera's own
-        # rendering and this request's overrides do not outlive it.
-        "colorProfile": apply_look_overrides(prepared.color_profile, input_path, look_overrides, look_style, dro_override,
-                                             dro_level_override),
+        "colorProfile": finish(prepared.color_profile),
         "bytesWritten": bytes_written,
     }
 

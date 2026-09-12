@@ -215,12 +215,10 @@ function resetLook(): void {
   lookStyle.value = null;
   droStrength.value = null;
   droLevel.value = DRO_AUTO;
-  void reloadLookProfile();
 }
 
 function setLookStyle(style: string): void {
   lookStyle.value = style;
-  void reloadLookProfile();
 }
 
 // ── DRO ──
@@ -263,7 +261,6 @@ const lookEdited = computed(() =>
 
 function setDro(value: number): void {
   droStrength.value = clamp(value, 0, DRO_MAX);
-  void reloadLookProfile();
 }
 
 // Off keeps the level it was on so switching back does not silently land on
@@ -277,7 +274,6 @@ function setDroMode(mode: "off" | "auto" | "level", level?: number): void {
     if (effectiveDro.value <= 0) droStrength.value = 1;
     droLevel.value = mode === "auto" ? DRO_AUTO : (level ?? droLevels.value[0] ?? 0);
   }
-  void reloadLookProfile();
 }
 
 // Sony's own menu names, for both the Creative Look picker and the DCP style
@@ -1780,13 +1776,15 @@ watch(sonyAdvancedColour, () => {
   applySonyAdvancedColour();
 });
 
-// The Creative Look sliders. Not a re-decode: reloadLookProfile swaps the
-// profile LUT under the pixels already on the GPU. Suppressed only while a
-// source load is in flight (that request carries the same tweaks itself) —
-// undo/redo must go through here, exactly as it does for dcpCode.
-watch(look, () => {
+// The Creative Look: style, sliders and DRO. Not a re-decode: reloadLookProfile
+// swaps the profile LUT under the pixels already on the GPU. Suppressed only
+// while a source load is in flight (that request carries the same tweaks
+// itself) — undo/redo must go through here, exactly as it does for dcpCode.
+// The promise is kept so the assistant can await the render it caused.
+let lookReload: Promise<void> = Promise.resolve();
+watch([look, lookStyle, droStrength, droLevel], () => {
   if (suppressDcpReload) return;
-  void reloadLookProfile();
+  lookReload = reloadLookProfile();
 }, { deep: true });
 
 // Re-decode when the user changes the DCP style or the colour engine (keeps the
@@ -1808,14 +1806,16 @@ watch(cameraMatch, () => {
 // because amount is a slider (the first decode runs inference; later ones hit the
 // worker's cache and only re-blend). The amount slider is hidden while disabled,
 // so a change here always alters the effective output.
+let denoiseReload: Promise<unknown> = Promise.resolve();
+function reloadDenoise(): Promise<unknown> {
+  denoiseReloadTimer = 0;
+  denoiseBusy.value = true;
+  return denoiseReload = loadSource(currentSourceId, { resetView: false }).finally(() => { denoiseBusy.value = false; });
+}
 watch(denoise, () => {
   if (suppressDcpReload || !currentSourceId) return;
   if (denoiseReloadTimer) clearTimeout(denoiseReloadTimer);
-  denoiseReloadTimer = window.setTimeout(() => {
-    denoiseReloadTimer = 0;
-    denoiseBusy.value = true;
-    void loadSource(currentSourceId, { resetView: false }).finally(() => { denoiseBusy.value = false; });
-  }, 250);
+  denoiseReloadTimer = window.setTimeout(reloadDenoise, 250);
 }, { deep: true });
 
 // Flush the latest edit on tab close. The IndexedDB write is async, so also
@@ -2025,7 +2025,7 @@ function flattenEdit(s: Snapshot): Record<string, unknown> {
   for (const k of LOOK_TWEAK_ORDER) out[`look.${k}`] = (s.look ?? lookAsShot.value)?.[k];
   out["look.advancedColour"] = s.sonyAdvancedColour ?? false;
   out["dro.strength"] = s.dro ?? droAsShot.value; out["dro.level"] = s.droLevel ?? DRO_AUTO;
-  for (const k of ["enabled", "auto", "amount", "edge", "chroma"] as const) out[`denoise.${k}`] = s.denoise?.[k];
+  for (const k of Object.keys(defaultDenoise()) as (keyof typeof denoise)[]) out[`denoise.${k}`] = s.denoise?.[k];
   return out;
 }
 function diffEdit(before: Snapshot, after: Snapshot): Record<string, { from: unknown; to: unknown }> {
@@ -2132,7 +2132,7 @@ const numOr = (v: unknown, fallback: number, min: number, max: number) => typeof
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function applyAssistantEdit(args: any): Promise<void> {
   requireImage();
-  if (args.reset) { resetRecipe(); resetCrop(); if (lookAsShot.value) resetLook(); }
+  if (args.reset) { resetRecipe(); resetCrop(); resetLook(); }
   for (const sp of SLIDER_SPECS) recipe[sp.key] = numOr(args.sliders?.[sp.key], recipe[sp.key], sp.min, sp.max);
   HSL_RANGES.forEach((r, i) => {
     const band = args.hsl?.[r.key];
@@ -2216,7 +2216,7 @@ async function applyAssistantEdit(args: any): Promise<void> {
   }
   if (args.look && lookAsShot.value) {
     const L = args.look;
-    if (typeof L.style === "string" && availableLooks.value.includes(L.style)) lookStyle.value = L.style;
+    if (typeof L.style === "string" && availableLooks.value.includes(L.style)) setLookStyle(L.style);
     if (L.tweaks) {
       const next = { ...effectiveLook.value };
       for (const sp of lookSliders.value) next[sp.key] = numOr(L.tweaks[sp.key], next[sp.key], sp.min, sp.max);
@@ -2224,19 +2224,11 @@ async function applyAssistantEdit(args: any): Promise<void> {
     }
     if (typeof L.advancedColour === "boolean") sonyAdvancedColour.value = L.advancedColour;
     if (L.dro && droAvailable.value) {
-      const lv = droLevels.value[Math.trunc(numOr(L.dro.level, 1, 1, droLevels.value.length)) - 1];
-      if (L.dro.mode === "off") droStrength.value = 0;
-      else if (L.dro.mode === "auto" || L.dro.mode === "level") {
-        if (effectiveDro.value <= 0) droStrength.value = 1;
-        droLevel.value = L.dro.mode === "auto" ? DRO_AUTO : lv;
+      if (["off", "auto", "level"].includes(L.dro.mode)) {
+        setDroMode(L.dro.mode, droLevels.value[Math.trunc(numOr(L.dro.level, 1, 1, droLevels.value.length)) - 1]);
       }
-      if (typeof L.dro.strength === "number") droStrength.value = clamp(L.dro.strength, 0, DRO_MAX);
+      if (typeof L.dro.strength === "number") setDro(L.dro.strength);
     }
-    // Let the look watcher's own reload go first, then win over it: the newest
-    // sequence number is the one that lands, and the model's next compare has
-    // to see the profile already on the GPU.
-    await nextTick();
-    await reloadLookProfile();
   }
   if (args.denoise && isRawSource.value) {
     const d = args.denoise;
@@ -2245,14 +2237,13 @@ async function applyAssistantEdit(args: any): Promise<void> {
     denoise.amount = numOr(d.amount, denoise.amount, 0, 100);
     denoise.edge = numOr(d.edge, denoise.edge, 0, 100);
     denoise.chroma = numOr(d.chroma, denoise.chroma, 0, 100);
-    // A re-decode behind the watcher's debounce; the compare that follows
-    // must not measure the old pixels.
-    await new Promise(r => setTimeout(r, 300));
-    await new Promise<void>(r => {
-      if (!denoiseBusy.value) return r();
-      const stop = watch(denoiseBusy, b => { if (!b) { stop(); r(); } });
-    });
   }
+  // The watchers above have now issued whatever reload the edit needs; the
+  // model's next compare must see it landed. The denoise debounce is for a
+  // dragged slider, not for one call — skip it.
+  await nextTick();
+  if (denoiseReloadTimer) { clearTimeout(denoiseReloadTimer); void reloadDenoise(); }
+  await Promise.all([lookReload, denoiseReload]);
 }
 
 const textContent = (v: unknown): ToolContent[] => [{ type: "text", text: JSON.stringify(v) }];
