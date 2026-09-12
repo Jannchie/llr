@@ -274,17 +274,21 @@ def luma_terms(cal: LookCalibration, fade: float = 0,
     10624, so it takes the entry above. Both measured on the running engine
     (sony_repro/notes/panel-sliders.md); a whole-number index is unchanged.
 
-    `advanced` replaces the contrast with 高级's own, which is the one constant
-    for every look rather than a per-look table entry. The *pivot* is left as the
-    shot's: both frames the setting was measured on were at Fade 0, where the
-    pivot is 0 either way, so there is no evidence that 高级 touches it and
-    inventing one would silently move every faded frame.
+    `advanced` (高级 colour reproduction) changes nothing here. It used to
+    replace the contrast with 17280/16384, the one value 高级 had been seen
+    with — on two Fade 0 frames, where that is simply entry 0 of the table
+    (every look on every body read so far carries the same ten entries,
+    17280 first). Probed on the running engine at export, 高级 and 标准 read
+    the same pivot and contrast at every Fade: SH at Fade 6 gives 12160 in
+    both, FL patched to Fade 3 gives 14208 in both. Overriding the table threw
+    the fade away: every Fade 1 frame rendered 7 L* too dark in the shadows,
+    SH's Fade 6 frames 20 L*. The parameter stays so the two wire fields keep
+    their meaning; LUMA_CONTRAST_ADVANCED is what entry 0 is.
     """
+    del advanced
     x = max(0.0, float(fade)) / FADE_PANEL_PER_STOP
     last = cal.luma_pivot.size - 1
     pivot = float(cal.luma_pivot[min(last, int(np.ceil(x)))]) / LUMA_FULL_SCALE
-    if advanced:
-        return pivot, LUMA_CONTRAST_ADVANCED
     table = cal.luma_contrast.astype(np.float64)
     k = min(int(x), last - 1)
     c = table[k] + (table[k + 1] - table[k]) * (x - k)

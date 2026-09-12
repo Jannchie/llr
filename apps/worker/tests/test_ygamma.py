@@ -200,12 +200,12 @@ def test_the_profile_carries_the_table_the_browser_indexes() -> None:
                                              (LUMA_LUT_FLAT, "FL")])
 def test_the_advanced_stage_reproduces_edit_s_own_tile_bit_for_bit(
         key: tuple[int, int], family: str) -> None:
-    """What "高级 swaps the table and the contrast" means: Edit's own pixels.
+    """What "高级 swaps the table" means: Edit's own pixels.
 
-    Rendering these tiles through the *standard* table, or through FL's own
-    contrast of 1.0, misses — which is the whole point of the pair. The FL frame
-    is the sharper of the two: its look's 0x780e entry is 16384 exactly, so
-    nothing about it hints at 17280 until Edit's own output is put beside it.
+    Rendering these tiles through the *standard* table misses — which is the
+    whole point of the pair. Both frames are Fade 0, so their contrast is the
+    table's entry 0, 17280/16384, in either mode (the FL frame's own 0x780e
+    reads exactly that too; an earlier note that it read 16384 was wrong).
     """
     data = np.load(ADVANCED_FIXTURES[key])
     assert tuple(int(v) for v in data["lut_key"]) == key, family
@@ -257,23 +257,26 @@ def test_the_advanced_tables_are_a_second_pair_and_not_the_first() -> None:
     assert np.array_equal(luma_lut_for_key((1, 2), advanced=True), flat)
 
 
-def test_the_advanced_contrast_is_one_constant_and_the_pivot_is_not_touched() -> None:
-    """17280/16384 for both families, whatever the look's own 0x780e says.
+# The 0x780e Fade table — the same ten entries in every look of every body read
+# so far (α7C II, α7 V); 17280 first, which is where 高级's "constant" came from.
+FADE_TABLE = np.array([17280, 15616, 14976, 14208, 13568, 12928, 12160, 11520, 10752, 10112], np.int64)
 
-    The pivot is deliberately the look's own: both frames the setting was
-    measured on are Fade 0, where it is zero either way, so there is nothing
-    here to say 高级 moves it.
+
+def test_the_advanced_contrast_keeps_the_shot_s_fade() -> None:
+    """Probed on the running engine at export: SH at Fade 6 reads pivot 10624 /
+    contrast 12160 in 高级 exactly as in 标准, FL patched to Fade 3 reads 14208
+    in both, FL at Fade 0 reads 17280 in both. 高级 does not replace the table;
+    the 17280 it was first seen with is entry 0. Replacing it threw the fade
+    away (Fade 1 frames 7 L* too dark in the shadows, SH's Fade 6 frames 20 L*).
     """
     cal = replace(_calibration(LUMA_LUT_FLAT),
-                  luma_pivot=np.arange(10, dtype=np.int64) * 1024,
-                  # FL's own table: 16384 everywhere, i.e. a contrast of 1.0.
-                  luma_contrast=np.full(10, 16384, np.int64))
-    for fade in (0, 5, 9):
+                  luma_pivot=np.array([0] + [10624] * 9, np.int64), luma_contrast=FADE_TABLE)
+    assert luma_terms(cal, 0, advanced=True)[1] == LUMA_CONTRAST_ADVANCED
+    for fade, want in ((0, 17280), (30, 14208), (60, 12160), (90, 10112)):
         pivot, contrast = luma_terms(cal, fade)
         pivot_adv, contrast_adv = luma_terms(cal, fade, advanced=True)
-        assert contrast == 1.0
-        assert contrast_adv == LUMA_CONTRAST_ADVANCED
-        assert pivot_adv == pivot
+        assert contrast == contrast_adv == want / LUMA_CONTRAST_UNIT
+        assert pivot_adv == pivot == (0 if fade == 0 else 10624) / 16383.0
 
 
 def test_the_render_path_swaps_both_halves_on_the_one_flag() -> None:
