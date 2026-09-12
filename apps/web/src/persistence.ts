@@ -18,7 +18,7 @@
 // v1 records (IndexedDB and the older localStorage store) migrate on load.
 //
 // Image pixels are NOT stored here: the RAW files live server-side under
-// tmp/sessions/<id> and are re-decoded on demand by their (persisted) id.
+// the API's cache root and are re-decoded on demand by their (persisted) id.
 
 const DB_NAME = "llr";
 const DB_VERSION = 1;

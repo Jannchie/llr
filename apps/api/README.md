@@ -2,7 +2,8 @@
 
 Local HTTP API bridging the web app and the Python worker daemon. It owns the
 worker's lifecycle (spawned on demand via `uv run`, restarted on death) and the
-server-side source cache under `tmp/sessions/<uuid>/` (7-day TTL; originals on
+server-side source cache under `$LLR_CACHE_DIR/sessions/<uuid>/` (default
+`~/.cache/llr`; kept until the source is deleted from the library — originals on
 the user's disk are never touched).
 
 ## Endpoints

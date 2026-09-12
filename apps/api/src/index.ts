@@ -1,8 +1,9 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
-import { access, mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { Readable } from "node:stream";
@@ -39,7 +40,13 @@ import {
 const port = Number(process.env.PORT ?? 8790);
 const host = process.env.HOST ?? "127.0.0.1";
 const repoRoot = resolveRepoRoot();
-const sessionsRoot = resolve(repoRoot, "tmp/sessions");
+// Everything the server keeps for the user — uploaded sources, their embedded
+// previews, the worker's decode cache — lives outside the checkout, so a
+// `git clean`, a moved repo or a rebuild cannot orphan a library the browser
+// still points at. Sources stay until DELETE /sources/:id; only per-request
+// scratch is swept.
+const cacheRoot = process.env.LLR_CACHE_DIR ?? resolve(process.env.XDG_CACHE_HOME ?? resolve(homedir(), ".cache"), "llr");
+const sessionsRoot = resolve(cacheRoot, "sessions");
 // Upload formats the worker can decode: RAW via LibRaw, plus plain images
 // (jpg/png/tiff) via Pillow. Broader than the worker's RAW_EXTENSIONS, which
 // answers "is this a RAW file", not "can we ingest it".
@@ -63,11 +70,9 @@ const SUPPORTED_EXTENSIONS = new Set([
 
 const JSON_BODY_LIMIT = 10 * 1024 * 1024;
 const FORM_BODY_LIMIT = 512 * 1024 * 1024;
-const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // linear-*.bin / export-*.jpg are per-request scratch that the request itself
-// deletes. Anything still there (the API died mid-render) is orphaned inside a
-// session dir whose mtime every later render refreshes, so the dir-level TTL
-// will never reach it. Well above the daemon's request timeout.
+// deletes. Anything still there (the API died mid-render) is orphaned, so it is
+// swept on age. Well above the daemon's request timeout.
 const SCRATCH_TTL_MS = 60 * 60 * 1000;
 const SCRATCH_FILE = /^(?:linear-[\w-]+\.bin|export-[\w-]+\.jpg)$/;
 
@@ -119,9 +124,10 @@ server.setTimeout(5 * 60 * 1000);
 server.listen(port, host, () => {
   console.log(`LLR API listening on http://${host}:${port}`);
   console.log(`Workspace root: ${repoRoot}`);
+  console.log(`Cache root: ${cacheRoot}`);
 });
 
-void cleanupSessions();
+void migrateLegacySessions().then(cleanupSessions);
 setInterval(() => void cleanupSessions(), 60 * 60 * 1000).unref();
 
 async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -139,8 +145,8 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
     return;
   }
 
-  // Remove the server-side cached copy of an import. Only ever touches
-  // tmp/sessions — the user's original file never enters this system.
+  // Remove the server-side cached copy of an import. Only ever touches the
+  // cache root — the user's original file never enters this system.
   const sourceId = pathname.match(SOURCE_ROUTE)?.[1];
   if (method === "DELETE" && sourceId) {
     await rm(sessionDirFor(sourceId), { recursive: true, force: true });
@@ -397,6 +403,16 @@ async function handleExport(request: IncomingMessage, response: ServerResponse):
   }
 }
 
+// Sessions used to live in the checkout at tmp/sessions; carry them across once
+// so the libraries the browser persisted keep resolving.
+async function migrateLegacySessions(): Promise<void> {
+  const legacy = resolve(repoRoot, "tmp/sessions");
+  if (existsSync(sessionsRoot) || !existsSync(legacy)) return;
+  await mkdir(cacheRoot, { recursive: true });
+  await rename(legacy, sessionsRoot);
+  console.log(`Moved ${legacy} -> ${sessionsRoot}`);
+}
+
 async function cleanupSessions(): Promise<void> {
   let entries;
   try {
@@ -414,11 +430,6 @@ async function cleanupSessions(): Promise<void> {
     }
     const dir = resolve(sessionsRoot, entry.name);
     try {
-      const stats = await stat(dir);
-      if (now - stats.mtimeMs > SESSION_TTL_MS) {
-        await rm(dir, { recursive: true, force: true });
-        continue;
-      }
       await sweepScratch(dir, now);
     } catch (error) {
       console.warn(`session cleanup failed for ${dir}: ${errorMessage(error)}`);
@@ -740,7 +751,7 @@ function sendJson(response: ServerResponse, body: unknown, status = 200): void {
 }
 
 // Runs before anything reads the body: a hostile page's request must not land
-// its side effects (a 512MB upload in tmp/sessions, attacker bytes handed to
+// its side effects (a 512MB upload in the cache root, attacker bytes handed to
 // LibRaw's parser) just because the reply it gets back is opaque to it.
 function isTrustedRequest(request: IncomingMessage): boolean {
   const origin = request.headers.origin;

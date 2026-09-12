@@ -1,7 +1,7 @@
 // Small UI helpers and types shared between App.vue and its child components.
 
 // `invalid` is frontend-only (set when the server can no longer decode the
-// source, e.g. tmp/sessions was cleared); never persisted.
+// source, e.g. the API's cache root was cleared); never persisted.
 export type Source = { id: string; name: string; size: number; embeddedUrl: string; invalid?: boolean };
 
 export function clamp(v: number, lo: number, hi: number): number {

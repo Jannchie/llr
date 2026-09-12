@@ -48,7 +48,9 @@ Layered LRU caches make slider-driven re-requests cheap: camera-RGB per
 per full parameter set → repeat requests skip everything. Under the latter sits
 a disk tier (`cache-<key>.f16` + `.json` beside the source, hardlinked into the
 response, LRU-bounded across sessions by `LLR_DISK_CACHE_MB`), so a reopened
-session skips the decode after a worker restart too.
+session skips the decode after a worker restart too. Sources and that cache
+live under `$LLR_CACHE_DIR` (default `~/.cache/llr`), outside the checkout, and
+stay until the photo is removed from the library.
 
 ## Render: web (`apps/web`)
 
