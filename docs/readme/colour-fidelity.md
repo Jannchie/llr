@@ -1,6 +1,7 @@
 # Colour fidelity against the camera JPEG
 
-Two α7C II frames, Creative Look FL, DRO Auto. Each render is compared with the
+Three α7C II frames, Creative Look FL — two with DRO Auto, the sunflowers with
+DRO off. Each render is compared with the
 JPEG the camera wrote into the same ARW, at 1/4 size so demosaic and sharpening
 differences do not count, in CIELAB (sRGB, D65). ΔE00 is CIEDE2000. Region
 columns are means over that region; for coloured regions only pixels the camera
@@ -18,9 +19,10 @@ on every band except deep shadows (L\* < 20, +0.5 ΔE00) and the most saturated
 colours (C\* > 60, ~0.3 units more chroma lost) — small against the 0.8–0.9
 ΔE00 it recovers on highlights and neutrals.
 Lightroom exports are full-size JPEGs from Lightroom Classic 15.4 with the
-Camera FL profile and every other setting at default. Regenerate with
+Camera FL profile and every other setting at default (the sunflowers frame
+from Lightroom's Adobe Imagecore export path, same profile). Regenerate with
 `docs/readme/tools/quant.py <camera.jpg> <regions.json> label=render.jpg …`;
-the region boxes are in `docs/readme/tools/regions{1,2}.json`.
+the region boxes are in `docs/readme/tools/regions{1,2,3}.json`.
 
 Geometry is not part of the measure but it has to line up for it to mean
 anything: block-matching LLR's export against the camera JPEG on a 9×13 grid
@@ -60,6 +62,19 @@ look" of foliage. On the second frame its larger error is tone rather than
 colour: the whole frame comes out ~+6 L\* brighter than the camera, which the
 DRO-aware renders do not do.
 
+## DSC02976 — sunflowers (DRO off)
+
+| Render | ΔE00 mean | ΔE00 median | ΔE00 p95 | petals: ΔE00 / Δh° / ΔC* / ΔL* | leaves: ΔE00 / Δh° / ΔC* / ΔL* | backdrop: ΔE00 / ΔL* |
+|---|---|---|---|---|---|---|
+| Imaging Edge · advanced colour | 1.66 | 1.60 | 3.09 | 2.06 / +1.8° / -0.0 / +1.7 | 0.98 / +0.9° / -0.6 / +0.2 | 1.36 / +0.3 |
+| LLR · Sony, advanced colour | 1.61 | 1.56 | 3.02 | 2.02 / +1.5° / -0.2 / +1.7 | 1.11 / +0.9° / -0.7 / +0.6 | 1.29 / +0.6 |
+| Lightroom · Camera FL | 6.86 | 6.64 | 14.33 | 9.29 / +12.5° / -7.7 / +6.6 | 6.41 / +9.7° / -1.1 / +5.4 | 5.73 / +5.5 |
+
+Saturated yellow is the hard case for a fitted profile: Lightroom turns the
+petals 12° and drops 8 units of chroma, and lifts the whole frame ~+5.5 L\*.
+Imaging Edge and LLR both keep the hue within 2° and the chroma within a unit
+of the camera, and with DRO off they agree with each other to ΔE00 0.59.
+
 ## LLR against Imaging Edge
 
 The same measure with Imaging Edge's export as the reference instead of the
@@ -71,6 +86,7 @@ camera JPEG, both in the same colour-reproduction mode:
 | DSC03633 | standard | 1.50 | 1.27 | 3.46 | red suit 2.19 / +0.2° / -0.9 / -2.2 | wall 0.93 / -0.7 |
 | DSC03630 | advanced | 0.82 | 0.66 | 1.90 | leaves 0.59 / +0.1° / -0.1 / +0.4 | pavement 0.65 / +0.1 |
 | DSC03630 | standard | 0.80 | 0.65 | 1.86 | leaves 0.59 / +0.1° / -0.1 / +0.4 | pavement 0.60 / +0.1 |
+| DSC02976 | advanced | 0.59 | 0.51 | 1.28 | petals 0.48 / -0.2° / -0.2 / +0.0 | backdrop 0.64 / +0.4 |
 
 On DSC03630 the two renders agree to within a unit of L\* across the whole
 tone range. On DSC03633 LLR's midtones (L\* 30–70) sit ~2.5 L\* below Imaging

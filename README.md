@@ -10,26 +10,29 @@ Two things it does that Lightroom does not:
 
 Three pairs, same crop of the same ARW, swapping in step:
 
-![Imaging Edge vs LLR, camera JPEG vs LLR, camera JPEG vs Lightroom Classic](docs/readme/three-pairs.gif)
+![Imaging Edge vs LLR, camera JPEG vs LLR, camera JPEG vs Lightroom Classic](docs/readme/three-pairs-can.gif)
+
+![Imaging Edge vs LLR, camera JPEG vs LLR, camera JPEG vs Lightroom — sunflowers](docs/readme/three-pairs-sunflowers.gif)
 
 *Left: Sony's own RAW converter (Imaging Edge) ↔ LLR — the same pipeline, so
 almost nothing moves. Middle: camera JPEG ↔ LLR. Right: camera JPEG ↔
-Lightroom Classic (Camera FL profile, defaults). Foliage is where a fitted
-profile drifts most — watch the greens lose their colour and the whole frame
-lift on the right.*
+Lightroom (Camera FL profile, defaults). Foliage and saturated yellow are
+where a fitted profile drifts most — watch the greens lose their colour, the
+petals turn, and the whole frame lift on the right.*
 
 The same three pairs measured (CIEDE2000; hue and chroma shifts are means over
 the coloured pixels of that region; [method and full tables](docs/readme/colour-fidelity.md)):
 
-| Pair | ΔE00 mean, frame 1 / 2 | Red suit ΔC\* | Hedge Δh° / ΔC\* | Leaves Δh° / ΔC\* |
-|---|---|---|---|---|
-| Imaging Edge ↔ LLR | 1.47 / 0.82 | −0.9 | +0.2° / −1.0 | +0.1° / −0.1 |
-| Camera JPEG ↔ LLR | 1.66 / 1.98 | −1.4 | +1.3° / −1.1 | +0.7° / −0.4 |
-| Camera JPEG ↔ Lightroom Classic · Camera FL | 2.92 / 5.64 | −5.9 | −4.6° / −4.5 | −3.0° / −3.3 |
+| Pair | ΔE00 mean, frame 1 / 2 / 3 | Red suit ΔC\* | Hedge Δh° / ΔC\* | Leaves Δh° / ΔC\* | Petals Δh° / ΔC\* |
+|---|---|---|---|---|---|
+| Imaging Edge ↔ LLR | 1.47 / 0.82 / 0.59 | −0.9 | +0.2° / −1.0 | +0.1° / −0.1 | −0.2° / −0.2 |
+| Camera JPEG ↔ LLR | 1.66 / 1.98 / 1.61 | −1.4 | +1.3° / −1.1 | +0.7° / −0.4 | +1.5° / −0.2 |
+| Camera JPEG ↔ Lightroom | 2.92 / 5.64 / 6.86 | −5.9 | −4.6° / −4.5 | −3.0° / −3.3 | +12.5° / −7.7 |
 
 Against Imaging Edge, LLR agrees to within a unit of L\* wherever the two pick
-the same DRO level. Against the camera JPEG it lands where Sony's own converter
-does (Imaging Edge itself measures 2.18 / 1.82).
+the same DRO level (frame 3 has DRO off: 0.59). Against the camera JPEG it
+lands where Sony's own converter does (Imaging Edge itself measures
+2.18 / 1.82 / 1.66).
 
 Every ARW carries the calibration Imaging Edge renders from: the body's
 hue-segmented colour matrix, the tone curve and chroma terms of each Creative
