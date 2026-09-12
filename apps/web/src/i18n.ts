@@ -210,7 +210,7 @@ const en = {
   // a switch says the same thing in one row, because Standard is the setting
   // this one is off at. Both halves of what Advanced changes are behind it.
   "look.advancedColour": "Advanced colour reproduction",
-  "look.advancedColourHint": "Imaging Edge's own Advanced setting: the engine's tone stage switches to its Advanced curve and a 3-D lookup table runs after it. Bright saturated colour loses brightness and saturation, highlights come down, and the brightest colour goes neutral — which is how the camera renders its own JPEG. Off by default, as it is in Imaging Edge.",
+  "look.advancedColourHint": "Imaging Edge's own Advanced setting: the engine's tone stage switches to its Advanced curve and a 3-D lookup table runs after it. Bright saturated colour loses brightness and saturation, highlights come down, and the brightest colour goes neutral — which is how the camera renders its own JPEG. On by default (Imaging Edge itself defaults to Standard).",
   "look.sharpening": "Sharpening",
   "look.sharpeningValue": "{level} · range {range}",
   "look.droOff": "Off",
@@ -523,7 +523,7 @@ const zh: Record<MessageKey, string> = {
   "look.asShotSuffix": " · 拍摄时",
   "look.borrowedHint": "该外观比这台机身新。色调曲线是索尼原厂的（跨机身逐字节一致），色彩取自搭载它的机身。",
   "look.advancedColour": "高级色彩复制",
-  "look.advancedColourHint": "Imaging Edge 的「色彩复制 = 高级」：色调那一级换成高级档自己的曲线，之后再过一张三维查找表。明亮的高饱和色会被压暗、压饱和，高光整体下压，最亮处的色彩直接收回中性——机内 JPEG 就是这么出片的。默认关，和 Imaging Edge 一致。",
+  "look.advancedColourHint": "Imaging Edge 的「色彩复制 = 高级」：色调那一级换成高级档自己的曲线，之后再过一张三维查找表。明亮的高饱和色会被压暗、压饱和，高光整体下压，最亮处的色彩直接收回中性——机内 JPEG 就是这么出片的。默认开（Imaging Edge 自己默认是标准）。",
   "look.sharpening": "机内锐化",
   "look.sharpeningValue": "{level} · 范围 {range}",
   "look.droOff": "关",
