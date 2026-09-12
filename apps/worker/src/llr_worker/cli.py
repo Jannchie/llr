@@ -15,7 +15,7 @@ import traceback
 from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -537,6 +537,65 @@ def _write_linear_f16(linear_arr: np.ndarray, output_path: Path) -> int:
     return out.nbytes
 
 
+# On-disk tier under the in-memory linear cache: the same f16 the response
+# carries, kept next to the source as `cache-<key>.f16` plus a `.json` sidecar
+# with the profile *before* look/DRO overrides (which are re-derived per request,
+# exactly as on a memory hit). Serving a hit is a hardlink into the response
+# path, so it costs nothing and the API's per-request unlink leaves the entry
+# alone. Bounded by bytes across every session; deleting a source from the
+# library drops its entries with it. The worker sources' newest mtime is part of the key so
+# a pipeline change cannot serve yesterday's pixels.
+_DISK_CACHE_BYTES_MAX = int(os.environ.get("LLR_DISK_CACHE_MB", "8192")) * _MIB
+_CODE_STAMP = max(p.stat().st_mtime_ns for p in Path(__file__).parent.rglob("*.py"))
+
+
+def _disk_cache_path(cache_key: tuple[Any, ...], output_path: Path) -> Path:
+    digest = hashlib.sha1(repr((_CODE_STAMP, *cache_key)).encode()).hexdigest()[:24]
+    return output_path.with_name(f"cache-{digest}.f16")
+
+
+def _read_disk_cache(disk: Path, output_path: Path) -> dict[str, Any] | None:
+    """The sidecar of a cached decode, with its pixels linked into output_path."""
+    sidecar = disk.with_suffix(".json")
+    try:
+        meta = json.loads(sidecar.read_text())
+        os.utime(disk)  # recency for eviction
+        output_path.unlink(missing_ok=True)
+        try:
+            os.link(disk, output_path)
+        except OSError:
+            shutil.copyfile(disk, output_path)
+        meta["bytesWritten"] = disk.stat().st_size
+        return meta
+    except (OSError, ValueError):
+        return None
+
+
+def _write_disk_cache(linear_arr: np.ndarray, meta: dict[str, Any], disk: Path, output_path: Path) -> int:
+    """Write the f16 once into the cache, link it to output_path, evict past the cap."""
+    tmp = disk.with_suffix(".tmp")
+    n = _write_linear_f16(linear_arr, tmp)
+    os.replace(tmp, disk)
+    disk.with_suffix(".json").write_text(json.dumps(meta))
+    try:
+        os.link(disk, output_path)
+    except OSError:
+        shutil.copyfile(disk, output_path)
+    # ponytail: whole-tree stat on every decode; sessions/<id>/ is the layout the API keeps
+    entries = []
+    for f in disk.parent.parent.glob("*/cache-*.f16"):
+        with suppress(OSError):  # swept by the API meanwhile
+            entries.append((f.stat().st_mtime, f.stat().st_size, f))
+    total = sum(e[1] for e in entries)
+    for _, size, f in sorted(entries):
+        if total <= _DISK_CACHE_BYTES_MAX or f == disk:
+            continue
+        f.unlink(missing_ok=True)
+        f.with_suffix(".json").unlink(missing_ok=True)
+        total -= size
+    return n
+
+
 def _stamp_look_choices(profile: dict[str, Any], input_path: Path) -> dict[str, Any]:
     """Add the picker's two facts: which looks this file has, and the shot's own.
 
@@ -685,6 +744,17 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
             "denoiseUsesChroma": dn_uses_chroma,
         }
 
+    # Disk tier: read regardless of purpose (an export wants the same pixels a
+    # preview cached), written only below where store_cache says so.
+    disk = _disk_cache_path(cache_key, output_path)
+    cached_meta = _read_disk_cache(disk, output_path) if disk.with_suffix(".json").exists() else None
+    if cached_meta is not None:
+        color_profile = _stamp_look_choices(cached_meta["colorProfile"], input_path)
+        cached_meta["colorProfile"] = apply_look_overrides(color_profile, input_path, look_overrides, look_style,
+                                                           dro_override, dro_level_override)
+        cached_meta["output"] = str(output_path)
+        return cached_meta
+
     recipe = merge_recipe(PROFILES[profile_id], {})
     if dcp_code:
         recipe["dcpCode"] = dcp_code
@@ -775,21 +845,37 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     if store_cache:
         _remember_pixels(_LINEAR_CACHE, cache_key, (linear_arr, prepared.color_profile), _LINEAR_CACHE_BYTES_MAX)
 
-    bytes_written = _write_linear_f16(linear_arr, output_path)
-
-    return {
+    meta = {
         "width": prepared.linear.shape[1],
         "height": prepared.linear.shape[0],
         "fullWidth": prepared.metadata.full_width,
         "fullHeight": prepared.metadata.full_height,
+        "colorProfile": prepared.color_profile,
+        "dtype": "float16",
+        "denoiseUsesChroma": dn_uses_chroma,
+    }
+    bytes_written = (_write_disk_cache(linear_arr, meta, disk, output_path) if store_cache
+                     else _write_linear_f16(linear_arr, output_path))
+    # The browser answers an auto-matched decode by asking for that code by name,
+    # which is the same DCP file under a different key: link the entry there too
+    # rather than decode the same pixels twice.
+    matched = (prepared.color_profile.get("selection") or {}).get("matchedCode")
+    if store_cache and not dcp_code and matched:
+        alias_key = _linear_cache_key(input_path, profile_id, half_size, max_size, matched, dn_model, dn_amount,
+                                      (dn_edge, dn_chroma), dn_strength)
+        alias = _disk_cache_path(alias_key, output_path)
+        for suffix in (".f16", ".json"):
+            with suppress(OSError):
+                os.link(disk.with_suffix(suffix), alias.with_suffix(suffix))
+
+    return {
+        **meta,
         "output": str(output_path),
         # After the cache insert, so what is cached stays the camera's own
         # rendering and this request's overrides do not outlive it.
         "colorProfile": apply_look_overrides(prepared.color_profile, input_path, look_overrides, look_style, dro_override,
                                              dro_level_override),
-        "dtype": "float16",
         "bytesWritten": bytes_written,
-        "denoiseUsesChroma": dn_uses_chroma,
     }
 
 

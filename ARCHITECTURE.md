@@ -45,7 +45,10 @@ local log mean the gain is indexed by.
 
 Layered LRU caches make slider-driven re-requests cheap: camera-RGB per
 (source, size, denoise) → re-applying a DCP skips the RAW decode; final linear
-per full parameter set → repeat requests skip everything.
+per full parameter set → repeat requests skip everything. Under the latter sits
+a disk tier (`cache-<key>.f16` + `.json` beside the source, hardlinked into the
+response, LRU-bounded across sessions by `LLR_DISK_CACHE_MB`), so a reopened
+session skips the decode after a worker restart too.
 
 ## Render: web (`apps/web`)
 
