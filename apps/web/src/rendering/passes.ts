@@ -8,7 +8,7 @@
  */
 
 import { COLOR_GLSL, PROPHOTO_Y, REC709_Y, glslFloat } from "./color-spaces";
-import { LENS_KNOTS } from "./lens";
+import { LENS_KNOTS, LENS_KNOT_SPAN } from "./lens";
 import { LUT_GLSL } from "./curve";
 import { HSL_GLSL } from "./hsl-bands";
 import { TONAL_GLSL } from "./tonal-model";
@@ -508,11 +508,13 @@ const float GRAD_HL_EDGE1 = ${glslFloat(GRAD_HL_EDGE1)};
 const float GRAD_BAL_SPAN = ${glslFloat(GRAD_BAL_SPAN)};
 const float GRAD_RENORM_CAP = ${glslFloat(GRAD_RENORM_CAP)};
 
-// Evaluate a lens table at normalised radius r. Knots at (i+0.5)/N; outside the
-// knot range clamp to the nearest knot. lens.ts lensInterp is the tested TS
-// mirror of this function, and N is injected from there so the two cannot drift.
+// Evaluate a lens table at normalised radius r. Knots at i / SPAN, the last one
+// short of the corner; past it the last segment continues for one more knot
+// (mix() with t - i > 1 extrapolates), then holds. lens.ts lensInterp is the
+// tested TS mirror of this function, and N / SPAN are injected from there so
+// the two cannot drift.
 float lensInterp(float table[${LENS_KNOTS}], float r) {
-  float t = clamp(r * ${glslFloat(LENS_KNOTS)} - 0.5, 0.0, ${glslFloat(LENS_KNOTS - 1)});
+  float t = clamp(r * ${glslFloat(LENS_KNOT_SPAN)}, 0.0, ${glslFloat(LENS_KNOTS)});
   int i = int(min(t, ${glslFloat(LENS_KNOTS - 2)}));
   return mix(table[i], table[i + 1], t - float(i));
 }

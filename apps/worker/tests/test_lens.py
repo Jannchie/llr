@@ -20,15 +20,17 @@ ON = {
 }
 
 
-def test_knots_span_the_frame():
-    """16 knots evenly over [0, 1], not (i+0.5)/15 which lands one at 1.033.
+def test_knots_start_at_the_centre_and_step_by_the_measured_span():
+    """16 knots at i / 15.2, the first at r = 0 (where the value is always 0).
 
-    Fitted against in-camera JPEGs, the /15 grid measures ~14% short on the
-    correction it applies; /16 needs no fudge factor on the 2^-14 scale.
+    Measured against in-camera JPEGs on 8 frames at 50..150 mm this spacing
+    leaves <= 0.3 px radial residual; (i+0.5)/16 left up to 2.5 px at mid
+    radius. See sony_lens_corrections.
     """
     out = sony_lens_corrections(ON)
     assert out is not None
-    assert out["knots"] == [(i + 0.5) / 16 for i in range(16)]
+    assert out["knots"] == [i / 15.2 for i in range(16)]
+    assert out["knots"][0] == 0.0 and out["distortion"][0] == 1.0
     assert out["distortion"][-1] == -527 * 2**-14 + 1
     assert out["caR"] and out["caB"]
 

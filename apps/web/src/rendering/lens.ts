@@ -4,18 +4,26 @@
  *
  * The worker delivers factor tables sampled on knots in radius normalised to
  * the frame's half-diagonal (corner = 1). The shader consumes fixed 16-entry
- * tables on the canonical grid knot[i] = (i + 0.5) / 16 — the same layout Sony
- * writes, so resampling is an identity for ARW files. Semantics:
+ * tables on the canonical grid knot[i] = i / LENS_KNOT_SPAN — the layout Sony
+ * writes (worker sony_lens_corrections, where the spacing was measured), so
+ * resampling is an identity for ARW files. Semantics:
  *
  *   distortion[i]  sampling factor: a pixel at corrected radius r fetches the
  *                  recorded frame at r * f(r)  (>1 = pincushion correction)
  *   vignetting[i]  linear-light gain at recorded radius r
  *
  * lensInterp() here is the tested mirror of the GLSL interpolation in
- * passes.ts — both clamp to the nearest knot outside the knot range.
+ * passes.ts. The last knot sits at r = 15 / 15.2 = 0.987, short of the corner,
+ * and the fill scale can ask past 1 for barrel — both extend the last segment
+ * linearly rather than clamping, which would leave the corners under-corrected
+ * by a few pixels at the long end of a zoom.
  */
 
 export const LENS_KNOTS = 16;
+/** Knot i sits at radius i / LENS_KNOT_SPAN; the worker's SONY_KNOT_SPAN. */
+export const LENS_KNOT_SPAN = 15.2;
+/** How far past the last knot the linear extension is trusted (in knots). */
+const LENS_EXTRAP_KNOTS = 1;
 
 /** Correction tables as delivered in colorProfile.lensCorr by the worker. */
 export interface LensCorrMeta {
@@ -34,11 +42,15 @@ export interface LensCorr {
 
 export const LENS_IDENTITY: readonly number[] = Object.freeze(new Array<number>(LENS_KNOTS).fill(1));
 
-const knotR = (i: number): number => (i + 0.5) / LENS_KNOTS;
+const knotR = (i: number): number => i / LENS_KNOT_SPAN;
 
-/** Evaluate a canonical 16-entry table at normalised radius r (GLSL mirror). */
+/**
+ * Evaluate a canonical 16-entry table at normalised radius r (GLSL mirror).
+ * Linear between knots; past the last knot the last segment continues, up to
+ * LENS_EXTRAP_KNOTS beyond it, then holds.
+ */
 export function lensInterp(table: readonly number[], r: number): number {
-  const t = Math.min(Math.max(r * LENS_KNOTS - 0.5, 0), LENS_KNOTS - 1);
+  const t = Math.min(Math.max(r * LENS_KNOT_SPAN, 0), LENS_KNOTS - 1 + LENS_EXTRAP_KNOTS);
   const i = Math.min(Math.floor(t), LENS_KNOTS - 2);
   return table[i] + (table[i + 1] - table[i]) * (t - i);
 }

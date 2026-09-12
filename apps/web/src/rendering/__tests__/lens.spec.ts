@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { LENS_IDENTITY, LENS_KNOTS, lensFillScale, lensInterp, mixLensTable, parseLensCorr } from "../lens";
+import { LENS_IDENTITY, LENS_KNOTS, LENS_KNOT_SPAN, lensFillScale, lensInterp, mixLensTable, parseLensCorr } from "../lens";
 
 // Worker output for samples/DSC01157.ARW (FE 50-150mm F2 GM @150mm) — Sony
 // int16 tables through the fixed-point maps (distortion p*2^-14+1, vignetting
-// 1/2^(0.5-2^(p*2^-13-1))), knots (i+0.5)/16. A real pincushion + falloff case.
+// 1/2^(0.5-2^(p*2^-13-1))), knots i/15.2. A real pincushion + falloff case.
 const SONY_DIST_RAW = [0, 3, 12, 26, 48, 74, 107, 145, 190, 240, 295, 358, 427, 502, 586, 677];
 const SONY_VIG_RAW = [0, 96, 96, 128, 352, 960, 1792, 2816, 3968, 5088, 6208, 7360, 8512, 9632, 10688, 11456];
-const KNOTS = Array.from({ length: 16 }, (_, i) => (i + 0.5) / 16);
+const KNOTS = Array.from({ length: 16 }, (_, i) => i / LENS_KNOT_SPAN);
 const SONY_DIST = SONY_DIST_RAW.map(p => p * 2 ** -14 + 1);
 const SONY_VIG = SONY_VIG_RAW.map(p => 1 / 2 ** (0.5 - 2 ** (p * 2 ** -13 - 1)));
 const sonyMeta = { knots: KNOTS, distortion: SONY_DIST, vignetting: SONY_VIG };
@@ -23,13 +23,25 @@ const SHORT_EDGE_3x2 = 2 / Math.hypot(3, 2);
 describe("lensInterp", () => {
   it("hits knot values exactly at knot positions", () => {
     for (let i = 0; i < LENS_KNOTS; i++) {
-      expect(lensInterp(SONY_DIST, (i + 0.5) / 16)).toBeCloseTo(SONY_DIST[i], 12);
+      expect(lensInterp(SONY_DIST, KNOTS[i])).toBeCloseTo(SONY_DIST[i], 12);
     }
   });
 
-  it("clamps to the nearest knot outside the knot range", () => {
+  it("starts at the centre, where the first knot always sits", () => {
+    expect(KNOTS[0]).toBe(0);
     expect(lensInterp(SONY_DIST, 0)).toBe(SONY_DIST[0]);
-    expect(lensInterp(SONY_DIST, 2)).toBe(SONY_DIST[15]);
+    expect(lensInterp(SONY_DIST, -1)).toBe(SONY_DIST[0]);
+  });
+
+  it("continues the last segment past the last knot, then holds", () => {
+    // The last knot is at 15/15.2 = 0.987 — the corner (r = 1) and the barrel
+    // fill scale's reach past it (~1.01) both land on the extension.
+    const slope = (SONY_DIST[15] - SONY_DIST[14]) / (KNOTS[15] - KNOTS[14]);
+    expect(KNOTS[15]).toBeLessThan(1);
+    expect(lensInterp(SONY_DIST, 1)).toBeCloseTo(SONY_DIST[15] + slope * (1 - KNOTS[15]), 12);
+    expect(lensInterp(SONY_DIST, 1.01)).toBeCloseTo(SONY_DIST[15] + slope * (1.01 - KNOTS[15]), 12);
+    // One knot past the end the extension stops — a wild radius cannot run away.
+    expect(lensInterp(SONY_DIST, 2)).toBeCloseTo(SONY_DIST[15] + slope * (KNOTS[15] - KNOTS[14]), 12);
   });
 
   it("interpolates linearly between knots", () => {
@@ -50,9 +62,9 @@ describe("parseLensCorr", () => {
   it("resamples a coarser knot layout onto the canonical grid", () => {
     // 2 knots spanning [0, 1]: values interpolate linearly in radius.
     const corr = parseLensCorr({ knots: [0, 1], distortion: [1, 1.1], vignetting: [1, 2] })!;
-    expect(corr.distortion[0]).toBeCloseTo(1 + 0.1 * (0.5 / 16), 12);
-    expect(corr.distortion[15]).toBeCloseTo(1 + 0.1 * (15.5 / 16), 12);
-    expect(corr.vignetting[7]).toBeCloseTo(1 + (7.5 / 16), 12);
+    expect(corr.distortion[0]).toBeCloseTo(1, 12);
+    expect(corr.distortion[15]).toBeCloseTo(1 + 0.1 * (15 / LENS_KNOT_SPAN), 12);
+    expect(corr.vignetting[7]).toBeCloseTo(1 + (7 / LENS_KNOT_SPAN), 12);
   });
 
   it("rejects malformed metadata", () => {
@@ -96,11 +108,12 @@ describe("lensFillScale", () => {
   });
 
   it("matches the scale Sony applied, measured off the in-camera JPEG", () => {
-    // Radial displacement between the in-camera JPEG and the uncorrected decode,
-    // fitted for the scale (residual rms ~4e-4, the block-matching noise floor).
-    // DSC02976 @50mm measures 1.0107, DSC02961 @104mm measures 0.9769.
+    // The uncorrected decode warped with this table and scale, block-matched
+    // against the in-camera JPEG on a 7x11 grid: radial residual flat to
+    // <= 0.2 px from centre to r = 0.93 on both frames (DSC02976 @50mm,
+    // DSC02961 @104mm). A scale off by 1e-3 would show as ~4 px at the edge.
     expect(lensFillScale(BARREL, SHORT_EDGE_3x2)).toBeCloseTo(1.0107, 3);
-    expect(lensFillScale(PINCUSHION, SHORT_EDGE_3x2)).toBeCloseTo(0.9769, 3);
+    expect(lensFillScale(PINCUSHION, SHORT_EDGE_3x2)).toBeCloseTo(0.9771, 3);
   });
 
   it("keeps every border point of the output frame inside the recorded frame", () => {

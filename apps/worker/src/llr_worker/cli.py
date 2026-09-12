@@ -1983,22 +1983,38 @@ def _exif_int_list(value: Any) -> list[int] | None:
     return None
 
 
+#: Sony writes 16 lens-correction knots; knot i sits at radius i / 15.2 of the
+#: frame's half-diagonal, the first at the centre (measured — see
+#: sony_lens_corrections). The web canonical grid (lens.ts) is the same one.
+SONY_KNOT_SPAN = 15.2
+
+
 def sony_lens_corrections(exif: dict[str, Any]) -> dict[str, Any] | None:
     """Map Sony's per-shot correction splines (SubIFD DistortionCorrParams /
     VignettingCorrParams / ChromaticAberrationCorrParams) to vendor-neutral
     factor tables. Each array is `nc` followed by nc int16 knot values (CA: 2*nc,
     R then B), knots evenly spaced in radius normalised to the frame's
-    half-diagonal: knots[i] = (i + 0.5) / nc. Fixed-point scales are the
-    community-documented ones (exiftool / darktable's reverse engineering):
-    distortion sampling factor p*2^-14 + 1 (corrected position -> distorted
-    source position), vignetting gain 1 / 2^(0.5 - 2^(p*2^-13 - 1)), lateral CA
-    per-channel radial factor p*2^-21 + 1.
+    half-diagonal, the first at the centre: knots[i] = i / SONY_KNOT_SPAN.
+    Fixed-point scales are the community-documented ones (exiftool /
+    darktable's reverse engineering): distortion sampling factor p*2^-14 + 1
+    (corrected position -> distorted source position), vignetting gain
+    1 / 2^(0.5 - 2^(p*2^-13 - 1)), lateral CA per-channel radial factor
+    p*2^-21 + 1.
 
-    The knot spacing is `/ nc`, not `/ (nc - 1)`: the latter puts the last knot
-    at r = 1.033, outside the frame, and measures ~14% short on the correction
-    it does apply. Fitted against 5 in-camera JPEGs (FE 50-150mm F2 GM, 50..104mm)
-    the spacing lands at 0.93 +- 0.02 of the `/ (nc - 1)` grid, i.e. 15/16, and
-    at that spacing the fixed-point scale above needs no fudge factor.
+    The knot spacing is measured, not documented. Neither `(i + 0.5) / nc`
+    (what this read before) nor darktable's `(i + 0.5) / (nc - 1)` matches the
+    camera: warp an uncorrected decode with either, block-match it against the
+    in-camera JPEG, and the radial residual peaks at 1.3-2.5 px around r = 0.5
+    and changes sign toward the corner — the shape of a grid that is too fine,
+    not of a wrong scale (a global fill-scale fit absorbs most of it, which is
+    how the earlier grid passed). Sweeping the spacing on 8 frames of the
+    FE 50-150mm F2 GM at 50..150 mm, barrel and pincushion, the residual
+    collapses to <= 0.3 px rms (the block-matching noise floor) at i / 15.2
+    with the first knot at the centre, and grows again either side (15.0:
+    0.3-0.8 px, 15.4: 0.5-0.8 px). With 16 knots the last one sits at
+    r = 0.987; the corner, and for barrel the fill scale's reach past it,
+    extrapolate the last segment. The 2^-14 scale is not degenerate with the
+    spacing: scaling the amplitude instead makes every grid worse.
 
     Each correction has its own switch, and the parameters are written whether
     or not the body used them — so reading them is not evidence that anything
@@ -2037,7 +2053,7 @@ def sony_lens_corrections(exif: dict[str, Any]) -> dict[str, Any] | None:
         return values if _exif_switch_on(exif.get(tag)) else [1.0] * nc
 
     out: dict[str, Any] = {
-        "knots": [(i + 0.5) / nc for i in range(nc)],
+        "knots": [i / SONY_KNOT_SPAN for i in range(nc)],
         "distortion": gated("DistortionCorrection",
                             [dist[i + 1] * 2**-14 + 1 for i in range(nc)]),
         "vignetting": gated("VignettingCorrection",

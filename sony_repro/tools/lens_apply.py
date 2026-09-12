@@ -22,17 +22,19 @@
 import numpy as np
 
 LENS_KNOTS = 16
+LENS_KNOT_SPAN = 15.2   # 结点 i 在半对角线的 i/15.2 处(lens.ts LENS_KNOT_SPAN,实测值)
+LENS_EXTRAP_KNOTS = 1
 FILL_SAMPLES = 16
 FILL_ITERS = 16
 
 
 def knot_r(i):
-    return (i + 0.5) / LENS_KNOTS
+    return i / LENS_KNOT_SPAN
 
 
 def lens_interp(table, r):
-    """`lens.ts` 的 lensInterp:结点外一律钳到最近的结点值。"""
-    t = np.clip(np.asarray(r) * LENS_KNOTS - 0.5, 0.0, LENS_KNOTS - 1.0)
+    """`lens.ts` 的 lensInterp:最后一个结点(r=0.987)之外沿最后一段线性外推一个结点距,再钳住。"""
+    t = np.clip(np.asarray(r) * LENS_KNOT_SPAN, 0.0, LENS_KNOTS - 1.0 + LENS_EXTRAP_KNOTS)
     i = np.minimum(np.floor(t).astype(np.int32), LENS_KNOTS - 2)
     tab = np.asarray(table, np.float64)
     return tab[i] + (tab[i + 1] - tab[i]) * (t - i)
