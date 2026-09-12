@@ -8,24 +8,32 @@ Two things it does that Lightroom does not:
 
 ## The camera's colour, not Adobe's
 
-![Camera JPEG, LLR's Sony engine, and an Adobe DCP render of the same ARW](docs/readme/sony-engine.jpg)
+![Camera JPEG, LLR's Sony engine, and Lightroom Classic on the same ARW](docs/readme/sony-engine.jpg)
 
 <table><tr>
 <td><img src="docs/readme/can-llr.gif" alt="Camera JPEG toggling against LLR's Sony render" width="440"></td>
-<td><img src="docs/readme/can-adobe.gif" alt="Camera JPEG toggling against the Adobe DCP render" width="440"></td>
+<td><img src="docs/readme/can-lightroom.gif" alt="Camera JPEG toggling against Lightroom Classic" width="440"></td>
 </tr></table>
 
-*Left: camera JPEG ↔ LLR. Right: camera JPEG ↔ Adobe DCP. Foliage is where a
-fitted profile drifts most — watch the greens go cool and dark on the right.*
+*Left: camera JPEG ↔ LLR. Right: camera JPEG ↔ Lightroom Classic (Camera FL
+profile, defaults). Foliage is where a fitted profile drifts most — watch the
+greens lose their colour and the whole frame lift on the right.*
+
+Measured against the camera JPEG (CIEDE2000; hue and chroma shifts are means
+over the coloured pixels of that region; [method and full tables](docs/readme/colour-fidelity.md)):
+
+| Render | ΔE00 mean, frame 1 / 2 | Red suit ΔC\* | Hedge Δh° / ΔC\* | Leaves Δh° / ΔC\* |
+|---|---|---|---|---|
+| LLR · Sony engine | 1.80 / 2.37 | −1.1 | +0.8° / −0.6 | +0.5° / 0.0 |
+| Lightroom Classic · Camera FL | 2.92 / 5.64 | −5.9 | −4.6° / −4.5 | −3.0° / −3.3 |
+| LLR · Adobe DCP (Camera FL) | 3.24 / 3.02 | −8.5 | −6.6° / −6.6 | −4.7° / −7.0 |
 
 Every ARW carries the calibration Imaging Edge renders from: the body's
 hue-segmented colour matrix, the tone curve and chroma terms of each Creative
 Look, and the DRO gain grid. LLR reads them back and runs that pipeline, so the
 first frame you see is the camera JPEG — at RAW depth, with every slider still
-live. On the first frame the render sits within a mean ΔE\*ab of 2.4 of the
-camera's own JPEG; Lightroom's Camera Matching profiles approximate the same
-look from a fitted DCP, and the Film look's reds and the wall's tone are where
-that drifts.
+live. Lightroom's Camera Matching profiles approximate the same look from a
+fitted DCP, and saturated reds and greens are where that drifts.
 
 What that buys you, after the shot:
 
