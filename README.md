@@ -10,9 +10,9 @@ Two things it does that Lightroom does not:
 
 Three pairs, same crop of the same ARW, swapping in step:
 
-![Imaging Edge vs LLR, camera JPEG vs LLR, camera JPEG vs Lightroom Classic](docs/readme/three-pairs-can.gif)
+![Imaging Edge vs LLR, camera JPEG vs LLR, camera JPEG vs Lightroom Classic](docs/readme/three-pairs-can.png)
 
-![Imaging Edge vs LLR, camera JPEG vs LLR, camera JPEG vs Lightroom — sunflowers](docs/readme/three-pairs-sunflowers.gif)
+![Imaging Edge vs LLR, camera JPEG vs LLR, camera JPEG vs Lightroom — sunflowers](docs/readme/three-pairs-sunflowers.png)
 
 *Left: Sony's own RAW converter (Imaging Edge) ↔ LLR. Middle: camera JPEG ↔
 LLR. Right: camera JPEG ↔ Lightroom (Camera FL profile, defaults) — watch the

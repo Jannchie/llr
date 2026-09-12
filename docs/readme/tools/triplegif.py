@@ -2,7 +2,9 @@
 A_k on frame 0 and B_k on frame 1, labels burnt into the corner. One palette
 across all six images so the swap shows only the render difference.
 
-Usage: triplegif.py <out.gif> <x0 y0 x1 y1> <panel width> <a1> <labelA1> <b1> <labelB1> <a2> ... <b3> <labelB3>
+Usage: triplegif.py <out.gif|out.png> <x0 y0 x1 y1> <panel width> <a1> <labelA1> <b1> <labelB1> <a2> ... <b3> <labelB3>
+A .png output is an APNG (lossless, 24-bit); .gif is 256 colours and only for
+where APNG cannot be shown.
 """
 import sys
 from PIL import Image, ImageDraw, ImageFont
@@ -37,10 +39,15 @@ def sheet(images):
 
 fa = sheet([panel(a, la) for a, la, _, _ in pairs])
 fb = sheet([panel(b, lb) for _, _, b, lb in pairs])
-both = Image.new("RGB", (fa.width, fa.height * 2))
-both.paste(fa, (0, 0)); both.paste(fb, (0, fa.height))
-pal = both.quantize(colors=256, method=Image.Quantize.MEDIANCUT)
-qa = fa.quantize(palette=pal, dither=Image.Dither.FLOYDSTEINBERG)
-qb = fb.quantize(palette=pal, dither=Image.Dither.FLOYDSTEINBERG)
-qa.save(out, save_all=True, append_images=[qb], duration=1100, loop=0, optimize=False)
+if out.lower().endswith(".png"):
+    # APNG: full 24-bit colour, lossless -- a comparison of renders that differ
+    # by a unit or two of L* cannot survive a 256-colour palette.
+    fa.save(out, save_all=True, append_images=[fb], duration=1100, loop=0)
+else:
+    both = Image.new("RGB", (fa.width, fa.height * 2))
+    both.paste(fa, (0, 0)); both.paste(fb, (0, fa.height))
+    pal = both.quantize(colors=256, method=Image.Quantize.MEDIANCUT)
+    qa = fa.quantize(palette=pal, dither=Image.Dither.FLOYDSTEINBERG)
+    qb = fb.quantize(palette=pal, dither=Image.Dither.FLOYDSTEINBERG)
+    qa.save(out, save_all=True, append_images=[qb], duration=1100, loop=0, optimize=False)
 print(out, fa.size)
