@@ -236,10 +236,7 @@ const en = {
   // Detail panel
   "panel.detail": "Detail",
   "detail.denoising": "Denoising…",
-  // A transcription of the camera maker's own filter, not a neural model — see
-  // denoise.DEFAULT_MODEL. Named "AI Denoise" until the backend was checked; if
-  // a neural one ever ships it gets its own control rather than quietly taking
-  // over this one.
+  // A transcription of the camera maker's own filter — see denoise.DEFAULT_MODEL.
   "detail.denoise": "Denoise",
   // Edit's own Auto switch. Strength follows the shot's ISO rather than the
   // Amount slider — four tenths up to ISO 400, full from ISO 1600 — which is

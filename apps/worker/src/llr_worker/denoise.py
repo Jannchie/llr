@@ -1104,9 +1104,7 @@ class SonyRawNRDenoiser:
 # actually asks for it.
 _DENOISER_CACHE: dict[str, Denoiser] = {}
 
-# Model id -> factory. No neural backend ships yet (deferred; must be
-# non-GPL); when one lands it should call register_denoiser() from its own
-# module to keep torch out of this module's import path.
+# Model id -> factory.
 _FACTORIES: dict[str, Callable[[], Denoiser]] = {
     "passthrough": PassthroughDenoiser,
     "wavelet": WaveletDenoiser,
