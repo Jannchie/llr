@@ -353,23 +353,24 @@ const hasCameraMatch = ref(false);
 // belongs to the worker and is recorded there -- sony/rawnr_simd.py's module
 // docstring -- not copied here, where it goes stale unnoticed.
 // Sony's "advanced colour reproduction" — Imaging Edge Edit's 色彩复制 radio.
-// On by default for a new import, unlike Edit's own default of 标准: measured
-// against the in-camera JPEG on two frames it is closer overall (ΔE00 1.66 vs
-// 1.73, 1.98 vs 2.25) and much closer on highlights and neutrals (+1.3 L* vs
-// +3.6 L* in the L* > 80 band), giving back ~0.3 units of chroma on the most
-// saturated colours and ~0.5 ΔE in deep shadows (docs/readme/colour-fidelity.md).
-// Snapshots that predate the switch still restore as off — what they rendered
-// with. One switch, two effects, which is how Edit has it: YGamma swaps to its
-// advanced table and contrast (worker sony/chroma.py), and ZcTask3DLut then
-// runs between it and the YCC return trip (worker sony/lut3d.py). Together they
-// bring bright saturated pixels down in luma and chroma and pull the top of the
-// Y range back to neutral, which is most of what makes Edit's output look like
-// the camera's JPEG.
+// Off by default, as in Edit. It was briefly on: whole-frame ΔE00 against the
+// camera JPEG favours it slightly (1.66 vs 1.73, 1.98 vs 2.25 on two frames),
+// because it wins on neutrals and highlights (+1.3 L* vs +3.6 L* above
+// L* 80). But what it does to get there is pull bright saturated colour down
+// in luma and chroma — the camera JPEG keeps that colour, its C* > 60 sits
+// 6–10% above Edit's own advanced render — and that is the part of a frame
+// the eye reads first (a field of sunflowers reads closer with it off).
+// Whole-frame CIEDE2000 under-weights exactly those pixels (its chroma term),
+// so the mean is not the judge here; camera match carries the neutral-and-
+// highlight correction instead, without the chroma cost. One switch, two
+// effects, which is how Edit has it: YGamma swaps to its advanced table and
+// contrast (worker sony/chroma.py), and ZcTask3DLut then runs between it and
+// the YCC return trip (worker sony/lut3d.py).
 //
 // Render-time, not a decode: the table is static, so this is a uniform and a
 // redraw. It still belongs in the snapshot — it is a per-image choice the way
 // the Creative Look tweaks are, and undo has to travel with it.
-const sonyAdvancedColour = ref(true);
+const sonyAdvancedColour = ref(false);
 // Camera match, the post chain's last stage: the residual the Sony engine's
 // own export still has against the body's JPEG, fitted per body and Creative
 // Look (worker sony/profile.py camera_match_table) and applied in CIELAB on
@@ -699,7 +700,7 @@ type Snapshot = {
   // Which DRO curve: -1 for the shot's own (Auto), 0..99 for a built-in preset.
   droLevel?: number | null;
   // Sony's advanced colour reproduction (ZcTask3DLut). Absent in older
-  // sessions, which rendered with it off; a new snapshot starts with it on.
+  // sessions, which rendered with it off, and off is the default again.
   sonyAdvancedColour?: boolean;
   // Camera match (the fitted correction toward the body's JPEG). Absent in
   // older sessions, which rendered without it; a new snapshot starts with it on.
@@ -738,7 +739,7 @@ function defaultSnapshot(name?: string): Snapshot {
     lookStyle: null,
     dro: null,
     droLevel: DRO_AUTO,
-    sonyAdvancedColour: true,
+    sonyAdvancedColour: false,
     sonyCameraMatch: true,
     masks: [],
   };
