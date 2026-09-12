@@ -10,11 +10,19 @@ Two things it does that Lightroom does not:
 
 ![Camera JPEG, LLR's Sony engine, and an Adobe DCP render of the same ARW](docs/readme/sony-engine.jpg)
 
+<table><tr>
+<td><img src="docs/readme/can-llr.gif" alt="Camera JPEG toggling against LLR's Sony render" width="440"></td>
+<td><img src="docs/readme/can-adobe.gif" alt="Camera JPEG toggling against the Adobe DCP render" width="440"></td>
+</tr></table>
+
+*Left: camera JPEG ↔ LLR. Right: camera JPEG ↔ Adobe DCP. Foliage is where a
+fitted profile drifts most — watch the greens go cool and dark on the right.*
+
 Every ARW carries the calibration Imaging Edge renders from: the body's
 hue-segmented colour matrix, the tone curve and chroma terms of each Creative
 Look, and the DRO gain grid. LLR reads them back and runs that pipeline, so the
 first frame you see is the camera JPEG — at RAW depth, with every slider still
-live. On the frame above the render sits within a mean ΔE\*ab of 2.4 of the
+live. On the first frame the render sits within a mean ΔE\*ab of 2.4 of the
 camera's own JPEG; Lightroom's Camera Matching profiles approximate the same
 look from a fitted DCP, and the Film look's reds and the wall's tone are where
 that drifts.
