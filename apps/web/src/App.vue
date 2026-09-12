@@ -967,11 +967,11 @@ const visibleGroups = computed(() =>
 // than a set of sliders, so cropMode stays the source of truth and the tab
 // follows it (the R shortcut and the editor's Done button move both).
 const EDIT_TABS: { key: EditTab; icon: string[] }[] = [
+  { key: "look", icon: ["M21 19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h3l1.5-2.5h5L16 7h3a2 2 0 0 1 2 2z", "M12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8z"] },
   { key: "light", icon: ["M12 3a9 9 0 0 0 0 18z", "M12 3a9 9 0 0 1 0 18"] },
   { key: "color", icon: ["M12 3a9 9 0 1 0 0 18c1.1 0 1.6-.9 1.6-1.7 0-1.6-1.4-1.9-1.4-3 0-.9.7-1.6 1.7-1.6H16a5 5 0 0 0 5-5c0-3.7-4-6.7-9-6.7z", "M7.5 12.5h.01", "M9.5 8.5h.01", "M14.5 8h.01"] },
   { key: "masks", icon: ["M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z", "M12 3v18", "M12 7.5h5.5", "M12 12h8.5", "M12 16.5h5.5"] },
   { key: "detail", icon: ["M12 4v16", "M4 12h16", "M6.3 6.3l11.4 11.4", "M17.7 6.3L6.3 17.7"] },
-  { key: "look", icon: ["M21 19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h3l1.5-2.5h5L16 7h3a2 2 0 0 1 2 2z", "M12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8z"] },
   { key: "crop", icon: ["M6 2v14a2 2 0 0 0 2 2h14", "M2 6h14a2 2 0 0 1 2 2v14"] },
   { key: "assistant", icon: ["M12 3l1.8 4.7L18.5 9.5l-4.7 1.8L12 16l-1.8-4.7L5.5 9.5l4.7-1.8z", "M19 16l.8 2.2 2.2.8-2.2.8L19 22l-.8-2.2-2.2-.8 2.2-.8z"] },
   { key: "recipes", icon: ["M6 3h12a1 1 0 0 1 1 1v17l-7-4-7 4V4a1 1 0 0 1 1-1z"] },
@@ -3040,6 +3040,9 @@ const vWheelAdjust = {
              for this frame, not a grade of ours, and it resets to what the body
              did like everything else in this panel. -->
         <template v-if="droAvailable">
+          <div class="control-row">
+            <label class="control-label" :title="t('look.droHint')">{{ t('look.droModeLabel') }}</label>
+          </div>
           <div class="dro-modes" role="group" :aria-label="t('look.droModeLabel')">
             <button type="button" class="dro-mode" :class="{ on: droMode === 'off' }"
               :aria-pressed="droMode === 'off'" @click="setDroMode('off')">
