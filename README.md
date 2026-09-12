@@ -8,15 +8,9 @@ Two things it does that Lightroom does not:
 
 ## The camera's colour, not Adobe's
 
-![Camera JPEG, Sony's Imaging Edge, LLR's Sony engine, and Lightroom Classic on the same ARW](docs/readme/sony-engine.jpg)
+Three pairs, same crop of the same ARW, swapping in step:
 
-Three pairs, same crop of the same ARW:
-
-<table><tr>
-<td><img src="docs/readme/can-imaging-edge-llr.gif" alt="Sony's Imaging Edge toggling against LLR's Sony render" width="300"></td>
-<td><img src="docs/readme/can-llr.gif" alt="Camera JPEG toggling against LLR's Sony render" width="300"></td>
-<td><img src="docs/readme/can-lightroom.gif" alt="Camera JPEG toggling against Lightroom Classic" width="300"></td>
-</tr></table>
+![Imaging Edge vs LLR, camera JPEG vs LLR, camera JPEG vs Lightroom Classic](docs/readme/three-pairs.gif)
 
 *Left: Sony's own RAW converter (Imaging Edge) ↔ LLR — the same pipeline, so
 almost nothing moves. Middle: camera JPEG ↔ LLR. Right: camera JPEG ↔
