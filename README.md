@@ -10,29 +10,32 @@ Two things it does that Lightroom does not:
 
 ![Camera JPEG, Sony's Imaging Edge, LLR's Sony engine, and Lightroom Classic on the same ARW](docs/readme/sony-engine.jpg)
 
+Three pairs, same crop of the same ARW:
+
 <table><tr>
-<td><img src="docs/readme/can-imaging-edge.gif" alt="Camera JPEG toggling against Sony's Imaging Edge" width="300"></td>
+<td><img src="docs/readme/can-imaging-edge-llr.gif" alt="Sony's Imaging Edge toggling against LLR's Sony render" width="300"></td>
 <td><img src="docs/readme/can-llr.gif" alt="Camera JPEG toggling against LLR's Sony render" width="300"></td>
 <td><img src="docs/readme/can-lightroom.gif" alt="Camera JPEG toggling against Lightroom Classic" width="300"></td>
 </tr></table>
 
-*Camera JPEG ↔ Imaging Edge (Sony's own RAW converter), ↔ LLR, ↔ Lightroom
-Classic (Camera FL profile, defaults). Foliage is where a fitted profile
-drifts most — watch the greens lose their colour and the whole frame lift on
-the right.*
+*Left: Sony's own RAW converter (Imaging Edge) ↔ LLR — the same pipeline, so
+almost nothing moves. Middle: camera JPEG ↔ LLR. Right: camera JPEG ↔
+Lightroom Classic (Camera FL profile, defaults). Foliage is where a fitted
+profile drifts most — watch the greens lose their colour and the whole frame
+lift on the right.*
 
-Measured against the camera JPEG (CIEDE2000; hue and chroma shifts are means
-over the coloured pixels of that region; [method and full tables](docs/readme/colour-fidelity.md)):
+The same three pairs measured (CIEDE2000; hue and chroma shifts are means over
+the coloured pixels of that region; [method and full tables](docs/readme/colour-fidelity.md)):
 
-| Render | ΔE00 mean, frame 1 / 2 | Red suit ΔC\* | Hedge Δh° / ΔC\* | Leaves Δh° / ΔC\* |
+| Pair | ΔE00 mean, frame 1 / 2 | Red suit ΔC\* | Hedge Δh° / ΔC\* | Leaves Δh° / ΔC\* |
 |---|---|---|---|---|
-| Imaging Edge · advanced colour | 2.18 / 1.82 | −0.6 | +1.1° / −0.1 | +0.5° / −0.3 |
-| LLR · Sony engine | 1.66 / 1.98 | −1.4 | +1.3° / −1.1 | +0.7° / −0.4 |
-| Lightroom Classic · Camera FL | 2.92 / 5.64 | −5.9 | −4.6° / −4.5 | −3.0° / −3.3 |
+| Imaging Edge ↔ LLR | 1.47 / 0.82 | −0.9 | +0.2° / −1.0 | +0.1° / −0.1 |
+| Camera JPEG ↔ LLR | 1.66 / 1.98 | −1.4 | +1.3° / −1.1 | +0.7° / −0.4 |
+| Camera JPEG ↔ Lightroom Classic · Camera FL | 2.92 / 5.64 | −5.9 | −4.6° / −4.5 | −3.0° / −3.3 |
 
-LLR is as close to the camera JPEG as Sony's own software is, and against
-Imaging Edge itself it measures ΔE00 0.8–1.5 mean — the two renders agree to
-within a unit of L\* wherever the DRO level is the same.
+Against Imaging Edge, LLR agrees to within a unit of L\* wherever the two pick
+the same DRO level. Against the camera JPEG it lands where Sony's own converter
+does (Imaging Edge itself measures 2.18 / 1.82).
 
 Every ARW carries the calibration Imaging Edge renders from: the body's
 hue-segmented colour matrix, the tone curve and chroma terms of each Creative
