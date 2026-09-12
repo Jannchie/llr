@@ -624,8 +624,8 @@ void main() {
   // clip where the engine clips them.
   if (u_sonyLinearExposure == 1) c *= exp2(u_exposure);
 
-  // --- DRO --- Before white balance and before exposure, matching where the
-  // engine's stage sits. One gain for all three channels, so it never shifts
+  // --- DRO --- After Edit's exposure gain and before everything tonal,
+  // matching where the engine's stage sits. One gain for all three channels, so it never shifts
   // colour; BT.601 luminance because that is what the engine forms it from.
   if (u_droActive == 1) {
     float ylog = log2(max(dot(c, vec3(0.299, 0.587, 0.114)), 1e-9) * u_droScale.y);

@@ -45,11 +45,19 @@ import numpy as np
 from .dro_presets import dro_preset_curve
 from .sr2 import DRO_CURVE_POINTS, DRO_LOG_CEILING, dro_curve
 
-# Neutral white sits exactly on the curve's last sample: the engine forms its
-# luminance as 0.299R + 0.587G + 0.114B over a 14-bit plane, and
-# log2(16383 * 0.5) is DRO_LOG_CEILING. Normalised luma therefore enters the
-# curve's domain as log2(luma * DRO_LUMA_WHITE).
-DRO_LUMA_WHITE = 8191.5
+# Where normalised white lands on the curve's log-luminance axis — and it is
+# not the top. The plane the stage reads is the engine's own demosaic output,
+# whose sensor white is 8192 (itp.ENGINE_WHITE), and the stage halves it on the
+# way in, so white enters the curve at log2(4096) = 12.0 and the table's last
+# stop is headroom for clipped highlights. Measured rather than derived: on
+# three ILCE-7CM2 exports the stage's input plane, captured tile by tile, is
+# 4064..4153x the luma of our linear in every band, and fitting the stage's
+# actual per-pixel gain with our own grid and curve gives 0.009..0.020 RMS
+# (log2) at 4096 against 0.20..0.27 at the 16383 the grid path once assumed
+# (tmp/nas/agents/dro.md). That assumption indexed the curve two stops too
+# high, which on a real DRO frame lifts the shadows 20..40% too little —
+# DSC06263 came out x1.40 darker than Edit through the midtones.
+DRO_LUMA_WHITE = 4096.0
 # BT.601, which is what the engine uses here (its own weights are these halved,
 # against a plane it has already shifted down by one bit).
 DRO_LUMA_WEIGHTS = (0.299, 0.587, 0.114)
@@ -59,12 +67,11 @@ DRO_LUMA_WEIGHTS = (0.299, 0.587, 0.114)
 # the gain at the curve's sharpest bend, which is visible; 512 holds it to 0.005.
 DRO_LUT_SIZE = 512
 DRO_MAX_STRENGTH = 2.0
-# What the grid path puts white on. The engine forms BT.601 over its 14-bit
-# plane, so normalised white enters the luma axis at log2(16383) = 14.0 and is
-# clamped to DRO_LOG_CEILING. Deliberately not DRO_LUMA_WHITE: that one exists
-# so the *global* fallback leaves white untouched, which the grid does not need
-# because its local mean rarely reaches the top of the axis in the first place.
-DRO_GRID_LUMA_WHITE = 16383.0
+# The grid path shares that axis. The local mean is sliced out of the grid at
+# the pixel's own Ylog, so putting white anywhere else mis-addresses the grid's
+# luma bins as well as the curve; the measurement above is of the grid path.
+# Kept as a separate name only because the wire format carries both.
+DRO_GRID_LUMA_WHITE = DRO_LUMA_WHITE
 
 # ---------------------------------------------------------------------------
 # The bilateral grid.
@@ -385,7 +392,8 @@ def gain_table_from_curve(
     strength = max(0.0, min(DRO_MAX_STRENGTH, float(strength)))
     src = np.arange(DRO_CURVE_POINTS) * (DRO_LOG_CEILING / DRO_CURVE_POINTS)
     at = np.linspace(0.0, DRO_LOG_CEILING, size)
-    # The table stops at 12.875 while normalised white reaches 12.9998, so the
+    # The table stops at 12.875 while the axis runs to 12.9998, and highlight
+    # headroom above white (which itself sits at 12.0) reaches that far, so the
     # last 1% of the range has to be extrapolated. The engine holds the tone
     # *value* there, which works out to dimming white by a ninth — but only
     # because its local mean puts almost nothing that high in the first place.

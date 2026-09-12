@@ -123,8 +123,9 @@ export type ProfileChroma = {
 export type SepiaToning = { weights: number[]; lut: number[][] };
 /**
  * Sony's DRO, as a gain against log luminance. `lut` is sampled uniformly over
- * [0, logCeiling]; a pixel enters that scale at log2(luma * lumaWhite), so
- * normalised white lands on the top. Null when the shot has no DRO to apply —
+ * [0, logCeiling]; a pixel enters that scale at log2(luma * lumaWhite), which
+ * puts normalised white one stop below the top, where the engine's own plane
+ * puts it (worker sony/dro.py). Null when the shot has no DRO to apply —
  * which includes the strength being zero, since there is then nothing to send.
  */
 export type ProfileDro = {
@@ -134,8 +135,9 @@ export type ProfileDro = {
   /**
    * The engine's bilateral grid. When present the tone curve is indexed by the
    * *local* log mean sliced out of it — which is what DRO is — instead of by
-   * the pixel's own luminance, and `gridLumaWhite` replaces `lumaWhite` because
-   * the two paths deliberately put white in different places (see sony/dro.py).
+   * the pixel's own luminance. `gridLumaWhite` replaces `lumaWhite` on that
+   * path; the worker sends the same value for both today, the split is kept
+   * for older responses that did not (see sony/dro.py).
    */
   grid?: ProfileDroGrid | null;
   gridLumaWhite?: number;
