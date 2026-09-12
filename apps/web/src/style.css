@@ -314,8 +314,14 @@ button {
   transition: filter 200ms ease;
 }
 
-.preview.is-rendering {
-  filter: brightness(0.85);
+.preview-placeholder {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: var(--viewport-bg);
+  user-select: none;
 }
 
 /* Camera-JPEG hold-to-compare: covers the canvas box, with the full-frame JPEG

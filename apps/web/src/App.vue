@@ -887,6 +887,7 @@ const {
   onEmptied: () => {
     currentSourceId = "";
     hasLinearData = false;
+    renderedId.value = "";
     lensCorr = null;
     lensCorrAvailable.value = false;
     isRawSource.value = true;
@@ -1158,6 +1159,7 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
       p3Supported.value = webglRenderer.p3Supported;
     }
     webglRenderer.uploadImage(linearFloat, linMeta.width, linMeta.height);
+    renderedId.value = id;
     bakeCurveLUT();
     webglRenderer.uploadProfileCurveLUT(profileCurveLUT);
     webglRenderer.uploadDcpTables(parseDcpTables(linMeta.colorProfile));
@@ -1371,6 +1373,10 @@ function readSharpening(cp: ColorProfileMeta | null | undefined) {
 // pixel array itself lives on the GPU after upload — keeping a JS reference
 // here would pin ~50 MB per image for nothing.
 let hasLinearData = false;
+// Which source's pixels the GPU holds. A switch shows the camera JPEG in place
+// of the outgoing frame until the decode lands; a same-source re-decode (dcp,
+// denoise) keeps the frame on screen instead.
+const renderedId = ref("");
 
 // In the crop editor the canvas renders a padded straighten bbox whose
 // out-of-image fill would be binned as real pixels — hand the histogram the
@@ -2580,10 +2586,6 @@ const vWheelAdjust = {
             <p class="dropzone-hint">{{ IMPORT_FORMAT_HINT }}</p>
           </div>
         </div>
-        <div v-show="activeSource && status === 'rendering' && !webglRenderer" class="preview-loading">
-          <span class="spinner spinner-lg" aria-hidden="true" />
-          <span>{{ t('status.decoding') }}</span>
-        </div>
         <div v-show="status === 'uploading' && !activeSource" class="preview-loading">
           <span class="spinner spinner-lg" aria-hidden="true" />
           <span>{{ t('status.importing') }}</span>
@@ -2592,6 +2594,10 @@ const vWheelAdjust = {
              the visible part of the frame; the compare overlays below stay
              full-frame and so keep displayTransform. -->
         <canvas v-show="webglRenderer != null && activeSource && !activeSource.invalid" ref="canvasRef" class="preview" :style="canvasBoxStyle" />
+        <!-- The camera JPEG stands in while a *different* source decodes: the
+             fit view is a plain contain, so it lands where the frame will. -->
+        <img v-if="activeSource && !activeSource.invalid && status === 'rendering' && renderedId !== activeSource.id"
+          class="preview-placeholder" :src="activeSource.embeddedUrl ? resolveUrl(activeSource.embeddedUrl) : thumbSrc(activeSource)" :alt="t('aria.preview')" />
         <!-- Camera-JPEG compare: opaque overlay in the canvas's exact box, with
              the full-frame JPEG placed inside it through the edit's own crop /
              straighten / flip so both sides show the same framing. The src stays
@@ -2603,7 +2609,7 @@ const vWheelAdjust = {
           <img :style="{ transform: embeddedTransform, width: srcW + 'px', height: srcH + 'px' }"
             :src="embeddedSrc || undefined" :alt="t('aria.cameraJpeg')" />
         </div>
-        <div v-show="activeSource && webglRenderer && (status === 'rendering' || status === 'uploading')"
+        <div v-show="activeSource && (status === 'rendering' || status === 'uploading')"
           class="viewport-busy" aria-live="polite">
           <span class="spinner" aria-hidden="true" />
           <span>{{ status === 'uploading' ? t('status.importing') : t('status.decoding') }}</span>
