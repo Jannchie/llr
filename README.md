@@ -14,42 +14,31 @@ Three pairs, same crop of the same ARW, swapping in step:
 
 ![Imaging Edge vs LLR, camera JPEG vs LLR, camera JPEG vs Lightroom — sunflowers](docs/readme/three-pairs-sunflowers.gif)
 
-*Left: Sony's own RAW converter (Imaging Edge) ↔ LLR — the same pipeline, so
-almost nothing moves. Middle: camera JPEG ↔ LLR. Right: camera JPEG ↔
-Lightroom (Camera FL profile, defaults). Foliage and saturated yellow are
-where a fitted profile drifts most — watch the greens lose their colour, the
-petals turn, and the whole frame lift on the right.*
+*Left: Sony's own RAW converter (Imaging Edge) ↔ LLR. Middle: camera JPEG ↔
+LLR. Right: camera JPEG ↔ Lightroom (Camera FL profile, defaults) — watch the
+greens lose their colour, the petals turn, and the whole frame lift.*
 
-The same three pairs measured (CIEDE2000; hue and chroma shifts are means over
-the coloured pixels of that region; [method and full tables](docs/readme/colour-fidelity.md)):
+Measured (CIEDE2000 mean over the frame; [method and per-region tables](docs/readme/colour-fidelity.md)):
 
-| Pair | ΔE00 mean, frame 1 / 2 / 3 | Red suit ΔC\* | Hedge Δh° / ΔC\* | Leaves Δh° / ΔC\* | Petals Δh° / ΔC\* |
-|---|---|---|---|---|---|
-| Imaging Edge ↔ LLR | 1.47 / 0.82 / 0.59 | −0.9 | +0.2° / −1.0 | +0.1° / −0.1 | −0.2° / −0.2 |
-| Camera JPEG ↔ LLR | 1.66 / 1.98 / 1.61 | −1.4 | +1.3° / −1.1 | +0.7° / −0.4 | +1.5° / −0.2 |
-| Camera JPEG ↔ Lightroom | 2.92 / 5.64 / 6.86 | −5.9 | −4.6° / −4.5 | −3.0° / −3.3 | +12.5° / −7.7 |
+| Pair | ΔE00, three frames |
+|---|---|
+| Imaging Edge ↔ LLR | 1.47 / 0.82 / 0.59 |
+| Camera JPEG ↔ LLR | 1.66 / 1.98 / 1.61 |
+| Camera JPEG ↔ Lightroom | 2.92 / 5.64 / 6.86 |
 
-Against Imaging Edge, LLR agrees to within a unit of L\* wherever the two pick
-the same DRO level (frame 3 has DRO off: 0.59). Against the camera JPEG it
-lands where Sony's own converter does (Imaging Edge itself measures
-2.18 / 1.82 / 1.66).
-
-Every ARW carries the calibration Imaging Edge renders from: the body's
-hue-segmented colour matrix, the tone curve and chroma terms of each Creative
-Look, and the DRO gain grid. LLR reads them back and runs that pipeline, so the
-first frame you see is the camera JPEG — at RAW depth, with every slider still
-live. Lightroom's Camera Matching profiles approximate the same look from a
-fitted DCP, and saturated reds and greens are where that drifts.
+Every ARW carries the calibration Imaging Edge renders from: the body's colour
+matrix and the tone curve and chroma terms of each Creative Look. LLR reads
+them back and runs that pipeline, so the first frame you see is the camera
+JPEG — at RAW depth, with every slider still live. Lightroom's Camera Matching
+profiles approximate the same look from a fitted DCP, and saturated colour is
+where that drifts.
 
 What that buys you, after the shot:
 
 - All of the body's Creative Looks (ST, PT, VV, FL, IN, …) switchable per
-  image, with the look's own contrast / highlights / shadows / fade / hue /
-  saturation / clarity tweaks on the camera's scale.
-- DRO as the camera applied it, or any of Imaging Edge's built-in levels.
-- Imaging Edge's *advanced colour reproduction* (its 3-D LUT), the step that
-  makes Edit's output match the in-camera JPEG.
-- Sony's own RAW-domain noise reduction, transcribed rather than approximated.
+  image, with the look's own tweaks on the camera's scale.
+- DRO as the camera applied it, or any of Imaging Edge's levels.
+- Sony's own RAW-domain noise reduction.
 
 Anything that is not a Sony RAW renders through an Adobe DCP instead, and the
 engine is a per-image switch.
