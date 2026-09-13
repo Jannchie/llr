@@ -4,14 +4,24 @@ Usage: quant.py <camera.jpg> <regions.json> <label=path> [label=path ...]
 regions.json: {"name": [x0, y0, x1, y1, "chroma"|"any"], ...} in frame fractions;
 "chroma" keeps only pixels the camera rendered with C* > 18 (the coloured object,
 not the gaps between leaves).
+
+Two columns beside the whole-frame dE00: "low-pass" is dE00 after a Gaussian blur
+(sigma LOWPASS px at this size), which drops the texture that noise reduction and
+sharpening put into the per-pixel number and keeps what the eye sees when the
+two are flicked -- a shift of the whole picture; "saturated" is the signed
+lightness and chroma offset on the pixels both renders put above C* 40, the
+colours the eye reads first. The masks use the mean of the two renders, since
+selecting on one side keeps its noise and biases the offset.
 """
 import json
 import sys
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
 W, H = 1752, 1168  # 1/4 size: colour, not demosaic/sharpening, is what is measured
+LOWPASS = 24  # px of Gaussian blur at this size (~6 px on the 1/16 frame the eye flicks)
+SATURATED = 40  # C* above which a pixel counts as a saturated colour
 
 
 def srgb_to_lab(a):
@@ -52,7 +62,8 @@ def de2000(lab1, lab2):
 
 
 def load(path):
-    return srgb_to_lab(np.asarray(Image.open(path).convert("RGB").resize((W, H), Image.LANCZOS), dtype=np.float64))
+    im = Image.open(path).convert("RGB").resize((W, H), Image.LANCZOS)
+    return srgb_to_lab(np.asarray(im, dtype=np.float64)), srgb_to_lab(np.asarray(im.filter(ImageFilter.GaussianBlur(LOWPASS)), dtype=np.float64))
 
 
 def hue(lab):
@@ -64,9 +75,9 @@ def circ_mean_diff(h1, h2):
     return d.mean()
 
 
-cam = load(sys.argv[1])
+cam, cam_lp = load(sys.argv[1])
 regions = json.load(open(sys.argv[2]))
-renders = [(kv.split("=", 1)[0], load(kv.split("=", 1)[1])) for kv in sys.argv[3:]]
+renders = [(kv.split("=", 1)[0], *load(kv.split("=", 1)[1])) for kv in sys.argv[3:]]
 
 masks = {}
 for name, (x0, y0, x1, y1, mode) in regions.items():
@@ -76,12 +87,14 @@ for name, (x0, y0, x1, y1, mode) in regions.items():
         m &= np.hypot(cam[..., 1], cam[..., 2]) > 18
     masks[name] = m
 
-head = ["Render", "ΔE00 mean", "ΔE00 median", "ΔE00 p95"] + [
+head = ["Render", "ΔE00 mean", "ΔE00 median", "ΔE00 p95", "ΔE00 low-pass", "saturated: ΔL* / ΔC*"] + [
     f"{n}: ΔE00 / Δh° / ΔC* / ΔL*" if regions[n][4] == "chroma" else f"{n}: ΔE00 / ΔL*" for n in regions]
 rows = []
-for label, lab in renders:
+for label, lab, lab_lp in renders:
     d = de2000(cam, lab)
-    row = [label, f"{d.mean():.2f}", f"{np.median(d):.2f}", f"{np.percentile(d, 95):.2f}"]
+    sat = (np.hypot(cam[..., 1], cam[..., 2]) + np.hypot(lab[..., 1], lab[..., 2])) / 2 > SATURATED
+    row = [label, f"{d.mean():.2f}", f"{np.median(d):.2f}", f"{np.percentile(d, 95):.2f}", f"{de2000(cam_lp, lab_lp).mean():.2f}",
+           f"{(lab[..., 0] - cam[..., 0])[sat].mean():+.1f} / {(np.hypot(lab[..., 1], lab[..., 2]) - np.hypot(cam[..., 1], cam[..., 2]))[sat].mean():+.1f}"]
     for n, m in masks.items():
         c, r = cam[m], lab[m]
         dL = f"{(r[:, 0] - c[:, 0]).mean():+.1f}"

@@ -19,14 +19,15 @@ Middle: camera JPEG ↔ LLR at its defaults. Right: camera JPEG ↔ Lightroom
 (Camera FL profile, defaults) — watch the greens lose their colour, the petals
 turn, and the whole frame lift.*
 
-Measured (CIEDE2000 mean over the frame; [method, per-region tables and a
-124-frame sample](docs/readme/colour-fidelity.md)):
+Measured (CIEDE2000 mean over the frame, per pixel and after a low-pass that
+drops texture and keeps what a flick between the two shows; [method,
+per-region tables and a 124-frame sample](docs/readme/colour-fidelity.md)):
 
-| Pair | ΔE00, three frames |
-|---|---|
-| Imaging Edge ↔ LLR, same settings | 1.04 / 0.82 / 0.59 |
-| Camera JPEG ↔ LLR, defaults | 1.40 / 0.94 / 0.80 |
-| Camera JPEG ↔ Lightroom | 2.92 / 5.64 / 6.86 |
+| Pair | ΔE00, three frames | ΔE00 low-pass |
+|---|---|---|
+| Imaging Edge ↔ LLR, same settings | 1.04 / 0.82 / 0.59 | 0.73 / 0.45 / 0.41 |
+| Camera JPEG ↔ LLR, defaults | 1.40 / 0.94 / 0.80 | 1.00 / 0.46 / 0.60 |
+| Camera JPEG ↔ Lightroom | 2.92 / 5.64 / 6.86 | 2.66 / 5.68 / 6.75 |
 
 Every ARW carries the calibration Imaging Edge renders from: the body's colour
 matrix and the tone curve and chroma terms of each Creative Look. LLR reads

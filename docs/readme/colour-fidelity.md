@@ -8,6 +8,16 @@ columns are means over that region; for coloured regions only pixels the camera
 rendered with C\* > 18 count (the object, not the gaps), and Δh° / ΔC\* / ΔL\*
 are the render's mean hue, chroma and lightness shift from the camera.
 
+Two columns are closer to what the eye does when it flicks between the two.
+*ΔE00 low-pass* is the same distance after a Gaussian blur (σ 24 px at this
+size): it drops the texture that noise reduction and sharpening put into the
+per-pixel number — on the sunflowers that is 0.2–0.3 of the whole-frame mean
+— and keeps a shift of the whole picture, which is what a flick shows.
+*Saturated ΔL\* / ΔC\** is the signed lightness and chroma offset on the pixels
+both renders put above C\* 40, the colours the eye reads first; a whole-frame
+mean can hide a +0.8 L\* on those behind a −0.3 elsewhere, and that +0.8 is
+visible.
+
 The camera JPEG is the preview embedded in the ARW (`pnpm worker --
 extract-preview`). Imaging Edge renders are JPEG exports from Sony's Imaging
 Edge Desktop (Edit), sRGB, DRO Auto and noise reduction Auto, in both of its
@@ -33,25 +43,25 @@ within 0.4 px.
 
 ## DSC03633 — statue, hedge, brick wall
 
-| Render | ΔE00 mean | ΔE00 median | ΔE00 p95 | red suit: ΔE00 / Δh° / ΔC* / ΔL* | hedge: ΔE00 / Δh° / ΔC* / ΔL* | wall: ΔE00 / ΔL* |
-|---|---|---|---|---|---|---|
-| Imaging Edge · advanced colour | 2.18 | 2.11 | 3.72 | 2.05 / -1.0° / -0.6 / +1.9 | 2.03 / +1.1° / -0.1 / +2.0 | 2.31 / +2.1 |
-| Imaging Edge · standard colour | 2.38 | 2.63 | 3.73 | 2.29 / -0.7° / -0.2 / +2.3 | 2.33 / +0.6° / +0.4 / +2.4 | 2.87 / +4.0 |
-| LLR · Sony, advanced colour | 2.33 | 2.14 | 4.57 | 1.73 / -0.9° / -1.2 / +1.4 | 2.51 / +1.2° / -0.2 / +2.6 | 2.21 / +2.1 |
-| LLR · defaults (standard + camera match) | 1.40 | 1.26 | 3.13 | 1.23 / -0.5° / -1.0 / +0.0 | 1.48 / -0.0° / -0.8 / +1.0 | 0.98 / +0.3 |
-| LLR · Sony, standard colour | 1.73 | 1.72 | 2.98 | 1.10 / -0.5° / -1.1 / +0.0 | 1.22 / +0.8° / -0.6 / +0.4 | 2.39 / +3.2 |
-| Lightroom Classic · Camera FL | 2.92 | 2.76 | 5.29 | 2.47 / +0.3° / -5.9 / -0.9 | 3.62 / -4.6° / -4.5 / -2.3 | 3.22 / +4.1 |
+| Render | ΔE00 mean | ΔE00 median | ΔE00 p95 | ΔE00 low-pass | saturated: ΔL* / ΔC* | red suit: ΔE00 / Δh° / ΔC* / ΔL* | hedge: ΔE00 / Δh° / ΔC* / ΔL* | wall: ΔE00 / ΔL* |
+|---|---|---|---|---|---|---|---|---|
+| Imaging Edge · advanced colour | 2.18 | 2.11 | 3.72 | 1.82 | +2.2 / -1.1 | 2.05 / -1.0° / -0.6 / +1.9 | 2.03 / +1.1° / -0.1 / +2.0 | 2.31 / +2.1 |
+| Imaging Edge · standard colour | 2.38 | 2.63 | 3.73 | 2.18 | +2.7 / -0.6 | 2.29 / -0.7° / -0.2 / +2.3 | 2.33 / +0.6° / +0.4 / +2.4 | 2.87 / +4.0 |
+| LLR · Sony, advanced colour | 2.33 | 2.14 | 4.57 | 2.02 | +2.0 / -1.6 | 1.73 / -0.9° / -1.2 / +1.4 | 2.51 / +1.2° / -0.2 / +2.6 | 2.21 / +2.1 |
+| LLR · defaults (standard + camera match) | 1.40 | 1.26 | 3.13 | 1.00 | +0.3 / -1.0 | 1.23 / -0.5° / -1.0 / +0.0 | 1.48 / -0.0° / -0.8 / +1.0 | 0.98 / +0.3 |
+| LLR · Sony, standard colour | 1.73 | 1.72 | 2.98 | 1.42 | +0.3 / -1.2 | 1.10 / -0.5° / -1.1 / +0.0 | 1.22 / +0.8° / -0.6 / +0.4 | 2.39 / +3.2 |
+| Lightroom Classic · Camera FL | 2.92 | 2.76 | 5.29 | 2.66 | +0.4 / -6.2 | 2.47 / +0.3° / -5.9 / -0.9 | 3.62 / -4.6° / -4.5 / -2.3 | 3.22 / +4.1 |
 
 ## DSC03630 — can under leaves
 
-| Render | ΔE00 mean | ΔE00 median | ΔE00 p95 | leaves: ΔE00 / Δh° / ΔC* / ΔL* | can: ΔE00 / ΔL* | pavement: ΔE00 / ΔL* |
-|---|---|---|---|---|---|---|
-| Imaging Edge · advanced colour | 1.82 | 1.85 | 3.00 | 1.32 / +0.5° / -0.3 / +1.2 | 1.93 / +1.7 | 2.14 / +2.2 |
-| Imaging Edge · standard colour | 2.03 | 2.24 | 3.06 | 1.60 / +0.3° / +0.2 / +1.7 | 2.48 / +3.0 | 2.51 / +3.3 |
-| LLR · Sony, advanced colour | 1.98 | 1.98 | 3.12 | 1.58 / +0.7° / -0.4 / +1.6 | 1.96 / +1.9 | 2.15 / +2.3 |
-| LLR · defaults (standard + camera match) | 0.94 | 0.79 | 2.16 | 0.73 / -0.3° / -0.8 / -0.1 | 1.08 / +0.1 | 0.74 / +0.2 |
-| LLR · Sony, standard colour | 2.25 | 2.40 | 3.15 | 1.91 / +0.5° / +0.0 / +2.1 | 2.53 / +3.1 | 2.56 / +3.4 |
-| Lightroom Classic · Camera FL | 5.64 | 4.80 | 12.79 | 3.80 / -3.0° / -3.3 / +3.6 | 2.46 / +2.2 | 4.63 / +6.1 |
+| Render | ΔE00 mean | ΔE00 median | ΔE00 p95 | ΔE00 low-pass | saturated: ΔL* / ΔC* | leaves: ΔE00 / Δh° / ΔC* / ΔL* | can: ΔE00 / ΔL* | pavement: ΔE00 / ΔL* |
+|---|---|---|---|---|---|---|---|---|
+| Imaging Edge · advanced colour | 1.82 | 1.85 | 3.00 | 1.51 | +1.5 / -0.4 | 1.32 / +0.5° / -0.3 / +1.2 | 1.93 / +1.7 | 2.14 / +2.2 |
+| Imaging Edge · standard colour | 2.03 | 2.24 | 3.06 | 1.89 | +2.0 / +0.2 | 1.60 / +0.3° / +0.2 / +1.7 | 2.48 / +3.0 | 2.51 / +3.3 |
+| LLR · Sony, advanced colour | 1.98 | 1.98 | 3.12 | 1.70 | +1.9 / -0.5 | 1.58 / +0.7° / -0.4 / +1.6 | 1.96 / +1.9 | 2.15 / +2.3 |
+| LLR · defaults (standard + camera match) | 0.94 | 0.79 | 2.16 | 0.46 | -0.1 / -0.4 | 0.73 / -0.3° / -0.8 / -0.1 | 1.08 / +0.1 | 0.74 / +0.2 |
+| LLR · Sony, standard colour | 2.25 | 2.40 | 3.15 | 2.12 | +2.3 / +0.1 | 1.91 / +0.5° / +0.0 / +2.1 | 2.53 / +3.1 | 2.56 / +3.4 |
+| Lightroom Classic · Camera FL | 5.64 | 4.80 | 12.79 | 5.68 | +7.9 / -3.6 | 3.80 / -3.0° / -3.3 / +3.6 | 2.46 / +2.2 | 4.63 / +6.1 |
 
 What the numbers say: Sony's own desktop render is not the camera JPEG either
 — Imaging Edge sits ~+2 L\* above the camera on neutrals in advanced mode and
@@ -66,12 +76,12 @@ DRO-aware renders do not do.
 
 ## DSC02976 — sunflowers (DRO off)
 
-| Render | ΔE00 mean | ΔE00 median | ΔE00 p95 | petals: ΔE00 / Δh° / ΔC* / ΔL* | leaves: ΔE00 / Δh° / ΔC* / ΔL* | backdrop: ΔE00 / ΔL* |
-|---|---|---|---|---|---|---|
-| Imaging Edge · advanced colour | 1.66 | 1.60 | 3.09 | 2.06 / +1.8° / -0.0 / +1.7 | 0.98 / +0.9° / -0.6 / +0.2 | 1.36 / +0.3 |
-| LLR · Sony, advanced colour | 1.61 | 1.56 | 3.02 | 2.02 / +1.5° / -0.2 / +1.7 | 1.11 / +0.9° / -0.7 / +0.6 | 1.29 / +0.6 |
-| LLR · defaults (standard + camera match) | 0.80 | 0.70 | 1.75 | 0.62 / -0.2° / -0.4 / -0.2 | 1.05 / -0.3° / -1.4 / -0.3 | 0.92 / -0.2 |
-| Lightroom · Camera FL | 6.86 | 6.64 | 14.33 | 9.29 / +12.5° / -7.7 / +6.6 | 6.41 / +9.7° / -1.1 / +5.4 | 5.73 / +5.5 |
+| Render | ΔE00 mean | ΔE00 median | ΔE00 p95 | ΔE00 low-pass | saturated: ΔL* / ΔC* | petals: ΔE00 / Δh° / ΔC* / ΔL* | leaves: ΔE00 / Δh° / ΔC* / ΔL* | backdrop: ΔE00 / ΔL* |
+|---|---|---|---|---|---|---|---|---|
+| Imaging Edge · advanced colour | 1.66 | 1.60 | 3.09 | 1.42 | +2.1 / -0.1 | 2.06 / +1.8° / -0.0 / +1.7 | 0.98 / +0.9° / -0.6 / +0.2 | 1.36 / +0.3 |
+| LLR · Sony, advanced colour | 1.61 | 1.56 | 3.02 | 1.39 | +1.9 / -0.4 | 2.02 / +1.5° / -0.2 / +1.7 | 1.11 / +0.9° / -0.7 / +0.6 | 1.29 / +0.6 |
+| LLR · defaults (standard + camera match) | 0.80 | 0.70 | 1.75 | 0.60 | -0.3 / -0.4 | 0.62 / -0.2° / -0.4 / -0.2 | 1.05 / -0.3° / -1.4 / -0.3 | 0.92 / -0.2 |
+| Lightroom · Camera FL | 6.86 | 6.64 | 14.33 | 6.75 | +9.2 / -10.7 | 9.29 / +12.5° / -7.7 / +6.6 | 6.41 / +9.7° / -1.1 / +5.4 | 5.73 / +5.5 |
 
 Saturated yellow is the hard case for a fitted profile: Lightroom turns the
 petals 12° and drops 8 units of chroma, and lifts the whole frame ~+5.5 L\*.
