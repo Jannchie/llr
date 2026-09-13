@@ -7,7 +7,9 @@ export default defineConfig({
     port: 5180,
     proxy: {
       "/api": {
-        target: "http://localhost:8790",
+        // Overridable so a second dev instance (another PORT for the api,
+        // --port for vite) can run beside one that is already up.
+        target: process.env.LLR_API_URL ?? "http://localhost:8790",
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ""),
       },
