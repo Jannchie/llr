@@ -104,7 +104,8 @@ actually breaks, 124 ARW+JPEG pairs were sampled from a 4850-pair library
 (one α7C II, three lenses), stratified over Creative Look (FL 40, IN 25,
 VV2 15, PT 12, ST 8, SH/NT/VV/Off 6 each), ISO 100–51200, DRO Off/Auto/Lv5,
 full and M-size RAW, and with/without in-camera look tweaks. Each was rendered
-at LLR's defaults and measured against its camera JPEG as above (whole-frame
+with advanced colour on and no camera match (the defaults at the time) and
+measured against its camera JPEG as above (whole-frame
 ΔE00 only). Three faults it exposed, all fixed in this tree:
 
 - **Fade** was thrown away under advanced colour reproduction (the YGamma
