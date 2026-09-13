@@ -258,7 +258,7 @@ def test_the_advanced_tables_are_a_second_pair_and_not_the_first() -> None:
 
 
 # The 0x780e Fade table — the same ten entries in every look of every body read
-# so far (α7C II, α7 V); 17280 first, which is where 高级's "constant" came from.
+# so far (a7C II, a7 V); 17280 first, which is where 高级's "constant" came from.
 FADE_TABLE = np.array([17280, 15616, 14976, 14208, 13568, 12928, 12160, 11520, 10752, 10112], np.int64)
 
 
