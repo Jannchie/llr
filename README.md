@@ -14,24 +14,28 @@ Three pairs, same crop of the same ARW, swapping in step:
 
 ![Imaging Edge vs LLR, camera JPEG vs LLR, camera JPEG vs Lightroom — sunflowers](docs/readme/three-pairs-sunflowers.png)
 
-*Left: Sony's own RAW converter (Imaging Edge) ↔ LLR. Middle: camera JPEG ↔
-LLR. Right: camera JPEG ↔ Lightroom (Camera FL profile, defaults) — watch the
-greens lose their colour, the petals turn, and the whole frame lift.*
+*Left: Sony's own RAW converter (Imaging Edge) ↔ LLR at the same settings.
+Middle: camera JPEG ↔ LLR at its defaults. Right: camera JPEG ↔ Lightroom
+(Camera FL profile, defaults) — watch the greens lose their colour, the petals
+turn, and the whole frame lift.*
 
-Measured (CIEDE2000 mean over the frame; [method and per-region tables](docs/readme/colour-fidelity.md)):
+Measured (CIEDE2000 mean over the frame; [method, per-region tables and a
+124-frame sample](docs/readme/colour-fidelity.md)):
 
 | Pair | ΔE00, three frames |
 |---|---|
-| Imaging Edge ↔ LLR | 1.04 / 0.82 / 0.59 |
-| Camera JPEG ↔ LLR | 2.33 / 1.98 / 1.61 |
+| Imaging Edge ↔ LLR, same settings | 1.04 / 0.82 / 0.59 |
+| Camera JPEG ↔ LLR, defaults | 1.60 / 1.13 / 1.01 |
 | Camera JPEG ↔ Lightroom | 2.92 / 5.64 / 6.86 |
 
 Every ARW carries the calibration Imaging Edge renders from: the body's colour
 matrix and the tone curve and chroma terms of each Creative Look. LLR reads
-them back and runs that pipeline, so the first frame you see is the camera
-JPEG — at RAW depth, with every slider still live. Lightroom's Camera Matching
-profiles approximate the same look from a fitted DCP, and saturated colour is
-where that drifts.
+them back and runs that pipeline, so what you see first is Sony's own render
+— at RAW depth, with every slider still live. On top of that, *camera match*
+(a switch) applies what the body's JPEG does that Imaging Edge does not: a
+fitted correction of a couple of L\* and a few percent of chroma, measured
+against the camera's JPEGs. Lightroom's Camera Matching profiles approximate
+the same look from a fitted DCP, and saturated colour is where that drifts.
 
 What that buys you, after the shot:
 
