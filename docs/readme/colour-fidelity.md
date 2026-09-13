@@ -38,7 +38,7 @@ within 0.4 px.
 | Imaging Edge · advanced colour | 2.18 | 2.11 | 3.72 | 2.05 / -1.0° / -0.6 / +1.9 | 2.03 / +1.1° / -0.1 / +2.0 | 2.31 / +2.1 |
 | Imaging Edge · standard colour | 2.38 | 2.63 | 3.73 | 2.29 / -0.7° / -0.2 / +2.3 | 2.33 / +0.6° / +0.4 / +2.4 | 2.87 / +4.0 |
 | LLR · Sony, advanced colour | 2.33 | 2.14 | 4.57 | 1.73 / -0.9° / -1.2 / +1.4 | 2.51 / +1.2° / -0.2 / +2.6 | 2.21 / +2.1 |
-| LLR · defaults (standard + camera match) | 1.64 | 1.44 | 3.48 | 1.31 / -0.4° / -1.0 / +0.9 | 1.90 / -0.0° / -0.6 / +1.8 | 1.28 / +1.2 |
+| LLR · defaults (standard + camera match) | 1.63 | 1.42 | 3.60 | 1.29 / -0.4° / -0.9 / +0.9 | 1.91 / -0.0° / -0.6 / +1.8 | 1.24 / +1.0 |
 | LLR · Sony, standard colour | 1.73 | 1.72 | 2.98 | 1.10 / -0.5° / -1.1 / +0.0 | 1.22 / +0.8° / -0.6 / +0.4 | 2.39 / +3.2 |
 | Lightroom Classic · Camera FL | 2.92 | 2.76 | 5.29 | 2.47 / +0.3° / -5.9 / -0.9 | 3.62 / -4.6° / -4.5 / -2.3 | 3.22 / +4.1 |
 
@@ -49,7 +49,7 @@ within 0.4 px.
 | Imaging Edge · advanced colour | 1.82 | 1.85 | 3.00 | 1.32 / +0.5° / -0.3 / +1.2 | 1.93 / +1.7 | 2.14 / +2.2 |
 | Imaging Edge · standard colour | 2.03 | 2.24 | 3.06 | 1.60 / +0.3° / +0.2 / +1.7 | 2.48 / +3.0 | 2.51 / +3.3 |
 | LLR · Sony, advanced colour | 1.98 | 1.98 | 3.12 | 1.58 / +0.7° / -0.4 / +1.6 | 1.96 / +1.9 | 2.15 / +2.3 |
-| LLR · defaults (standard + camera match) | 1.16 | 1.04 | 2.26 | 0.99 / -0.2° / -0.6 / +0.8 | 1.42 / +1.2 | 0.95 / +0.8 |
+| LLR · defaults (standard + camera match) | 1.20 | 1.12 | 2.27 | 0.99 / -0.2° / -0.6 / +0.7 | 1.32 / +0.9 | 1.12 / +1.1 |
 | LLR · Sony, standard colour | 2.25 | 2.40 | 3.15 | 1.91 / +0.5° / +0.0 / +2.1 | 2.53 / +3.1 | 2.56 / +3.4 |
 | Lightroom Classic · Camera FL | 5.64 | 4.80 | 12.79 | 3.80 / -3.0° / -3.3 / +3.6 | 2.46 / +2.2 | 4.63 / +6.1 |
 
@@ -70,7 +70,7 @@ DRO-aware renders do not do.
 |---|---|---|---|---|---|---|
 | Imaging Edge · advanced colour | 1.66 | 1.60 | 3.09 | 2.06 / +1.8° / -0.0 / +1.7 | 0.98 / +0.9° / -0.6 / +0.2 | 1.36 / +0.3 |
 | LLR · Sony, advanced colour | 1.61 | 1.56 | 3.02 | 2.02 / +1.5° / -0.2 / +1.7 | 1.11 / +0.9° / -0.7 / +0.6 | 1.29 / +0.6 |
-| LLR · defaults (standard + camera match) | 1.00 | 0.94 | 1.84 | 1.03 / +0.1° / +0.1 / +0.9 | 0.90 / -0.2° / -1.1 / +0.1 | 0.96 / +0.4 |
+| LLR · defaults (standard + camera match) | 0.89 | 0.84 | 1.66 | 0.88 / +0.1° / +0.1 / +0.7 | 0.91 / -0.2° / -1.1 / +0.1 | 0.93 / +0.3 |
 | Lightroom · Camera FL | 6.86 | 6.64 | 14.33 | 9.29 / +12.5° / -7.7 / +6.6 | 6.41 / +9.7° / -1.1 / +5.4 | 5.73 / +5.5 |
 
 Saturated yellow is the hard case for a fitted profile: Lightroom turns the
@@ -159,22 +159,30 @@ noise reduction is stronger), the saturated colours 1–3% less (IN up to 10%),
 and the midtones and highlights 1–3 L\* brighter. `sony_repro/tools/camera_match_fit.py`
 fits that from ARW+JPEG pairs as a smooth surface over (L\*, C\*) for the
 luma offset and the chroma gain plus a periodic hue table, per body and
-look, on the standard-colour render it is applied to; the web applies it as
-the last pass on the display-encoded frame, behind the *camera match* switch.
-Held out 40% of the 103 frames:
+look; the web applies it as the last pass on the display-encoded frame,
+behind the *camera match* switch.
 
-| 42 held-out frames | before | after |
+The switch also takes the engine's *advanced* luma pair (YGamma table and
+contrast) without the 3-D LUT. The standard table has no highlight
+roll-off: a frame whose camera JPEG holds 22.6k pixels at 254+ came out with
+66k of them, and no display-referred correction can put back what the
+render already clipped. The advanced luma pair lands at 30k on that frame
+(Edit's own advanced export: 29k) and keeps the saturated colour the LUT
+would have cost. The surface is fitted on that render
+(`LLR_CAMERA_MATCH_IDENTITY=1` makes the worker send an identity table for
+the fitting exports). Held out 40% of 100 frames:
+
+| 40 held-out frames | before | after |
 |---|---|---|
-| whole frame ΔE00 mean / median | 1.88 / 1.66 | **1.70 / 1.52** |
-| saturated pixels (C\* > 40) ΔE00 | 2.13 | **1.77** |
-| saturated pixels ΔC\* | +0.43 | −0.15 |
-| bright saturated ΔE00 | 2.59 | **2.28** |
+| whole frame ΔE00 mean / median | 1.91 / 1.72 | **1.76 / 1.63** |
+| saturated pixels (C\* > 40) ΔE00 | 1.92 | **1.69** |
+| saturated pixels ΔC\* | +0.82 | +0.31 |
+| bright saturated ΔE00 | 2.30 | **2.15** |
 
 (Masks on the mean chroma of the two renders; masking on one side selects
 its noise and biases ΔC\* by ±0.5.) Two things the fit deliberately does not
 do: it ramps to identity over the last 8 L\* at black and at white, because
-the top bin's median honestly says the camera's near-whites sit 2–4 L\* lower
-but a clipped highlight is 255 on both sides and a table that pulls white to
+a clipped highlight is 255 on both sides and a table that pulls white to
 L\* 96 leaves every white in the frame a grey 245; and a cell measured on
 fewer than 8 frames is left to the smoothing and the ridge, since the bright
 saturated corner is where a handful of frames produce medians like 0.5.

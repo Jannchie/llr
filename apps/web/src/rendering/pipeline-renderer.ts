@@ -2343,6 +2343,11 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     // default is the stage off), and the asset has to have arrived — a failed
     // fetch leaves the switch inert rather than rendering a zero table.
     i("u_sonyLut3dActive", chroma && this.sonyLut3dWanted && this.sonyLut3dLoaded ? 1 : 0);
+    // Camera match takes the advanced luma pair (highlight roll-off) without the
+    // 3-D LUT: measured against the camera JPEG the standard table clips ~3x
+    // the camera's highlight area, the advanced one lands on it, and the LUT is
+    // what costs the saturated colour. Same arrival gate as the table itself.
+    i("u_sonyLumaAdvForce", chroma && this.sonyCameraMatchWanted && this.sonyCameraMatch ? 1 : 0);
     i("u_sepiaActive", this.sepiaActive && this.sepiaLutTex ? 1 : 0);
     i("u_droActive", this.droActive && this.droLutTex ? 1 : 0);
     v2("u_droScale", this.droScale[0], this.droScale[1]);

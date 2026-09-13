@@ -131,6 +131,7 @@ uniform sampler2D u_sonyLumaLut;
 // own entry is 1.0 — and the pivot is not swapped (worker sony/chroma.py
 // luma_terms says why). Same 128x128 fold, same texelFetch rules as above.
 uniform int u_sonyLumaLutAdvActive;
+uniform int u_sonyLumaAdvForce;
 uniform sampler2D u_sonyLumaLutAdv;
 uniform float u_sonyLumaAdvContrast;
 // ChromaSuppres, which the engine runs just *before* YGamma and indexes by the
@@ -305,7 +306,10 @@ vec3 sonyChroma(vec3 s) {
   // both — so the switch below drives this as well as the 3-D LUT. Gated on the
   // advanced table having arrived: an older response carries only the standard
   // one, and rendering 高级's contrast against 标准's table would be neither.
-  bool adv = u_sonyLut3dActive == 1 && u_sonyLumaLutAdvActive == 1;
+  // Camera match asks for the advanced luma pair on its own (u_sonyLumaAdvForce):
+  // it is the highlight roll-off the camera has and the standard table lacks,
+  // without the 3-D LUT that pulls saturated colour down (pipeline-renderer).
+  bool adv = u_sonyLumaLutAdvActive == 1 && (u_sonyLut3dActive == 1 || u_sonyLumaAdvForce == 1);
   int idx = int(clamp(floor(y * 16383.0), 0.0, 16383.0));
   if (adv) {
     y = texelFetch(u_sonyLumaLutAdv, ivec2(idx & 127, idx >> 7), 0).r / 16383.0;
@@ -1721,7 +1725,7 @@ export const PASSES: PassDef[] = [
     "u_sonyChromaActive", "u_sonyCross", "u_sonyGain", "u_sonyLuma", "u_sonySat",
     "u_sonyHue", "u_sonyLevels",
     "u_sonyLumaLutActive", "u_sonyLumaLut",
-    "u_sonyLumaLutAdvActive", "u_sonyLumaLutAdv", "u_sonyLumaAdvContrast",
+    "u_sonyLumaLutAdvActive", "u_sonyLumaLutAdv", "u_sonyLumaAdvContrast", "u_sonyLumaAdvForce",
     "u_sonyCSActive", "u_sonyCS",
     "u_sonyLut3dActive", "u_sony_lut3d",
     "u_sepiaActive", "u_sepiaWeights", "u_sepia_lut",

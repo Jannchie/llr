@@ -6,8 +6,10 @@ transform in CIELAB.
 
 <sample dir> holds <name>.ARW / <name>.JPG (camera) / <name>.<suffix>.jpg
 (LLR's own export with the switches the table is meant for -- fit on the
-render it will be applied to) and residuals.json from tmp/nas/measure.py (for
-the exif fields). Frames with a corrupt ISO (65535), a manual DRO level, or
+render it will be applied to: camera match ON, so the shader takes the
+advanced luma pair, with the worker started under LLR_CAMERA_MATCH_IDENTITY=1
+so it sends an identity table and nothing is corrected yet) and
+residuals.json from tmp/nas/measure.py (for the exif fields). Frames with a corrupt ISO (65535), a manual DRO level, or
 dE00 >= 8 are left out — those are not a fixed transform's business.
 
 Model, applied to LLR's finished sRGB pixel converted to Lab (D65):

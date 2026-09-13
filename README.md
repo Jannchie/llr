@@ -25,14 +25,15 @@ Measured (CIEDE2000 mean over the frame; [method, per-region tables and a
 | Pair | ΔE00, three frames |
 |---|---|
 | Imaging Edge ↔ LLR, same settings | 1.04 / 0.82 / 0.59 |
-| Camera JPEG ↔ LLR, defaults | 1.64 / 1.16 / 1.00 |
+| Camera JPEG ↔ LLR, defaults | 1.63 / 1.20 / 0.89 |
 | Camera JPEG ↔ Lightroom | 2.92 / 5.64 / 6.86 |
 
 Every ARW carries the calibration Imaging Edge renders from: the body's colour
 matrix and the tone curve and chroma terms of each Creative Look. LLR reads
 them back and runs that pipeline, so what you see first is Sony's own render
 — at RAW depth, with every slider still live. On top of that, *camera match*
-(a switch) applies what the body's JPEG does that Imaging Edge does not: a
+(a switch) applies what the body's JPEG does that Imaging Edge does not: the
+engine's own highlight roll-off without the LUT that costs saturation, and a
 fitted correction of a couple of L\* and a few percent of chroma, measured
 against the camera's JPEGs. Lightroom's Camera Matching profiles approximate
 the same look from a fitted DCP, and saturated colour is where that drifts.

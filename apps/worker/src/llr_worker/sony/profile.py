@@ -43,6 +43,7 @@ browser, so they ride out on the profile as constants.
 from __future__ import annotations
 
 import json
+import os
 import struct
 from dataclasses import dataclass
 from functools import lru_cache
@@ -694,6 +695,16 @@ def camera_match_table(body: str | None, style: str | None) -> dict[str, list[An
     table = looks.get(style or "") or looks.get(CAMERA_MATCH_POOLED)
     if not isinstance(table, dict):
         return None
+    if os.environ.get("LLR_CAMERA_MATCH_IDENTITY"):
+        # The fitter's input: camera match switched on -- which also selects
+        # the advanced luma pair in the shader -- but with nothing corrected,
+        # so the render is exactly what the surface will be applied to.
+        # sony_repro/tools/camera_match_fit.py says when to set this.
+        return {
+            "dL": [[0.0] * len(CAMERA_MATCH_C_AXIS) for _ in CAMERA_MATCH_L_AXIS],
+            "cr": [[1.0] * len(CAMERA_MATCH_C_AXIS) for _ in CAMERA_MATCH_L_AXIS],
+            "hs": [0.0] * len(CAMERA_MATCH_H_AXIS),
+        }
     return {
         "dL": [[float(v) for v in row] for row in table["dL"]],
         "cr": [[float(v) for v in row] for row in table["cr"]],

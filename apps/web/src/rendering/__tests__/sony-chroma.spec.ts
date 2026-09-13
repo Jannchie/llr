@@ -439,15 +439,16 @@ describe("Sony RGB2YCC", () => {
       lutFrom(KNEE_LUT_SAMPLES), true, knee)[0]).not.toBeCloseTo(0.570954, 4);
   });
 
-  it("has the shader pick the advanced table on the same flag as the 3-D LUT", () => {
+  it("has the shader pick the advanced table on the 3-D LUT's flag, or on camera match's", () => {
     const src = PROCESS_SHADER.slice(PROCESS_SHADER.indexOf("vec3 sonyChroma"));
     const body = src.slice(0, src.indexOf("\n}"));
-    // One flag, both halves — that is what makes this Imaging Edge's single
-    // 色彩复制 setting rather than two switches that happen to travel together.
-    // The second half of the condition is the guard: an older profile response
-    // carries no advanced table, and 高级's contrast against 标准's table would
-    // be neither setting.
-    expect(body).toContain("bool adv = u_sonyLut3dActive == 1 && u_sonyLumaLutAdvActive == 1;");
+    // The 3-D LUT flag drives both halves — that is what makes 高级 Imaging
+    // Edge's single 色彩复制 setting. Camera match is the one other caller: it
+    // takes the advanced luma pair (the camera's highlight roll-off) without
+    // the LUT, via u_sonyLumaAdvForce. The arrival guard stays: an older
+    // profile response carries no advanced table, and 高级's contrast against
+    // 标准's table would be neither setting.
+    expect(body).toContain("bool adv = u_sonyLumaLutAdvActive == 1 && (u_sonyLut3dActive == 1 || u_sonyLumaAdvForce == 1);");
     expect(body).toContain("y = texelFetch(u_sonyLumaLutAdv, ivec2(idx & 127, idx >> 7), 0).r / 16383.0;");
     expect(body).not.toContain("texture(u_sonyLumaLutAdv");
     // The advanced fetch wins over the standard one rather than running after
