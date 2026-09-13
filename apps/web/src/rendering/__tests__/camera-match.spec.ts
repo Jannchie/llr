@@ -42,14 +42,14 @@ const LAB_POINTS = [
   [50.0, 30.0, -3.0], // hue 354.3, past the last sector centre
 ];
 const FL_EXPECTED = [
-  [48.57621, 18.86754, 9.93076],
-  [11.74036, -29.05936, 25.01010],
-  [94.35281, 2.72001, -39.98884],
-  [2.81830, 0.44942, -0.18345],
-  [58.30801, -25.54183, -23.41175],
-  [83.68644, 40.44031, 58.41276],
-  [54.77280, 80.65485, 61.22404],
-  [48.57830, 29.14034, -2.41781],
+  [48.56259, 18.99749, 9.89603],
+  [11.58677, -29.21391, 24.98058],
+  [96.33142, 3.92887, -40.18590],
+  [2.92669, 0.48651, -0.18874],
+  [58.39777, -25.69982, -23.40432],
+  [84.20393, 41.16469, 59.01875],
+  [54.81450, 81.19425, 61.17392],
+  [48.57828, 29.23987, -2.33830],
 ];
 
 const close = (got: readonly number[], want: readonly number[], tol: number) => {
@@ -70,8 +70,8 @@ describe("applyCameraMatchLab", () => {
   });
 
   it("picks the table it is given, not always FL", () => {
-    close(applyCameraMatchLab(LAB_POINTS[0], POOLED), [48.25873, 18.95516, 9.65470], 1e-4);
-    close(applyCameraMatchLab(LAB_POINTS[0], IN), [49.47538, 18.57796, 9.36519], 1e-4);
+    close(applyCameraMatchLab(LAB_POINTS[0], POOLED), [48.24155, 19.06496, 9.57718], 1e-4);
+    close(applyCameraMatchLab(LAB_POINTS[0], IN), [49.52866, 18.88574, 9.24020], 1e-4);
   });
 
   it("leaves a neutral neutral", () => {

@@ -25,7 +25,7 @@ Measured (CIEDE2000 mean over the frame; [method, per-region tables and a
 | Pair | ΔE00, three frames |
 |---|---|
 | Imaging Edge ↔ LLR, same settings | 1.04 / 0.82 / 0.59 |
-| Camera JPEG ↔ LLR, defaults | 1.60 / 1.13 / 1.01 |
+| Camera JPEG ↔ LLR, defaults | 1.64 / 1.16 / 1.00 |
 | Camera JPEG ↔ Lightroom | 2.92 / 5.64 / 6.86 |
 
 Every ARW carries the calibration Imaging Edge renders from: the body's colour

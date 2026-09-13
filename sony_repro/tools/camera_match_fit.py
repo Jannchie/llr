@@ -61,11 +61,12 @@ H_AXIS = np.arange(7.5, 360, 15.0)
 L_BINS = np.arange(0, 101, 10.0)
 C_BINS = np.array([0, 5, 10, 15, 22, 30, 40, 50, 60, 75, 90, 200.0])
 MIN_FRAMES = 6
-MIN_BAND_FRAMES = 4
+MIN_BAND_FRAMES = 8
 MIN_PIXELS = 200
 SHRINK = 6.0
 LIMITS = {"dL": 4.0, "cr": (0.85, 1.15), "hs": 4.0}
 SMOOTH = 4.0       # second-difference penalty, in units of the data weight
+END_RAMP = 8.0     # L* over which the correction fades to identity at black and white
 RIDGE = 0.05       # pull toward identity per cell, relative to one measured cell
 
 
@@ -80,8 +81,8 @@ def load(d: Path, name: str, suffix: str):
 
 
 def stats(cam, llr):
-    """Per-frame cell medians on the LLR pixel's (L*, C*): dL, chroma ratio; and
-    per hue sector (C* > 15): hue shift. NaN where a cell is thin."""
+    """Per-frame cell medians over (L*, C*): dL, chroma ratio; and per hue
+    sector (C* > 15): hue shift. NaN where a cell is thin."""
     L, C = cam[..., 0], np.hypot(cam[..., 1], cam[..., 2])
     Lr, Cr = llr[..., 0], np.hypot(llr[..., 1], llr[..., 2])
     hue = np.degrees(np.arctan2(cam[..., 2], cam[..., 1])) % 360
@@ -89,7 +90,14 @@ def stats(cam, llr):
     dh = (hue - huer + 180) % 360 - 180
     nl, nc = len(L_BINS) - 1, len(C_BINS) - 1
     dL = np.full((nl, nc), np.nan); cr = np.full((nl, nc), np.nan)
-    li = np.clip(np.digitize(Lr, L_BINS) - 1, 0, nl - 1); ci = np.clip(np.digitize(Cr, C_BINS) - 1, 0, nc - 1)
+    # Cells are assigned on the mean of the two renders, not on LLR's value
+    # alone: binning on one noisy side selects the pixels whose noise pushed
+    # that side up, and every ratio in the cell then reads low (regression to
+    # the mean) -- measured as a spurious unit of chroma over-correction at
+    # C* > 40. The table is still indexed by LLR's (L*, C*) when applied; the
+    # bias only lives in how the measurements were grouped.
+    Lm, Cm = (L + Lr) / 2, (C + Cr) / 2
+    li = np.clip(np.digitize(Lm, L_BINS) - 1, 0, nl - 1); ci = np.clip(np.digitize(Cm, C_BINS) - 1, 0, nc - 1)
     cell = li * nc + ci
     for k in range(nl * nc):
         m = cell == k
@@ -101,8 +109,9 @@ def stats(cam, llr):
         if C_BINS[j] >= 5:
             cr[i, j] = np.median(C[m]) / max(np.median(Cr[m]), 1e-6)
     hs = np.full(len(H_AXIS), np.nan)
+    hm = np.degrees(np.arctan2(cam[..., 2] + llr[..., 2], cam[..., 1] + llr[..., 1])) % 360
     for i in range(len(H_AXIS)):
-        m = (huer >= i * 15) & (huer < i * 15 + 15) & (Cr > 15)
+        m = (hm >= i * 15) & (hm < i * 15 + 15) & (Cm > 15)
         if m.sum() >= MIN_PIXELS:
             hs[i] = np.median(dh[m])
     return dL, cr, hs
@@ -158,6 +167,16 @@ def fit(S, pooled=None):
             v = base + (v - base) * w
         lim = LIMITS[k]
         v = np.clip(v, lim[0], lim[1]) if isinstance(lim, tuple) else np.clip(v, neutral - lim, neutral + lim)
+        # The end points stay put. The top L* bin's median says the camera's
+        # near-whites sit 2-4 L* below ours, and that is true of L* 90-97 --
+        # but a clipped highlight is 255 on both sides, and a table that pulls
+        # L* 100 down to 96 leaves every white in the frame a grey 245: the
+        # first thing the eye notices. So the correction ramps to identity
+        # over the last END_RAMP L* (and the first, for the same reason at
+        # black), which compresses the top of the range a little harder than
+        # the camera and keeps the whites white.
+        ramp = np.clip(np.minimum(L_AXIS, 100 - L_AXIS) / END_RAMP, 0, 1)[:, None]
+        v = neutral + (v - neutral) * ramp
         out[k] = np.round(v, 4).tolist()
     med, count = agg(2)
     ok = count >= MIN_BAND_FRAMES
@@ -207,11 +226,18 @@ def tables(data, names, R):
 
 
 def evaluate(cam, llr):
-    """Whole-frame dE00 mean, saturated-pixel dE00 mean and dC*, bright saturated dE00."""
+    """Whole-frame dE00 mean, saturated-pixel dE00 mean and dC*, bright saturated dE00.
+
+    The saturated / bright masks are taken on the mean of the two renders, not
+    on the camera alone: selecting on one side's chroma keeps the pixels whose
+    noise pushed that side up, and dC* then reads +0.5 before any correction
+    and -0.5 after a correct one.
+    """
     d = de2000(cam, llr)
-    C = np.hypot(cam[..., 1], cam[..., 2]); L = cam[..., 0]
-    sat = C > 40; bright = sat & (L > 60)
-    dc = (np.hypot(llr[..., 1], llr[..., 2]) - C)
+    C = np.hypot(cam[..., 1], cam[..., 2]); Cr = np.hypot(llr[..., 1], llr[..., 2])
+    Cm, Lm = (C + Cr) / 2, (cam[..., 0] + llr[..., 0]) / 2
+    sat = Cm > 40; bright = sat & (Lm > 60)
+    dc = Cr - C
     return (d.mean(), d[sat].mean() if sat.sum() > 200 else np.nan, dc[sat].mean() if sat.sum() > 200 else np.nan,
             d[bright].mean() if bright.sum() > 200 else np.nan)
 
