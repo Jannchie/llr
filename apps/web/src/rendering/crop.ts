@@ -191,19 +191,17 @@ export function sourceNormToImageNorm(su: number, sv: number, c: CropState): [nu
 }
 
 /**
- * CSS `matrix3d()` placing an untouched full-frame image of the source through
- * the same recompose the render applied — the forward direction of
- * `buildCropTransform`, which maps the other way (output → texcoord). A 3D
- * matrix because the transform can be a perspective.
- *
- * The element is assumed laid out at `srcW × srcH` px with `transform-origin:
- * 0 0`; the matrix maps it into a box of `outW × outH` px covering `outRect` of
- * the output frame. Used by the camera-JPEG compare overlay, which must show
- * the same crop/straighten/flip as the canvas it covers.
+ * The 3×3 (row-major, projective) matrix placing an untouched full-frame image
+ * of the source through the same recompose the render applied — the forward
+ * direction of `buildCropTransform`, which maps the other way (output →
+ * texcoord). Source px → px of a box of `outW × outH` covering `outRect` of
+ * the output frame. `cssRecomposeMatrix` wraps it for the compare overlay;
+ * the histogram bins the camera JPEG through the same matrix so the two
+ * cover the same crop/straighten/flip.
  */
-export function cssRecomposeMatrix(
+export function recomposeMatrix(
   c: CropState, srcW: number, srcH: number, outRect: Rect, outW: number, outH: number,
-): string {
+): number[] {
   const [iw, ih] = imageDims(srcW, srcH, c.orientation);
   const b = pixelBox(c, iw, ih);
   const a = (c.angle * Math.PI) / 180;
@@ -220,7 +218,19 @@ export function cssRecomposeMatrix(
     const dx = x - b.cx, dy = y - b.cy;
     return [(b.cx + dx * cos + dy * sin - outRect.x) * kx, (b.cy - dx * sin + dy * cos - outRect.y) * ky];
   });
-  const [m0, m1, m2, m3, m4, m5, m6, m7, m8] = mul3(O, mul3(H, S)).map((v) => (Math.abs(v) < 1e-9 ? 0 : v));
+  return mul3(O, mul3(H, S)).map((v) => (Math.abs(v) < 1e-9 ? 0 : v));
+}
+
+/**
+ * CSS `matrix3d()` of `recomposeMatrix` — a 3D matrix because the transform
+ * can be a perspective. The element is assumed laid out at `srcW × srcH` px
+ * with `transform-origin: 0 0`. Used by the camera-JPEG compare overlay,
+ * which must show the same crop/straighten/flip as the canvas it covers.
+ */
+export function cssRecomposeMatrix(
+  c: CropState, srcW: number, srcH: number, outRect: Rect, outW: number, outH: number,
+): string {
+  const [m0, m1, m2, m3, m4, m5, m6, m7, m8] = recomposeMatrix(c, srcW, srcH, outRect, outW, outH);
   // CSS matrix3d is column-major with z passed through untouched.
   return `matrix3d(${[m0, m3, 0, m6, m1, m4, 0, m7, 0, 0, 1, 0, m2, m5, 0, m8].join(", ")})`;
 }

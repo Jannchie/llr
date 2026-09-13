@@ -13,6 +13,68 @@ export interface HistogramBins {
   l: Uint32Array; // luminance
 }
 
+/**
+ * Rec.709 luma of display-encoded 8-bit values — the L row of every CPU binner
+ * here. Rounded, as the GPU scatter pass rounds (`int(v * 255.0 + 0.5)`): the
+ * weights sum to 1 only to four places, and truncation put white in bin 254.
+ */
+export function lumaBin(r: number, g: number, b: number): number {
+  return Math.min(255, Math.round(0.2126 * r + 0.7152 * g + 0.0722 * b));
+}
+
+/** Bins display-encoded RGBA pixels (alpha ignored) — the CPU half of every binner. */
+export function binRgba(data: Uint8ClampedArray | Uint8Array): HistogramBins {
+  const bins: HistogramBins = {
+    r: new Uint32Array(256), g: new Uint32Array(256),
+    b: new Uint32Array(256), l: new Uint32Array(256),
+  };
+  for (let i = 0; i + 3 < data.length; i += 4) {
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+    bins.r[r]++; bins.g[g]++; bins.b[b]++;
+    bins.l[lumaBin(r, g, b)]++;
+  }
+  return bins;
+}
+
+// Long-edge cap for binning a decoded image on the CPU (binImageThrough): the
+// draw and the per-pixel loop are both linear in the area, and a 1024-px long
+// edge (~0.7 MP) reads back in a few ms while keeping every tone of a
+// full-frame JPEG represented.
+const BIN_IMAGE_LONG = 1024;
+
+/**
+ * Bins a decoded image the way the renderer bins its own output, so the
+ * histogram can follow the hold-to-compare against the camera JPEG. The image
+ * is drawn through `matrix` — the recompose the compare overlay is placed with
+ * (crop.ts recomposeMatrix), source px → px of an `outW × outH` box — scaled to
+ * a long edge of ~1024, so the bins cover the same crop / straighten / flip as
+ * the frame the overlay stands in for. A 2D canvas is affine, so the projective
+ * row of a perspective transform is dropped; on such a frame the sampled area
+ * drifts at the edges, nothing more. Null when the canvas is unavailable
+ * (no 2D context, a tainted image).
+ */
+export function binImageThrough(
+  img: CanvasImageSource, srcW: number, srcH: number, matrix: readonly number[], outW: number, outH: number,
+): HistogramBins | null {
+  const k = Math.min(1, BIN_IMAGE_LONG / Math.max(outW, outH));
+  const w = Math.max(1, Math.round(outW * k));
+  const h = Math.max(1, Math.round(outH * k));
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return null;
+  const [m0, m1, m2, m3, m4, m5] = matrix;
+  // Canvas setTransform(a, b, c, d, e, f): x' = a·x + c·y + e, y' = b·x + d·y + f.
+  ctx.setTransform(k * m0, k * m3, k * m1, k * m4, k * m2, k * m5);
+  ctx.drawImage(img, 0, 0, srcW, srcH);
+  try {
+    return binRgba(ctx.getImageData(0, 0, w, h).data);
+  } catch {
+    return null;
+  }
+}
+
 /** Vertical-axis compression for the bin counts. */
 export type HistogramScale = "linear" | "sqrt" | "log";
 

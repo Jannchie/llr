@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { binScaler, clipIndicators, measureHint, measureHistogram, measurePixels, robustMax, type HistogramBins, type HistogramMeasure } from "../histogram";
+import { binRgba, binScaler, clipIndicators, lumaBin, measureHint, measureHistogram, measurePixels, robustMax, type HistogramBins, type HistogramMeasure } from "../histogram";
 
 function makeBins(fill = 0): HistogramBins {
   return {
@@ -9,6 +9,36 @@ function makeBins(fill = 0): HistogramBins {
     l: new Uint32Array(256).fill(fill),
   };
 }
+
+describe("binRgba", () => {
+  it("bins each channel and Rec.709 luma, ignoring alpha", () => {
+    const px = new Uint8ClampedArray([
+      255, 0, 0, 255,   // red: luma 54
+      0, 255, 0, 0,     // green, transparent: still counted; luma 182
+      10, 20, 30, 128,  // luma 19
+      255, 255, 255, 255,
+    ]);
+    const bins = binRgba(px);
+    expect(bins.r[255]).toBe(2);
+    expect(bins.g[255]).toBe(2);
+    expect(bins.b[30]).toBe(1);
+    expect(bins.l[lumaBin(255, 0, 0)]).toBe(1);
+    expect(bins.l[lumaBin(0, 255, 0)]).toBe(1);
+    expect(bins.l[255]).toBe(1);
+    expect(Array.from(bins.r).reduce((a, b) => a + b, 0)).toBe(4);
+  });
+
+  it("truncates luma into the 0..255 bins", () => {
+    expect(lumaBin(255, 255, 255)).toBe(255);
+    expect(lumaBin(0, 0, 0)).toBe(0);
+    expect(lumaBin(255, 0, 0)).toBe(54);
+  });
+
+  it("gives empty bins for no pixels", () => {
+    const bins = binRgba(new Uint8Array(0));
+    expect(Array.from(bins.l).every((c) => c === 0)).toBe(true);
+  });
+});
 
 describe("robustMax", () => {
   it("ignores the clipping bins so a blown background cannot flatten the plot", () => {

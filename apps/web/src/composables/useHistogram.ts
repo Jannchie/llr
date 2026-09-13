@@ -1,5 +1,6 @@
 import { ref, watch } from "vue";
 import { renderHistogram } from "../rendering/histogram";
+import type { HistogramBins } from "../rendering/histogram";
 import type { HistogramView, PipelineRenderer } from "../rendering/pipeline-renderer";
 
 /**
@@ -17,6 +18,12 @@ export function useHistogram(opts: {
   ready: () => boolean;
   /** Histogram render window override (crop editor); undefined = full output. */
   view: () => HistogramView | undefined;
+  /**
+   * Bins to draw instead of the renderer's, while something other than the
+   * render is on screen (the hold-to-compare against the camera JPEG); null
+   * or undefined = read the render as usual.
+   */
+  bins?: () => HistogramBins | null | undefined;
   minIntervalMs?: number;
 }) {
   const canvasRef = ref<HTMLCanvasElement | null>(null);
@@ -65,7 +72,7 @@ export function useHistogram(opts: {
     }
     busy = true;
     try {
-      const bins = await renderer.readHistogram(opts.view());
+      const bins = opts.bins?.() ?? await renderer.readHistogram(opts.view());
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
       const dpr = window.devicePixelRatio || 1;

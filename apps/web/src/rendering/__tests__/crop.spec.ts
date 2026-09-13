@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   applyAspectRatio, buildCropTransform, cloneCrop, constrainCrop, cornersInsideImage,
-  cropOutputRect, cropOutputSize, cropOutputSizeForAspect, cssRecomposeMatrix, customAspectKey, defaultCrop,
+  cropOutputRect, cropOutputSize, cropOutputSizeForAspect, cssRecomposeMatrix, customAspectKey, defaultCrop, recomposeMatrix,
   imageDims, isDefaultCrop, parseCustomAspect, ratioToFraction, resolveAspectFraction,
   resolveAspectRatio, rotate90, straightenedBBox, straightenAngle, cropGuideShapes, cropCornersImage, CROP_GUIDES,
   defaultTransform, transformMatrix, guidedHomography, flipCrop, outFrameToImagePx, imagePxToOutFrame,
@@ -116,6 +116,24 @@ describe("cssRecomposeMatrix", () => {
       // ...must land on the same output point once the CSS matrix places it.
       expect(bx / ow).toBeCloseTo(px, 4);
       expect(by / oh).toBeCloseTo(py, 4);
+    }
+  });
+
+  it.each(CASES)("is the CSS form of the row-major recomposeMatrix for %s", (_name, c) => {
+    // The histogram bins the camera JPEG through the raw matrix on a 2D canvas
+    // (an affine setTransform), so its first two rows must be what the CSS
+    // overlay is placed with — the same point must land in the same place.
+    const [iw, ih] = imageDims(SRC_W, SRC_H, c.orientation);
+    const rect = cropOutputRect(c, iw, ih);
+    const [ow, oh] = cropOutputSize(c, SRC_W, SRC_H);
+    const m = recomposeMatrix(c, SRC_W, SRC_H, rect, ow, oh);
+    const css = cssRecomposeMatrix(c, SRC_W, SRC_H, rect, ow, oh);
+    expect(m).toHaveLength(9);
+    for (const [x, y] of [[0, 0], [SRC_W, 0], [SRC_W / 3, SRC_H * 0.8]]) {
+      const w = m[6] * x + m[7] * y + m[8];
+      const [cx, cy] = applyCss(css, x, y);
+      expect((m[0] * x + m[1] * y + m[2]) / w).toBeCloseTo(cx, 6);
+      expect((m[3] * x + m[4] * y + m[5]) / w).toBeCloseTo(cy, 6);
     }
   });
 });

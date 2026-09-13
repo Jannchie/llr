@@ -24,7 +24,7 @@ import { LUT_SIZE, buildToneCurveLUT, defaultToneCurve } from "./curve";
 import { LOG2_MID } from "./tonal-model";
 import { GROUP_STRIDE, MASK_UBO_BYTES, MASK_USE, imgFromTex } from "./masks";
 import { defaultCrop } from "./crop";
-import type { HistogramBins } from "./histogram";
+import { binRgba, type HistogramBins } from "./histogram";
 
 // Contrast and Blacks are not here: they are display-referred and baked into
 // the tone-curve LUT (curve.ts BasicAdjust), not shader uniforms.
@@ -1987,11 +1987,7 @@ export class PipelineRenderer {
   /** CPU fallback: render a small copy, read it back (sync), and bin it in JS. */
   private readHistogramCPU(view?: HistogramView): HistogramBins {
     const gl = this.gl;
-    const bins: HistogramBins = {
-      r: new Uint32Array(256), g: new Uint32Array(256),
-      b: new Uint32Array(256), l: new Uint32Array(256),
-    };
-    if (!this.sourceTex || !this.outWidth || !this.outHeight) return bins;
+    if (!this.sourceTex || !this.outWidth || !this.outHeight) return binRgba(new Uint8Array(0));
 
     const { w, h } = this.ensureHistoFbo(HISTO_LONG_CPU, view);
     // Point-sample the source (NEAREST) so the downscale doesn't average
@@ -2005,14 +2001,7 @@ export class PipelineRenderer {
     const buf = new Uint8Array(n * 4);
     gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-
-    for (let i = 0; i < n; i++) {
-      const r = buf[i * 4], g = buf[i * 4 + 1], b = buf[i * 4 + 2];
-      bins.r[r]++; bins.g[g]++; bins.b[b]++;
-      // Rec.709 luma of the display-encoded values, matching Lightroom's scope.
-      bins.l[Math.min(255, (0.2126 * r + 0.7152 * g + 0.0722 * b) | 0)]++;
-    }
-    return bins;
+    return binRgba(buf);
   }
 
   /** GPU path: scatter every pixel into a 256×4 float bin texture. */

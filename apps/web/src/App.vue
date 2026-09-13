@@ -10,7 +10,7 @@ import {
 } from "./rendering/curve";
 import {
   defaultCrop, cloneCrop, isDefaultCrop, imageDims, buildCropTransform,
-  cropOutputRect, cropOutputSize, straightenedBBox, cssRecomposeMatrix,
+  cropOutputRect, cropOutputSize, straightenedBBox, cssRecomposeMatrix, recomposeMatrix,
   applyAspectRatio, resolveAspectFraction, cropOutputSizeForAspect, CROP_GUIDES, constrainCrop,
   ASPECT_PRESETS,
   type AspectPreset, type CropState,
@@ -37,7 +37,7 @@ import { useLibrary } from "./composables/useLibrary";
 import { useHistogram } from "./composables/useHistogram";
 import { useExport, type ExportPlan } from "./composables/useExport";
 import { useAssistant, modelKey, THINKING_LEVELS, type AssistantTool, type ToolContent, type TurnUsage } from "./composables/useAssistant";
-import { measureHint, measureHistogram, measurePixels } from "./rendering/histogram";
+import { binImageThrough, measureHint, measureHistogram, measurePixels } from "./rendering/histogram";
 import ModelSettings from "./components/ModelSettings.vue";
 import AssistantMessage from "./components/AssistantMessage.vue";
 import ChatIcon, { type ChatIconName } from "./components/ChatIcon.vue";
@@ -1076,6 +1076,19 @@ const embeddedTransform = computed(() => {
   return cssRecomposeMatrix(
     crop, srcW.value, srcH.value, cropOutputRect(crop, iw, ih), imageW.value, imageH.value);
 });
+// The overlay's <img>, for the histogram: while the hold shows the camera JPEG
+// the scope shows its bins too, binned through the same recompose as the
+// overlay so both read the same framing. Null bins (image not decoded yet,
+// nothing to compare) leave the render's histogram in place.
+const embeddedImgRef = ref<HTMLImageElement | null>(null);
+function embeddedHistogramBins() {
+  const img = embeddedImgRef.value;
+  if (!showEmbedded.value || !img?.complete || !img.naturalWidth) return null;
+  if (!srcW.value || !srcH.value || !imageW.value || !imageH.value) return null;
+  const [iw, ih] = imageDims(srcW.value, srcH.value, crop.orientation);
+  const m = recomposeMatrix(crop, srcW.value, srcH.value, cropOutputRect(crop, iw, ih), imageW.value, imageH.value);
+  return binImageThrough(img, srcW.value, srcH.value, m, imageW.value, imageH.value);
+}
 
 // Denoise params for the render-linear request. amount is normalised to 0..1;
 // disabled (or amount 0) tells the worker to skip inference entirely.
@@ -1433,9 +1446,13 @@ const histogram = useHistogram({
   renderer: () => webglRenderer,
   ready: () => hasLinearData && !!imageW.value && !!imageH.value,
   view: () => (cropMode.value ? cropHistogramView() : undefined),
+  bins: embeddedHistogramBins,
 });
 const histoCanvasRef = histogram.canvasRef;
 const scheduleHistogram = histogram.schedule;
+// The camera-JPEG hold is an overlay, not a draw, so no draw reschedules the
+// scope for it: do it here, both ways (the release brings the render's back).
+watch(showEmbedded, () => scheduleHistogram());
 
 /**
  * Push the advanced-colour switch at the renderer and repaint once it has the
@@ -2736,7 +2753,7 @@ const vWheelAdjust = {
         <div v-show="showEmbedded && webglRenderer != null && activeSource && !activeSource.invalid"
           class="preview compare-embedded"
           :style="{ transform: displayTransform, width: imageW + 'px', height: imageH + 'px' }">
-          <img :style="{ transform: embeddedTransform, width: srcW + 'px', height: srcH + 'px' }"
+          <img ref="embeddedImgRef" :style="{ transform: embeddedTransform, width: srcW + 'px', height: srcH + 'px' }"
             :src="embeddedSrc || undefined" :alt="t('aria.cameraJpeg')" />
         </div>
         <div v-show="activeSource && (status === 'rendering' || status === 'uploading')"
