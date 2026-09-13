@@ -632,39 +632,59 @@ def sepia_toning(style: str) -> dict[str, Any] | None:
 # Camera match: what the body's own JPEG does on top of this whole chain, as a
 # small display-referred transform in CIELAB fitted per body and per Creative
 # Look (sony_repro/tools/camera_match_fit.py, whose apply() is the reference
-# the shader mirrors). Fitted on 116 ARW + in-camera JPEG pairs from one
+# the shader mirrors). Fitted on ARW + in-camera JPEG pairs from one
 # ILCE-7CM2: the residual is a fixed few L* in the mid-tones, a few percent of
 # chroma and a degree or two of hue, and it is stable enough across frames to
-# be worth a table — held-out dE00 mean 2.11 -> 1.97, median 1.95 -> 1.81.
+# be worth a table.
 #
-# Ten L* bands (centres 5, 15, ..., 95) for the lightness offset `dL` and the
-# chroma ratio `cr`, twelve hue sectors (centres 15, 45, ..., 345) for the hue
-# shift `hs`; linear between centres, clamped at the ends of the L* axis and
-# periodic in hue. Keyed by the exif Model first — a table fitted on one body
-# says nothing about another, so an unknown body gets no table at all rather
-# than the nearest one — then by look, with "*" the pooled table for a look the
-# fit had too few frames of.
+# The lightness offset `dL` and the chroma ratio `cr` are surfaces over
+# (L*, C*) rather than bands over L* alone, because the residual pulls in
+# opposite directions at the two ends of the chroma axis: near neutrals this
+# chain sits more saturated than the camera, the saturated colours less. Both
+# are 21 x 19 grids — L* 0..100 and C* 0..90 in steps of 5, sampled
+# bilinearly and held at the grid's edges (C* past 90 reads the last column).
+# The hue shift `hs` is 24 sectors of 15 degrees (centres 7.5, 22.5, ...),
+# linear between centres and periodic. Keyed by the exif Model first — a
+# table fitted on one body says nothing about another, so an unknown body
+# gets no table at all rather than the nearest one — then by look, with "*"
+# the pooled table for a look the fit had too few frames of.
 CAMERA_MATCH_DATA = _DATA / "camera_match.json"
 CAMERA_MATCH_POOLED = "*"
-CAMERA_MATCH_L_BANDS = 10
-CAMERA_MATCH_H_SECTORS = 12
+# The grid the shader's step sizes are built for (camera-match.ts). The json
+# carries its own axes (lAxis/cAxis/hAxis) and the loader checks they are
+# these, so a refit at another density fails loudly instead of being sampled
+# at the wrong pitch.
+CAMERA_MATCH_L_AXIS = [float(v) for v in range(0, 101, 5)]
+CAMERA_MATCH_C_AXIS = [float(v) for v in range(0, 91, 5)]
+CAMERA_MATCH_H_AXIS = [7.5 + 15.0 * i for i in range(24)]
+CAMERA_MATCH_L_STEPS = len(CAMERA_MATCH_L_AXIS)
+CAMERA_MATCH_C_STEPS = len(CAMERA_MATCH_C_AXIS)
+CAMERA_MATCH_H_SECTORS = len(CAMERA_MATCH_H_AXIS)
 
 
 @lru_cache(maxsize=1)
-def _camera_match_tables() -> dict[str, dict[str, dict[str, Any]]]:
+def _camera_match_tables() -> dict[str, dict[str, Any]]:
     if not CAMERA_MATCH_DATA.exists():
         return {}
     with CAMERA_MATCH_DATA.open(encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+    for body, looks in data.items():
+        axes = (looks.get("lAxis"), looks.get("cAxis"), looks.get("hAxis"))
+        if axes != (CAMERA_MATCH_L_AXIS, CAMERA_MATCH_C_AXIS, CAMERA_MATCH_H_AXIS):
+            raise ValueError(f"camera_match.json: {body} is not on the grid the shader samples")
+    return data
 
 
-def camera_match_table(body: str | None, style: str | None) -> dict[str, list[float]] | None:
+def camera_match_table(body: str | None, style: str | None) -> dict[str, list[Any]] | None:
     """The fitted correction for this body and look in wire form, or None.
 
     None both for a body the fit never saw and for a profile built without
     exif: either way there is nothing honest to apply, and the frontend hides
     the switch. A look the fit has no table of its own for takes the pooled
-    one — that is what "*" is, the median over every frame of the body.
+    one — that is what "*" is, the fit over every frame of the body.
+
+    `dL` and `cr` are [L* step][C* step] (21 rows of 19), `hs` the 24 sectors;
+    the axes are the constants above, which the frontend has its own copy of.
     """
     if not body:
         return None
@@ -672,11 +692,11 @@ def camera_match_table(body: str | None, style: str | None) -> dict[str, list[fl
     if not looks:
         return None
     table = looks.get(style or "") or looks.get(CAMERA_MATCH_POOLED)
-    if table is None:
+    if not isinstance(table, dict):
         return None
     return {
-        "dL": [float(v) for v in table["dL"]],
-        "cr": [float(v) for v in table["cr"]],
+        "dL": [[float(v) for v in row] for row in table["dL"]],
+        "cr": [[float(v) for v in row] for row in table["cr"]],
         "hs": [float(v) for v in table["hs"]],
     }
 

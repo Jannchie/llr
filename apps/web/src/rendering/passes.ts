@@ -10,8 +10,9 @@
 import { COLOR_GLSL, PROPHOTO_Y, REC709_Y, glslFloat } from "./color-spaces";
 import { LENS_KNOTS, LENS_KNOT_SPAN } from "./lens";
 import {
+  CAMERA_MATCH_C_PITCH, CAMERA_MATCH_C_STEPS,
   CAMERA_MATCH_H_ORIGIN, CAMERA_MATCH_H_PITCH, CAMERA_MATCH_H_SECTORS,
-  CAMERA_MATCH_L_BANDS, CAMERA_MATCH_L_ORIGIN, CAMERA_MATCH_L_PITCH,
+  CAMERA_MATCH_L_PITCH, CAMERA_MATCH_L_STEPS,
   LAB_WHITE, SRGB_TO_XYZ, XYZ_TO_SRGB,
 } from "./camera-match";
 import { LUT_GLSL } from "./curve";
@@ -1551,12 +1552,20 @@ void main() {
 // pipeline's finished sRGB frame and the body's own JPEG, per body and
 // Creative Look (worker sony/profile.py camera_match_table, data from
 // sony_repro/tools/camera_match_fit.py). It is not an engine stage — it is
-// what the engine's export still differs from the camera by, measured on 116
-// frames and small enough (a few L*, a few percent of chroma, a degree or two
-// of hue) to be a fixed table. It runs on the display-encoded frame because
-// that is what the fit measured: the tables are in CIELAB over sRGB, and the
-// maths here is the transcription of camera-match.ts, which is the tested
-// mirror.
+// what the engine's export still differs from the camera by, measured on a
+// hundred-odd frames and small enough (a few L*, a few percent of chroma, a
+// degree or two of hue) to be a fixed table. It runs on the display-encoded
+// frame because that is what the fit measured: the tables are in CIELAB over
+// sRGB, and the maths here is the transcription of camera-match.ts, which is
+// the tested mirror.
+//
+// The tables travel as two textures rather than uniform arrays: the dL and
+// cr surfaces are 21 x 19 each, past what a uniform array should carry. Both
+// are read with texelFetch and the interpolation is written out here, never
+// left to LINEAR: a float texture with a LINEAR filter is *incomplete* on a
+// device without OES_texture_float_linear, and an incomplete texture samples
+// as zero with nothing logged (pipeline-renderer.ts floatLinear) — the stage
+// would silently flatten every pixel's chroma to nothing.
 
 /** A row-major 3x3 as a GLSL constructor, which takes its columns. */
 function glslMat3(m: readonly number[]): string {
@@ -1567,13 +1576,16 @@ export const CAMERA_MATCH_SHADER = `#version 300 es
 precision highp float;
 out vec4 outColor;
 uniform sampler2D u_scene;                          // the finished frame, display-encoded sRGB
-uniform float u_cmL[${CAMERA_MATCH_L_BANDS}];       // dL: L* offset per L* band
-uniform float u_cmC[${CAMERA_MATCH_L_BANDS}];       // cr: chroma ratio per L* band
-uniform float u_cmH[${CAMERA_MATCH_H_SECTORS}];     // hs: hue shift in degrees per hue sector
-const int NL = ${CAMERA_MATCH_L_BANDS};
+// The (L*, C*) grid, NC wide (x = C* step) by NL high (y = L* step): R = dL,
+// the L* offset, G = cr, the chroma ratio (camera-match.ts cameraMatchGridTexels).
+uniform sampler2D u_cmGrid;
+// The hue sectors, NH x 1: R = hs, the hue shift in degrees.
+uniform sampler2D u_cmHue;
+const int NL = ${CAMERA_MATCH_L_STEPS};
+const int NC = ${CAMERA_MATCH_C_STEPS};
 const int NH = ${CAMERA_MATCH_H_SECTORS};
-const float L_ORIGIN = ${glslFloat(CAMERA_MATCH_L_ORIGIN)};
 const float L_PITCH = ${glslFloat(CAMERA_MATCH_L_PITCH)};
+const float C_PITCH = ${glslFloat(CAMERA_MATCH_C_PITCH)};
 const float H_ORIGIN = ${glslFloat(CAMERA_MATCH_H_ORIGIN)};
 const float H_PITCH = ${glslFloat(CAMERA_MATCH_H_PITCH)};
 // sRGB (D65) <-> XYZ and the Lab white, the pair every dE00 in this repo was
@@ -1613,19 +1625,32 @@ void main() {
   float h = C > 0.0 ? degrees(atan(b, a)) : 0.0;
   h -= 360.0 * floor(h / 360.0);
 
-  // The band tables: linear between centres, held at the ends (np.interp).
-  float t = clamp((L - L_ORIGIN) / L_PITCH, 0.0, float(NL - 1));
-  int i = min(int(floor(t)), NL - 2);
-  float ft = t - float(i);
-  float dL = mix(u_cmL[i], u_cmL[i + 1], ft);
-  float cr = mix(u_cmC[i], u_cmC[i + 1], ft);
+  // The (L*, C*) grid: bilinear between grid points and held at the edges —
+  // the fractional index is clamped to the grid, so a C* past the last column
+  // reads that column (camera-match.ts cameraMatchBilinear). Hand-written
+  // rather than a LINEAR sample, see the note above the shader.
+  float fl = clamp(L / L_PITCH, 0.0, float(NL - 1));
+  float fc = clamp(C / C_PITCH, 0.0, float(NC - 1));
+  int il = min(int(floor(fl)), NL - 2);
+  int ic = min(int(floor(fc)), NC - 2);
+  float tl = fl - float(il);
+  float tc = fc - float(ic);
+  vec2 g00 = texelFetch(u_cmGrid, ivec2(ic, il), 0).rg;
+  vec2 g01 = texelFetch(u_cmGrid, ivec2(ic + 1, il), 0).rg;
+  vec2 g10 = texelFetch(u_cmGrid, ivec2(ic, il + 1), 0).rg;
+  vec2 g11 = texelFetch(u_cmGrid, ivec2(ic + 1, il + 1), 0).rg;
+  vec2 g = mix(mix(g00, g01, tc), mix(g10, g11, tc), tl);
+  float dL = g.r;
+  float cr = g.g;
   // The sector table, periodic: the last sector runs into the first at 360.
   float th = (h - H_ORIGIN) / H_PITCH;
   th -= float(NH) * floor(th / float(NH));
   int j = min(int(floor(th)), NH - 1);
-  float hs = mix(u_cmH[j], u_cmH[(j + 1) % NH], th - float(j));
+  float hs = mix(texelFetch(u_cmHue, ivec2(j, 0), 0).r,
+                 texelFetch(u_cmHue, ivec2((j + 1) % NH, 0), 0).r, th - float(j));
 
-  // L' = L + dL(L); C' = C * cr(L), on the original L; h' = h + hs(h).
+  // L' = L + dL(L, C); C' = C * cr(L, C), both on the original L and C;
+  // h' = h + hs(h).
   float C2 = C * cr;
   float h2 = radians(h + hs);
   vec3 lab = vec3(L + dL, C2 * cos(h2), C2 * sin(h2));
@@ -1666,9 +1691,8 @@ export const SONY_POST_PROGRAMS = {
     fsSource: MARBLE_COMPOSE_SHADER,
     uniforms: ["u_scene", "u_blur", "u_protect", "u_strength", "u_amount"],
   },
-  // The arrays are registered by their bare name: that location addresses
-  // element 0, and uniform1fv from it fills the whole table.
-  cameraMatch: { fsSource: CAMERA_MATCH_SHADER, uniforms: ["u_scene", "u_cmL", "u_cmC", "u_cmH"] },
+  // The two tables are samplers (units 1 and 2, bound in runCameraMatch).
+  cameraMatch: { fsSource: CAMERA_MATCH_SHADER, uniforms: ["u_scene", "u_cmGrid", "u_cmHue"] },
 } as const;
 
 export type SonyPostProgramName = keyof typeof SONY_POST_PROGRAMS;

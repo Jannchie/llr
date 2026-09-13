@@ -2,39 +2,48 @@
  * Camera match: what the body's own JPEG does on top of the whole Sony chain,
  * as a small display-referred correction in CIELAB. The worker ships the
  * table fitted for this body and Creative Look (`profileCameraMatch`, from
- * sony/data/camera_match.json — 116 ARW + in-camera JPEG pairs of one
- * ILCE-7CM2); the shader (passes.ts CAMERA_MATCH_SHADER) runs it as the last
- * stage of the post chain, on the finished sRGB frame, which is exactly the
- * frame the fit measured against.
+ * sony/data/camera_match.json — ARW + in-camera JPEG pairs of one ILCE-7CM2);
+ * the shader (passes.ts CAMERA_MATCH_SHADER) runs it as the last stage of the
+ * post chain, on the finished sRGB frame, which is exactly the frame the fit
+ * measured against.
  *
  * The reference is sony_repro/tools/camera_match_fit.py `apply()`, and this
  * file is its tested mirror — the GLSL is a transcription of these functions,
  * and camera-match.spec.ts pins both to the numbers the worker's test
  * (tests/test_camera_match.py) regenerates from the reference itself:
  *
- *     L' = L + dL(L)      ten 10-L*-wide bands, centres 5, 15, ..., 95
- *     C' = C * cr(L)      the same bands, on the *original* L
- *     h' = h + hs(h)      twelve 30-degree sectors, centres 15, 45, ..., 345
+ *     L' = L + dL(L, C)   a 21 x 19 grid over L* 0..100 and C* 0..90, step 5
+ *     C' = C * cr(L, C)   the same grid, both sampled at the *original* L, C
+ *     h' = h + hs(h)      24 sectors of 15 degrees, centres 7.5, 22.5, ...
  *
- * with np.interp's rules: linear between centres, held at the end values on
- * the L* axis, periodic on the hue circle. sRGB <-> Lab is the D65 pair in
+ * with the reference's rules: bilinear inside the grid and held at its edges
+ * (a C* past 90 reads the last column), linear between sector centres and
+ * periodic on the hue circle (np.interp on the tiled axis). Two dimensions
+ * because the residual is not one number per lightness: near neutrals the
+ * chain sits more saturated than the camera, the saturated colours less, and
+ * a band over L* alone averaged the two. sRGB <-> Lab is the D65 pair in
  * docs/readme/tools/quant.py, the one every dE00 number in this repo was
  * measured with.
  */
 
-export const CAMERA_MATCH_L_BANDS = 10;
-export const CAMERA_MATCH_H_SECTORS = 12;
-/** Centre of band 0 and the band pitch, in L*. */
-export const CAMERA_MATCH_L_ORIGIN = 5;
-export const CAMERA_MATCH_L_PITCH = 10;
+/** Grid rows (L* axis) and columns (C* axis) of dL and cr; hue sectors of hs. */
+export const CAMERA_MATCH_L_STEPS = 21;
+export const CAMERA_MATCH_C_STEPS = 19;
+export const CAMERA_MATCH_H_SECTORS = 24;
+/** The grid pitch, in L* and C*: row i is L* = 5 i, column j is C* = 5 j. */
+export const CAMERA_MATCH_L_PITCH = 5;
+export const CAMERA_MATCH_C_PITCH = 5;
 /** Centre of sector 0 and the sector pitch, in degrees. */
-export const CAMERA_MATCH_H_ORIGIN = 15;
-export const CAMERA_MATCH_H_PITCH = 30;
+export const CAMERA_MATCH_H_ORIGIN = 7.5;
+export const CAMERA_MATCH_H_PITCH = 15;
 
-/** `profileCameraMatch` as the worker sends it (sony/profile.py camera_match_table). */
+/**
+ * `profileCameraMatch` as the worker sends it (sony/profile.py
+ * camera_match_table): `dL` and `cr` are [L* step][C* step], `hs` the sectors.
+ */
 export interface ProfileCameraMatch {
-  dL: number[];
-  cr: number[];
+  dL: number[][];
+  cr: number[][];
   hs: number[];
 }
 
@@ -42,22 +51,34 @@ export interface ProfileCameraMatch {
 export function parseCameraMatch(meta: unknown): ProfileCameraMatch | null {
   const m = meta as ProfileCameraMatch | null | undefined;
   if (!m || !Array.isArray(m.dL) || !Array.isArray(m.cr) || !Array.isArray(m.hs)) return null;
-  if (m.dL.length !== CAMERA_MATCH_L_BANDS || m.cr.length !== CAMERA_MATCH_L_BANDS
-    || m.hs.length !== CAMERA_MATCH_H_SECTORS) return null;
-  if (![...m.dL, ...m.cr, ...m.hs].every(Number.isFinite)) return null;
-  return { dL: [...m.dL], cr: [...m.cr], hs: [...m.hs] };
+  const grid = (g: unknown[]): number[][] | null => {
+    if (g.length !== CAMERA_MATCH_L_STEPS) return null;
+    const rows: number[][] = [];
+    for (const row of g) {
+      if (!Array.isArray(row) || row.length !== CAMERA_MATCH_C_STEPS || !row.every(Number.isFinite)) return null;
+      rows.push([...row]);
+    }
+    return rows;
+  };
+  const dL = grid(m.dL), cr = grid(m.cr);
+  if (!dL || !cr) return null;
+  if (m.hs.length !== CAMERA_MATCH_H_SECTORS || !m.hs.every(Number.isFinite)) return null;
+  return { dL, cr, hs: [...m.hs] };
 }
 
 /**
- * A band table at L* (GLSL mirror). Linear between band centres and held at
- * the two end values beyond them — np.interp's behaviour, which is what the
- * fit's apply() used.
+ * A grid table at (L*, C*) — GLSL mirror. Bilinear between grid points and
+ * held at the edges: the reference clamps the fractional index to the grid,
+ * so anything past the last row or column reads that row or column.
  */
-export function cameraMatchInterp(table: readonly number[], L: number): number {
-  const n = table.length;
-  const t = Math.min(Math.max((L - CAMERA_MATCH_L_ORIGIN) / CAMERA_MATCH_L_PITCH, 0), n - 1);
-  const i = Math.min(Math.floor(t), n - 2);
-  return table[i] + (table[i + 1] - table[i]) * (t - i);
+export function cameraMatchBilinear(table: readonly (readonly number[])[], L: number, C: number): number {
+  const nl = CAMERA_MATCH_L_STEPS, nc = CAMERA_MATCH_C_STEPS;
+  const fl = Math.min(Math.max(L / CAMERA_MATCH_L_PITCH, 0), nl - 1);
+  const fc = Math.min(Math.max(C / CAMERA_MATCH_C_PITCH, 0), nc - 1);
+  const il = Math.min(Math.floor(fl), nl - 2), ic = Math.min(Math.floor(fc), nc - 2);
+  const tl = fl - il, tc = fc - ic;
+  const r0 = table[il], r1 = table[il + 1];
+  return (1 - tl) * ((1 - tc) * r0[ic] + tc * r0[ic + 1]) + tl * ((1 - tc) * r1[ic] + tc * r1[ic + 1]);
 }
 
 /**
@@ -138,8 +159,8 @@ export function applyCameraMatchLab(lab: readonly number[], t: ProfileCameraMatc
   // atan2(0, 0) is 0 in numpy and undefined in GLSL; the hue of a neutral is
   // moot either way, because its chroma stays zero.
   const h = C > 0 ? (((Math.atan2(b, a) * 180) / Math.PI) % 360 + 360) % 360 : 0;
-  const L2 = L + cameraMatchInterp(t.dL, L);
-  const C2 = C * cameraMatchInterp(t.cr, L);
+  const L2 = L + cameraMatchBilinear(t.dL, L, C);
+  const C2 = C * cameraMatchBilinear(t.cr, L, C);
   const h2 = ((h + cameraMatchInterpHue(t.hs, h)) * Math.PI) / 180;
   return [L2, C2 * Math.cos(h2), C2 * Math.sin(h2)];
 }
@@ -147,4 +168,22 @@ export function applyCameraMatchLab(lab: readonly number[], t: ProfileCameraMatc
 /** The whole stage on one display pixel: sRGB -> Lab -> correction -> sRGB. */
 export function applyCameraMatch(rgb: readonly number[], t: ProfileCameraMatch): [number, number, number] {
   return labToSrgb(applyCameraMatchLab(srgbToLab(rgb), t));
+}
+
+/**
+ * The grid as the shader's texture: one texel per grid point, C* along x
+ * (19 wide) and L* along y (21 high), R = dL and G = cr, so a texelFetch at
+ * (j, i) is table[i][j]. Two channels in one texture because both surfaces are
+ * read at the same point.
+ */
+export function cameraMatchGridTexels(t: ProfileCameraMatch): Float32Array {
+  const out = new Float32Array(CAMERA_MATCH_L_STEPS * CAMERA_MATCH_C_STEPS * 2);
+  for (let i = 0; i < CAMERA_MATCH_L_STEPS; i++) {
+    for (let j = 0; j < CAMERA_MATCH_C_STEPS; j++) {
+      const k = (i * CAMERA_MATCH_C_STEPS + j) * 2;
+      out[k] = t.dL[i][j];
+      out[k + 1] = t.cr[i][j];
+    }
+  }
+  return out;
 }

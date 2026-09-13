@@ -11,7 +11,10 @@ import {
   MASK_BLUR_SHADER, MASK_DOWNSAMPLE_SHADER, MASK_VERTEX_SHADER, PASSES, VERTEX_SHADER,
 } from "./passes";
 import { type MarbleUniforms, type ProfileMarble, marbleUniforms } from "./sony-marble";
-import type { ProfileCameraMatch } from "./camera-match";
+import {
+  CAMERA_MATCH_C_STEPS, CAMERA_MATCH_H_SECTORS, CAMERA_MATCH_L_STEPS,
+  type ProfileCameraMatch, cameraMatchGridTexels,
+} from "./camera-match";
 import {
   SPICA_CODE_COUNT, SPICA_LUT, SPICA_TABLE_COUNT, SPICA_TAP_COUNT, SPICA_WEIGHTS,
 } from "./spica-tables";
@@ -580,6 +583,11 @@ export class PipelineRenderer {
   // stays put while the switch is off so flipping it back is a redraw.
   private sonyCameraMatch: ProfileCameraMatch | null = null;
   private sonyCameraMatchWanted = false;
+  // The table as the shader reads it (uploadCameraMatchTables): the dL/cr
+  // grid as one RG32F texture and the hue sectors as an R32F row. Textures
+  // rather than uniform arrays because the grid is 21 x 19 x 2 numbers.
+  private cameraMatchGridTex: WebGLTexture | null = null;
+  private cameraMatchHueTex: WebGLTexture | null = null;
   // Its four buffers, cached together under one size key as
   // [down, mean, blur, out]. One entry rather than four maps because they are
   // allocated and dropped as a unit, and stored as an array so evictOldest frees
@@ -942,10 +950,48 @@ export class PipelineRenderer {
     const marble = curve?.marble ?? null;
     const uniforms = marble ? marbleUniforms(marble, marble.slider) : null;
     this.sonyMarble = uniforms && uniforms.amount > 0 ? uniforms : null;
-    // The match's three tables are uniforms too, so a look change — which
-    // re-keys the table — is the same upload as everything else here.
+    // The match's tables are per-profile too, so a look change — which
+    // re-keys the table — re-uploads them along with everything else here.
     this.sonyCameraMatch = curve?.cameraMatch ?? null;
+    this.uploadCameraMatchTables();
     this.uploadSonyPostUniforms();
+  }
+
+  /**
+   * The camera-match tables as textures, rewritten whenever the profile lands
+   * (a few kilobytes, nothing per frame). Both are read with texelFetch and
+   * filtered NEAREST — R32F/RG32F under NEAREST need no extension, and the
+   * shader interpolates by hand, so a device without float-LINEAR support
+   * renders the same as one with it (see the note above CAMERA_MATCH_SHADER).
+   * With no table the textures are dropped; the stage is gated on the table
+   * (cameraMatchOn), so nothing ever samples them missing.
+   */
+  private uploadCameraMatchTables(): void {
+    const gl = this.gl;
+    const t = this.sonyCameraMatch;
+    if (!t) {
+      if (this.cameraMatchGridTex) gl.deleteTexture(this.cameraMatchGridTex);
+      if (this.cameraMatchHueTex) gl.deleteTexture(this.cameraMatchHueTex);
+      this.cameraMatchGridTex = this.cameraMatchHueTex = null;
+      return;
+    }
+    const write = (tex: WebGLTexture | null, w: number, h: number, internal: number, format: number,
+                   data: Float32Array): WebGLTexture | null => {
+      const out = tex ?? gl.createTexture();
+      if (!out) return null;
+      gl.bindTexture(gl.TEXTURE_2D, out);
+      gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, format, gl.FLOAT, data);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      return out;
+    };
+    // x = C* step, y = L* step, so texel (j, i) is dL[i][j] / cr[i][j].
+    this.cameraMatchGridTex = write(this.cameraMatchGridTex, CAMERA_MATCH_C_STEPS, CAMERA_MATCH_L_STEPS,
+                                    gl.RG32F, gl.RG, cameraMatchGridTexels(t));
+    this.cameraMatchHueTex = write(this.cameraMatchHueTex, CAMERA_MATCH_H_SECTORS, 1,
+                                   gl.R32F, gl.RED, Float32Array.from(t.hs));
   }
 
   /**
@@ -1151,7 +1197,11 @@ export class PipelineRenderer {
   }
 
   private cameraMatchOn(): boolean {
-    return this.sonyCameraMatchWanted && this.sonyCameraMatch !== null;
+    // The textures too: a table whose upload failed must not run the stage,
+    // because an unbound sampler reads zero and a chroma ratio of zero
+    // would strip every colour from the frame.
+    return this.sonyCameraMatchWanted && this.sonyCameraMatch !== null
+      && this.cameraMatchGridTex !== null && this.cameraMatchHueTex !== null;
   }
 
   /**
@@ -1741,12 +1791,20 @@ export class PipelineRenderer {
    * Camera match, the chain's last stage: the finished display-encoded frame
    * through the fitted CIELAB tables and back (passes.ts CAMERA_MATCH_SHADER,
    * reference in sony_repro/tools/camera_match_fit.py, mirror in
-   * camera-match.ts). The tables are per-profile uniforms, set in
-   * uploadSonyPostUniforms; nothing here varies per draw but the buffers.
+   * camera-match.ts). The tables are per-profile textures
+   * (uploadCameraMatchTables) on units 1 and 2; nothing here varies per draw
+   * but the buffers.
    */
   private runCameraMatch(src: WebGLTexture, dst: WebGLFramebuffer | null): void {
+    const gl = this.gl;
     const prog = this.sonyPostProgs.get("cameraMatch")!;
-    this.blitQuad(prog.prog, src, dst);
+    this.blitQuad(prog.prog, src, dst, () => {
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, this.cameraMatchGridTex);
+      gl.activeTexture(gl.TEXTURE2);
+      gl.bindTexture(gl.TEXTURE_2D, this.cameraMatchHueTex);
+      gl.activeTexture(gl.TEXTURE0);
+    });
   }
 
   /**
@@ -1876,15 +1934,13 @@ export class PipelineRenderer {
       gl.uniform1i(spica.u["u_weights"]!, 1);
       gl.uniform1i(spica.u["u_lut"]!, 2);
     }
-    // The match's three tables. Written only when there is a table: the stage
-    // is gated on cameraMatchOn, so a program built before a table arrived is
-    // never drawn with its zeros.
+    // The match's samplers, bound once: the tables are textures
+    // (uploadCameraMatchTables) that runCameraMatch puts on units 1 and 2.
     const match = this.sonyPostProgs.get("cameraMatch");
-    if (match && this.sonyCameraMatch) {
+    if (match) {
       gl.useProgram(match.prog);
-      gl.uniform1fv(match.u["u_cmL"]!, this.sonyCameraMatch.dL);
-      gl.uniform1fv(match.u["u_cmC"]!, this.sonyCameraMatch.cr);
-      gl.uniform1fv(match.u["u_cmH"]!, this.sonyCameraMatch.hs);
+      gl.uniform1i(match.u["u_cmGrid"]!, 1);
+      gl.uniform1i(match.u["u_cmHue"]!, 2);
     }
     const compose = this.sonyPostProgs.get("compose");
     if (!compose) return;
@@ -2229,6 +2285,8 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     if (this.maskProgBlur) gl.deleteProgram(this.maskProgBlur);
     if (this.quadVao0) gl.deleteVertexArray(this.quadVao0);
     this.releaseSonyPostTargets();
+    if (this.cameraMatchGridTex) gl.deleteTexture(this.cameraMatchGridTex);
+    if (this.cameraMatchHueTex) gl.deleteTexture(this.cameraMatchHueTex);
     for (const { prog } of this.sonyPostProgs.values()) gl.deleteProgram(prog);
     this.sonyPostProgs.clear();
     for (const buf of this.quadBuffers) gl.deleteBuffer(buf);
