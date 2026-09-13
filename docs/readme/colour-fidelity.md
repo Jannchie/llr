@@ -38,7 +38,7 @@ within 0.4 px.
 | Imaging Edge · advanced colour | 2.18 | 2.11 | 3.72 | 2.05 / -1.0° / -0.6 / +1.9 | 2.03 / +1.1° / -0.1 / +2.0 | 2.31 / +2.1 |
 | Imaging Edge · standard colour | 2.38 | 2.63 | 3.73 | 2.29 / -0.7° / -0.2 / +2.3 | 2.33 / +0.6° / +0.4 / +2.4 | 2.87 / +4.0 |
 | LLR · Sony, advanced colour | 2.33 | 2.14 | 4.57 | 1.73 / -0.9° / -1.2 / +1.4 | 2.51 / +1.2° / -0.2 / +2.6 | 2.21 / +2.1 |
-| LLR · defaults (standard + camera match) | 1.63 | 1.42 | 3.60 | 1.29 / -0.4° / -0.9 / +0.9 | 1.91 / -0.0° / -0.6 / +1.8 | 1.24 / +1.0 |
+| LLR · defaults (standard + camera match) | 1.40 | 1.26 | 3.13 | 1.23 / -0.5° / -1.0 / +0.0 | 1.48 / -0.0° / -0.8 / +1.0 | 0.98 / +0.3 |
 | LLR · Sony, standard colour | 1.73 | 1.72 | 2.98 | 1.10 / -0.5° / -1.1 / +0.0 | 1.22 / +0.8° / -0.6 / +0.4 | 2.39 / +3.2 |
 | Lightroom Classic · Camera FL | 2.92 | 2.76 | 5.29 | 2.47 / +0.3° / -5.9 / -0.9 | 3.62 / -4.6° / -4.5 / -2.3 | 3.22 / +4.1 |
 
@@ -49,7 +49,7 @@ within 0.4 px.
 | Imaging Edge · advanced colour | 1.82 | 1.85 | 3.00 | 1.32 / +0.5° / -0.3 / +1.2 | 1.93 / +1.7 | 2.14 / +2.2 |
 | Imaging Edge · standard colour | 2.03 | 2.24 | 3.06 | 1.60 / +0.3° / +0.2 / +1.7 | 2.48 / +3.0 | 2.51 / +3.3 |
 | LLR · Sony, advanced colour | 1.98 | 1.98 | 3.12 | 1.58 / +0.7° / -0.4 / +1.6 | 1.96 / +1.9 | 2.15 / +2.3 |
-| LLR · defaults (standard + camera match) | 1.20 | 1.12 | 2.27 | 0.99 / -0.2° / -0.6 / +0.7 | 1.32 / +0.9 | 1.12 / +1.1 |
+| LLR · defaults (standard + camera match) | 0.94 | 0.79 | 2.16 | 0.73 / -0.3° / -0.8 / -0.1 | 1.08 / +0.1 | 0.74 / +0.2 |
 | LLR · Sony, standard colour | 2.25 | 2.40 | 3.15 | 1.91 / +0.5° / +0.0 / +2.1 | 2.53 / +3.1 | 2.56 / +3.4 |
 | Lightroom Classic · Camera FL | 5.64 | 4.80 | 12.79 | 3.80 / -3.0° / -3.3 / +3.6 | 2.46 / +2.2 | 4.63 / +6.1 |
 
@@ -70,7 +70,7 @@ DRO-aware renders do not do.
 |---|---|---|---|---|---|---|
 | Imaging Edge · advanced colour | 1.66 | 1.60 | 3.09 | 2.06 / +1.8° / -0.0 / +1.7 | 0.98 / +0.9° / -0.6 / +0.2 | 1.36 / +0.3 |
 | LLR · Sony, advanced colour | 1.61 | 1.56 | 3.02 | 2.02 / +1.5° / -0.2 / +1.7 | 1.11 / +0.9° / -0.7 / +0.6 | 1.29 / +0.6 |
-| LLR · defaults (standard + camera match) | 0.89 | 0.84 | 1.66 | 0.88 / +0.1° / +0.1 / +0.7 | 0.91 / -0.2° / -1.1 / +0.1 | 0.93 / +0.3 |
+| LLR · defaults (standard + camera match) | 0.80 | 0.70 | 1.75 | 0.62 / -0.2° / -0.4 / -0.2 | 1.05 / -0.3° / -1.4 / -0.3 | 0.92 / -0.2 |
 | Lightroom · Camera FL | 6.86 | 6.64 | 14.33 | 9.29 / +12.5° / -7.7 / +6.6 | 6.41 / +9.7° / -1.1 / +5.4 | 5.73 / +5.5 |
 
 Saturated yellow is the hard case for a fitted profile: Lightroom turns the
@@ -153,14 +153,28 @@ again, as in Edit; what it loses on neutrals is what camera match is for.
 ### Camera match
 
 What is left between Edit's pipeline and the camera JPEG is nearly a fixed
-transform per Creative Look, and not one number per lightness: near-neutral
-pixels (C\* < 15) come out 3–10% more saturated than the camera (its chroma
-noise reduction is stronger), the saturated colours 1–3% less (IN up to 10%),
-and the midtones and highlights 1–3 L\* brighter. `sony_repro/tools/camera_match_fit.py`
-fits that from ARW+JPEG pairs as a smooth surface over (L\*, C\*) for the
-luma offset and the chroma gain plus a periodic hue table, per body and
-look; the web applies it as the last pass on the display-encoded frame,
-behind the *camera match* switch.
+transform per Creative Look and Fade state, and not one number per lightness:
+near-neutral pixels (C\* < 15) come out 3–10% more saturated than the camera
+(its chroma noise reduction is stronger), the saturated colours 1–3% less (IN
+up to 10%), and with Fade off the midtones 2.5 L\* brighter.
+`sony_repro/tools/camera_match_fit.py` fits that from ARW+JPEG pairs as a
+smooth surface over (L\*, C\*) for the luma offset and the chroma gain plus a
+periodic hue table, per body and look; the web applies it as the last pass on
+the display-encoded frame, behind the *camera match* switch.
+
+Fade is a key of its own because it moves the lightness residual more than
+any look does. Across the L-size frames of the sample, every shot with Fade 0
+(FL, PT, VV, VV2, ST) sits +2.2 to +3.3 L\* above its camera JPEG in the
+midtones, and every shot with any Fade at all (IN at 3, FL at 1, SH at 6 —
+1 does what 6 does) sits within ±0.5 of it. One table across both landed at
+−1.5 and left the Fade-0 majority a full L\* bright, which is what the eye
+read as "still brighter than the camera". The lightness surface is now
+fitted per look and Fade state (`FL`, `FL+fade`, pooled `*` / `*+fade`); the
+chroma and hue tables stay per look, fitted over both — Fade is a luma stage,
+and the few Fade frames of one look are too thin at high chroma to say
+otherwise. M-size frames stay out of the fit: their DRO still runs the
+global fallback, and their offsets spread from −4 to +8 L\* where L-size
+frames of one group sit within a unit.
 
 The switch also takes the engine's *advanced* luma pair (YGamma table and
 contrast) without the 3-D LUT. The standard table has no highlight
@@ -170,22 +184,28 @@ render already clipped. The advanced luma pair lands at 30k on that frame
 (Edit's own advanced export: 29k) and keeps the saturated colour the LUT
 would have cost. The surface is fitted on that render
 (`LLR_CAMERA_MATCH_IDENTITY=1` makes the worker send an identity table for
-the fitting exports). Held out 40% of 100 frames:
+the fitting exports). Held out 40% of the 67 L-size frames:
 
-| 40 held-out frames | before | after |
+| 26 held-out frames | before | after |
 |---|---|---|
-| whole frame ΔE00 mean / median | 1.91 / 1.72 | **1.76 / 1.63** |
-| saturated pixels (C\* > 40) ΔE00 | 1.92 | **1.69** |
-| saturated pixels ΔC\* | +0.82 | +0.31 |
-| bright saturated ΔE00 | 2.30 | **2.15** |
+| whole frame ΔE00 mean / median | 2.03 / 1.71 | **1.61 / 1.27** |
+| saturated pixels (C\* > 40) ΔE00 | 2.11 | **1.51** |
+| saturated pixels ΔC\* | +1.06 | +0.92 |
+| bright saturated ΔE00 | 2.47 | **1.73** |
+| midtone ΔL\* (L\* 30–80), mean / mean abs | +1.25 / 1.63 | **−0.24 / 0.66** |
+
+(The same frames through the previous one-table-per-look fit: 1.84 / 1.60,
+1.68, +0.92, 2.14, and a midtone ΔL\* of −0.78 / 1.39 — over-darkening the
+Fade frames by as much as it under-corrected the rest.)
 
 (Masks on the mean chroma of the two renders; masking on one side selects
 its noise and biases ΔC\* by ±0.5.) Two things the fit deliberately does not
 do: it ramps to identity over the last 8 L\* at black and at white, because
 a clipped highlight is 255 on both sides and a table that pulls white to
-L\* 96 leaves every white in the frame a grey 245; and a cell measured on
-fewer than 8 frames is left to the smoothing and the ridge, since the bright
-saturated corner is where a handful of frames produce medians like 0.5.
+L\* 96 leaves every white in the frame a grey 245; and a chroma cell
+measured on fewer than 8 frames is left to the smoothing and the ridge, since
+the bright saturated corner is where a handful of frames produce medians like
+0.5 (the lightness surface takes a cell on 4 — every frame has midtones).
 
 An earlier table indexed by lightness alone averaged the near-neutral excess
 with the saturated deficit and lowered chroma everywhere — the whole-frame
@@ -197,5 +217,6 @@ cannot build DRO's bilateral grid from LibRaw's planes and fall back to a
 global curve (~20% too bright against Edit on strong-DRO frames); the camera's
 own AWB keeps more warmth under tungsten than Edit does (R/G 1.1–1.2, not in
 the file as far as Edit knows either); DRO's manual levels (Lv5) render
-brighter than the camera; and the ~+2 L\* the camera sits below Edit on
-well-exposed frames.
+brighter than the camera; and the ~+2.5 L\* the camera sits below Edit with
+Fade off, which the table now carries but the pipeline does not explain.
+

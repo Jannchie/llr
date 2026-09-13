@@ -29,7 +29,7 @@ const table = (look: string): ProfileCameraMatch => {
   if (!t) throw new Error(`camera_match.json: no ${look} table`);
   return t;
 };
-const FL = table("FL"), POOLED = table("*"), IN = table("IN");
+const FL = table("FL"), POOLED = table("*"), FL_FADE = table("FL+fade");
 
 const LAB_POINTS = [
   [50.0, 20.0, 10.0],
@@ -42,14 +42,14 @@ const LAB_POINTS = [
   [50.0, 30.0, -3.0], // hue 354.3, past the last sector centre
 ];
 const FL_EXPECTED = [
-  [48.59419, 18.96270, 9.87999],
-  [11.56296, -29.27396, 25.03533],
-  [96.47422, 3.93267, -40.09106],
-  [2.88470, 0.48510, -0.18799],
-  [58.53046, -25.72384, -23.31064],
-  [83.61916, 41.06189, 58.85542],
-  [54.42310, 81.64728, 61.50325],
-  [48.61556, 29.20502, -2.32475],
+  [47.67279, 18.75364, 9.72516],
+  [11.23440, -29.08673, 24.94623],
+  [96.13714, 4.43324, -40.04275],
+  [2.88463, 0.48059, -0.18353],
+  [57.47476, -25.49222, -23.36832],
+  [82.12916, 40.99567, 58.50616],
+  [53.09560, 82.05247, 61.51336],
+  [47.70675, 28.99767, -2.21355],
 ];
 
 const close = (got: readonly number[], want: readonly number[], tol: number) => {
@@ -70,8 +70,8 @@ describe("applyCameraMatchLab", () => {
   });
 
   it("picks the table it is given, not always FL", () => {
-    close(applyCameraMatchLab(LAB_POINTS[0], POOLED), [48.31936, 19.06737, 9.57210], 1e-4);
-    close(applyCameraMatchLab(LAB_POINTS[0], IN), [49.53354, 18.86703, 9.19428], 1e-4);
+    close(applyCameraMatchLab(LAB_POINTS[0], POOLED), [47.65237, 19.01029, 9.51756], 1e-4);
+    close(applyCameraMatchLab(LAB_POINTS[0], FL_FADE), [50.08255, 18.75364, 9.72516], 1e-4);
   });
 
   it("leaves a neutral neutral", () => {

@@ -2,8 +2,8 @@
 the body's own JPEG (sony/profile.py camera_match_table, data/camera_match.json).
 
 Two things are pinned here. Which table a shot gets — by body first, then by
-look, with "*" the pooled fallback and no table at all for a body the fit never
-saw. And what the correction *does* to a Lab point, taken from the reference
+look and Fade state, with "*" / "*+fade" the pooled fallbacks and no table at
+all for a body the fit never saw. And what the correction *does* to a Lab point, taken from the reference
 implementation itself (sony_repro/tools/camera_match_fit.py apply()) so the
 browser's mirror (apps/web/src/rendering/__tests__/camera-match.spec.ts) can
 assert the same numbers against the same shipped table.
@@ -26,6 +26,7 @@ from llr_worker.sony.profile import (
     CAMERA_MATCH_H_SECTORS,
     CAMERA_MATCH_L_AXIS,
     CAMERA_MATCH_L_STEPS,
+    LookTweaks,
     calibration_for,
     camera_match_table,
     look_render_info,
@@ -57,19 +58,19 @@ LAB_POINTS = [
     [50.0, 30.0, -3.0],
 ]
 FL_EXPECTED = [
-    [48.59419, 18.96270, 9.87999],
-    [11.56296, -29.27396, 25.03533],
-    [96.47422, 3.93267, -40.09106],
-    [2.88470, 0.48510, -0.18799],
-    [58.53046, -25.72384, -23.31064],
-    [83.61916, 41.06189, 58.85542],
-    [54.42310, 81.64728, 61.50325],
-    [48.61556, 29.20502, -2.32475],
+    [47.67279, 18.75364, 9.72516],
+    [11.23440, -29.08673, 24.94623],
+    [96.13714, 4.43324, -40.04275],
+    [2.88463, 0.48059, -0.18353],
+    [57.47476, -25.49222, -23.36832],
+    [82.12916, 40.99567, 58.50616],
+    [53.09560, 82.05247, 61.51336],
+    [47.70675, 28.99767, -2.21355],
 ]
-# The first point through the pooled table and through IN, so a mirror that
-# picked the wrong table cannot pass by accident.
-POOLED_EXPECTED_FIRST = [48.31936, 19.06737, 9.57210]
-IN_EXPECTED_FIRST = [49.53354, 18.86703, 9.19428]
+# The first point through the pooled table and through FL with Fade on, so a
+# mirror that picked the wrong table cannot pass by accident.
+POOLED_EXPECTED_FIRST = [47.65237, 19.01029, 9.51756]
+FL_FADE_EXPECTED_FIRST = [50.08255, 18.75364, 9.72516]
 
 
 def test_the_shipped_table_is_the_fit_s_own_shape() -> None:
@@ -101,7 +102,25 @@ def test_a_fitted_look_gets_its_own_table_and_an_unknown_look_the_pooled_one() -
     # A look the fit had too few frames of falls to the pooled table.
     assert camera_match_table(BODY, "SE") == {k: data["*"][k] for k in ("dL", "cr", "hs")}
     assert camera_match_table(BODY, None) == camera_match_table(BODY, "SE")
-    assert camera_match_table(BODY, "FL") != camera_match_table(BODY, "IN")
+    assert camera_match_table(BODY, "FL") != camera_match_table(BODY, "PT")
+
+
+def test_fade_on_selects_the_look_s_fade_table_and_its_lightness_only() -> None:
+    data = json.loads(CAMERA_MATCH_DATA.read_text(encoding="utf-8"))[BODY]
+    fade = camera_match_table(BODY, "FL", fade=3)
+    assert fade == {k: data["FL+fade"][k] for k in ("dL", "cr", "hs")}
+    # Any non-zero Fade, on either scale, is "on"; 0 is the plain table.
+    assert camera_match_table(BODY, "FL", fade=1) == fade
+    assert camera_match_table(BODY, "FL", fade=0) == camera_match_table(BODY, "FL")
+    # Fade moves the lightness surface only: the chroma and hue tables are the
+    # look's, shared across both Fade states.
+    plain = camera_match_table(BODY, "FL")
+    assert fade["dL"] != plain["dL"]
+    assert fade["cr"] == plain["cr"] and fade["hs"] == plain["hs"]
+    # A look with no Fade table of its own falls to the pooled Fade table, not
+    # to its own Fade-0 one: Fade moves more than the look does.
+    assert camera_match_table(BODY, "PT", fade=2) == {k: data["*+fade"][k] for k in ("dL", "cr", "hs")}
+    assert camera_match_table(BODY, "SE", fade=2) == camera_match_table(BODY, "PT", fade=2)
 
 
 def test_an_unknown_body_gets_no_table_rather_than_another_body_s() -> None:
@@ -132,7 +151,7 @@ def test_the_pinned_lab_numbers_are_the_reference_implementation_s() -> None:
     got = apply(pts, camera_match_table(BODY, "FL"))[0]
     assert np.allclose(got, FL_EXPECTED, atol=1e-4)
     assert np.allclose(apply(pts, camera_match_table(BODY, "SE"))[0][0], POOLED_EXPECTED_FIRST, atol=1e-4)
-    assert np.allclose(apply(pts, camera_match_table(BODY, "IN"))[0][0], IN_EXPECTED_FIRST, atol=1e-4)
+    assert np.allclose(apply(pts, camera_match_table(BODY, "FL", fade=1))[0][0], FL_FADE_EXPECTED_FIRST, atol=1e-4)
 
 
 @requires_sample
@@ -142,6 +161,11 @@ def test_the_profile_carries_the_table_for_its_body_and_look() -> None:
     with_body = look_render_info(cal, "FL", body=BODY).to_json()
     assert with_body["cameraBody"] == BODY
     assert with_body["profileCameraMatch"] == camera_match_table(BODY, "FL")
+    # The profile's own Fade picks the Fade table — a rebuild for a moved
+    # slider re-keys it the same way, since to_json reads the tweaks it holds.
+    faded = look_render_info(cal, "FL", LookTweaks(fade=2), body=BODY).to_json()
+    assert faded["profileCameraMatch"] == camera_match_table(BODY, "FL", fade=2)
+    assert faded["profileCameraMatch"] != with_body["profileCameraMatch"]
     # No exif, no body, no table — never a default one.
     without = look_render_info(cal, "FL").to_json()
     assert without["cameraBody"] is None

@@ -370,7 +370,7 @@ class SonyRenderInfo:
             # when no table was fitted for this body — the switch then has
             # nothing to do and the panel hides it. Re-derived here on every
             # rebuild because it is per-look, like the YGamma table.
-            "profileCameraMatch": camera_match_table(self.body, self.style),
+            "profileCameraMatch": camera_match_table(self.body, self.style, self.tweaks.fade),
             # The Saturation slider. The gains above are already divided by it;
             # this is the factor the shader multiplies back after the clamp,
             # which is where the setting's whole visible effect comes from.
@@ -647,10 +647,19 @@ def sepia_toning(style: str) -> dict[str, Any] | None:
 # The hue shift `hs` is 24 sectors of 15 degrees (centres 7.5, 22.5, ...),
 # linear between centres and periodic. Keyed by the exif Model first — a
 # table fitted on one body says nothing about another, so an unknown body
-# gets no table at all rather than the nearest one — then by look, with "*"
-# the pooled table for a look the fit had too few frames of.
+# gets no table at all rather than the nearest one — then by look and the
+# Fade state ("FL", "FL+fade"), with "*" / "*+fade" the pooled tables for a
+# look the fit had too few frames of.
+#
+# Fade is a key because it moves the lightness residual more than any look
+# does: with Fade off the camera's mid-tones sit ~2.5 L* below this chain's,
+# with any Fade at all (1 does what 6 does) they sit on them. One table across
+# both landed between and left every Fade-0 frame a full L* brighter than its
+# JPEG. The chroma and hue tables are per look only — the fitter shares them
+# across the two Fade states, because Fade is a luma stage.
 CAMERA_MATCH_DATA = _DATA / "camera_match.json"
 CAMERA_MATCH_POOLED = "*"
+CAMERA_MATCH_FADE = "+fade"
 # The grid the shader's step sizes are built for (camera-match.ts). The json
 # carries its own axes (lAxis/cAxis/hAxis) and the loader checks they are
 # these, so a refit at another density fails loudly instead of being sampled
@@ -676,13 +685,17 @@ def _camera_match_tables() -> dict[str, dict[str, Any]]:
     return data
 
 
-def camera_match_table(body: str | None, style: str | None) -> dict[str, list[Any]] | None:
-    """The fitted correction for this body and look in wire form, or None.
+def camera_match_table(body: str | None, style: str | None, fade: int = 0) -> dict[str, list[Any]] | None:
+    """The fitted correction for this body, look and Fade state in wire form, or None.
 
     None both for a body the fit never saw and for a profile built without
     exif: either way there is nothing honest to apply, and the frontend hides
     the switch. A look the fit has no table of its own for takes the pooled
-    one — that is what "*" is, the fit over every frame of the body.
+    one for the same Fade state — Fade moves the residual more than the look
+    does — and failing that "*", the fit over every Fade-0 frame of the body.
+
+    `fade` is the effective setting (the shot's, or the slider's on a rebuild),
+    on either scale: only whether it is zero matters.
 
     `dL` and `cr` are [L* step][C* step] (21 rows of 19), `hs` the 24 sectors;
     the axes are the constants above, which the frontend has its own copy of.
@@ -692,7 +705,9 @@ def camera_match_table(body: str | None, style: str | None) -> dict[str, list[An
     looks = _camera_match_tables().get(body.strip())
     if not looks:
         return None
-    table = looks.get(style or "") or looks.get(CAMERA_MATCH_POOLED)
+    suffix = CAMERA_MATCH_FADE if fade else ""
+    table = (looks.get((style or "") + suffix) or looks.get(CAMERA_MATCH_POOLED + suffix)
+             or looks.get(CAMERA_MATCH_POOLED))
     if not isinstance(table, dict):
         return None
     if os.environ.get("LLR_CAMERA_MATCH_IDENTITY"):

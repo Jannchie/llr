@@ -63,13 +63,31 @@ H_AXIS = np.arange(7.5, 360, 15.0)
 L_BINS = np.arange(0, 101, 10.0)
 C_BINS = np.array([0, 5, 10, 15, 22, 30, 40, 50, 60, 75, 90, 200.0])
 MIN_FRAMES = 6
+POOLED = "*"
+FADE_SUFFIX = "+fade"
+# M-size (3584 x 2560) frames stay out of the fit: their DRO is still the
+# engine's global fallback rather than the body's grid (PIPELINE.md), so what
+# separates them from their camera JPEG is that, not the camera's finishing,
+# and their frame offsets spread from -4 to +8 L* where L-size frames of one
+# group sit within a unit of each other.
+M_SIZE_MAX_WIDTH = 4000
 MIN_BAND_FRAMES = 8
+# The lightness surface can take a cell on fewer frames: every frame has
+# mid-tones at low chroma, and a cell's lightness median is steady on four of
+# them where its chroma ratio in the bright saturated corner is not on eight.
+# It also lets a look of six frames -- a Fade state of one look -- contribute
+# its own mid-tones instead of only a shrunk copy of the pooled table.
+MIN_BAND_FRAMES_L = 4
 MIN_PIXELS = 200
 SHRINK = 6.0
 LIMITS = {"dL": 4.0, "cr": (0.85, 1.15), "hs": 4.0}
 SMOOTH = 4.0       # second-difference penalty, in units of the data weight
 END_RAMP = 8.0     # L* over which the correction fades to identity at black and white
 RIDGE = 0.05       # pull toward identity per cell, relative to one measured cell
+
+
+def is_m_size(meta) -> bool:
+    return max(int(v) for v in str(meta["ImageSize"]).replace("x", " ").split()) < M_SIZE_MAX_WIDTH
 
 
 def load(d: Path, name: str, suffix: str):
@@ -161,9 +179,9 @@ def fit(S, pooled=None):
         rows = np.array([s[idx] for s in S], float)
         return np.nanmedian(rows, 0), np.sum(~np.isnan(rows), 0)
     out = {}
-    for k, idx, neutral in (("dL", 0, 0.0), ("cr", 1, 1.0)):
+    for k, idx, neutral, min_frames in (("dL", 0, 0.0, MIN_BAND_FRAMES_L), ("cr", 1, 1.0, MIN_BAND_FRAMES)):
         med, count = agg(idx)
-        v = smooth_surface(med, count, neutral)
+        v = smooth_surface(med, count, neutral, min_frames)
         if pooled is not None:
             base = np.asarray(pooled[k], float); w = len(S) / (len(S) + SHRINK)
             v = base + (v - base) * w
@@ -218,17 +236,60 @@ def apply(llr, model):
 
 
 def tables(data, names, R):
-    pooled = fit([data[n][2] for n in names])
-    out = {"*": pooled}
-    for st in sorted(set(STYLE[int(R[n]["meta"]["CreativeStyle"])] for n in names)):
-        ns = [n for n in names if STYLE[int(R[n]["meta"]["CreativeStyle"])] == st]
+    """One table per group key. The lightness surface is fitted per group --
+    the look and its Fade state -- because Fade is what moves it. The chroma
+    and hue tables are fitted per look over both Fade states: Fade is a luma
+    stage, the chroma residual does not follow it, and a Fade-state's few
+    frames of one look are too thin at high chroma to say otherwise (the
+    IN+fade held-out frames came back over-saturated when they did)."""
+    by_look = {POOLED: fit([data[n][2] for n in names])}
+    looks = [group_key(R[n]["meta"]).removesuffix(FADE_SUFFIX) for n in names]
+    for look in sorted(set(looks)):
+        ns = [n for n, k in zip(names, looks) if k == look]
         if len(ns) >= MIN_FRAMES:
-            out[st] = fit([data[n][2] for n in ns], pooled)
+            by_look[look] = fit([data[n][2] for n in ns], by_look[POOLED])
+    out = {}
+    keys = [group_key(R[n]["meta"]) for n in names]
+    for fade in ("", FADE_SUFFIX):
+        ns = [n for n, k in zip(names, keys) if k.endswith(FADE_SUFFIX) == bool(fade)]
+        if not ns:
+            continue
+        # The pooled table for this Fade state, which the looks shrink toward.
+        pooled = fit([data[n][2] for n in ns])
+        out[POOLED + fade] = pooled
+        for key in sorted(set(k for n, k in zip(names, keys) if n in set(ns))):
+            ns_k = [n for n, k in zip(names, keys) if k == key]
+            if len(ns_k) >= MIN_FRAMES:
+                out[key] = fit([data[n][2] for n in ns_k], pooled)
+    for key, t in out.items():
+        chroma = by_look.get(key.removesuffix(FADE_SUFFIX), by_look[POOLED])
+        t["cr"], t["hs"] = chroma["cr"], chroma["hs"]
+    if POOLED not in out:
+        out[POOLED] = {**by_look[POOLED], "dL": out[POOLED + FADE_SUFFIX]["dL"]}
     return out
 
 
+def group_key(meta) -> str:
+    """Which table a frame is fitted into and applied with: the look, and
+    whether the shot's Fade is on. Fade splits the frames in two: with it off
+    the camera's mid-tones sit ~2.5 L* below the engine's, with it on (any
+    amount -- 1 does the same as 6) they sit on them. A table fitted across
+    both lands between and leaves each half a full L* off in opposite
+    directions, which on the Fade-0 majority reads as a frame still brighter
+    than the camera's."""
+    return STYLE[int(meta["CreativeStyle"])] + (FADE_SUFFIX if int(float(meta.get("Fade", 0))) else "")
+
+
+def pick(tables, key):
+    """The table for a group key: the look's own, else the pooled one for the
+    same Fade state -- Fade moves more than any look does -- else the pooled."""
+    fade = key.endswith(FADE_SUFFIX)
+    return tables.get(key) or tables.get(POOLED + FADE_SUFFIX if fade else POOLED) or tables[POOLED]
+
+
 def evaluate(cam, llr):
-    """Whole-frame dE00 mean, saturated-pixel dE00 mean and dC*, bright saturated dE00.
+    """Whole-frame dE00 mean, saturated-pixel dE00 mean and dC*, bright saturated dE00,
+    and the mid-tone (L* 30-80) lightness offset llr - cam.
 
     The saturated / bright masks are taken on the mean of the two renders, not
     on the camera alone: selecting on one side's chroma keeps the pixels whose
@@ -240,8 +301,10 @@ def evaluate(cam, llr):
     Cm, Lm = (C + Cr) / 2, (cam[..., 0] + llr[..., 0]) / 2
     sat = Cm > 40; bright = sat & (Lm > 60)
     dc = Cr - C
+    mid = (Lm > 30) & (Lm < 80)
     return (d.mean(), d[sat].mean() if sat.sum() > 200 else np.nan, dc[sat].mean() if sat.sum() > 200 else np.nan,
-            d[bright].mean() if bright.sum() > 200 else np.nan)
+            d[bright].mean() if bright.sum() > 200 else np.nan,
+            np.median((llr[..., 0] - cam[..., 0])[mid]) if mid.sum() > 200 else np.nan)
 
 
 def main() -> int:
@@ -252,7 +315,7 @@ def main() -> int:
     R = json.load(open(d / "residuals.json"))
     names = sorted(n for n, v in R.items() if "meta" in v and int(float(v["meta"]["ISO"])) < 65535
                    and str(v["meta"]["DynamicRangeOptimizer"]) != "20" and 0.05 < v["dE_mean"] < 8
-                   and (d / f"{n}.{suffix}.jpg").exists())
+                   and (d / f"{n}.{suffix}.jpg").exists() and not is_m_size(v["meta"]))
     body = subprocess.run(["exiftool", "-fast", "-s", "-s", "-s", "-Model", str(d / f"{names[0]}.ARW")], capture_output=True, text=True).stdout.strip()
     data = {}
     for n in names:
@@ -264,17 +327,21 @@ def main() -> int:
         t = tables(data, train, R)
         rows = []
         for n in test:
-            cam, llr, _ = data[n]; st = STYLE[int(R[n]["meta"]["CreativeStyle"])]
-            rows.append(evaluate(cam, llr) + evaluate(cam, apply(llr, t.get(st, t["*"]))))
-        rows = np.array(rows)
+            cam, llr, _ = data[n]
+            rows.append(evaluate(cam, llr) + evaluate(cam, apply(llr, pick(t, group_key(R[n]["meta"])))))
+        rows = np.array(rows); k = len(rows[0]) // 2
         print(f"held-out {len(test)} frames, before -> after:")
-        print(f"  whole frame dE00 mean      {rows[:, 0].mean():.2f} -> {rows[:, 4].mean():.2f}   median {np.median(rows[:, 0]):.2f} -> {np.median(rows[:, 4]):.2f}")
-        print(f"  saturated (C*>40) dE00     {np.nanmean(rows[:, 1]):.2f} -> {np.nanmean(rows[:, 5]):.2f}   dC* {np.nanmean(rows[:, 2]):+.2f} -> {np.nanmean(rows[:, 6]):+.2f}")
-        print(f"  bright saturated dE00      {np.nanmean(rows[:, 3]):.2f} -> {np.nanmean(rows[:, 7]):.2f}")
+        print(f"  whole frame dE00 mean      {rows[:, 0].mean():.2f} -> {rows[:, k].mean():.2f}   median {np.median(rows[:, 0]):.2f} -> {np.median(rows[:, k]):.2f}")
+        print(f"  saturated (C*>40) dE00     {np.nanmean(rows[:, 1]):.2f} -> {np.nanmean(rows[:, k + 1]):.2f}   dC* {np.nanmean(rows[:, 2]):+.2f} -> {np.nanmean(rows[:, k + 2]):+.2f}")
+        print(f"  bright saturated dE00      {np.nanmean(rows[:, 3]):.2f} -> {np.nanmean(rows[:, k + 3]):.2f}")
+        # The number the eye reads as "brighter than the camera": the frame's
+        # mid-tone offset. Its mean says which way the sample leans, its mean
+        # absolute value how far a typical frame still is from its camera JPEG.
+        print(f"  mid-tone dL* llr-cam       mean {np.nanmean(rows[:, 4]):+.2f} -> {np.nanmean(rows[:, k + 4]):+.2f}   mean |dL*| {np.nanmean(np.abs(rows[:, 4])):.2f} -> {np.nanmean(np.abs(rows[:, k + 4])):.2f}")
     t = tables(data, names, R)
-    for st, m in t.items():
+    for st, m in sorted(t.items()):
         cr = np.asarray(m["cr"]); dL = np.asarray(m["dL"])
-        print(f"  {st:4s} n={m['frames']:3d}  chroma gain at L*50: C*10 {cr[10, 2]:.3f} C*30 {cr[10, 6]:.3f} C*60 {cr[10, 12]:.3f} C*90 {cr[10, 18]:.3f} | at L*75: C*60 {cr[15, 12]:.3f}"
+        print(f"  {st:8s} n={m['frames']:3d}  chroma gain at L*50: C*10 {cr[10, 2]:.3f} C*30 {cr[10, 6]:.3f} C*60 {cr[10, 12]:.3f} C*90 {cr[10, 18]:.3f} | at L*75: C*60 {cr[15, 12]:.3f}"
               f" | dL at C*10: L*30 {dL[6, 2]:+.1f} L*60 {dL[12, 2]:+.1f} L*85 {dL[17, 2]:+.1f} | hue {min(m['hs']):+.1f}..{max(m['hs']):+.1f}")
     existing = json.load(open(out)) if out.exists() else {}
     existing[body] = {"lAxis": L_AXIS.tolist(), "cAxis": C_AXIS.tolist(), "hAxis": H_AXIS.tolist(), **t}

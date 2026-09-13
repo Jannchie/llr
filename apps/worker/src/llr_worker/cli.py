@@ -625,7 +625,8 @@ def _stamp_look_choices(profile: dict[str, Any], input_path: Path) -> dict[str, 
     if not profile.get("cameraBody"):
         profile["cameraBody"] = camera_body_from_exif(read_exiftool_metadata(input_path))
     profile.setdefault("profileCameraMatch",
-                       camera_match_table(profile["cameraBody"], profile.get("creativeLook")))
+                       camera_match_table(profile["cameraBody"], profile.get("creativeLook"),
+                                          LookTweaks.from_json(profile.get("lookTweaks")).fade))
     return profile
 
 
