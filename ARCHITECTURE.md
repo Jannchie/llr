@@ -36,12 +36,17 @@ the record, and the code carries the measured accuracy in its docstrings.
 
 Its parts split by what they cost. The matrix is the only half that touches
 pixels, and all ten Creative Looks share one, so switching looks — or moving any
-of the five tweaks, or DRO — needs no decode: `look-profile` returns a rebuilt
-profile and the shader re-applies it to pixels the browser already holds. DRO
-rides that same route because it is one scalar gain per pixel, and a scalar
-commutes with the matrix. What travels with the profile is a gain table plus the
-engine's 8×6×14 bilateral grid, which the shader interpolates to recover the
-local log mean the gain is indexed by.
+of the nine tweaks, or DRO — needs no decode: the profile is rebuilt and the
+shader re-applies it to pixels the browser already holds. Switching looks is a
+`look-profile` request (another look is another calibration to read); the
+tweaks and the DRO strength are rebuilt in the browser itself
+(`rendering/sony-look.ts`, a transcription of the worker's construction over
+the `lookCalibration` block every profile carries, pinned to the worker's
+numbers by `tests/test_look_rebuild.py`'s fixture), so a drag redraws one frame
+behind the finger. DRO rides that same route because it is one scalar gain per
+pixel, and a scalar commutes with the matrix. What travels with the profile is
+a gain table plus the engine's 8×6×14 bilateral grid, which the shader
+interpolates to recover the local log mean the gain is indexed by.
 
 Layered LRU caches make slider-driven re-requests cheap: camera-RGB per
 (source, size, denoise) → re-applying a DCP skips the RAW decode; final linear

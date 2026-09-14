@@ -11,6 +11,7 @@ import {
   MASK_BLUR_SHADER, MASK_DOWNSAMPLE_SHADER, MASK_VERTEX_SHADER, PASSES, VERTEX_SHADER,
 } from "./passes";
 import { type MarbleUniforms, type ProfileMarble, marbleUniforms } from "./sony-marble";
+import { StaticAsset } from "./static-asset";
 import {
   CAMERA_MATCH_C_STEPS, CAMERA_MATCH_H_SECTORS, CAMERA_MATCH_L_STEPS,
   type ProfileCameraMatch, cameraMatchGridTexels,
@@ -365,46 +366,18 @@ const SONY_LUMA_LUT_ADV_UNIT = 12;
 // switch inert rather than render something wrong.
 const SONY_LUT3D_N = 33;
 const SONY_LUT3D_LEN = SONY_LUT3D_N * SONY_LUT3D_N * SONY_LUT3D_N * 3;
-const SONY_LUT3D_URL = "sony-lut3d.bin";
-
-// The asset, fetched at most once per page and shared by every renderer — the
-// preview's and the off-screen one each export builds. null once a fetch has
-// failed, which is what makes the switch inert with a single warning rather
-// than one per redraw.
-let sonyLut3dData: Int16Array | null = null;
-let sonyLut3dPending: Promise<Int16Array | null> | null = null;
-
 /**
  * Sony's static 3-D LUT: 33x33x33 int16 triples, little-endian, in [iu][iv][iy]
  * order with the Y axis fastest (sony_repro/tools/make_lut3d_asset.py writes it
  * from the worker's own table, and passes.ts sonyLut3dPoint documents the fetch
- * coordinate that layout implies).
- *
- * The table is static — one dump out of the engine reproduces two bodies, two
- * frames and all eleven Creative Looks bit-exactly — so it is an asset rather
- * than something the decode carries, and one fetch serves the whole session.
+ * coordinate that layout implies). One dump out of the engine reproduces two
+ * bodies, two frames and all eleven Creative Looks bit-exactly, so it is an
+ * asset rather than something the decode carries.
  */
-export function loadSonyLut3d(): Promise<Int16Array | null> {
-  if (sonyLut3dData) return Promise.resolve(sonyLut3dData);
-  sonyLut3dPending ??= fetch(`${import.meta.env.BASE_URL}${SONY_LUT3D_URL}`)
-    .then(async (res) => {
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const buf = await res.arrayBuffer();
-      const data = new Int16Array(buf);
-      if (data.length !== SONY_LUT3D_LEN) {
-        throw new Error(`expected ${SONY_LUT3D_LEN} int16, got ${data.length}`);
-      }
-      sonyLut3dData = data;
-      return data;
-    })
-    .catch((err: unknown) => {
-      // One line, once: the stage is optional, and a page that cannot fetch it
-      // should keep rendering everything else rather than log per frame.
-      console.warn("[llr] Sony advanced colour reproduction unavailable:", err);
-      return null;
-    });
-  return sonyLut3dPending;
-}
+const SONY_LUT3D = new StaticAsset<Int16Array>("sony-lut3d.bin",
+  (buf) => (buf.byteLength === SONY_LUT3D_LEN * 2 ? new Int16Array(buf) : null),
+  "Sony advanced colour reproduction");
+export const loadSonyLut3d = (): Promise<Int16Array | null> => SONY_LUT3D.load();
 
 /**
  * base64 IEEE half floats -> the Uint16Array texImage3D takes for HALF_FLOAT.
@@ -495,6 +468,9 @@ export class PipelineRenderer {
   // a redraw; the shader picks between them on u_sonyLut3dActive.
   private sonyLumaLutAdvTex: WebGLTexture | null = null;
   private sonyLumaLutAdvActive = false;
+  // The arrays the two textures were last filled from (uploadSonyLumaLUT).
+  private sonyLumaLutLast: number[] | null = null;
+  private sonyLumaLutAdvLast: number[] | null = null;
   // Sony's 3-D LUT (ZcTask3DLut, "advanced colour reproduction"). A user switch
   // and a render-time one: the table is static, so turning it on costs a redraw
   // and never a re-decode. `wanted` is what the user asked for and `Tex` is
@@ -943,6 +919,10 @@ export class PipelineRenderer {
     this.profileCurveSrgb = curve?.srgbBasis ?? false;
     this.profileChroma = curve?.chroma ?? null;
     this.uploadSepiaLUT(curve?.chroma?.sepia ?? null);
+    // A Creative Look rebuild in the browser (sony-look.ts) carries these two
+    // tables forward by reference — they are the look's, not the tweak's —
+    // so a drag at 100 Hz would otherwise re-upload 128 KB of unchanged
+    // texture per event. Same array, same texture: skip.
     this.uploadSonyLumaLUT(curve?.chroma?.lumaLut ?? null, false);
     this.uploadSonyLumaLUT(curve?.chroma?.lumaLutAdvanced ?? null, true);
     this.uploadDroLUT(curve?.dro ?? null);
@@ -1155,6 +1135,10 @@ export class PipelineRenderer {
     if (advanced) this.sonyLumaLutAdvActive = active;
     else this.sonyLumaLutActive = active;
     if (!active || !lut) return;
+    const last = advanced ? this.sonyLumaLutAdvLast : this.sonyLumaLutLast;
+    if (lut === last) return;
+    if (advanced) this.sonyLumaLutAdvLast = lut;
+    else this.sonyLumaLutLast = lut;
     const data = new Float32Array(SONY_LUMA_LUT_SIZE);
     for (let i = 0; i < SONY_LUMA_LUT_SIZE; i++) data[i] = lut[i]!;
     let tex = advanced ? this.sonyLumaLutAdvTex : this.sonyLumaLutTex;
@@ -2282,6 +2266,7 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     this.sonyLumaLutTex = null;
     if (this.sonyLumaLutAdvTex) gl.deleteTexture(this.sonyLumaLutAdvTex);
     this.sonyLumaLutAdvTex = null;
+    this.sonyLumaLutLast = this.sonyLumaLutAdvLast = null;
     if (this.sonyLut3dTex) gl.deleteTexture(this.sonyLut3dTex);
     this.sonyLut3dTex = null;
     // The GL object is gone but the fetched bytes are not — they are shared and

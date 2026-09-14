@@ -324,6 +324,13 @@ class SonyRenderInfo:
     # must not be handed to another. None when no exif was read, which means
     # no table and the stage off.
     body: str | None = None
+    # The tweak-free half of this look, in wire form (look_calibration_block):
+    # what the browser needs to rebuild everything above for a moved slider
+    # without asking — the factory curve the tone tweaks reshape, the Fade
+    # tables, the undivided chroma gains, the unscaled DRO tables and both
+    # Fade states' camera-match tables. The engine's construction it runs on
+    # them is mirrored in apps/web/src/rendering/sony-look.ts.
+    calibration: dict[str, Any] | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -435,6 +442,10 @@ class SonyRenderInfo:
             # measured against the stage's real input plane (sony/dro.py);
             # still sent so an older page keeps its own fallback rule.
             "droGridLumaWhite": DRO_GRID_LUMA_WHITE,
+            # Everything the browser needs to redo this rebuild itself for a
+            # moved tweak or DRO strength (sony-look.ts rebuildLookProfile).
+            # Per look, so it arrives again with every look switch.
+            "lookCalibration": self.calibration,
         }
 
 
@@ -840,6 +851,10 @@ def look_render_info(
     # not passing anything to a shader, does both halves itself and so takes the
     # look's own gains — do not feed it these.
     sat = saturation_factor(tweaks.saturation)
+    # 饱和度 -100 is a factor of 0: the shader's multiply-back zeroes the
+    # chroma whatever the divided gains say, so the gains go out undivided
+    # rather than through a division by zero.
+    gain_wire = [float(x) / sat if sat > 0.0 else float(x) for x in gain]
     luma_black, luma_scale = luma_levels(tweaks.black, tweaks.white)
     # As-shot is 1.0 exactly when the body applied DRO. A frame it rendered
     # without DRO still ships the table, so the control has something to scale,
@@ -874,7 +889,7 @@ def look_render_info(
         tone_curve=tone_curve_points(cal, tweaks.highlights, tweaks.shadows,
                                      tweaks.contrast),
         chroma_cross=[float(x) for x in cross],
-        chroma_gain=[float(x) / sat for x in gain],
+        chroma_gain=gain_wire,
         chroma_saturation=sat,
         chroma_hue=hue_degrees(tweaks.hue),
         sepia=sepia_toning(style),
@@ -920,7 +935,43 @@ def look_render_info(
         # on a Sony RAW, since it needs one for its calibration. Auto is the part
         # that still depends on the file, and dro_gain is what reports on that.
         dro_available=True,
+        calibration=look_calibration_block(cal, style, body, gain, dro=dro, dro_gain=dro_gain),
     )
+
+
+def look_calibration_block(
+    cal: LookCalibration, style: str, body: str | None, chroma_gain: np.ndarray,
+    dro: bool = False, dro_gain: list[float] | None = None,
+) -> dict[str, Any]:
+    """The tweak-independent inputs of look_render_info, in wire form.
+
+    With these the browser can rebuild a profile for a moved slider without a
+    round trip: the factory curve's control points (tone.base_curve), the ten
+    Fade entries (chroma.luma_terms), the chroma gains before Saturation
+    divides them, the DRO tables at unit strength (scale_dro_gain is a power,
+    so the browser can apply the strength itself) and both Fade states'
+    camera-match tables. Only what a tweak or the strength can reach is here;
+    the YGamma tables, ChromaSuppres and the rest ride on the profile
+    unchanged and the browser keeps them.
+
+    The construction that turns these into a profile is the engine's, mirrored
+    in apps/web/src/rendering/sony-look.ts and pinned to this module's own
+    output by tests/test_look_rebuild.py's fixture.
+    """
+    return {
+        "curveX": [int(v) for v in cal.curve_x],
+        "curveY": [int(v) for v in cal.curve_y],
+        "lumaPivot": [int(v) for v in cal.luma_pivot],
+        "lumaContrast": [int(v) for v in cal.luma_contrast],
+        "chromaGain": [float(x) for x in chroma_gain],
+        "droGainAsShot": None if dro_gain is None else [float(g) for g in dro_gain],
+        # Auto on a body that used DRO but wrote no curve renders the engine's
+        # level-5 preset; only then is there something to scale.
+        "droGainNoCurve": (dro_level_gain_table(DRO_LEVEL_NO_CURVE)
+                           if dro and dro_gain is None else None),
+        "cameraMatch": camera_match_table(body, style, 0),
+        "cameraMatchFade": camera_match_table(body, style, 1),
+    }
 
 
 def apply_sony_profile(

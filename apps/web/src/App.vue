@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 import { PipelineRenderer, parseDcpTables, type EditParams, type ProfileCurve, type ViewWindow } from "./rendering/pipeline-renderer";
 import { sonyChromaNrSlider } from "./rendering/sony-denoise";
 import { parseCameraMatch } from "./rendering/camera-match";
+import { loadToneFamily, rebuildLookProfile, toneFamilyLoaded } from "./rendering/sony-look";
 import {
   curveToLUT, buildToneCurveLUT, defaultToneCurve, normalizeToneCurve,
   DEFAULT_BASIC, sameBasic,
@@ -1141,6 +1142,8 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
 
     hasLinearData = true;
     profileCurveLUT = buildProfileLUT(linMeta.colorProfile);
+    lookBase = linMeta.colorProfile;
+    if (lookBase?.kind === "sony") void loadToneFamily();
     lensCorr = parseLensCorr(linMeta.colorProfile?.lensCorr);
     // Whether this shot brought correction tables at all, which is what decides
     // if the Lens group is worth offering. Reactive because lensCorr itself is
@@ -1222,12 +1225,57 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
 
 let denoiseReloadTimer = 0; // debounce for the denoise watcher below
 
-// A moved Creative Look slider needs no pixels: the six tweaks reshape the tone
+// A moved Creative Look slider needs no pixels: the tweaks reshape the tone
 // curve, the chroma terms and Clarity's gain that the shader applies, and the
-// decoded frame is already on the GPU. So this re-fetches the profile alone
-// (~75 kB, most of it the tone curve) and re-uploads the LUT, instead of
-// re-decoding like dcp/denoise do — the frame it replaces is tens of megabytes.
-// Sequenced, not debounced: the request is cheap and a drag should track.
+// decoded frame is already on the GPU. Nor, usually, does it need the worker:
+// the profile the last decode or look switch brought carries the look's own
+// calibration (lookCalibration), and rebuildLookProfile is the worker's own
+// construction over it — so a drag is a rebuild on this thread and a redraw,
+// one frame behind the finger like the Basic sliders. The worker is asked
+// only for what the browser cannot do from that block: another look (another
+// calibration), a manual DRO preset it does not hold, a profile from an older
+// worker, or the family asset not having landed yet.
+//
+// `lookBase` is that last worker-built profile; the local rebuild never
+// replaces it, so every rebuild starts from the same inputs.
+let lookBase: ColorProfileMeta | null = null;
+
+function rebuildLookLocally(): ColorProfileMeta | null {
+  const family = toneFamilyLoaded();
+  if (!lookBase || !family || !lookAsShot.value) return null;
+  // Another look is another calibration, which only the worker can read.
+  if (effectiveLookStyle.value !== lookBase.creativeLook) return null;
+  return rebuildLookProfile(lookBase, effectiveLook.value,
+    { strength: droStrength.value, level: droLevel.value }, family);
+}
+
+// The tail both paths share: the profile onto the renderer and a redraw. The
+// camera-match table is per look and Fade state, so it is re-read here — but
+// whether there is one at all can only change with the body.
+function installLookProfile(profile: ColorProfileMeta): void {
+  if (!webglRenderer) return;
+  hasSonyCameraMatch.value = parseCameraMatch(profile.profileCameraMatch) !== null;
+  profileCurveLUT = buildProfileLUT(profile);
+  webglRenderer.uploadProfileCurveLUT(profileCurveLUT);
+  scheduleWebGLDraw();
+}
+
+// The profile for where the controls are now: rebuilt here when that can be
+// done, else asked of the worker. Resolves when it is on screen. A local
+// answer retires any request still out for an earlier position, which must
+// not land on top of it.
+function refreshLook(): Promise<void> {
+  const local = rebuildLookLocally();
+  if (!local) return reloadLookProfile();
+  lookProfileSeq++;
+  installLookProfile(local);
+  return Promise.resolve();
+}
+
+// The request path. Sequenced, not debounced: the request is cheap and a drag
+// should track. Its answer becomes the new base, and what goes on screen is a
+// local rebuild over that base for wherever the sliders are *now* — the
+// request carried the positions at the time it left.
 let lookProfileSeq = 0;
 async function reloadLookProfile(): Promise<void> {
   if (!currentSourceId || !lookAsShot.value) return;
@@ -1238,15 +1286,10 @@ async function reloadLookProfile(): Promise<void> {
       droStrength.value ?? undefined, droLevel.value);
     // A newer slider position (or a different image) owns the renderer now.
     if (seq !== lookProfileSeq || !profile || !webglRenderer) return;
+    lookBase = profile;
     lookBorrowed.value = profile.lookBorrowed === true;
     sharpening.value = readSharpening(profile);
-    // The table is per look, so the rebuilt profile carries the one for the
-    // look it was asked for — and whether there is one at all can only change
-    // with the body, which is the same on both sides of a look change.
-    hasSonyCameraMatch.value = parseCameraMatch(profile.profileCameraMatch) !== null;
-    profileCurveLUT = buildProfileLUT(profile);
-    webglRenderer.uploadProfileCurveLUT(profileCurveLUT);
-    scheduleWebGLDraw();
+    installLookProfile(rebuildLookLocally() ?? profile);
   } catch (err) {
     if (seq !== lookProfileSeq) return;
     status.value = "error";
@@ -1850,8 +1893,7 @@ watch(sonyCameraMatch, () => {
 // The promise is kept so the assistant can await the render it caused.
 let lookReload: Promise<void> = Promise.resolve();
 watch([look, lookStyle, droStrength, droLevel], () => {
-  if (suppressDcpReload) return;
-  lookReload = reloadLookProfile();
+  if (!suppressDcpReload) lookReload = refreshLook();
 }, { deep: true });
 
 // Re-decode when the user changes the DCP style or the colour engine (keeps the

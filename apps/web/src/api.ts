@@ -152,6 +152,12 @@ export type ColorProfileMeta = {
   // fitted for this body, which hides the switch — a table from another body
   // is never substituted. Shape in rendering/camera-match.ts parseCameraMatch.
   profileCameraMatch?: unknown;
+  // The tweak-free inputs of the Sony rebuild (worker sony/profile.py
+  // look_calibration_block), so a moved tweak or DRO strength is rebuilt here
+  // (rendering/sony-look.ts) rather than fetched. Shape in parseLookCalibration;
+  // absent on the DCP path and from an older worker, which falls back to
+  // fetchLookProfile.
+  lookCalibration?: unknown;
   // What the tone curve and chroma terms above were built with, and what the
   // body itself recorded. The Creative Look panel starts at lookAsShot, which
   // is also what a double-click resets a slider to.
