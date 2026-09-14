@@ -329,6 +329,19 @@ const lensCorrAvailable = ref(false);
 // `activeProfileKind` would guess, and guess wrong on a Sony RAW rendered
 // through the DCP path.
 const denoiseUsesChroma = ref(true);
+// Whether the frame runs Sony's own filter (the one denoiser without a Color
+// NR control — that is what the flag reports). Its Auto is nothing more than
+// the manual panel at its defaults: amount 50 is Auto's strength to the bit,
+// edge and colour 50 are the camera's own values (worker sony/rawnr_simd.py
+// manual_strength, sony_repro/notes/static-rawnr.md 7.1). So on these frames
+// there is no switch — the three sliders stand, 50 is "as the camera" — and
+// the request goes out manual whatever an older session stored. The wavelet
+// fallback keeps the switch: there Auto scales its amount by the ISO, which a
+// slider position does not.
+const sonyDenoiser = computed(() => isRawSource.value && !denoiseUsesChroma.value);
+/** The Auto switch as the render sees it: never on a Sony frame. */
+const effectiveDenoiseAuto = (d: { auto: boolean } = denoise): boolean => d.auto && !sonyDenoiser.value;
+const denoiseAuto = computed(() => effectiveDenoiseAuto());
 // Fitted camera-match table (see worker fit_profile.py): pulls the DCP render
 // toward the camera's own JPEG. On by default — it is the point of the profile —
 // but toggleable to compare against Adobe's uncorrected look. Only meaningful
@@ -390,8 +403,12 @@ const sonyAdvancedColour = ref(false);
 // fitted on another body would be a guess, so the row hides instead.
 const sonyCameraMatch = ref(true);
 const hasSonyCameraMatch = ref(false);
+// 50 for every slider: the camera's own position on the Sony filter, and
+// Edit's default. (Amount used to start at 100, which on a Sony frame renders
+// exactly as 50 — above it the engine changes the filter itself, which the
+// transcription cannot follow, so the strength holds at Auto's.)
 const defaultDenoise = () => ({
-  enabled: true, auto: true, amount: 100, edge: 50, chroma: 50,
+  enabled: true, auto: true, amount: 50, edge: 50, chroma: 50,
 });
 const denoise = reactive(defaultDenoise());
 const denoiseBusy = ref(false);
@@ -1028,7 +1045,8 @@ const curveEdited = computed(() =>
   JSON.stringify(toneCurve.value) !== JSON.stringify(defaultToneCurve()));
 const denoiseEdited = computed(() => {
   const d = defaultDenoise() as Record<string, unknown>;
-  return Object.entries(denoise).some(([k, v]) => v !== d[k]);
+  // The switch means nothing on a Sony frame (sonyDenoiser), so it is not an edit there.
+  return Object.entries(denoise).some(([k, v]) => v !== d[k] && !(k === "auto" && sonyDenoiser.value));
 });
 // The accent dot on a tab: which groups hold a non-default value, so an edit
 // buried in a closed tab is still visible.
@@ -1112,9 +1130,15 @@ function embeddedHistogramBins() {
 // other silently changes the number by 100x, so keep them apart.
 // edge and chroma are *not* rescaled: 0..100 is the wire scale for those.
 function denoisePayload(d: typeof denoise = denoise): DenoisePayload {
+  // On a Sony frame the switch is gone and the sliders rule (sonyDenoiser);
+  // on the wavelet, Auto is the manual panel at its defaults with every
+  // slider greyed out, so the edge value goes out neutral rather than
+  // whatever a manual session left. Colour NR is neutralised the same way
+  // where it is applied (sonyChromaNrSlider).
+  const auto = effectiveDenoiseAuto(d);
   return {
-    enabled: d.enabled, auto: d.auto, amount: d.amount / 100,
-    edge: d.edge, chroma: d.chroma,
+    enabled: d.enabled, auto, amount: d.amount / 100,
+    edge: auto ? 50 : d.edge, chroma: d.chroma,
   };
 }
 
@@ -1151,7 +1175,7 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
 
     hasLinearData = true;
     profileCurveLUT = buildProfileLUT(linMeta.colorProfile);
-    lookBase = linMeta.colorProfile;
+    lookBase = lookCurrent = linMeta.colorProfile;
     if (lookBase?.kind === "sony") void loadToneFamily();
     lensCorr = parseLensCorr(linMeta.colorProfile?.lensCorr);
     // Whether this shot brought correction tables at all, which is what decides
@@ -1260,9 +1284,13 @@ function rebuildLookLocally(): ColorProfileMeta | null {
 
 // The tail both paths share: the profile onto the renderer and a redraw. The
 // camera-match table is per look and Fade state, so it is re-read here — but
-// whether there is one at all can only change with the body.
+// whether there is one at all can only change with the body. `lookCurrent`
+// is what is on screen, for a redraw that changes nothing about the look
+// (a Colour NR move, which buildProfileLUT reads for Marble).
+let lookCurrent: ColorProfileMeta | null = null;
 function installLookProfile(profile: ColorProfileMeta): void {
   if (!webglRenderer) return;
+  lookCurrent = profile;
   hasSonyCameraMatch.value = parseCameraMatch(profile.profileCameraMatch) !== null;
   profileCurveLUT = buildProfileLUT(profile);
   webglRenderer.uploadProfileCurveLUT(profileCurveLUT);
@@ -1447,7 +1475,7 @@ function buildProfileLUT(cp: ColorProfileMeta | null | undefined): ProfileCurve 
     // control at ten times the scale (2.24.2), and that position is what
     // reaches the stage — it moves both the thresholds and the blend.
     marble: cp?.profileMarble && denoise.enabled
-      ? { ...cp.profileMarble, slider: sonyChromaNrSlider(denoise.chroma, denoise.auto) }
+      ? { ...cp.profileMarble, slider: sonyChromaNrSlider(denoise.chroma, denoiseAuto.value) }
       : null,
     // Camera match, after Marble. The table alone travels here; whether it runs
     // is the switch, pushed at the renderer by applySonyCameraMatch. Null for a
@@ -1932,10 +1960,21 @@ function reloadDenoise(): Promise<unknown> {
   denoiseBusy.value = true;
   return denoiseReload = loadSource(currentSourceId, { resetView: false }).finally(() => { denoiseBusy.value = false; });
 }
-watch(denoise, () => {
+function scheduleDenoiseReload(): void {
   if (suppressDcpReload || !currentSourceId) return;
   if (denoiseReloadTimer) clearTimeout(denoiseReloadTimer);
   denoiseReloadTimer = window.setTimeout(reloadDenoise, 250);
+}
+// Every control but Colour NR reaches the decode; Colour NR does only where
+// the frame's denoiser takes it (the worker keys it out of its cache the same
+// way). Any change at all is also a redraw of the profile as it stands: on a
+// Sony frame Colour NR drives Marble in the shader, which buildProfileLUT
+// reads, and the switch gates it. The flag is read in the callback, not
+// tracked: a source switch changes it and must not re-decode on its own.
+watch([() => denoise.enabled, () => denoise.auto, () => denoise.amount, () => denoise.edge], scheduleDenoiseReload);
+watch(() => denoise.chroma, () => { if (denoiseUsesChroma.value) scheduleDenoiseReload(); });
+watch(denoise, () => {
+  if (!suppressDcpReload && currentSourceId && lookCurrent) installLookProfile(lookCurrent);
 }, { deep: true });
 
 // Flush the latest edit on tab close. The IndexedDB write is async, so also
@@ -2237,7 +2276,7 @@ const SET_EDIT_SCHEMA = {
       },
     },
     denoise: {
-      type: "object", description: "RAW-domain noise reduction (re-decodes, ~seconds). auto follows the shot's ISO like the camera; amount applies when auto is off. edge/chroma: 50 is neutral.",
+      type: "object", description: "RAW-domain noise reduction (re-decodes, ~seconds). amount/edge/chroma are on Imaging Edge's 0..100 scale, 50 = as the camera (amounts above 50 render as 50 on a Sony RAW). auto only matters on non-Sony RAWs, where it makes the strength follow the shot's ISO instead of amount.",
       properties: { enabled: { type: "boolean" }, auto: { type: "boolean" }, amount: num(0, 100), edge: num(0, 100), chroma: num(0, 100) },
     },
   },
@@ -3303,17 +3342,19 @@ const vWheelAdjust = {
             <span class="switch-track"><span class="switch-thumb" /></span>
           </label>
         </div>
-        <!-- Auto is Edit's own: the strength follows the shot's ISO rather than
-             the slider. The worker resolves it, since ISO lives in the file. -->
-        <div class="control-row" v-show="denoise.enabled" style="margin-top: 6px;">
+        <!-- The wavelet's Auto: its strength follows the shot's ISO rather
+             than the slider, and the worker resolves it since ISO lives in the
+             file. Sony's own filter has no such switch (sonyDenoiser): its Auto
+             is the sliders at 50, so the sliders stand and reset is Auto. -->
+        <div class="control-row" v-if="!sonyDenoiser" v-show="denoise.enabled" style="margin-top: 6px;">
           <label class="control-label" for="denoise-auto">{{ t('detail.denoiseAuto') }}</label>
           <label class="switch">
             <input id="denoise-auto" type="checkbox" v-model="denoise.auto" />
             <span class="switch-track"><span class="switch-thumb" /></span>
           </label>
         </div>
-        <SliderRow v-show="denoise.enabled && !denoise.auto" v-model="denoise.amount" style="margin-top: 6px;"
-          :label="t('detail.amount')" input-id="denoise-amount" :min="0" :max="100" :reset-value="100" />
+        <SliderRow v-show="denoise.enabled && !denoiseAuto" v-model="denoise.amount" style="margin-top: 6px;"
+          :label="t('detail.amount')" input-id="denoise-amount" :min="0" :max="100" :reset-value="50" />
         <!-- 50 is neutral for both: the camera's own detail-restore value, and
              the tuned chroma threshold. Reset therefore goes to 50, not 100. -->
         <!-- Color NR shows where it reaches the pixels: on frames whose RAW
@@ -3324,9 +3365,11 @@ const vWheelAdjust = {
              which is why denoiseUsesChroma alone says no. In Auto the engine
              greys the slider out, so it hides. The value is kept either way, so
              it comes back if the frame changes. -->
-        <SliderRow v-show="denoise.enabled && (denoiseUsesChroma || (activeProfileKind === 'sony' && !denoise.auto))" v-model="denoise.chroma" style="margin-top: 6px;"
+        <SliderRow v-show="denoise.enabled && (denoiseUsesChroma || sonyDenoiser)" v-model="denoise.chroma" style="margin-top: 6px;"
           :label="t('detail.chromaNr')" input-id="denoise-chroma" :min="0" :max="100" :reset-value="50" />
-        <SliderRow v-show="denoise.enabled" v-model="denoise.edge" style="margin-top: 6px;"
+        <!-- Greyed out in Auto in Edit too: Auto is the manual panel at its
+             defaults, and denoisePayload sends the neutral value for it. -->
+        <SliderRow v-show="denoise.enabled && !denoiseAuto" v-model="denoise.edge" style="margin-top: 6px;"
           :label="t('detail.edgeNr')" input-id="denoise-edge" :min="0" :max="100" :reset-value="50" />
       </section>
 
