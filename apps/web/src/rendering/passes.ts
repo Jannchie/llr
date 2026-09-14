@@ -1616,6 +1616,12 @@ vec3 labFInv3(vec3 f) {
   vec3 c = f * f * f;
   return mix((f - LAB_OFFSET) / LAB_KAPPA, c, step(LAB_EPS, c));
 }
+// Catmull-Rom weights for the four knots around a fractional position t.
+vec4 catmullRom(float t) {
+  float t2 = t * t, t3 = t2 * t;
+  return vec4(-0.5 * t3 + t2 - 0.5 * t, 1.5 * t3 - 2.5 * t2 + 1.0,
+              -1.5 * t3 + 2.0 * t2 + 0.5 * t, 0.5 * t3 - 0.5 * t2);
+}
 
 void main() {
   vec3 rgb = clamp(texelFetch(u_scene, ivec2(gl_FragCoord.xy), 0).rgb, 0.0, 1.0);
@@ -1629,29 +1635,39 @@ void main() {
   float h = C > 0.0 ? degrees(atan(b, a)) : 0.0;
   h -= 360.0 * floor(h / 360.0);
 
-  // The (L*, C*) grid: bilinear between grid points and held at the edges —
-  // the fractional index is clamped to the grid, so a C* past the last column
-  // reads that column (camera-match.ts cameraMatchBilinear). Hand-written
-  // rather than a LINEAR sample, see the note above the shader.
+  // The (L*, C*) grid: Catmull-Rom cubic between grid points — through the
+  // knot values with a continuous slope, where a bilinear's slope would step
+  // at every knot and the corrected frame's tone density with it, a comb in
+  // its histogram at the grid's 5 L* pitch — and held at the edges: the
+  // fractional index is clamped to the grid and the stencil's rows and
+  // columns past it read the edge (camera-match.ts cameraMatchCubic).
   float fl = clamp(L / L_PITCH, 0.0, float(NL - 1));
   float fc = clamp(C / C_PITCH, 0.0, float(NC - 1));
   int il = min(int(floor(fl)), NL - 2);
   int ic = min(int(floor(fc)), NC - 2);
-  float tl = fl - float(il);
-  float tc = fc - float(ic);
-  vec2 g00 = texelFetch(u_cmGrid, ivec2(ic, il), 0).rg;
-  vec2 g01 = texelFetch(u_cmGrid, ivec2(ic + 1, il), 0).rg;
-  vec2 g10 = texelFetch(u_cmGrid, ivec2(ic, il + 1), 0).rg;
-  vec2 g11 = texelFetch(u_cmGrid, ivec2(ic + 1, il + 1), 0).rg;
-  vec2 g = mix(mix(g00, g01, tc), mix(g10, g11, tc), tl);
+  vec4 wl = catmullRom(fl - float(il));
+  vec4 wc = catmullRom(fc - float(ic));
+  vec2 g = vec2(0.0);
+  for (int r = 0; r < 4; r++) {
+    int row = clamp(il + r - 1, 0, NL - 1);
+    vec2 acc = vec2(0.0);
+    for (int c = 0; c < 4; c++) {
+      acc += wc[c] * texelFetch(u_cmGrid, ivec2(clamp(ic + c - 1, 0, NC - 1), row), 0).rg;
+    }
+    g += wl[r] * acc;
+  }
   float dL = g.r;
   float cr = g.g;
-  // The sector table, periodic: the last sector runs into the first at 360.
+  // The sector table, the same cubic and periodic: the stencil wraps around
+  // the hue circle, so the last sector runs into the first at 360.
   float th = (h - H_ORIGIN) / H_PITCH;
   th -= float(NH) * floor(th / float(NH));
   int j = min(int(floor(th)), NH - 1);
-  float hs = mix(texelFetch(u_cmHue, ivec2(j, 0), 0).r,
-                 texelFetch(u_cmHue, ivec2((j + 1) % NH, 0), 0).r, th - float(j));
+  vec4 wh = catmullRom(th - float(j));
+  float hs = 0.0;
+  for (int k = 0; k < 4; k++) {
+    hs += wh[k] * texelFetch(u_cmHue, ivec2((j + k - 1 + NH) % NH, 0), 0).r;
+  }
 
   // L' = L + dL(L, C); C' = C * cr(L, C), both on the original L and C;
   // h' = h + hs(h).
@@ -1677,6 +1693,7 @@ void main() {
  * runs after the compose when the profile carries it and NR is on.
  */
 export const SONY_POST_PROGRAMS = {
+  noise: { fsSource: NOISE_LUMA_SHADER, uniforms: ["u_scene", "u_sceneTexel", "u_step", "u_sigma", "u_amount"] },
   down: { fsSource: CLARITY_DOWN_SHADER, uniforms: ["u_input", "u_cell", "u_taps"] },
   edge: { fsSource: CLARITY_EDGE_SHADER, uniforms: ["u_input", "u_texel", "u_threshold"] },
   blur: { fsSource: CLARITY_BLUR_SHADER, uniforms: ["u_input", "u_texel", "u_centerMix"] },

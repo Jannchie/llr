@@ -16,9 +16,9 @@
  *     C' = C * cr(L, C)   the same grid, both sampled at the *original* L, C
  *     h' = h + hs(h)      24 sectors of 15 degrees, centres 7.5, 22.5, ...
  *
- * with the reference's rules: bilinear inside the grid and held at its edges
- * (a C* past 90 reads the last column), linear between sector centres and
- * periodic on the hue circle (np.interp on the tiled axis). Two dimensions
+ * with the reference's rules: Catmull-Rom cubic inside the grid and held at
+ * its edges (a C* past 90 reads the last column), the same cubic between
+ * sector centres and periodic on the hue circle. Two dimensions
  * because the residual is not one number per lightness: near neutrals the
  * chain sits more saturated than the camera, the saturated colours less, and
  * a band over L* alone averaged the two. sRGB <-> Lab is the D65 pair in
@@ -66,31 +66,50 @@ export function parseCameraMatch(meta: unknown): ProfileCameraMatch | null {
   return { dL, cr, hs: [...m.hs] };
 }
 
+/** Catmull-Rom weights for the four knots around a fractional position t. */
+export function catmullRom(t: number): [number, number, number, number] {
+  const t2 = t * t, t3 = t2 * t;
+  return [-0.5 * t3 + t2 - 0.5 * t, 1.5 * t3 - 2.5 * t2 + 1, -1.5 * t3 + 2 * t2 + 0.5 * t, 0.5 * t3 - 0.5 * t2];
+}
+
 /**
- * A grid table at (L*, C*) — GLSL mirror. Bilinear between grid points and
- * held at the edges: the reference clamps the fractional index to the grid,
- * so anything past the last row or column reads that row or column.
+ * A grid table at (L*, C*) — GLSL mirror. Catmull-Rom cubic between grid
+ * points (through the knot values, continuous slope — a bilinear's slope
+ * steps at every knot and so does the corrected frame's tone density, a comb
+ * in its histogram at the grid pitch) and held at the edges: the reference
+ * clamps the fractional index to the grid, and the stencil's rows and columns
+ * past it read the edge row or column.
  */
-export function cameraMatchBilinear(table: readonly (readonly number[])[], L: number, C: number): number {
+export function cameraMatchCubic(table: readonly (readonly number[])[], L: number, C: number): number {
   const nl = CAMERA_MATCH_L_STEPS, nc = CAMERA_MATCH_C_STEPS;
   const fl = Math.min(Math.max(L / CAMERA_MATCH_L_PITCH, 0), nl - 1);
   const fc = Math.min(Math.max(C / CAMERA_MATCH_C_PITCH, 0), nc - 1);
   const il = Math.min(Math.floor(fl), nl - 2), ic = Math.min(Math.floor(fc), nc - 2);
-  const tl = fl - il, tc = fc - ic;
-  const r0 = table[il], r1 = table[il + 1];
-  return (1 - tl) * ((1 - tc) * r0[ic] + tc * r0[ic + 1]) + tl * ((1 - tc) * r1[ic] + tc * r1[ic + 1]);
+  const wl = catmullRom(fl - il), wc = catmullRom(fc - ic);
+  let out = 0;
+  for (let r = 0; r < 4; r++) {
+    const row = table[Math.min(Math.max(il + r - 1, 0), nl - 1)];
+    let acc = 0;
+    for (let c = 0; c < 4; c++) acc += wc[c] * row[Math.min(Math.max(ic + c - 1, 0), nc - 1)];
+    out += wl[r] * acc;
+  }
+  return out;
 }
 
 /**
- * The sector table at hue h (degrees, any value), periodic: the last sector
- * interpolates into the first across 360, as the fit's tiled np.interp does.
+ * The sector table at hue h (degrees, any value), the same cubic and
+ * periodic: the stencil wraps around the hue circle, so the last sector runs
+ * into the first across 360.
  */
 export function cameraMatchInterpHue(table: readonly number[], h: number): number {
   const n = table.length;
   const raw = (h - CAMERA_MATCH_H_ORIGIN) / CAMERA_MATCH_H_PITCH;
   const t = ((raw % n) + n) % n;
   const i = Math.min(Math.floor(t), n - 1);
-  return table[i] + (table[(i + 1) % n] - table[i]) * (t - i);
+  const w = catmullRom(t - i);
+  let out = 0;
+  for (let k = 0; k < 4; k++) out += w[k] * table[(((i + k - 1) % n) + n) % n];
+  return out;
 }
 
 // sRGB (D65) <-> CIELAB, the pair in docs/readme/tools/quant.py srgb_to_lab.
@@ -159,8 +178,8 @@ export function applyCameraMatchLab(lab: readonly number[], t: ProfileCameraMatc
   // atan2(0, 0) is 0 in numpy and undefined in GLSL; the hue of a neutral is
   // moot either way, because its chroma stays zero.
   const h = C > 0 ? (((Math.atan2(b, a) * 180) / Math.PI) % 360 + 360) % 360 : 0;
-  const L2 = L + cameraMatchBilinear(t.dL, L, C);
-  const C2 = C * cameraMatchBilinear(t.cr, L, C);
+  const L2 = L + cameraMatchCubic(t.dL, L, C);
+  const C2 = C * cameraMatchCubic(t.cr, L, C);
   const h2 = ((h + cameraMatchInterpHue(t.hs, h)) * Math.PI) / 180;
   return [L2, C2 * Math.cos(h2), C2 * Math.sin(h2)];
 }

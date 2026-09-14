@@ -48,8 +48,12 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageOps
 
+import re
+
 _q = {}
-exec((Path(__file__).resolve().parents[2] / "docs" / "readme" / "tools" / "quant.py").read_text().split("cam = load")[0], _q)
+# quant.py's definitions, without the script body that follows them — the
+# line that loads the camera JPEG off argv, whatever it unpacks into.
+exec(re.split(r"(?m)^cam\b.*= load\(", (Path(__file__).resolve().parents[2] / "docs" / "readme" / "tools" / "quant.py").read_text())[0], _q)
 srgb_to_lab, de2000 = _q["srgb_to_lab"], _q["de2000"]
 
 STYLE = {0: "ST", 1: "VV", 2: "NT", 3: "PT", 15: "FL", 16: "VV2", 17: "IN", 18: "SH", 255: "Off"}
@@ -216,22 +220,51 @@ def fit(S, pooled=None):
     return out
 
 
+def _catmull_rom(t):
+    """Catmull-Rom weights for the four points around a fractional position:
+    the cubic through the grid values with a continuous first derivative."""
+    t2, t3 = t * t, t * t * t
+    return (-0.5 * t3 + t2 - 0.5 * t, 1.5 * t3 - 2.5 * t2 + 1.0,
+            -1.5 * t3 + 2.0 * t2 + 0.5 * t, 0.5 * t3 - 0.5 * t2)
+
+
 def apply(llr, model):
-    """The correction, in Lab -- the reference the shader mirrors (bilinear on
-    the grid, clamped to its edges; linear and periodic in hue)."""
+    """The correction, in Lab -- the reference the shader mirrors.
+
+    Catmull-Rom cubic on the grid, clamped to its edges (an index past the
+    grid reads the edge row or column), and cubic and periodic in hue. Cubic
+    rather than bilinear because the correction is applied to a continuous
+    tone scale: a piecewise-linear dL(L) has a different slope on each side of
+    every knot, and the output's tone density steps by that ratio every 5 L*
+    -- a comb in the histogram of the corrected frame, at the grid's pitch,
+    that the camera's own JPEG does not have. The cubic goes through the same
+    knot values with a continuous slope, so the density is continuous too;
+    between knots it differs from the bilinear by well under the fit's own
+    accuracy on these smooth tables."""
     L, a, b = llr[..., 0], llr[..., 1], llr[..., 2]
     C = np.hypot(a, b); h = np.degrees(np.arctan2(b, a)) % 360
-    dL, cr = np.asarray(model["dL"]), np.asarray(model["cr"])
-    fl = np.clip(L / 5.0, 0, len(L_AXIS) - 1 - 1e-9); fc = np.clip(C / 5.0, 0, len(C_AXIS) - 1 - 1e-9)
+    dL, cr = np.asarray(model["dL"], float), np.asarray(model["cr"], float)
+    nl, nc = len(L_AXIS), len(C_AXIS)
+    fl = np.clip(L / 5.0, 0, nl - 1 - 1e-9); fc = np.clip(C / 5.0, 0, nc - 1 - 1e-9)
     il, ic = fl.astype(int), fc.astype(int); tl, tc = fl - il, fc - ic
+    wl, wc = _catmull_rom(tl), _catmull_rom(tc)
+    rows = [np.clip(il + k, 0, nl - 1) for k in (-1, 0, 1, 2)]
+    cols = [np.clip(ic + k, 0, nc - 1) for k in (-1, 0, 1, 2)]
 
     def sample(g):
-        return ((1 - tl) * (1 - tc) * g[il, ic] + tl * (1 - tc) * g[il + 1, ic]
-                + (1 - tl) * tc * g[il, ic + 1] + tl * tc * g[il + 1, ic + 1])
-    hs = np.asarray(model["hs"])
-    ax = np.concatenate([H_AXIS - 360, H_AXIS, H_AXIS + 360])
+        out = 0.0
+        for wr, r in zip(wl, rows):
+            for wk, c in zip(wc, cols):
+                out = out + wr * wk * g[r, c]
+        return out
+    hs = np.asarray(model["hs"], float)
+    n = len(hs)
+    th = (h - H_AXIS[0]) / 15.0
+    j = np.floor(th).astype(int); tj = th - j
+    wh = _catmull_rom(tj)
+    shift = sum(w * hs[(j + k) % n] for w, k in zip(wh, (-1, 0, 1, 2)))
     L2 = L + sample(dL); C2 = C * sample(cr)
-    h2 = np.radians(h + np.interp(h, ax, np.tile(hs, 3)))
+    h2 = np.radians(h + shift)
     return np.stack([L2, C2 * np.cos(h2), C2 * np.sin(h2)], -1)
 
 

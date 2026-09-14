@@ -43,10 +43,12 @@ requires_exiftool = pytest.mark.skipif(detect_exiftool() is None, reason="exifto
 requires_reference = pytest.mark.skipif(not REFERENCE.exists(), reason="sony_repro not checked out")
 
 # Lab points through the shipped FL table, as camera_match_fit.apply() gives
-# them (rounded to 1e-5; tmp/nas/agents/cm2_ref.py prints them). Chosen to hit
-# both ends of the L* axis (clamped), a near-neutral where the chroma ratio has
-# almost nothing to scale, a C* past the grid's last column (held), and a hue
-# past the last sector centre (periodic wrap).
+# them (rounded to 1e-5; the test below regenerates them from the reference —
+# Catmull-Rom on the grid since the bilinear's knot-by-knot slope steps put a
+# comb in the corrected frame's histogram). Chosen to hit both ends of the L*
+# axis (clamped), a near-neutral where the chroma ratio has almost nothing to
+# scale, a C* past the grid's last column (held), and a hue past the last
+# sector centre (periodic wrap).
 LAB_POINTS = [
     [50.0, 20.0, 10.0],
     [12.0, -30.0, 25.0],
@@ -58,19 +60,19 @@ LAB_POINTS = [
     [50.0, 30.0, -3.0],
 ]
 FL_EXPECTED = [
-    [47.67279, 18.75364, 9.72516],
-    [11.23440, -29.08673, 24.94623],
-    [96.13714, 4.43324, -40.04275],
-    [2.88463, 0.48059, -0.18353],
-    [57.47476, -25.49222, -23.36832],
-    [82.12916, 40.99567, 58.50616],
-    [53.09560, 82.05247, 61.51336],
-    [47.70675, 28.99767, -2.21355],
+    [47.67252, 18.74766, 9.75026],
+    [11.21839, -29.06290, 24.94379],
+    [96.18377, 4.43625, -40.05408],
+    [2.90908, 0.48165, -0.18390],
+    [57.47470, -25.50087, -23.36192],
+    [82.12877, 41.12082, 58.41827],
+    [53.09560, 82.05076, 61.51565],
+    [47.70672, 28.99927, -2.20584],
 ]
 # The first point through the pooled table and through FL with Fade on, so a
 # mirror that picked the wrong table cannot pass by accident.
-POOLED_EXPECTED_FIRST = [47.65237, 19.01029, 9.51756]
-FL_FADE_EXPECTED_FIRST = [50.08255, 18.75364, 9.72516]
+POOLED_EXPECTED_FIRST = [47.65198, 19.01415, 9.51949]
+FL_FADE_EXPECTED_FIRST = [50.08299, 18.74766, 9.75026]
 
 
 def test_the_shipped_table_is_the_fit_s_own_shape() -> None:

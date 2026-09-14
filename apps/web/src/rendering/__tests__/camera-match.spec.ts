@@ -6,7 +6,8 @@ import {
   CAMERA_MATCH_L_STEPS,
   applyCameraMatch,
   applyCameraMatchLab,
-  cameraMatchBilinear,
+  cameraMatchCubic,
+  catmullRom,
   cameraMatchGridTexels,
   cameraMatchInterpHue,
   labToSrgb,
@@ -42,14 +43,14 @@ const LAB_POINTS = [
   [50.0, 30.0, -3.0], // hue 354.3, past the last sector centre
 ];
 const FL_EXPECTED = [
-  [47.67279, 18.75364, 9.72516],
-  [11.23440, -29.08673, 24.94623],
-  [96.13714, 4.43324, -40.04275],
-  [2.88463, 0.48059, -0.18353],
-  [57.47476, -25.49222, -23.36832],
-  [82.12916, 40.99567, 58.50616],
-  [53.09560, 82.05247, 61.51336],
-  [47.70675, 28.99767, -2.21355],
+  [47.67252, 18.74766, 9.75026],
+  [11.21839, -29.06290, 24.94379],
+  [96.18377, 4.43625, -40.05408],
+  [2.90908, 0.48165, -0.18390],
+  [57.47470, -25.50087, -23.36192],
+  [82.12877, 41.12082, 58.41827],
+  [53.09560, 82.05076, 61.51565],
+  [47.70672, 28.99927, -2.20584],
 ];
 
 const close = (got: readonly number[], want: readonly number[], tol: number) => {
@@ -70,36 +71,45 @@ describe("applyCameraMatchLab", () => {
   });
 
   it("picks the table it is given, not always FL", () => {
-    close(applyCameraMatchLab(LAB_POINTS[0], POOLED), [47.65237, 19.01029, 9.51756], 1e-4);
-    close(applyCameraMatchLab(LAB_POINTS[0], FL_FADE), [50.08255, 18.75364, 9.72516], 1e-4);
+    close(applyCameraMatchLab(LAB_POINTS[0], POOLED), [47.65198, 19.01415, 9.51949], 1e-4);
+    close(applyCameraMatchLab(LAB_POINTS[0], FL_FADE), [50.08299, 18.74766, 9.75026], 1e-4);
   });
 
   it("leaves a neutral neutral", () => {
     const [L, a, b] = applyCameraMatchLab([40, 0, 0], FL);
     expect(a).toBe(0);
     expect(b).toBe(0);
-    expect(L).toBeCloseTo(40 + cameraMatchBilinear(FL.dL, 40, 0), 10);
+    expect(L).toBeCloseTo(40 + cameraMatchCubic(FL.dL, 40, 0), 10);
   });
 });
 
-describe("cameraMatchBilinear", () => {
+describe("cameraMatchCubic", () => {
   // value = 100 * row + column, so any sample reads back its own coordinates.
   const ramp = Array.from({ length: CAMERA_MATCH_L_STEPS }, (_, i) =>
     Array.from({ length: CAMERA_MATCH_C_STEPS }, (_, j) => 100 * i + j));
-  it("is the grid value at a grid point and bilinear between", () => {
-    expect(cameraMatchBilinear(ramp, 0, 0)).toBe(0);
-    expect(cameraMatchBilinear(ramp, 50, 30)).toBe(1006);
-    expect(cameraMatchBilinear(ramp, 100, 90)).toBe(2018);
-    expect(cameraMatchBilinear(ramp, 52.5, 31)).toBeCloseTo(1050 + 6.2, 10);
+  it("is the grid value at a grid point and linear between on a linear table", () => {
+    expect(cameraMatchCubic(ramp, 0, 0)).toBe(0);
+    expect(cameraMatchCubic(ramp, 50, 30)).toBe(1006);
+    expect(cameraMatchCubic(ramp, 100, 90)).toBe(2018);
+    expect(cameraMatchCubic(ramp, 52.5, 31)).toBeCloseTo(1050 + 6.2, 10);
+  });
+  it("is C1: the slope does not step at a knot", () => {
+    // A bump table: the bilinear's slope would jump at row 10; the cubic's
+    // one-sided differences either side of the knot agree.
+    const bump = ramp.map((row, i) => row.map(() => Math.exp(-((i - 10) ** 2) / 8)));
+    const eps = 1e-3;
+    const before = (cameraMatchCubic(bump, 50, 30) - cameraMatchCubic(bump, 50 - eps, 30)) / eps;
+    const after = (cameraMatchCubic(bump, 50 + eps, 30) - cameraMatchCubic(bump, 50, 30)) / eps;
+    expect(Math.abs(before - after)).toBeLessThan(1e-3);
   });
   it("holds the edge past the grid (the reference clamps the index)", () => {
-    expect(cameraMatchBilinear(ramp, 50, 120)).toBe(1018);
-    expect(cameraMatchBilinear(ramp, 130, 30)).toBe(2006);
-    expect(cameraMatchBilinear(ramp, -3, -3)).toBe(0);
+    expect(cameraMatchCubic(ramp, 50, 120)).toBe(1018);
+    expect(cameraMatchCubic(ramp, 130, 30)).toBe(2006);
+    expect(cameraMatchCubic(ramp, -3, -3)).toBe(0);
   });
   it("indexes rows by L* and columns by C*, not the other way round", () => {
-    expect(cameraMatchBilinear(ramp, 5, 10)).toBe(102);
-    expect(cameraMatchBilinear(ramp, 10, 5)).toBe(201);
+    expect(cameraMatchCubic(ramp, 5, 10)).toBe(102);
+    expect(cameraMatchCubic(ramp, 10, 5)).toBe(201);
   });
 });
 
@@ -110,12 +120,21 @@ describe("cameraMatchInterpHue", () => {
     expect(cameraMatchInterpHue(ramp, 352.5)).toBe(23);
     expect(cameraMatchInterpHue(ramp, 30)).toBeCloseTo(1.5, 12);
   });
-  it("wraps across 360: the last sector interpolates into the first", () => {
-    // Midway between 352.5 (value 23) and 7.5 (value 0) is 360 == 0.
-    expect(cameraMatchInterpHue(ramp, 0)).toBeCloseTo(11.5, 12);
-    expect(cameraMatchInterpHue(ramp, 360)).toBeCloseTo(11.5, 12);
-    expect(cameraMatchInterpHue(ramp, 2.5)).toBeCloseTo(23 + (0 - 23) * (2 / 3), 12);
+  it("wraps across 360: the stencil runs from the last sector into the first", () => {
+    // A periodic table, so the wrap is a smooth crossing rather than the
+    // ramp's cliff: midway between 352.5 and 7.5 (i.e. at 360 == 0) the four
+    // knots are sectors 22, 23, 0 and 1.
+    const wave = ramp.map(i => Math.cos((2 * Math.PI * i) / CAMERA_MATCH_H_SECTORS));
+    const w = catmullRom(0.5);
+    const mid = w[0] * wave[22] + w[1] * wave[23] + w[2] * wave[0] + w[3] * wave[1];
+    expect(cameraMatchInterpHue(wave, 0)).toBeCloseTo(mid, 12);
+    expect(cameraMatchInterpHue(wave, 360)).toBeCloseTo(mid, 12);
+    // On a linear ramp the cubic is linear wherever the four knots are — so
+    // away from the cliff the old expectation still holds...
+    expect(cameraMatchInterpHue(ramp, 30)).toBeCloseTo(1.5, 12);
+    // ...and a sector centre reads its own value, wrapped from either side.
     expect(cameraMatchInterpHue(ramp, -7.5)).toBe(23);
+    expect(cameraMatchInterpHue(ramp, 367.5)).toBe(0);
   });
 });
 
@@ -156,7 +175,7 @@ describe("applyCameraMatch", () => {
     const out = applyCameraMatch(px, FL);
     expect(out.every(v => v >= 0 && v <= 1)).toBe(true);
     const before = srgbToLab(px), after = srgbToLab(out);
-    expect(after[0] - before[0]).toBeCloseTo(cameraMatchBilinear(FL.dL, before[0], Math.hypot(before[1], before[2])), 5);
+    expect(after[0] - before[0]).toBeCloseTo(cameraMatchCubic(FL.dL, before[0], Math.hypot(before[1], before[2])), 5);
   });
 });
 
