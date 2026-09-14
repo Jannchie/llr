@@ -25,10 +25,13 @@ from llr_worker.sony import calibration_for, looks_in_file
 from llr_worker.sony.chroma import (
     LUMA_CONTRAST_ADVANCED,
     LUMA_CONTRAST_UNIT,
+    LUMA_LUT_COARSE_STEP,
     LUMA_LUT_SIZE,
     LUMA_LUT_WIRE,
+    _luma_luts,
     luma_gamma,
     luma_lut,
+    luma_lut_dequantised,
     luma_terms,
     ygamma_planes,
 )
@@ -329,3 +332,41 @@ def test_the_profile_carries_both_tables_and_both_contrasts() -> None:
         # ...beside the standard one, which is unchanged.
         assert info["profileLumaLut"][16383] == top
         assert info["profileLumaContrastAdvanced"] == LUMA_CONTRAST_ADVANCED
+
+
+def test_every_table_is_a_ten_bit_coarse_one_linearly_expanded() -> None:
+    """What luma_lut_dequantised builds on: every 16th entry is a multiple of
+    16, and the entries between are the straight line through their
+    neighbours — the engine's own expansion, exact to the entry."""
+    step = LUMA_LUT_COARSE_STEP
+    for name, table in _luma_luts().items():
+        t = table.astype(np.int64)
+        coarse = t[::step]
+        assert np.all(coarse % step == 0), name
+        rebuilt = np.interp(np.arange(t.size), np.arange(0, t.size, step), coarse)
+        assert np.array_equal(np.rint(rebuilt).astype(np.int64), t), name
+
+
+def test_the_dequantised_advanced_table_has_no_comb_and_stays_within_the_quantisation() -> None:
+    """The comb: the raw advanced table binned to 8-bit output codes takes 80,
+    64, 64, 56, 56 inputs per code in turn. The curve under it takes as many
+    as its slope says and no pattern besides — and it never leaves the raw
+    table by more than two coarse steps, keeps the tail past the reachable
+    range untouched, and is monotone."""
+    raw = _luma_luts()["adv_c1024_d16384"].astype(np.int64)
+    smooth = luma_lut_dequantised(raw).astype(np.int64)
+
+    def per_code(t: np.ndarray) -> np.ndarray:
+        return np.bincount(np.clip(t[:LUMA_LUT_WIRE], 0, 32767) // 64, minlength=512)[100:230]
+
+    assert per_code(raw).max() >= 80 and per_code(raw).min() <= 56
+    # The curve's own slope (the roll-off) still moves the count, so this is
+    # a bound on the swing, not a demand for 64 everywhere: the raw comb
+    # swings by 24 code to code, the curve by a couple.
+    assert np.abs(np.diff(per_code(smooth))).max() <= 4
+    assert np.abs(smooth - raw)[:LUMA_LUT_WIRE + 1].max() <= 2 * LUMA_LUT_COARSE_STEP
+    assert np.all(np.diff(smooth[:LUMA_LUT_WIRE + 1]) >= 0)
+    assert np.array_equal(smooth[LUMA_LUT_WIRE + 1:], raw[LUMA_LUT_WIRE + 1:])
+    # ...and it is what the profile ships for the match.
+    assert np.array_equal(luma_lut(_calibration(LUMA_LUT_FLAT), advanced=True, dequantised=True), smooth)
+

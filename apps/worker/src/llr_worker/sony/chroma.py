@@ -125,12 +125,23 @@ def _luma_luts() -> dict[str, np.ndarray]:
     return tables
 
 
-def luma_lut(cal: LookCalibration, advanced: bool = False) -> np.ndarray:
+@lru_cache(maxsize=4)
+def _luma_lut_dequantised(name: str) -> np.ndarray:
+    """luma_lut_dequantised of one shipped table, solved once and shared."""
+    table = luma_lut_dequantised(_luma_luts()[name])
+    table.flags.writeable = False
+    return table
+
+
+def luma_lut(cal: LookCalibration, advanced: bool = False, dequantised: bool = False) -> np.ndarray:
     """The table YGamma indexes Y through for this look. uint16[32768].
 
     `advanced` is Edit's 色彩复制 = 高级: the same family, the other dump. It is
     the same switch that adds the 3-D LUT, so a caller that turns one on turns
     both on — see apply_chroma.
+
+    `dequantised` is the smooth curve under that table rather than the table
+    itself (luma_lut_dequantised) — what the browser renders with.
 
     An unseen selector falls back to the near-identity family rather than
     raising: it is the eight-look majority, so a body writing a pair nobody has
@@ -146,7 +157,62 @@ def luma_lut(cal: LookCalibration, advanced: bool = False) -> np.ndarray:
                   f"look {cal.name!r}; falling back to {_LUMA_LUT_NAMES[LUMA_LUT_FLAT]}",
                   file=sys.stderr)
         name = _LUMA_LUT_NAMES[LUMA_LUT_FLAT]
-    return _luma_luts()[_LUMA_LUT_ADVANCED + name if advanced else name]
+    key_name = _LUMA_LUT_ADVANCED + name if advanced else name
+    return _luma_lut_dequantised(key_name) if dequantised else _luma_luts()[key_name]
+
+
+#: What the YGamma tables are made of: every one of the four is a 2048-entry
+#: table with 10-bit outputs (every value a multiple of 16) that the engine
+#: expands to its 32768 entries by linear interpolation — read every 16th
+#: entry and the rest are the straight lines between them, exactly. See
+#: luma_lut_dequantised for what that costs and what the browser gets instead.
+LUMA_LUT_COARSE_STEP = 16
+#: The smoothing weight for luma_lut_dequantised: a second-difference penalty
+#: on the coarse samples, at the strength where the fit stops following the
+#: 0/16/32 block pattern and follows the curve under it. The residual it
+#: leaves is ~9 on the table's scale — the pattern's own size — and past 1e3
+#: the density is as even as the curve's own slope allows (the knee's
+#: roll-off legitimately puts 75 inputs on a code where the mid-tones put 64).
+LUMA_LUT_DEQUANT_LAMBDA = 1e3
+
+
+def luma_lut_dequantised(lut: np.ndarray, lam: float = LUMA_LUT_DEQUANT_LAMBDA) -> np.ndarray:
+    """The smooth curve a YGamma table is the 10-bit quantisation of.
+
+    A coarse step of 16 is a quarter of an 8-bit output code, so a curve of
+    slope ~0.95 is written as a run of block slopes drawn from {0, 1, 2}, and
+    binned to 8-bit codes the input density goes 80, 64, 64, 56, 56 and
+    repeats: a comb of period five codes, at +-25%, in the histogram of any
+    frame rendered through the advanced tables (the standard ones are slope 1
+    through most of the range and their blocks come out even). Treating the
+    table as what it is — samples of a smooth curve rounded to multiples of
+    LUMA_LUT_COARSE_STEP — this estimates the curve with a Whittaker smoother
+    (least squares with a penalty on the second differences) and expands that
+    the way the engine expands its own. Not a running mean: no window to pick,
+    no smearing of the knee, and the estimate is of the thing that was
+    quantised rather than of the quantisation pattern's average. It stays
+    within 21/16383 of the table — a third of an 8-bit code at most, a tenth
+    on average — so what the 高级 export is measured against does not move.
+
+    What the browser renders the advanced stage with, under 高级 and under the
+    camera match that borrows the table for its highlight roll-off. The
+    integer stage here (ygamma_planes), which the tests hold to the engine's
+    own planes, keeps the raw table.
+    """
+    x = np.asarray(lut, np.float64)
+    step = LUMA_LUT_COARSE_STEP
+    # Only the half a float pipeline can reach (LUMA_LUT_WIRE): the tail past
+    # it stays the table's own, and the solve is a quarter of the size.
+    top = LUMA_LUT_WIRE
+    coarse = x[:top + 1:step]
+    n = coarse.size
+    # (I + lam D2'D2) z = y, dense: 1025 x 1025, once per table (see luma_lut).
+    d2 = np.diff(np.eye(n), 2, axis=0)
+    z = np.linalg.solve(np.eye(n) + lam * (d2.T @ d2), coarse)
+    fine = np.interp(np.arange(top + 1), np.arange(0, top + 1, step), z)
+    out = x.copy()
+    out[:top + 1] = np.maximum.accumulate(fine)   # the curve is monotone; the fit's last-bit dips are not
+    return np.rint(np.clip(out, 0, 65535)).astype(np.uint16)
 
 
 def blend_params(base: np.ndarray, deltas: np.ndarray, weights: np.ndarray) -> np.ndarray:

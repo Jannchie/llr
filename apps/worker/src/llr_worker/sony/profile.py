@@ -250,6 +250,10 @@ class SonyRenderInfo:
     # the decode. The contrast is 高级's one constant rather than a per-look
     # entry (chroma.LUMA_CONTRAST_ADVANCED); the pivot is shared with the
     # standard path, which is why there is no advanced one here.
+    # The advanced one goes out as the smooth curve under the engine's table
+    # rather than the table itself — chroma.luma_lut_dequantised says why and
+    # by how little it differs; the worker's own integer stage keeps the raw
+    # table.
     luma_lut_advanced: list[int] | None = None
     luma_contrast_advanced: float = LUMA_CONTRAST_ADVANCED
     # YGamma's level pair from the 黑色/白色 sliders (chroma.luma_levels): the
@@ -879,7 +883,7 @@ def look_render_info(
         luma_black=luma_black,
         luma_scale=luma_scale,
         luma_lut=[int(v) for v in ygamma_lut(cal)[:LUMA_LUT_WIRE]],
-        luma_lut_advanced=[int(v) for v in ygamma_lut(cal, advanced=True)[:LUMA_LUT_WIRE]],
+        luma_lut_advanced=[int(v) for v in ygamma_lut(cal, advanced=True, dequantised=True)[:LUMA_LUT_WIRE]],
         luma_contrast_advanced=luma_contrast_advanced,
         tweaks=tweaks,
         as_shot=tweaks if as_shot is None else as_shot,
