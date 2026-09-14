@@ -508,8 +508,15 @@ def _file_stamp(input_path: Path) -> tuple[Any, ...]:
         return (str(input_path),)
 
 
-def dro_grid_cached(input_path: Path, exif: dict[str, Any]) -> dict[str, Any] | None:
-    """This shot's DRO grid, opening the RAW only if a decode has not already.
+def dro_grid_cached(input_path: Path, exif: dict[str, Any],
+                    raw: rawpy.RawPy | None = None) -> dict[str, Any] | None:
+    """This shot's DRO grid, from the cache when a decode has built it already.
+
+    The grid depends on the RAW's pixels alone, so a decode that follows
+    another of the same file — a moved denoise slider, a DCP switch — takes
+    the first one's rather than binning the mosaic again (a quarter of a
+    second on a 33 MP frame). A caller with the RAW open passes it (the
+    decode path); otherwise it is opened here.
 
     Returns None both for "no grid possible" and for a file that cannot be read;
     the consumer's fallback is the same either way, so they do not need telling
@@ -520,10 +527,16 @@ def dro_grid_cached(input_path: Path, exif: dict[str, Any]) -> dict[str, Any] | 
         if key in _DRO_GRID_CACHE:
             _DRO_GRID_CACHE.move_to_end(key)
             return _DRO_GRID_CACHE[key]
+
+    def build(handle: rawpy.RawPy) -> dict[str, Any]:
+        crop = camera_crop_rect(handle, exif)
+        return dro_grid_json(dro_grid(handle, crop[0] if crop else None))
     try:
-        with rawpy.imread(str(input_path)) as raw:
-            crop = camera_crop_rect(raw, exif)
-            value = dro_grid_json(dro_grid(raw, crop[0] if crop else None))
+        if raw is not None:
+            value = build(raw)
+        else:
+            with rawpy.imread(str(input_path)) as opened:
+                value = build(opened)
     except (rawpy.LibRawError, OSError, ValueError):
         value = None
     _remember(_DRO_GRID_CACHE, key, value, _DRO_GRID_CACHE_MAX)
@@ -1812,14 +1825,10 @@ def read_raw_metadata(input_path: Path, raw: rawpy.RawPy) -> RawMetadata:
     # that is what lets someone dial DRO in on a frame shot without it. Whether
     # the body used it rides on dro_active, which is what sets the default.
     dro_gain = dro_gain_table(input_path)
-    # Only worth the raw pass when there is a curve for it to index. Needs the
-    # camera crop because the grid is addressed in sensor coordinates while the
-    # render is the cropped, flipped frame.
-    grid = dro_grid_json(
-        dro_grid(raw, camera_crop[0] if camera_crop else None)) if dro_gain else None
-    # The RAW is already open here, so this is the cheap place to fill the cache
+    # Only worth the raw pass when there is a curve for it to index; the RAW
+    # being open here is what makes this the cheap place to fill the cache
     # the look-profile path reads from.
-    _remember(_DRO_GRID_CACHE, _file_stamp(input_path), grid, _DRO_GRID_CACHE_MAX)
+    grid = dro_grid_cached(input_path, exif, raw) if dro_gain else None
     return RawMetadata(
         make=exif.get("Make"),
         model=exif.get("Model"),
