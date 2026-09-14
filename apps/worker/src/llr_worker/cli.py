@@ -2493,7 +2493,10 @@ def save_jpeg(image: Image.Image, output_path: Path, quality: int) -> None:
 
 
 def run_capture(command: list[str], env: dict[str, str] | None = None) -> str:
-    result = subprocess.run(command, check=True, env=env, text=True, capture_output=True)
+    # The daemon's stdin is the API's request pipe; a child that inherits it
+    # never sees EOF, and on Windows exiftool then never exits — so the decode
+    # hung at the metadata read until the API's 120s timeout.
+    result = subprocess.run(command, check=True, env=env, text=True, capture_output=True, stdin=subprocess.DEVNULL)
     return result.stdout
 
 
