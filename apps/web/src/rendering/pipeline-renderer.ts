@@ -54,6 +54,11 @@ export interface EditParams {
   // uncorrected rendering (0). A parameter rather than a per-image upload
   // because it is a user toggle, and it no longer costs a decode to flip.
   cameraMatch: number;
+  // Luminance noise reduction (passes.ts NOISE_LUMA_SHADER), the display-side
+  // half beside the worker's RAW-domain stage: the amount 0..100 (0 = the
+  // stage is off) and the Detail slider 0..100, 50 neutral, which sets how
+  // fine a difference still counts as detail rather than grain.
+  nrLuminance: number; nrDetail: number;
   // Masks (masks.ts packMasks): the packed uniform block, how many groups it
   // holds, which blocks they touch, the previewed group's packed index (-1 =
   // no overlay), and the texcoord -> oriented image-norm matrix plus aspect
@@ -215,8 +220,16 @@ type PostProgram = { prog: WebGLProgram; u: Record<string, WebGLUniformLocation 
  * skips it. Its grid size travels *inside* it rather than beside it, so there
  * is no way to read the dimensions of a base layer that does not exist.
  */
+/** Luminance NR's terms for one draw (renderPass noiseStage), null = off. */
+type NoiseStage = { amount: number; sigma: number };
+
 type SonyPostTargets = {
   scene: RenderTarget;
+  // Luminance NR, when the stage runs: its terms and its output, which the
+  // chain then reads as its scene while `scene` itself is free. Null when
+  // the stage is off, or when the render scale leaves it nothing to do
+  // (prepareSonyPost).
+  noise: (NoiseStage & { target: RenderTarget }) | null;
   base: { pair: [RenderTarget, RenderTarget]; w: number; h: number } | null;
   // The one extra full-resolution buffer Spica needs. Spica reads its
   // neighbours, so it cannot run in the same pass as sharpening — the
@@ -418,6 +431,14 @@ export interface ViewWindow { x: number; y: number; w: number; h: number }
 const HISTO_LONG_GPU = 1024;
 const HISTO_LONG_CPU = 256;
 
+// Luminance NR's range sigma at Detail 50, in display-encoded units — about
+// six 8-bit steps, the grain of a high-ISO frame after the tone curve. The
+// slider moves it two octaves either way (prepareSonyPost). Below this many
+// texels of tap spacing the stage is skipped: the resampling has averaged
+// the grain away already, and the kernel would be reading one texel.
+const NOISE_SIGMA_BASE = 0.025;
+const NOISE_MIN_STEP = 0.25;
+
 // Long-edge cap for the blurred log-luminance mask (Highlights/Shadows
 // locality). Fixed regardless of source size so the blur is a constant
 // fraction of the frame and preview/export masks match by construction.
@@ -434,6 +455,7 @@ export const DEFAULT_PARAMS: EditParams = {
   displayGamut: 0,
   lensDist: [...LENS_IDENTITY], lensVig: [...LENS_IDENTITY],
   cameraMatch: 1,
+  nrLuminance: 0, nrDetail: 50,
   masks: new Float32Array(0), maskGroups: 0, maskUse: 0, maskPreview: -1,
   imgFromTex: imgFromTex(defaultCrop()), imgAspect: 1,
 };
@@ -597,6 +619,8 @@ export class PipelineRenderer {
   private sonyBaseTargets = new Map<string, [RenderTarget, RenderTarget]>();
   // Spica's intermediate, keyed the same way as the scene it alternates with.
   private sonyMidTargets = new Map<string, RenderTarget>();
+  private noiseTargets = new Map<string, RenderTarget>();
+
   /** Cleared once a compile or a framebuffer check fails, so it is never retried. */
   private sonyPostSupported = false;
   /** Whether float textures are LINEAR-filterable (OES_texture_float_linear). */
@@ -1285,13 +1309,12 @@ export class PipelineRenderer {
     // With either post stage on, the main pass renders into a scene target and
     // the chain below composes from it into `fbo` instead.
     const xform = texXform ?? this.texXform;
-    // Marble and the match are listed here as well as in prepareSonyPost's
-    // own gate: a profile with sharpening unreadable (amount 0) still carries
-    // Marble, and the match runs on whatever the chain leaves — with nothing
-    // else on, it reads the main pass's scene directly.
-    const post = this.sonyClarity || this.sonySharpen || this.sonySpica || this.sonyMarble || this.cameraMatchOn()
-      ? this.prepareSonyPost(w, h, xform)
+    // Luminance NR is a parameter, not a profile block: derived per draw and
+    // handed to the chain beside the transform.
+    const noise: NoiseStage | null = p.nrLuminance > 0
+      ? { amount: Math.min(1, p.nrLuminance / 100), sigma: NOISE_SIGMA_BASE * Math.pow(2, (50 - p.nrDetail) / 25) }
       : null;
+    const post = this.prepareSonyPost(w, h, xform, noise);
     gl.bindFramebuffer(gl.FRAMEBUFFER, post ? post.scene.fbo : fbo);
     gl.viewport(0, 0, w, h);
     gl.useProgram(this.program);
@@ -1377,12 +1400,17 @@ export class PipelineRenderer {
    * histogram renders at 512 px and would otherwise still build the full
    * sensor's 1/8 grid.
    */
-  private prepareSonyPost(w: number, h: number, xform: Float32Array): SonyPostTargets | null {
+  private prepareSonyPost(w: number, h: number, xform: Float32Array, nr: NoiseStage | null): SonyPostTargets | null {
     if (!this.sonyPostSupported) return null;
-    if (!this.sonyClarity && !this.sonySharpen && !this.sonySpica && !this.sonyMarble && !this.cameraMatchOn()) return null;
+    // Marble and the match are gated here like the rest: a profile with
+    // sharpening unreadable (amount 0) still carries Marble, and the match
+    // runs on whatever the chain leaves — with nothing else on, it reads the
+    // main pass's scene directly. Nothing on at all: no chain, and renderPass
+    // draws straight to its target.
+    if (!this.sonyClarity && !this.sonySharpen && !this.sonySpica && !this.sonyMarble && !this.cameraMatchOn() && !nr) return null;
     if (!this.postProgram("compose")) return null;
 
-    const float = this.sceneNeedsFloat();
+    const float = this.sceneNeedsFloat(nr !== null);
     const scene = this.cachedFrame(this.sonySceneTargets, w, h, float);
     if (!scene) {
       this.sonyPostSupported = false;   // permanently: fall back to no post pass
@@ -1390,6 +1418,15 @@ export class PipelineRenderer {
     }
     const zoom = Math.hypot(xform[0], xform[1]) || 1;
     const detailScale = Math.min(1, w / Math.max(1, this.texWidth * zoom));
+    // Luminance NR, first in the chain. Its taps step by the render scale
+    // (the kernel spans the same sensor pixels at every zoom), so a preview
+    // small enough to have averaged the grain away skips it. Like the other
+    // stages it drops out alone if its buffer or program will not build.
+    let noise: SonyPostTargets["noise"] = null;
+    if (nr && detailScale >= NOISE_MIN_STEP && this.postProgram("noise")) {
+      const target = this.cachedFrame(this.noiseTargets, w, h, float);
+      if (target) noise = { ...nr, target };
+    }
     // Spica needs its programs, its tables and the intermediate all present; if
     // any of them will not build, the rest of the chain still runs without it
     // rather than the whole post pass disappearing.
@@ -1417,7 +1454,7 @@ export class PipelineRenderer {
       const buffer = own ? this.cachedMidTarget(w, h, float) : null;
       if (!own || buffer) match = { buffer };
     }
-    if (!this.sonyClarity) return { scene, base: null, mid, marble, match, detailScale };
+    if (!this.sonyClarity) return { scene, noise, base: null, mid, marble, match, detailScale };
     if (!this.postProgram("down") || !this.postProgram("edge") || !this.postProgram("blur")) return null;
 
     const down = this.sonyClarity.downsample;
@@ -1425,7 +1462,7 @@ export class PipelineRenderer {
     const bh = Math.max(1, Math.min(h, Math.round((this.texHeight * zoom) / down)));
     const pair = this.cachedBasePair(bw, bh);
     if (!pair) return null;
-    return { scene, base: { pair, w: bw, h: bh }, mid, marble, match, detailScale };
+    return { scene, noise, base: { pair, w: bw, h: bh }, mid, marble, match, detailScale };
   }
 
   /**
@@ -1450,8 +1487,10 @@ export class PipelineRenderer {
    * otherwise be averaging away — the noise it exists to remove would arrive
    * pre-quantised into bands.
    */
-  private sceneNeedsFloat(): boolean {
-    return this.sonySharpen !== null || this.sonySpica !== null || this.sonyMarble !== null;
+  private sceneNeedsFloat(noise: boolean): boolean {
+    // Luminance NR is the fourth, for Marble's reason: what it measures is
+    // the last couple of bits.
+    return this.sonySharpen !== null || this.sonySpica !== null || this.sonyMarble !== null || noise;
   }
 
   /**
@@ -1679,9 +1718,25 @@ export class PipelineRenderer {
   private runSonyPost(t: SonyPostTargets, fbo: WebGLFramebuffer | null, w: number, h: number): void {
     const gl = this.gl;
     const compose = this.sonyPostProgs.get("compose")!;
-    const { scene, base, mid, match } = t;
-
+    const { base, mid, match } = t;
+    let scene = t.scene;
     gl.bindVertexArray(this.unitQuadVao());
+    // Luminance NR first, before anything sharpens: the main pass's frame
+    // through the bilateral into its own buffer, which then stands as the
+    // scene for every stage below — they never learn the difference, and the
+    // original scene target is simply free from here on.
+    if (t.noise) {
+      const noise = this.sonyPostProgs.get("noise")!;
+      const nr = t.noise;
+      gl.viewport(0, 0, w, h);
+      this.blitQuad(noise.prog, scene.tex, nr.target.fbo, () => {
+        gl.uniform2f(noise.u["u_sceneTexel"]!, 1 / w, 1 / h);
+        gl.uniform1f(noise.u["u_step"]!, t.detailScale);
+        gl.uniform1f(noise.u["u_sigma"]!, nr.sigma);
+        gl.uniform1f(noise.u["u_amount"]!, nr.amount);
+      });
+      scene = nr.target;
+    }
     // The match with nothing in front of it reads the scene itself — one draw,
     // no compose blit to make a copy for it.
     if (match && !this.sonyClarity && !this.sonySharpen && !this.sonySpica && !t.marble) {
@@ -1767,6 +1822,7 @@ export class PipelineRenderer {
       // The sharpen kernel steps in scene texels — three of them either way,
       // which is what the engine's three sensor pixels become here.
       gl.uniform2f(compose.u["u_sceneTexel"]!, 1 / w, 1 / h);
+
       // Zero when Spica ran, because the pass above already sharpened `src`.
       gl.uniform1f(compose.u["u_sharpen"]!, mid ? 0 : sharpenAmount);
       gl.uniform1f(compose.u["u_gain"]!, this.sonyClarity?.gain ?? 0);
@@ -1953,6 +2009,7 @@ export class PipelineRenderer {
     this.evictOldest(this.sonySceneTargets, 0);
     this.evictOldest(this.sonyBaseTargets, 0);
     this.evictOldest(this.sonyMidTargets, 0);
+    this.evictOldest(this.noiseTargets, 0);
     this.evictOldest(this.sonyMarbleTargets, 0);
   }
 

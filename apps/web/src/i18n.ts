@@ -195,6 +195,11 @@ const en = {
   "slider.saturation": "Saturation",
   "slider.lensDistortion": "Distortion",
   "slider.lensVignetting": "Vignetting",
+  // Luminance NR on the finished frame (rendering/passes.ts NOISE_LUMA_SHADER),
+  // named as Lightroom names the same pair.
+  "panel.noise": "Noise Reduction",
+  "slider.nrLuminance": "Luminance",
+  "slider.nrDetail": "Detail",
   "slider.hint": "Click to select, then scroll to nudge (Shift ×10) · Double-click to reset",
 
   // The shot's in-camera Creative Look tweaks (Sony engine only). Named apart
@@ -516,6 +521,9 @@ const zh: Record<MessageKey, string> = {
   "slider.saturation": "饱和度",
   "slider.lensDistortion": "扭曲度",
   "slider.lensVignetting": "晕影",
+  "panel.noise": "减少杂色",
+  "slider.nrLuminance": "明亮度",
+  "slider.nrDetail": "细节",
   "slider.hint": "点击选中后可滚轮微调（Shift ×10）· 双击复位",
 
   "panel.creativeLook": "创意外观",

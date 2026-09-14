@@ -957,6 +957,64 @@ void main() {
   outColor = vec4(sum / wsum, 0.0, 0.0, 1.0);
 }`;
 
+// ===== Luminance noise reduction =====
+//
+// The light, display-side half of noise reduction — what Lightroom's Detail
+// panel does with its Luminance/Detail sliders, beside the heavy RAW-domain
+// stage the worker runs (Sony's RawNR or the wavelet, both a re-decode). This
+// one is a shader pass, so it drags in real time and stacks on top of
+// whatever the decode already removed; it is the first stage of the post
+// chain, before sharpening, so the sharpener never sees what it takes out.
+//
+// A 7x7 bilateral filter on luma in the display-encoded frame: a tap counts
+// by its distance (sigma 2 texels) and by how far its luma is from the
+// centre's (sigma = u_sigma, the Detail slider), so grain averages out and an
+// edge, whose far side is many sigmas away, does not. Chroma is left alone —
+// the result is the input scaled by the luma ratio — because colour noise is
+// its own stage (Marble on a Sony frame). Display-encoded rather than
+// scene-linear because noise is nearer to uniform there: linear noise grows
+// with the signal, and one threshold would have to be wrong somewhere.
+//
+// The taps step u_step texels. A preview rendered at a fraction of the source
+// has already averaged the grain away in its resampling, and a kernel of full
+// texels there would reach across many sensor pixels and smooth real detail
+// the export keeps — so the step is the render scale (runSonyPost), the
+// kernel spans the same sensor pixels at every zoom, and below a quarter
+// texel the stage is skipped as having nothing left to do.
+export const NOISE_LUMA_SHADER = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 outColor;
+uniform sampler2D u_scene;      // the finished frame, display-encoded
+uniform vec2 u_sceneTexel;      // one scene texel in UV
+uniform float u_step;           // tap spacing in scene texels (the render scale)
+uniform float u_sigma;          // range sigma, in display-encoded units
+uniform float u_amount;         // 0..1, how much of the filtered luma to take
+const vec3 LUMA = vec3(${glslFloat(REC709_Y[0])}, ${glslFloat(REC709_Y[1])}, ${glslFloat(REC709_Y[2])});
+const int R = 3;
+const float SPATIAL = 1.0 / (2.0 * 2.0 * 2.0);   // 1 / (2 sigma_s^2), sigma_s = 2 texels
+void main() {
+  vec3 rgb = texture(u_scene, v_uv).rgb;
+  float y0 = dot(rgb, LUMA);
+  float range = 1.0 / (2.0 * u_sigma * u_sigma);
+  float sum = 0.0, wsum = 0.0;
+  for (int j = -R; j <= R; j++) {
+    for (int i = -R; i <= R; i++) {
+      vec2 o = vec2(float(i), float(j)) * u_step * u_sceneTexel;
+      float y = dot(texture(u_scene, v_uv + o).rgb, LUMA);
+      float d = y - y0;
+      float w = exp(-float(i * i + j * j) * SPATIAL - d * d * range);
+      sum += w * y;
+      wsum += w;
+    }
+  }
+  float yf = mix(y0, sum / wsum, u_amount);
+  // Scale the colour by the luma ratio so hue and saturation stay; a black
+  // centre has no ratio to keep and takes the difference instead.
+  vec3 out3 = y0 > 1e-4 ? rgb * (yf / y0) : rgb + vec3(yf - y0);
+  outColor = vec4(clamp(out3, 0.0, 1.0), 1.0);
+}`;
+
 // ===== Sony in-camera Clarity (ZcTaskSIMDMarble) =====
 // A post-pass on the finished, display-encoded frame, which is where the engine
 // runs it. Four steps, mirroring the engine's own (sony_repro/PIPELINE.md 7.9.1

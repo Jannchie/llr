@@ -46,7 +46,7 @@ import { extractRecipe, applyRecipe, serializeRecipe, parseRecipe, loadSavedReci
 
 // ── types ──
 
-type RecipeKey = "exposure"|"contrast"|"highlights"|"shadows"|"whites"|"blacks"|"vibrance"|"saturation"|"temperature"|"tint"|"clarity"|"dehaze"|"lensDistortion"|"lensVignetting";
+type RecipeKey = "exposure"|"contrast"|"highlights"|"shadows"|"whites"|"blacks"|"vibrance"|"saturation"|"temperature"|"tint"|"clarity"|"dehaze"|"lensDistortion"|"lensVignetting"|"nrLuminance"|"nrDetail";
 type Recipe = Record<RecipeKey, number>;
 // Labels are not stored: a slider's caption is always `slider.<key>` and a
 // group's is `panel.<title>`, so the catalog can't drift from the controls.
@@ -54,7 +54,7 @@ type SliderSpec = { key: RecipeKey; min: number; max: number; step: number };
 // needsLensCorr: the group's controls do nothing but blend the shot's own
 // correction tables toward identity, so they only mean something when the file
 // carried a pair (see lensCorrAvailable).
-type SliderGroup = { title: "tone" | "presence" | "color" | "lens"; tab: EditTab; items: SliderSpec[]; needsLensCorr?: boolean };
+type SliderGroup = { title: "tone" | "presence" | "color" | "lens" | "noise"; tab: EditTab; items: SliderSpec[]; needsLensCorr?: boolean };
 
 // The rail shows one group at a time, picked from the icon strip along its
 // outer edge. Nine always-open panels stacked to 2400px — reaching the curve
@@ -70,6 +70,7 @@ const defaultRecipe = (): Recipe => ({
   whites: 0, blacks: 0, vibrance: 0, saturation: 0,
   temperature: 6500, tint: 0, clarity: 0, dehaze: 0,
   lensDistortion: 100, lensVignetting: 0,
+  nrLuminance: 0, nrDetail: 50,
 });
 
 const groups: SliderGroup[] = [
@@ -94,6 +95,14 @@ const groups: SliderGroup[] = [
   { title: "lens", tab: "detail", needsLensCorr: true, items: [
     { key: "lensDistortion", min: 0, max: 100, step: 1 },
     { key: "lensVignetting", min: 0, max: 100, step: 1 },
+  ]},
+  // The display-side half of noise reduction (rendering/passes.ts
+  // NOISE_LUMA_SHADER): a shader stage on the finished frame, so it drags in
+  // real time, and it sits on top of whatever the RAW-domain stage below
+  // took out. Lightroom's Luminance / Detail pair, on their scale.
+  { title: "noise", tab: "detail", items: [
+    { key: "nrLuminance", min: 0, max: 100, step: 1 },
+    { key: "nrDetail", min: 0, max: 100, step: 1 },
   ]},
 ];
 
@@ -1337,6 +1346,8 @@ function buildPipelineParams(s?: Snapshot, opts: { preview?: boolean } = {}): Pa
     // Not read off the snapshot: the match is a global profile setting, like the
     // display gamut, not a per-image edit that undo should travel with.
     cameraMatch: cameraMatch.value ? 1 : 0,
+    nrLuminance: r.nrLuminance ?? 0,
+    nrDetail: r.nrDetail ?? 50,
     ...packMasks(s?.masks ?? masks, s?.crop ?? crop, srcW.value, srcH.value,
       { temperature: r.temperature, tint: r.tint },
       !s && opts.preview !== false && maskPreview.value ? selectedMask.value : null),
