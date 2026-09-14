@@ -1033,11 +1033,17 @@ let tabBeforeCrop: EditTab = editTab.value;
 
 // Before an image lands, Settings is the only tab with anything in it; Creative
 // Look needs the shot's own as-shot values to reset back to.
-const availableTabs = computed(() => EDIT_TABS.filter(tb => {
-  if (!activeSource.value) return tb.key === "settings";
-  if (tb.key === "look") return !!lookAsShot.value;
-  return true;
-}));
+// The Creative Look tab is a Sony decode's to offer, and only the decode
+// knows — so while one is in flight the tab stays in the rail, disabled,
+// rather than popping in a few seconds later (or out, on a re-decode).
+const availableTabs = computed(() => {
+  const loading = status.value === "uploading" || status.value === "rendering";
+  return EDIT_TABS.flatMap(tb => {
+    if (!activeSource.value) return tb.key === "settings" ? [{ ...tb, disabled: false }] : [];
+    if (tb.key === "look" && !lookAsShot.value) return loading ? [{ ...tb, disabled: true }] : [];
+    return [{ ...tb, disabled: false }];
+  });
+});
 
 const tabGroups = computed(() => visibleGroups.value.filter(g => g.tab === editTab.value));
 
@@ -3554,6 +3560,7 @@ const vWheelAdjust = {
       <nav class="rail-tabs" :aria-label="t('rail.tabs')">
         <button v-for="tb in availableTabs" :key="tb.key" type="button"
           class="rail-tab" :class="{ 'is-on': editTab === tb.key }" :aria-pressed="editTab === tb.key"
+          :disabled="tb.disabled"
           :title="t(`tab.${tb.key}`)" :aria-label="t(`tab.${tb.key}`)" @click="selectTab(tb.key)">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
             <path v-for="(d, i) in tb.icon" :key="i" :d="d" />

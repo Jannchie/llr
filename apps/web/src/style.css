@@ -631,9 +631,16 @@ button {
   height: 18px;
 }
 
-.rail-tab:hover:not(.is-on) {
+.rail-tab:hover:not(.is-on):not(:disabled) {
   color: var(--text);
   background: var(--card-hover);
+}
+
+/* Offered but not yet openable — a Sony decode still deciding whether the
+   Creative Look tab is this image's. */
+.rail-tab:disabled {
+  opacity: 0.35;
+  cursor: default;
 }
 
 .rail-tab.is-on {
