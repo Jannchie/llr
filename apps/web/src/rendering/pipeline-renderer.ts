@@ -437,7 +437,12 @@ export interface ViewWindow { x: number; y: number; w: number; h: number }
 // smoothness/clipping accuracy against per-update GPU cost. The GPU path scatters
 // on-device (16 KB read-back regardless of size) so it can afford a denser sample
 // than the CPU path (which loops over every pixel in JS after a full read-back).
-const HISTO_LONG_GPU = 512;
+//
+// 1024 to match histogram.ts BIN_IMAGE_LONG, which is what the camera JPEG's
+// histogram is binned from: at 512 the render put a quarter as many samples
+// into the same 256 bins, and its counts were visibly rougher than the JPEG's
+// beside it — a comb that read as the render being noisier than it is.
+const HISTO_LONG_GPU = 1024;
 const HISTO_LONG_CPU = 256;
 
 // Long-edge cap for the blurred log-luminance mask (Highlights/Shadows
@@ -542,6 +547,7 @@ export class PipelineRenderer {
   private histoTex: WebGLTexture | null = null;
   private histoW = 0;
   private histoH = 0;
+  private histoFmt = 0;
   // GPU histogram: a 256×4 float accumulation target (rows = R,G,B,L) plus the
   // scatter program that bins every pixel into it. Built lazily on first use.
   private histoBinFbo: WebGLFramebuffer | null = null;
@@ -619,6 +625,10 @@ export class PipelineRenderer {
   private sonyPostSupported = false;
   /** Whether float textures are LINEAR-filterable (OES_texture_float_linear). */
   private floatLinear = false;
+  // RGBA16 (unsigned normalised 16-bit, EXT_texture_norm16) when the driver
+  // has it, else 0: the format every full-resolution post-chain buffer holds
+  // a display-encoded frame in. See frameTarget for why not 16F.
+  private rgba16 = 0;
   // Async histogram read-back: persistent PIXEL_PACK buffer + the in-flight
   // read (only one at a time; concurrent callers share it).
   private histoPbo: WebGLBuffer | null = null;
@@ -655,6 +665,8 @@ export class PipelineRenderer {
     // programs to find out.
     this.sonyPostSupported = floatRenderable;
     this.floatLinear = !!gl.getExtension("OES_texture_float_linear");
+    const norm16 = gl.getExtension("EXT_texture_norm16") as { RGBA16_EXT: number } | null;
+    this.rgba16 = norm16?.RGBA16_EXT ?? 0;
 
     const pass = PASSES[0];
     this.program = this.compileProgram(pass.fsSource);
@@ -1387,8 +1399,11 @@ export class PipelineRenderer {
     if (!this.postProgram("compose")) return null;
 
     const float = this.sceneNeedsFloat();
-    const scene = this.cachedSceneTarget(w, h, float);
-    if (!scene) return null;
+    const scene = this.cachedFrame(this.sonySceneTargets, w, h, float);
+    if (!scene) {
+      this.sonyPostSupported = false;   // permanently: fall back to no post pass
+      return null;
+    }
     const zoom = Math.hypot(xform[0], xform[1]) || 1;
     const detailScale = Math.min(1, w / Math.max(1, this.texWidth * zoom));
     // Spica needs its programs, its tables and the intermediate all present; if
@@ -1456,21 +1471,22 @@ export class PipelineRenderer {
   }
 
   /**
-   * The scene target for one output size, keeping the last two alive.
+   * A cached full-frame buffer for one output size, from `cache`, keeping
+   * the last two alive.
    *
-   * The precision is part of the key, not just the size: the same w×h at 16F
-   * and at 8-bit are different resources, and handing back the wrong one would
-   * either waste half the memory or silently sharpen 8-bit data.
+   * The precision is part of the key, not just the size: the same w×h at
+   * 16-bit and at 8-bit are different resources, and handing back the wrong
+   * one would either waste half the memory or silently sharpen 8-bit data.
    *
    * Two entries, because the preview and the histogram render at their own
    * sizes and would otherwise evict each other every frame. Reinserting on a
    * hit makes that a true LRU: with plain insertion order a crop drag (a new
    * preview size every mousemove) evicts the histogram's target on alternate
-   * frames, re-allocating it for nothing.
+   * frames, re-allocating it for nothing. Null when the driver will not
+   * allocate one; what that means is the caller's call (the scene is fatal
+   * to the chain, an intermediate drops its stage alone).
    */
-  private cachedSceneTarget(w: number, h: number, float: boolean): RenderTarget | null {
-    const gl = this.gl;
-    const cache = this.sonySceneTargets;
+  private cachedFrame(cache: Map<string, RenderTarget>, w: number, h: number, float: boolean): RenderTarget | null {
     const key = `${w}x${h}:${float ? "f" : "b"}`;
     const hit = cache.get(key);
     if (hit) {
@@ -1478,24 +1494,36 @@ export class PipelineRenderer {
       cache.set(key, hit);
       return hit;
     }
-    const made = float
-      ? this.makeRenderTarget(w, h, gl.RGBA16F, gl.RGBA, gl.FLOAT)
-      : this.makeRenderTarget(w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE);
-    if (!made) {
-      this.sonyPostSupported = false;   // permanently: fall back to no post pass
-      return null;
-    }
+    const made = this.frameTarget(w, h, float);
+    if (!made) return null;
     this.evictOldest(cache, 1);
     cache.set(key, made);
     return made;
   }
 
   /**
-   * Spica's intermediate, cached exactly like the scene target and in the same
-   * format — the two alternate, so a mismatch would silently lose precision on
-   * every other pass. Kept in its own cache rather than as a third scene entry
-   * so that a preview and a histogram at different sizes cannot evict it.
+   * A full-resolution buffer for a display-encoded frame: 16-bit normalised
+   * where the driver offers it, half float otherwise, 8-bit when nothing in
+   * the chain thresholds on the low bits (sceneNeedsFloat).
+   *
+   * Normalised rather than float for the precision's shape. The frame is in
+   * [0, 1] and every stage reads it as such — Spica and Marble rebuild the
+   * engine's 14-bit planes from it — and a half float spends its bits on
+   * range it never uses: from 0.5 up it has 2048 steps per unit, under the
+   * 16383 the planes are on and no finer than Spica's own range threshold.
+   * RGBA16 is 65535 uniform steps for the same memory.
    */
+  private frameTarget(w: number, h: number, float: boolean): RenderTarget | null {
+    const gl = this.gl;
+    if (!float) return this.makeRenderTarget(w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE);
+    if (this.rgba16) {
+      const made = this.makeRenderTarget(w, h, this.rgba16, gl.RGBA, gl.UNSIGNED_SHORT);
+      if (made) return made;
+      this.rgba16 = 0;   // the extension is there but will not render: half float from here on
+    }
+    return this.makeRenderTarget(w, h, gl.RGBA16F, gl.RGBA, gl.FLOAT);
+  }
+
   /**
    * Marble's four buffers, or null if any of them will not build.
    *
@@ -1543,7 +1571,7 @@ export class PipelineRenderer {
       small(), small(), small(),
       // The full-resolution handoff only ever holds a display-referred frame,
       // so it wants the scene's format rather than the planes' precision.
-      this.makeRenderTarget(w, h, gl.RGBA16F, gl.RGBA, gl.FLOAT),
+      this.frameTarget(w, h, true),
     ];
     if (set.some(t => !t)) {
       for (const t of set) {
@@ -1559,24 +1587,10 @@ export class PipelineRenderer {
     return shape(made);
   }
 
+  /** Spica's intermediate (and the match's own buffer): not fatal to the chain
+   * when it will not allocate — prepareSonyPost drops that stage alone. */
   private cachedMidTarget(w: number, h: number, float: boolean): RenderTarget | null {
-    const gl = this.gl;
-    const key = `${w}x${h}:${float ? "f" : "b"}`;
-    const hit = this.sonyMidTargets.get(key);
-    if (hit) {
-      this.sonyMidTargets.delete(key);
-      this.sonyMidTargets.set(key, hit);
-      return hit;
-    }
-    const made = float
-      ? this.makeRenderTarget(w, h, gl.RGBA16F, gl.RGBA, gl.FLOAT)
-      : this.makeRenderTarget(w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE);
-    // Unlike the scene target, failing here is not fatal to the post chain:
-    // prepareSonyPost drops Spica and the other stages carry on.
-    if (!made) return null;
-    this.evictOldest(this.sonyMidTargets, 1);
-    this.sonyMidTargets.set(key, made);
-    return made;
+    return this.cachedFrame(this.sonyMidTargets, w, h, float);
   }
 
   /**
@@ -2095,6 +2109,19 @@ export class PipelineRenderer {
   }
 
   /** (Re)create the RGBA8 FBO the histogram is binned from, capped to `longCap`. */
+  /**
+   * The processed frame the histogram is binned from. The GPU path takes 16
+   * bits per channel (RGBA16, where the driver has it) rather than the 8 the
+   * display gets: the luma bin is a weighted sum of the three channels, and
+   * summed from 8-bit codes it lands on a lattice — on a frame whose channels
+   * are shifted against each other (the camera match moves chroma by a few
+   * percent) some luma bins collect two lattice points and their neighbours
+   * one, a comb the camera's own JPEG histogram beside it does not have. The
+   * R, G and B bins are unchanged either way: the scatter rounds them to the
+   * same 8-bit codes the display shows. The CPU path reads bytes back, which
+   * only an 8-bit target allows; it runs once histoGpuSupported has gone
+   * false, so the format follows that flag.
+   */
   private ensureHistoFbo(longCap: number, view?: HistogramView): { w: number; h: number } {
     const gl = this.gl;
     const baseW = view?.width ?? this.outWidth;
@@ -2103,12 +2130,13 @@ export class PipelineRenderer {
     const scale = Math.min(1, longCap / long);
     const w = Math.max(1, Math.round(baseW * scale));
     const h = Math.max(1, Math.round(baseH * scale));
-    if (this.histoFbo && this.histoW === w && this.histoH === h) return { w, h };
+    const fmt = this.histoGpuSupported && this.rgba16 ? this.rgba16 : gl.RGBA8;
+    if (this.histoFbo && this.histoW === w && this.histoH === h && this.histoFmt === fmt) return { w, h };
     if (this.histoTex) gl.deleteTexture(this.histoTex);
     if (this.histoFbo) gl.deleteFramebuffer(this.histoFbo);
     const tex = gl.createTexture()!;
     gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texImage2D(gl.TEXTURE_2D, 0, fmt, w, h, 0, gl.RGBA, fmt === gl.RGBA8 ? gl.UNSIGNED_BYTE : gl.UNSIGNED_SHORT, null);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     const fbo = gl.createFramebuffer()!;
@@ -2119,6 +2147,7 @@ export class PipelineRenderer {
     this.histoFbo = fbo;
     this.histoW = w;
     this.histoH = h;
+    this.histoFmt = fmt;
     return { w, h };
   }
 
