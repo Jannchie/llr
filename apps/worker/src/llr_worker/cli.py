@@ -42,6 +42,7 @@ from .sony import (
     apply_look_overrides,
     apply_sony_profile,
     calibration_for,
+    linear_matrix_numba,
     looks_in_file,
     rawnr_simd,
     stops_to_panel,
@@ -322,7 +323,7 @@ def _warm_kernels() -> None:
     a machine pays seconds of LLVM. Doing it here, on a thread, hides that
     behind the upload of the first image.
     """
-    for mod in (sony_itp, rawnr_simd, denoise_module):
+    for mod in (sony_itp, rawnr_simd, denoise_module, linear_matrix_numba):
         try:
             mod.warmup()
         except Exception as error:

@@ -310,6 +310,25 @@ def test_neutral_pixels_come_through_unchanged() -> None:
     assert np.allclose(matrix.apply(grey), grey, atol=1e-6)
 
 
+def test_the_compiled_apply_is_the_numpy_form_to_the_bit() -> None:
+    """apply runs the numba kernel (sony/linear_matrix_numba); apply_reference
+    is the whole-array numpy form it was transcribed from. The kernel keeps
+    numpy's float32 order for the luma, the angle, the bin and the three sums,
+    so the two agree exactly — on random colour, on greys, on the axes where
+    the angle's mod wraps, and on a frame wide enough for several strips."""
+    matrix = SegmentedMatrix(fake_coeff(5))
+    rng = np.random.default_rng(11)
+    img = rng.random((600, 37, 3), dtype=np.float32) * 1.6
+    img[::7] = img[::7, :, :1]  # greys
+    img[1::7, :, 2] = img[1::7, :, 0]  # b == r: angle 0 / pi, the wrap
+    ref = matrix.apply_reference(img)
+    got = matrix.apply(img)
+    assert got.dtype == np.float32 and got.shape == img.shape
+    assert np.array_equal(got, ref)
+    # A list of pixels rather than an image takes the same path.
+    assert np.array_equal(matrix.apply(img.reshape(-1, 3)), ref.reshape(-1, 3))
+
+
 def test_apply_is_scale_invariant() -> None:
     """Doubling the exposure must double the output, not shift its colour."""
     matrix = SegmentedMatrix(fake_coeff(3))

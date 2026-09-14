@@ -96,7 +96,20 @@ class SegmentedMatrix:
         return cls(linear_matrix_coeff(path), hue_lut)
 
     def apply(self, rgb: np.ndarray) -> np.ndarray:
-        """Apply the matching segment matrix to every pixel of a (..., 3) array."""
+        """Apply the matching segment matrix to every pixel of a (..., 3) array.
+
+        The compiled kernel (linear_matrix_numba) does the work; apply_reference
+        below is the numpy form it reproduces, kept as the test's oracle.
+        """
+        from . import linear_matrix_numba
+
+        lut = self._hue_lut if self._hue_lut is not None else load_hue_lut()
+        return linear_matrix_numba.apply(np.asarray(rgb, dtype=np.float32), self.table, lut)
+
+    def apply_reference(self, rgb: np.ndarray) -> np.ndarray:
+        """The whole-array numpy form: a 3x3 gathered per pixel, then einsum.
+        2.35 s and a 1.2 GB temporary on a 33 MP frame, which is why it is no
+        longer what apply runs — but it is what the kernel is held to."""
         a = np.asarray(rgb, dtype=np.float32)
         m = self.table[hue_index(a, self._hue_lut)]
         return np.einsum("...ij,...j->...i", m, a)
