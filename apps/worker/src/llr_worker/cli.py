@@ -239,7 +239,9 @@ def find_repo_root() -> Path:
 
 
 def resolve_path(root: Path, value: str) -> Path:
-    if is_windows_drive_path(value):
+    # The API hands over Windows drive paths; they only need the /mnt/<drive>
+    # translation when the worker itself runs under WSL, not natively on Windows.
+    if os.name != "nt" and is_windows_drive_path(value):
         drive = value[0].lower()
         rest = value[2:].lstrip("\\/")
         return (Path("/mnt") / drive / rest.replace("\\", "/")).resolve()
