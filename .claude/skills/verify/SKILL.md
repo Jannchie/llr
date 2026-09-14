@@ -45,12 +45,10 @@ pnpm dev   # starts @llr/api (port 8790) + @llr/web (vite, port 5173 or next fre
 - Run `pnpm dev` from the repo root — the shell cwd persists between Bash calls, and
   from `apps/web` it silently starts only Vite (API missing → decode hangs on proxy
   ECONNREFUSED).
-- On a fresh browser profile (no IndexedDB session) the app AUTO-IMPORTS
-  `/sample.arw` (DSC01157.ARW) on mount. This upload races any `set_input_files`
-  import your script does — a "removed" or counted filmstrip cell can reappear when
-  the auto-import lands late. Always wait for the auto-imported cell to settle
-  (1 cell + `Decoded` status) before importing test files, and count cells from
-  that baseline.
+- On a fresh browser profile (no IndexedDB session) the app starts at the
+  dropzone with nothing loaded — there is no sample auto-import any more, so a
+  script has to import `samples/DSC01157.ARW` itself via `input[type=file]`
+  before there is anything to drive.
 - `Decoded` in `.status-value` can be STALE from the previous image right after
   triggering a new import. Gate on the expected `.film-cell` count together with
   the `Decoded` text, not on the text alone.

@@ -2016,18 +2016,9 @@ onMounted(async () => {
 
   await loadThumbCache();
 
-  // Restore a previous session if one exists; otherwise auto-load the sample.
-  if (await restoreSession()) return;
-  try {
-    const res = await fetch("/sample.arw");
-    if (res.ok) {
-      const blob = await res.blob();
-      const file = new File([blob], "DSC01157.ARW", { type: blob.type });
-      await uploadFiles([file]);
-    }
-  } catch (e) {
-    console.warn("Auto-load sample failed:", e);
-  }
+  // Restore a previous session if one exists; a fresh one starts at the
+  // dropzone rather than with a sample import.
+  await restoreSession();
 });
 
 function pickFiles(): void { fileInput.value?.click(); }
