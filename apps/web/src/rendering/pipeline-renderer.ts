@@ -237,7 +237,11 @@ type SonyPostTargets = {
   // it is reading. One buffer is enough for both: the chain alternates between
   // this and `scene`, so whichever it wrote last is the one the compose reads.
   // Null when Spica is off, which is when nothing needs an intermediate.
+  // YNR needs it for the same reason and shares it: with either on, the
+  // sharpen goes into `mid` first.
   mid: RenderTarget | null;
+  // YNR's mix, 0..1; 0 = the pass does not run (prepareSonyPost).
+  ynr: number;
   // Marble's other half, the chroma cleanup (passes.ts marble* shaders,
   // reference and calibration in worker sony/marble.py). `down`, `mean` and
   // `blur` are the three 1/4-resolution planes the engine's cnr1..cnr3 work on,
@@ -274,6 +278,9 @@ export type ProfileCurve =
     lut: Float32Array; srgbBasis: boolean; chroma?: ProfileChroma | null;
     dro?: ProfileDro | null; clarity?: ProfileClarity | null;
     sharpen?: ProfileSharpen | null; spica?: ProfileSpica | null;
+    // The median pass Edit adds above amount 50 (passes.ts YNR_SHADER), as the
+    // percent of it to mix in: (amount - 50) * 2, so 0 (the default) is off.
+    ynr?: number | null;
     // Marble's chroma cleanup: the shot's ISO and threshold calibration as the
     // worker sent them, plus where Edit's 色彩降噪 control (0..10, 5 = Auto)
     // sits. Everything the four marble* passes need is derived from these by
@@ -582,6 +589,8 @@ export class PipelineRenderer {
   // the profile and the colour-NR slider once per profile rebuild rather than
   // per frame. Null — the default — means the chain below is unchanged.
   private sonyMarble: MarbleUniforms | null = null;
+  // YNR's percent, 0..100 (passes.ts YNR_SHADER); 0 = off.
+  private sonyYnr = 0;
   // Camera match: the table the profile carries, and whether the switch is
   // on. Both have to hold for the stage to run (cameraMatchOn); the table
   // stays put while the switch is off so flipping it back is a redraw.
@@ -960,6 +969,7 @@ export class PipelineRenderer {
     this.sonySharpen = sharpen && sharpen.amount > 0 ? sharpen : null;
     const spica = curve?.spica ?? null;
     this.sonySpica = spica && spica.amount > 0 ? spica : null;
+    this.sonyYnr = Math.max(0, Math.min(100, curve?.ynr ?? 0));
     // Marble's numbers are the slider applied to the body's calibration
     // (sony-marble.ts). An amount of zero means the blend would put the
     // original chroma back untouched, so the stage is dropped outright.
@@ -1407,7 +1417,7 @@ export class PipelineRenderer {
     // runs on whatever the chain leaves — with nothing else on, it reads the
     // main pass's scene directly. Nothing on at all: no chain, and renderPass
     // draws straight to its target.
-    if (!this.sonyClarity && !this.sonySharpen && !this.sonySpica && !this.sonyMarble && !this.cameraMatchOn() && !nr) return null;
+    if (!this.sonyClarity && !this.sonySharpen && !this.sonySpica && !this.sonyMarble && !this.cameraMatchOn() && !nr && !this.sonyYnr) return null;
     if (!this.postProgram("compose")) return null;
 
     const float = this.sceneNeedsFloat(nr !== null);
@@ -1431,10 +1441,13 @@ export class PipelineRenderer {
     // any of them will not build, the rest of the chain still runs without it
     // rather than the whole post pass disappearing.
     let mid: RenderTarget | null = null;
-    if (this.sonySpica && this.postProgram("spica") && this.uploadSpicaTables()) {
-      mid = this.cachedMidTarget(w, h, float);
-    }
-    if (this.sonySpica && !mid) this.sonySpica = null;
+    const spicaReady = !!this.sonySpica && this.postProgram("spica") && this.uploadSpicaTables();
+    // YNR takes the same intermediate; like the bilateral it is skipped at a
+    // render scale small enough to have averaged the grain away.
+    const ynrReady = this.sonyYnr > 0 && detailScale >= NOISE_MIN_STEP && this.postProgram("ynr");
+    if (spicaReady || ynrReady) mid = this.cachedMidTarget(w, h, float);
+    if (this.sonySpica && !(spicaReady && mid)) this.sonySpica = null;
+    const ynr = ynrReady && mid ? this.sonyYnr / 100 : 0;
     // Same all-or-nothing rule as Spica's: if the stage's programs or buffers
     // will not build, it drops out and the rest of the chain still runs.
     let marble: SonyPostTargets["marble"] = null;
@@ -1454,7 +1467,7 @@ export class PipelineRenderer {
       const buffer = own ? this.cachedMidTarget(w, h, float) : null;
       if (!own || buffer) match = { buffer };
     }
-    if (!this.sonyClarity) return { scene, noise, base: null, mid, marble, match, detailScale };
+    if (!this.sonyClarity) return { scene, noise, base: null, mid, ynr, marble, match, detailScale };
     if (!this.postProgram("down") || !this.postProgram("edge") || !this.postProgram("blur")) return null;
 
     const down = this.sonyClarity.downsample;
@@ -1462,7 +1475,7 @@ export class PipelineRenderer {
     const bh = Math.max(1, Math.min(h, Math.round((this.texHeight * zoom) / down)));
     const pair = this.cachedBasePair(bw, bh);
     if (!pair) return null;
-    return { scene, noise, base: { pair, w: bw, h: bh }, mid, marble, match, detailScale };
+    return { scene, noise, base: { pair, w: bw, h: bh }, mid, ynr, marble, match, detailScale };
   }
 
   /**
@@ -1739,7 +1752,7 @@ export class PipelineRenderer {
     }
     // The match with nothing in front of it reads the scene itself — one draw,
     // no compose blit to make a copy for it.
-    if (match && !this.sonyClarity && !this.sonySharpen && !this.sonySpica && !t.marble) {
+    if (match && !this.sonyClarity && !this.sonySharpen && !this.sonySpica && !t.marble && !t.ynr) {
       gl.viewport(0, 0, w, h);
       this.runCameraMatch(scene.tex, fbo);
       return;
@@ -1789,6 +1802,21 @@ export class PipelineRenderer {
         });
         src = mid;
       }
+      // YNR between the two halves of sharpening, where the engine runs it:
+      // the sharpened frame's luma through the median, into whichever buffer
+      // the last pass was not writing.
+      if (t.ynr > 0) {
+        const ynr = this.sonyPostProgs.get("ynr")!;
+        const dst = src === scene ? mid : scene;
+        this.blitQuad(ynr.prog, src.tex, dst.fbo, () => {
+          gl.uniform2f(ynr.u["u_sceneTexel"]!, 1 / w, 1 / h);
+          gl.uniform1f(ynr.u["u_step"]!, t.detailScale);
+          gl.uniform1f(ynr.u["u_percent"]!, t.ynr);
+        });
+        src = dst;
+      }
+    }
+    if (mid && this.sonySpica) {
       const spica = this.sonyPostProgs.get("spica")!;
       const dst = src === scene ? mid : scene;
       this.blitQuad(spica.prog, src.tex, dst.fbo, () => {

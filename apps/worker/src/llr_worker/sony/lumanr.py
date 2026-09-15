@@ -208,7 +208,13 @@ def _ynr_strip(plane: np.ndarray, percent: int, sobel_threshold: int, size: int)
     a = plane.astype(np.int64, copy=False)
     med = (_median_5x5(plane) if size == 5 else _median_3x3(plane)).astype(np.int64)
 
-    p = np.pad(a, 1, mode="edge")
+    # The mask is built on the *median* plane, not the source: the engine's
+    # mask builder (0x14039d740) is handed the median it just made. Measured on
+    # its own tiles at amount 100 (sony_repro/notes/highiso-denoise-gap.md
+    # 9.4): Sobel on the source leaves 0.08-0.13% of the pixels wrong -- the
+    # impulses the median removed still fire the mask and hand the source
+    # back -- while Sobel on the median reproduces both tiles bit for bit.
+    p = np.pad(med, 1, mode="edge")
     h, w = plane.shape
     up, mid, dn = p[0:h, :], p[1:1 + h, :], p[2:2 + h, :]
     gy = ((dn[:, 0:w] + 2 * dn[:, 1:1 + w] + dn[:, 2:2 + w])

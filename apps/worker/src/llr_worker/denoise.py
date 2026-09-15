@@ -178,8 +178,9 @@ def _over_rows(height: int, work: Callable[[int, int], None]) -> None:
 
 
 def _pack_normalise(mosaic: np.ndarray, black: np.ndarray, scale: np.ndarray) -> np.ndarray:
-    """`clip((pack_bayer(mosaic).astype(f32) - black) / scale, 0, 1)`, one pass,
-    reading the uint16 `mosaic` where it lies."""
+    """`(pack_bayer(mosaic).astype(f32) - black) / scale`, one pass, reading the
+    uint16 `mosaic` where it lies. Unclamped: below-black pixels come out
+    negative (see the kernel's docstring for why that matters)."""
     out = np.empty((mosaic.shape[0] // 2, mosaic.shape[1] // 2, 4), dtype=np.float32)
     black, scale = _f32(black), _f32(scale)
     _over_rows(out.shape[0],
@@ -304,7 +305,7 @@ class Denoiser(Protocol):
         self, planes: np.ndarray, sigma: float | None = None, cfa: Sequence[str] | None = None,
         noise: NoiseCurve | None = None, detail: DetailRestore | None = None,
         *, chroma_scale: float = 1.0, sensor_levels: SensorLevels | None = None,
-        strength: float = 1.0,
+        strength: float = 1.0, amount_ui: float = 50.0,
     ) -> np.ndarray: ...
 
     name: str
@@ -339,7 +340,7 @@ class PassthroughDenoiser:
         self, planes: np.ndarray, sigma: float | None = None, cfa: Sequence[str] | None = None,
         noise: NoiseCurve | None = None, detail: DetailRestore | None = None,
         *, chroma_scale: float = 1.0, sensor_levels: SensorLevels | None = None,
-        strength: float = 1.0,
+        strength: float = 1.0, amount_ui: float = 50.0,
     ) -> np.ndarray:
         return planes
 
@@ -771,13 +772,13 @@ class WaveletDenoiser:
         self, planes: np.ndarray, sigma: float | None = None, cfa: Sequence[str] | None = None,
         noise: NoiseCurve | None = None, detail: DetailRestore | None = None,
         *, chroma_scale: float = 1.0, sensor_levels: SensorLevels | None = None,
-        strength: float = 1.0,
+        strength: float = 1.0, amount_ui: float = 50.0,
     ) -> np.ndarray:
         # sensor_levels is for the raw-level filter only; this one works in the
         # normalised domain the protocol hands it and fits its own scale. The
         # ISO strength is likewise the engine's write-back rule for its own
         # filter; for this one the caller rides it on the decode blend instead.
-        del sensor_levels, strength
+        del sensor_levels, strength, amount_ui
         planes = np.clip(planes.astype(np.float32, copy=False), 0.0, 1.0)
         levels = self._levels_for(planes.shape[:2])
 
@@ -859,6 +860,8 @@ class DenoiseStats:
     chroma_scale: float = 1.0
     #: The ISO strength the denoiser was asked to write back at (1.0 = full).
     strength: float = 1.0
+    #: Edit's manual amount the thresholds were built for (50 = Auto).
+    amount_ui: float = 50.0
 
 
 
@@ -871,11 +874,14 @@ def denoise_raw_inplace(
     detail: DetailRestore | None = None,
     chroma_scale: float = 1.0,
     strength: float = 1.0,
+    amount_ui: float = 50.0,
 ) -> DenoiseStats | None:
     """Denoise ``raw``'s visible Bayer mosaic in place.
 
-    ``strength`` is the engine's ISO strength (sony/rawnr_simd.iso_strength),
-    honoured by the denoiser that reproduces the engine and ignored by the rest.
+    ``strength`` is the engine's ISO strength (sony/rawnr_simd.iso_strength)
+    and ``amount_ui`` Edit's manual Noise Reduction amount on its 0..100 scale
+    (50 = Auto); both are honoured by the denoiser that reproduces the engine
+    and ignored by the rest.
 
     Mutates ``raw.raw_image`` so a subsequent ``raw.postprocess()`` demosaics the
     cleaned data. Returns stats for logging, or ``None`` when the sensor's CFA is
@@ -906,7 +912,7 @@ def denoise_raw_inplace(
     norm = _pack_normalise(mosaic, black, scale)
 
     denoised = denoiser(norm, sigma, cfa, noise, detail, chroma_scale=chroma_scale,
-                        sensor_levels=(black, white), strength=strength)
+                        sensor_levels=(black, white), strength=strength, amount_ui=amount_ui)
 
     # Straight back into the mosaic: nothing after this reads `denoised`, so the
     # denormalise, the clamp, the rounding and the unpack are one traversal.
@@ -923,6 +929,7 @@ def denoise_raw_inplace(
         detail_restored=None if detail is None else detail[0],
         chroma_scale=float(chroma_scale),
         strength=float(strength),
+        amount_ui=float(amount_ui),
     )
 
 
@@ -1035,7 +1042,7 @@ class SonyRawNRDenoiser:
         self, planes: np.ndarray, sigma: float | None = None, cfa: Sequence[str] | None = None,
         noise: NoiseCurve | None = None, detail: DetailRestore | None = None,
         *, chroma_scale: float = 1.0, sensor_levels: SensorLevels | None = None,
-        strength: float = 1.0,
+        strength: float = 1.0, amount_ui: float = 50.0,
     ) -> np.ndarray:
         from .sony import rawnr_simd as simd
         from .sony.rawnr import ENGINE_FULL_SCALE, NoiseModel
@@ -1057,12 +1064,17 @@ class SonyRawNRDenoiser:
         span = np.maximum(white - black, 1.0)
         raw = _to_levels(planes, span, black, ENGINE_FULL_SCALE)
 
+        # The manual amount, the way the engine spends it: the table rebuilt
+        # from a scaled strength and the blend weight from the slider (50 is
+        # the tags and the neutral 512, i.e. Auto). Not on the write-back --
+        # that is the ISO's.
+        noise = noise.for_amount(amount_ui)
         # float32 once here rather than a full-plane int32->float32 copy per
         # gather inside `filt`.
         table = np.asarray(noise.threshold(np.arange(simd.TABLE_SIZE, dtype=np.int64)),
                            dtype=np.float32)
 
-        kw: dict[str, int] = {}
+        kw: dict[str, int] = {"blend": simd.blend_table_value(amount_ui)}
         if detail is not None:
             # Both halves of DetailRestore are dimensionless on the wire so they
             # can drive a denoiser in any units; put the engine's own back.

@@ -1468,6 +1468,12 @@ function buildProfileLUT(cp: ColorProfileMeta | null | undefined): ProfileCurve 
     // with complementary weights, so a shot can have this on with sharpening
     // barely doing anything, or the reverse — each is gated on its own amount.
     spica: cp?.profileSpica?.amount ? cp.profileSpica : null,
+    // Above amount 50 Edit adds a median pass on luma (ZcTaskYNR) that the RAW
+    // stage cannot express — captured at export, 50 runs it 0 times and 75/100
+    // once per tile (highiso-denoise-gap.md 3). Its mix is (amount - 50) * 2
+    // percent, so the default and everything below it leave the chain alone.
+    // Sony frames only: the wavelet's amount is a decode blend, not this.
+    ynr: sonyDenoiser.value && denoise.enabled ? Math.max(0, (denoise.amount - 50) * 2) : 0,
     // Marble's other half, the chroma cleanup — on for the same reason the three
     // above are, that the engine runs it and reproducing the engine means
     // running it. Unlike them it has no per-shot amount to gate on: the worker

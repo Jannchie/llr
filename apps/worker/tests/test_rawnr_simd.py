@@ -40,7 +40,6 @@ from llr_worker.sony.rawnr_simd import (
     denoise_phase_rb,
     filt,
     iso_strength,
-    manual_strength,
     warmup,
 )
 
@@ -427,16 +426,31 @@ def test_the_strength_blend_keeps_the_engines_float32_order() -> None:
     assert not np.array_equal(other, apply_strength(f, src, float(s)))
 
 
-def test_the_manual_amount_meets_auto_at_fifty_and_off_at_zero() -> None:
-    """Measured at export (DSC03036): the manual panel's default of 50 gives a
-    RawNR output bit-identical to Auto, and 0 is off. Above 50 the engine
-    changes the filter itself, which this cannot follow, so it holds Auto's."""
-    assert manual_strength(50, 2000) == pytest.approx(iso_strength(2000))
-    assert manual_strength(50, 100) == pytest.approx(iso_strength(100))
-    assert manual_strength(0, 2000) == 0.0
-    assert manual_strength(25, 2000) == pytest.approx(0.5 * iso_strength(2000))
-    assert manual_strength(100, 2000) == pytest.approx(iso_strength(2000))
-    assert manual_strength(-5, 2000) == 0.0
+def test_the_manual_amount_rebuilds_the_thresholds_the_engine_way() -> None:
+    """Captured at export on ISO 25600 (highiso-denoise-gap.md 3): the
+    per-plane strength the engine builds its table from is the tag at UI 50
+    (48), 72 at 75 and 96 at 100 -- ``trunc(tag * (1 + t/100))`` -- and the
+    table at 75 is the 50 table times 1.5 entry for entry. UI 0 zeroes it,
+    which is what makes 0 off. A model without the unfolded tags scales its
+    folded pair the same way."""
+    from llr_worker.sony.rawnr import NoiseModel
+
+    tagged = NoiseModel(lo=0, hi=3072, base=72, slope=396, strength=48, base_coeff=128, slope_coeff=704)
+    assert tagged.for_amount(50) == tagged
+    assert tagged.for_amount(75).strength == 72
+    assert tagged.for_amount(100).strength == 96
+    assert tagged.for_amount(0).strength == 0
+    # The captured tables' entries at 0 / 2048 / 4096 (DSC03692, three amounts).
+    probe = np.array([0, 2048, 4096])
+    np.testing.assert_array_equal(tagged.threshold(probe), [72, 270, 369])
+    np.testing.assert_array_equal(tagged.for_amount(75).threshold(probe), [108, 405, 553])
+    np.testing.assert_array_equal(tagged.for_amount(100).threshold(probe), [144, 540, 738])
+    assert not tagged.for_amount(0).threshold(np.arange(0, 3073, 256)).any()
+
+    folded = NoiseModel(lo=0, hi=3072, base=72, slope=396)
+    assert (folded.for_amount(100).base, folded.for_amount(100).slope) == (144, 792)
+    assert (folded.for_amount(25).base, folded.for_amount(25).slope) == (36, 198)
+    assert folded.for_amount(-5).base == 0
 
 
 def test_warmup_compiles_the_kernels_without_a_real_plane() -> None:

@@ -201,24 +201,15 @@ def iso_strength(iso: float) -> float:
 #: Where Edit's manual Noise Reduction panel meets Auto. Measured at export on
 #: DSC03036 (ISO 2000): with the panel at its defaults -- 量 50 / 色彩降噪 5 /
 #: 边缘降噪 50 -- the stage's output is bit-identical to Auto's, so the manual
-#: default *is* Auto. 量 0 leaves 93% of the pixels within one LSB of the input
-#: (off, near enough). 25 and 75..100 are not a blend toward either end: the
-#: filter itself changes (its tile halo grows by 8 px from 75 up), which is not
-#: reproduced here. sony_repro/notes/measured-chroma-gap.md 2.24.2.
+#: default *is* Auto. Away from 50 the amount is not a write-back blend (that
+#: is the ISO's, `apply_strength`, and it stays): the engine rebuilds the
+#: threshold table from a scaled strength (`NoiseModel.for_amount`) and fills
+#: the blend table from the slider (`blend_table_value`) -- verified bit for
+#: bit at 75 and 100 on ISO 25600 tiles, and it is what makes UI 0 off (a zero
+#: table admits no neighbour). Above 50 the engine also adds a median pass on
+#: luma (ZcTaskYNR, lumanr.py), which lives after the tone chain and so on the
+#: browser's side of the wire. sony_repro/notes/highiso-denoise-gap.md 3.
 MANUAL_AMOUNT_AUTO = 50.0
-
-
-def manual_strength(amount: float, iso: float) -> float:
-    """The write-back strength for a manual Noise Reduction amount (0..100).
-
-    Pinned at both ends the engine was measured at: 0 is off, 50 is exactly
-    Auto's `iso_strength`. Between them it is a straight line, which is the
-    honest shape for two measured points; above 50 the engine strengthens the
-    filter in a way this stage cannot express, so it holds Auto's value rather
-    than invent one.
-    """
-    a = max(0.0, min(float(amount), MANUAL_AMOUNT_AUTO)) / MANUAL_AMOUNT_AUTO
-    return iso_strength(iso) * a
 
 
 def apply_strength(filtered: np.ndarray, original: np.ndarray, strength: float) -> np.ndarray:

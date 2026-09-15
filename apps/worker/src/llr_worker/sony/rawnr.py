@@ -150,6 +150,36 @@ class NoiseModel:
     hi: int
     base: int
     slope: int
+    #: The unfolded inputs, kept so :meth:`for_amount` can re-fold them the way
+    #: the engine does for a manual amount. None on a model built from the
+    #: folded pair alone (tests, fixtures), which then scales the pair itself.
+    strength: int | None = None
+    base_coeff: int | None = None
+    slope_coeff: int | None = None
+
+    def for_amount(self, ui: float) -> NoiseModel:
+        """The curve for a manual Noise Reduction amount (0..100, 50 = Auto).
+
+        The engine stores ``t = (UI - 50) * 2`` and rebuilds its table from an
+        effective strength of ``trunc(tag * (1 + t/100))``: the tag itself at
+        50, one and a half times it at 75, twice at 100, and zero at 0 -- which
+        is why UI 0 is off rather than weak (notes/static-rawnr.md 7.3).
+        Verified at 75 and 100 against the engine's own tables, ISO 25600
+        (notes/highiso-denoise-gap.md 3): with this and the blend table the
+        kernel reproduces the engine's tiles bit for bit.
+        """
+        factor = 1.0 + (float(ui) - 50.0) * 2.0 / 100.0
+        factor = max(0.0, factor)
+        if self.strength is None or self.base_coeff is None or self.slope_coeff is None:
+            return NoiseModel(lo=self.lo, hi=self.hi,
+                              base=int(self.base * factor), slope=int(self.slope * factor))
+        fold = int(self.strength * factor) * _COEFF_NUMERATOR
+        return NoiseModel(
+            lo=self.lo, hi=self.hi,
+            base=(fold * self.base_coeff) >> _STRENGTH_SHIFT,
+            slope=(fold * self.slope_coeff) >> _STRENGTH_SHIFT,
+            strength=int(self.strength * factor), base_coeff=self.base_coeff, slope_coeff=self.slope_coeff,
+        )
 
     def threshold(self, level: np.ndarray | float) -> np.ndarray:
         """Threshold for a local signal level, both on the 0..16383 scale.
@@ -305,6 +335,7 @@ def _cached_read(path: str, size: int,
             hi=tags[LEVEL_HI_TAG],
             base=(fold * tags[BASE_COEFF_TAG]) >> _STRENGTH_SHIFT,
             slope=(fold * tags[SLOPE_COEFF_TAG]) >> _STRENGTH_SHIFT,
+            strength=int(strength), base_coeff=int(tags[BASE_COEFF_TAG]), slope_coeff=int(tags[SLOPE_COEFF_TAG]),
         )
 
     detail = None

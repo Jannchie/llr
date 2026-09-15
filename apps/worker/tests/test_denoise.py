@@ -88,6 +88,37 @@ def test_passthrough_denoise_reproduces_mosaic_bit_for_bit() -> None:
     assert np.array_equal(mosaic, original)
 
 
+def test_below_black_pixels_reach_the_denoiser_as_negative_noise() -> None:
+    """The normalisation must not clamp at black.
+
+    At ISO 25600 7% of a 7CM2 frame sits below the black level. Clamped to
+    zero, that noise is one-sided and a sigma filter's mean lands high --
+    measured +3 levels on the engine's own tile, red worst, a grey-magenta
+    cast in the finished shadows (sony_repro/notes/highiso-denoise-gap.md).
+    The denoiser has to see the negative values; a passthrough then puts the
+    original levels back, so nothing below black is lost on the way either.
+    """
+    seen: dict[str, np.ndarray] = {}
+
+    class Spy:
+        name = "spy"
+
+        def __call__(self, planes, sigma=None, cfa=None, noise=None, detail=None,
+                     *, chroma_scale=1.0, sensor_levels=None, strength=1.0, amount_ui=50.0):
+            seen["planes"] = planes.copy()
+            return planes
+
+    rng = np.random.default_rng(5)
+    mosaic = rng.integers(300, 900, size=(16, 16), dtype=np.uint16)  # black is 512
+    original = mosaic.copy()
+    denoise_raw_inplace(make_raw(mosaic), Spy())
+    planes = seen["planes"]
+    assert (planes < 0).any(), "below-black pixels were clamped before the denoiser"
+    expected = (pack_bayer(original).astype(np.float32) - 512.0) / (16383.0 - 512.0)
+    np.testing.assert_allclose(planes, expected, rtol=0, atol=1e-6)
+    assert np.array_equal(mosaic, original)
+
+
 def test_odd_trailing_row_and_column_left_untouched() -> None:
     rng = np.random.default_rng(3)
     mosaic = random_mosaic(rng, 9, 11)
@@ -217,7 +248,7 @@ def test_denoise_passes_the_cfa_and_the_noise_curve_through() -> None:
         name = "spy"
 
         def __call__(self, planes, sigma=None, cfa=None, noise=None, detail=None,
-                     *, chroma_scale=1.0, sensor_levels=None, strength=1.0):
+                     *, chroma_scale=1.0, sensor_levels=None, strength=1.0, amount_ui=50.0):
             seen.update(cfa=cfa, noise=noise, detail=detail, chroma=chroma_scale,
                         levels=sensor_levels)
             return planes

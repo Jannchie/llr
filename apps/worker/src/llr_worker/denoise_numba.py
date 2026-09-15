@@ -47,26 +47,30 @@ import numpy as np
 
 @numba.njit(cache=True, nogil=True)
 def pack_normalise_rows(mosaic, black, scale, out, y0, y1):
-    """`clip((pack_bayer(mosaic).astype(f32) - black) / scale, 0, 1)`, one pass.
+    """`(pack_bayer(mosaic).astype(f32) - black) / scale`, one pass -- and no
+    clamp.
+
+    A pixel below the black level is negative noise, not an error: at ISO 25600
+    on a 7CM2 that is 7% of the frame. Clamping it to zero here (as this once
+    did) cuts the noise off on one side, and a sigma filter averaging a
+    one-sided distribution lands systematically high -- +3 levels on the
+    engine's own tile, worst on red, which reached the finished frame as a
+    grey-magenta cast in the shadows (sony_repro/notes/highiso-denoise-gap.md
+    section 4.2). The engine feeds its filter the raw values, negative noise
+    included; each denoiser clamps where it needs to (the wavelet to [0, 1],
+    Sony's to the sensor's [0, full] in `to_levels_rows`).
 
     Reads the mosaic straight out of the caller's (strided) visible crop rather
     than a contiguous copy of it -- the copy existed only so `pack_bayer` could
     stack four strided views, and there is no stacking here.
     """
-    zero = np.float32(0.0)
-    one = np.float32(1.0)
     w2 = out.shape[1]
     for i in range(y0, y1):
         top = 2 * i
         for j in range(w2):
             left = 2 * j
             for k in range(4):
-                v = (np.float32(mosaic[top + (k >> 1), left + (k & 1)]) - black[k]) / scale[k]
-                if v < zero:
-                    v = zero
-                elif v > one:
-                    v = one
-                out[i, j, k] = v
+                out[i, j, k] = (np.float32(mosaic[top + (k >> 1), left + (k & 1)]) - black[k]) / scale[k]
 
 
 @numba.njit(cache=True, nogil=True)

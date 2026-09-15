@@ -1015,6 +1015,75 @@ void main() {
   outColor = vec4(clamp(out3, 0.0, 1.0), 1.0);
 }`;
 
+// ===== Sony manual Noise Reduction above 50: ZcTaskYNR =====
+// The engine's second luma stage (worker sony/lumanr.py, notes/static-ynr.md):
+// a 3x3 median of Y, mixed into Y by P percent, everywhere the Sobel gradient
+// of the *median* plane stays under a threshold — which at its default of
+// 0x1FFF on the 14-bit scale (half of full) is nearly everywhere. The mask is
+// built on the median, not the source (the engine's own tiles say so, bit for
+// bit: highiso-denoise-gap.md 9.4), so an impulse the median removes cannot
+// protect itself. It joins the chain only when the amount goes
+// past 50 (P = (amount - 50) * 2), which is the one thing Edit adds there that
+// the RAW stage cannot express; it runs after sharpening and before Spica, in
+// luma, so the colour differences are left exactly as they were. Taps step by
+// the render scale for the same reason the bilateral's do: the median is three
+// sensor pixels wide, whatever the preview's resolution.
+export const YNR_SHADER = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 outColor;
+uniform sampler2D u_scene;      // the sharpened frame, display-encoded
+uniform vec2 u_sceneTexel;      // one scene texel in UV
+uniform float u_step;           // tap spacing in scene texels (the render scale)
+uniform float u_percent;        // 0..1, how much of the median to take
+const vec3 LUMA = vec3(${glslFloat(REC709_Y[0])}, ${glslFloat(REC709_Y[1])}, ${glslFloat(REC709_Y[2])});
+const float SOBEL_T = 8191.0 / 16383.0;
+void swap(inout float a, inout float b) { float t = min(a, b); b = max(a, b); a = t; }
+// Median of nine by a sorting network (19 compare-exchanges).
+float median9(float y[9]) {
+  swap(y[0], y[1]); swap(y[3], y[4]); swap(y[6], y[7]);
+  swap(y[1], y[2]); swap(y[4], y[5]); swap(y[7], y[8]);
+  swap(y[0], y[1]); swap(y[3], y[4]); swap(y[6], y[7]);
+  swap(y[0], y[3]); swap(y[3], y[6]); swap(y[0], y[3]);
+  swap(y[1], y[4]); swap(y[4], y[7]); swap(y[1], y[4]);
+  swap(y[2], y[5]); swap(y[5], y[8]); swap(y[2], y[5]);
+  swap(y[2], y[4]); swap(y[4], y[6]); swap(y[2], y[4]);
+  return y[4];
+}
+void main() {
+  vec3 rgb = texture(u_scene, v_uv).rgb;
+  // 5x5 of luma: the 3x3 median at the centre and at its eight neighbours,
+  // because the gate reads the Sobel of the median plane.
+  float y[25];
+  for (int j = -2; j <= 2; j++) {
+    for (int i = -2; i <= 2; i++) {
+      vec2 o = vec2(float(i), float(j)) * u_step * u_sceneTexel;
+      y[(j + 2) * 5 + (i + 2)] = dot(texture(u_scene, v_uv + o).rgb, LUMA);
+    }
+  }
+  float y0 = y[12];
+  float m[9];
+  for (int j = 0; j < 3; j++) {
+    for (int i = 0; i < 3; i++) {
+      float w[9];
+      for (int b = 0; b < 3; b++) {
+        for (int a = 0; a < 3; a++) {
+          w[b * 3 + a] = y[(j + b) * 5 + (i + a)];
+        }
+      }
+      m[j * 3 + i] = median9(w);
+    }
+  }
+  float med = m[4];
+  // The engine gates on the standard Sobel of the median plane: (gx² + gy²) / 2 > T².
+  float gy = (m[6] + 2.0 * m[7] + m[8]) - (m[0] + 2.0 * m[1] + m[2]);
+  float gx = (m[2] + 2.0 * m[5] + m[8]) - (m[0] + 2.0 * m[3] + m[6]);
+  float edge = (gx * gx + gy * gy) * 0.5 > SOBEL_T * SOBEL_T ? 0.0 : 1.0;
+  float yf = mix(y0, med, u_percent * edge);
+  // Luma moves, chroma stays: the same additive shift in all three channels.
+  outColor = vec4(clamp(rgb + vec3(yf - y0), 0.0, 1.0), 1.0);
+}`;
+
 // ===== Sony in-camera Clarity (ZcTaskSIMDMarble) =====
 // A post-pass on the finished, display-encoded frame, which is where the engine
 // runs it. Four steps, mirroring the engine's own (sony_repro/PIPELINE.md 7.9.1
@@ -1752,6 +1821,7 @@ void main() {
  */
 export const SONY_POST_PROGRAMS = {
   noise: { fsSource: NOISE_LUMA_SHADER, uniforms: ["u_scene", "u_sceneTexel", "u_step", "u_sigma", "u_amount"] },
+  ynr: { fsSource: YNR_SHADER, uniforms: ["u_scene", "u_sceneTexel", "u_step", "u_percent"] },
   down: { fsSource: CLARITY_DOWN_SHADER, uniforms: ["u_input", "u_cell", "u_taps"] },
   edge: { fsSource: CLARITY_EDGE_SHADER, uniforms: ["u_input", "u_texel", "u_threshold"] },
   blur: { fsSource: CLARITY_BLUR_SHADER, uniforms: ["u_input", "u_texel", "u_centerMix"] },

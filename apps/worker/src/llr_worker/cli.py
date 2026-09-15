@@ -59,7 +59,7 @@ from .sony.marble import marble_block
 from .sony.profile import camera_match_table, look_render_info
 from .sony.rawnr import detail_restore as sony_detail_restore
 from .sony.rawnr import noise_model as sony_noise_model
-from .sony.rawnr_simd import iso_strength, manual_strength
+from .sony.rawnr_simd import iso_strength
 from .sony.sharpness import (
     SHARPNESS_DEFAULT,
     SHARPNESS_RANGE_DEFAULT,
@@ -420,6 +420,7 @@ def _linear_cache_key(
     denoise_amount: float,
     denoise_tweaks: tuple[float, float] = (50.0, 50.0),
     denoise_strength: float = 1.0,
+    denoise_amount_ui: float = 50.0,
 ) -> tuple[Any, ...]:
     """Everything that changes a decoded pixel, and nothing that does not.
 
@@ -433,7 +434,7 @@ def _linear_cache_key(
         base = (str(input_path), st.st_size, int(st.st_mtime_ns))
     except OSError:
         base = (str(input_path),)
-    return (*base, profile_id, bool(half_size), int(max_size or 0), dcp_code or "", denoise_model or "", round(float(denoise_amount), 3), _key_tweaks(denoise_model, denoise_tweaks), round(float(denoise_strength), 4))
+    return (*base, profile_id, bool(half_size), int(max_size or 0), dcp_code or "", denoise_model or "", round(float(denoise_amount), 3), _key_tweaks(denoise_model, denoise_tweaks), round(float(denoise_strength), 4), round(float(denoise_amount_ui), 2))
 
 
 _LINEAR_CACHE: OrderedDict[tuple[Any, ...], tuple[np.ndarray, dict[str, Any]]] = OrderedDict()
@@ -677,6 +678,9 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     # noisy/denoised decode blend as the approximation it always was.
     dn_auto = bool(denoise_req.get("auto", False))
     dn_strength = 1.0
+    # Edit's manual amount on its own 0..100 scale, 50 = Auto; only Sony's
+    # filter reads it (the wavelet has `dn_amount` as a decode blend instead).
+    dn_amount_ui = 50.0
     # Which filter runs is not the client's to pick: llr has one denoiser and
     # the goal is that it is Edit's. The request says whether to denoise and how
     # much, never with what; migrating means moving DEFAULT_MODEL, once.
@@ -711,15 +715,16 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
                 dn_amount = iso_strength(float(iso))
     elif file_model == "sony":
         # Edit's manual panel, measured at export: its default amount of 50 is
-        # Auto to the bit, 0 is off, and in between the write-back strength is
-        # the honest straight line (sony/rawnr_simd.py manual_strength). Above
-        # 50 the engine changes the filter itself, which this cannot follow, so
-        # the strength holds at Auto's. The amount is spent here, as the
-        # engine's own write-back, not as a blend of two decodes.
+        # Auto to the bit, and the ISO write-back applies at every amount. The
+        # amount itself goes to the filter -- it rebuilds the thresholds and
+        # the blend weight (denoise.py SonyRawNRDenoiser, verified bit for bit
+        # at 75 and 100) -- never onto a blend of two decodes; 0 is off because
+        # a zeroed table admits no neighbour, so it need not decode at all.
         iso = _exif_int(read_exiftool_metadata(input_path).get("ISO"))
         if iso:
-            dn_strength = manual_strength(dn_amount * 100.0, float(iso))
-            dn_amount = 1.0 if dn_strength > 0.0 else 0.0
+            dn_strength = iso_strength(float(iso))
+            dn_amount_ui = dn_amount * 100.0
+            dn_amount = 1.0 if dn_amount_ui > 0.0 else 0.0
     # Forcing denoise off here for a rendered image (rather than no-op'ing
     # deeper) keeps the two-decode blend below from decoding an identical image
     # twice.
@@ -753,7 +758,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     dro_level_override = (None if request.get("droLevel") is None
                           else dro_level_from_request(request))
 
-    cache_key = _linear_cache_key(input_path, profile_id, half_size, max_size, dcp_code, dn_model, dn_amount, (dn_edge, dn_chroma), dn_strength)
+    cache_key = _linear_cache_key(input_path, profile_id, half_size, max_size, dcp_code, dn_model, dn_amount, (dn_edge, dn_chroma), dn_strength, dn_amount_ui)
 
     # What is cached is always the camera's own rendering; this request's
     # overrides are layered on the way out, so they never outlive it. Stamped
@@ -822,6 +827,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
                 denoise_model=dn_model,
                 denoise_tweaks=(dn_edge, dn_chroma),
                 denoise_strength=dn_strength,
+                denoise_amount_ui=dn_amount_ui,
                 raw_provider=open_raw,
                 store_cache=store_cache,
             )
@@ -845,6 +851,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
                     denoise_model=dn_model,
                     denoise_tweaks=(dn_edge, dn_chroma),
                     denoise_strength=dn_strength,
+                    denoise_amount_ui=dn_amount_ui,
                     raw_provider=open_raw,
                     store_cache=store_cache,
                 )
@@ -899,7 +906,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     matched = (prepared.color_profile.get("selection") or {}).get("matchedCode")
     if store_cache and not dcp_code and matched:
         alias_key = _linear_cache_key(input_path, profile_id, half_size, max_size, matched, dn_model, dn_amount,
-                                      (dn_edge, dn_chroma), dn_strength)
+                                      (dn_edge, dn_chroma), dn_strength, dn_amount_ui)
         alias = _disk_cache_path(alias_key, output_path)
         for suffix in (".f16", ".json"):
             with suppress(OSError):
@@ -1418,6 +1425,7 @@ def extract_preview_image(input_path: Path) -> Image.Image:
 def _raw_cache_key(
     input_path: Path, half_size: bool, max_size: int | None, denoise_model: str | None,
     denoise_tweaks: tuple[float, float] = (50.0, 50.0), denoise_strength: float = 1.0,
+    denoise_amount_ui: float = 50.0,
 ) -> tuple[Any, ...]:
     try:
         stat = input_path.stat()
@@ -1429,7 +1437,10 @@ def _raw_cache_key(
     # denoiser actually consumes them; see `_key_tweaks`.
     # The ISO strength changes the denoised pixels too (it is the engine's
     # write-back blend, applied inside the Sony denoiser), so it is keyed.
-    return (*base, denoise_model or "", _key_tweaks(denoise_model, denoise_tweaks), round(float(denoise_strength), 4))
+    # So is the manual amount: it changes the Sony filter's thresholds and
+    # blend, i.e. the pixels (for the wavelet it is inert and keyed at 50).
+    return (*base, denoise_model or "", _key_tweaks(denoise_model, denoise_tweaks), round(float(denoise_strength), 4),
+            round(float(denoise_amount_ui), 2) if denoise_model == "sony" else 50.0)
 
 
 @dataclass(frozen=True)
@@ -1526,6 +1537,7 @@ def prepare_linear(
     raw_provider: Callable[[], rawpy.RawPy] | None = None,
     store_cache: bool = True,
     denoise_strength: float = 1.0,
+    denoise_amount_ui: float = 50.0,
 ) -> PreparedLinear:
     """Decode RAW into linear working-space RGB (cached per variant).
 
@@ -1549,7 +1561,8 @@ def prepare_linear(
     if denoise_model:
         denoise_model = effective_model(denoise_model, input_path)
 
-    cache_key = _raw_cache_key(input_path, half_size, max_size, denoise_model, denoise_tweaks, denoise_strength)
+    cache_key = _raw_cache_key(input_path, half_size, max_size, denoise_model, denoise_tweaks, denoise_strength,
+                               denoise_amount_ui)
 
     # Cache hit: re-apply DCP on cached camera RGB without re-decoding RAW
     with _CACHE_LOCK:
@@ -1611,7 +1624,7 @@ def prepare_linear(
                 raw, get_denoiser(denoise_model), noise=curve,
                 detail=None if restore is None or curve is None
                 else (restore.fraction, restore.limit_in_thresholds(curve)),
-                chroma_scale=chroma / 50.0, strength=denoise_strength)
+                chroma_scale=chroma / 50.0, strength=denoise_strength, amount_ui=denoise_amount_ui)
             # Which of those two happened is invisible from the result, and it
             # is the one input that varies per *file* rather than per request —
             # so a frame that denoises unlike its neighbours is explained here
@@ -1620,6 +1633,8 @@ def prepare_linear(
                     else f" detail={stats.detail_restored:.2f}")
             if stats is not None and stats.strength != 1.0:
                 kept += f" strength={stats.strength:.3f}"
+            if stats is not None and stats.amount_ui != 50.0:
+                kept += f" amount={stats.amount_ui:.0f}"
             note = (f"{stats.model} {stats.width}x{stats.height} "
                     f"noise={stats.noise_source}{kept}" if stats is not None
                     else "skipped, sensor CFA is not 2x2 Bayer")
