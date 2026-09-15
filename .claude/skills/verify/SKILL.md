@@ -19,10 +19,16 @@ pnpm dev   # starts @llr/api (port 8790) + @llr/web (vite, port 5173 or next fre
 - Python Playwright is installed globally; the repo has no JS playwright. The cached
   Playwright chromium may be version-mismatched — launch with the system Chrome:
   `p.chromium.launch(channel="chrome", headless=True)`.
-- Import an image through the real UI: `page.set_input_files("input[type=file]", "/home/jannchie/llr/samples/DSC01157.ARW")`.
+- Import an image through the real UI: `page.set_input_files("input[type=file][accept]", "/home/jannchie/llr/samples/DSC01157.ARW")`
+  (the second, `webkitdirectory` input imports a whole directory with its subfolders).
 - Wait for decode: `.status-value` text contains `Decoded` (first decode takes ~5-30s; use a 120s timeout).
-- Session state persists in IndexedDB — a reload restores the last session (useful for
-  persistence tests, but means a fresh run may start with leftover images).
+- The library lives server-side (`$LLR_CACHE_DIR/catalog.db`) and the open folder /
+  active photo / view in localStorage — a reload restores the last session (useful for
+  persistence tests, but means a run against the same cache root starts with leftover
+  images). Point `LLR_CACHE_DIR` at a scratch directory for a clean library.
+- Library view: press `g` (grid, `.grid-cell` per visible photo — windowed, so the count is
+  a screenful, not the folder), `e` back to develop. Folder tree rows are `.tree-row`;
+  `page.drag_and_drop(".grid-cell", ".tree-row:has-text('Name')")` moves photos.
 
 ## Useful hooks
 
@@ -45,7 +51,7 @@ pnpm dev   # starts @llr/api (port 8790) + @llr/web (vite, port 5173 or next fre
 - Run `pnpm dev` from the repo root — the shell cwd persists between Bash calls, and
   from `apps/web` it silently starts only Vite (API missing → decode hangs on proxy
   ECONNREFUSED).
-- On a fresh browser profile (no IndexedDB session) the app starts at the
+- On an empty library the app starts at the
   dropzone with nothing loaded — there is no sample auto-import any more, so a
   script has to import `samples/DSC01157.ARW` itself via `input[type=file]`
   before there is anything to drive.

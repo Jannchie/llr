@@ -21,7 +21,9 @@ import {
   type PromptBody,
   type ToolResultBody,
 } from "./agent.js";
+import { Catalog, CatalogError, ROOT_FOLDER_ID, type PhotoMeta, type PhotoRow } from "./catalog.js";
 import {
+  FOLDER_ID,
   SOURCE_ID,
   buildLinearFrameHeader,
   clampDroLevel,
@@ -32,7 +34,9 @@ import {
   isAllowedHost,
   isJsonContentType,
   isLocalOrigin,
+  isValidFolderId,
   isValidSourceId,
+  normalizeFolderName,
   pickExtension,
   type RenderLinearBody,
 } from "./protocol.js";
@@ -43,10 +47,19 @@ const repoRoot = resolveRepoRoot();
 // Everything the server keeps for the user — uploaded sources, their embedded
 // previews, the worker's decode cache — lives outside the checkout, so a
 // `git clean`, a moved repo or a rebuild cannot orphan a library the browser
-// still points at. Sources stay until DELETE /sources/:id; only per-request
-// scratch is swept.
+// still points at. A photo's files stay until it leaves the catalog; only
+// per-request scratch (and directories the catalog no longer names) is swept.
 const cacheRoot = process.env.LLR_CACHE_DIR ?? resolve(process.env.XDG_CACHE_HOME ?? resolve(homedir(), ".cache"), "llr");
 const sessionsRoot = resolve(cacheRoot, "sessions");
+// What is in the library: folders, photos and their edits (catalog.ts). The
+// files a photo owns live in sessions/<id>/ beside the worker's decode cache.
+const catalog = new Catalog(resolve(cacheRoot, "catalog.db"));
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.once(signal, () => {
+    catalog.close(); // checkpoints the WAL so the next open starts clean
+    process.exit(0);
+  });
+}
 // Upload formats the worker can decode: RAW via LibRaw, plus plain images
 // (jpg/png/tiff) via Pillow. Broader than the worker's RAW_EXTENSIONS, which
 // answers "is this a RAW file", not "can we ingest it".
@@ -104,9 +117,10 @@ const server = createServer((request, response) => {
     // Same reasoning for the 4xx we raise ourselves: a stale tab asking for a
     // source the TTL sweep already removed is the client's problem, not a
     // failure worth a stack trace. 5xx and anything unrecognised still log.
-    if (!(error instanceof HttpError) || error.status >= 500) console.error(error);
+    const status = error instanceof HttpError || error instanceof CatalogError ? error.status : 500;
+    if (status >= 500) console.error(error);
     if (!response.headersSent) {
-      sendJson(response, { error: errorMessage(error) }, error instanceof HttpError ? error.status : 500);
+      sendJson(response, { error: errorMessage(error) }, status);
     } else {
       response.end();
     }
@@ -140,23 +154,8 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
     return;
   }
 
-  if (method === "POST" && pathname === "/sources") {
-    await handleSourceUpload(request, response);
-    return;
-  }
-
-  // Remove the server-side cached copy of an import. Only ever touches the
-  // cache root — the user's original file never enters this system.
-  const sourceId = pathname.match(SOURCE_ROUTE)?.[1];
-  if (method === "DELETE" && sourceId) {
-    await rm(sessionDirFor(sourceId), { recursive: true, force: true });
-    sendJson(response, { ok: true });
-    return;
-  }
-
-  const embeddedId = pathname.match(EMBEDDED_ROUTE)?.[1];
-  if (method === "GET" && embeddedId) {
-    await streamFile(response, resolve(sessionDirFor(embeddedId), "embedded.jpg"));
+  if (pathname === "/catalog/tree" || pathname === "/catalog/adopt" || pathname.startsWith("/folders") || pathname.startsWith("/photos")) {
+    await routeCatalog(pathname, method, request, response);
     return;
   }
 
@@ -233,13 +232,180 @@ async function routeAgent(action: string, method: string, request: IncomingMessa
   }
 }
 
-async function handleSourceUpload(request: IncomingMessage, response: ServerResponse): Promise<void> {
+// ── Catalog: folders, photos, edits ──
+//
+// Every route here is a thin validation layer over catalog.ts; the only I/O
+// beyond the database is copying an upload in, asking the worker for its
+// previews, and removing a photo's directory once its row is gone.
+
+const FOLDER_ROUTE = new RegExp(`^/folders/(${FOLDER_ID})$`);
+const FOLDER_PHOTOS_ROUTE = new RegExp(`^/folders/(${FOLDER_ID})/photos$`);
+const PHOTO_ROUTE = new RegExp(`^/photos/(${SOURCE_ID})$`);
+const PHOTO_EDIT_ROUTE = new RegExp(`^/photos/(${SOURCE_ID})/edit$`);
+const PHOTO_IMAGE_ROUTE = new RegExp(`^/photos/(${SOURCE_ID})/(thumb|embedded)\\.jpg$`);
+
+// The most ids one request may name. A whole folder's worth is the realistic
+// maximum; anything larger is a runaway client.
+const IDS_LIMIT = 5000;
+
+async function routeCatalog(pathname: string, method: string, request: IncomingMessage, response: ServerResponse): Promise<void> {
+  if (method === "GET" && pathname === "/catalog/tree") {
+    sendJson(response, { folders: catalog.tree() });
+    return;
+  }
+  if (method === "POST" && pathname === "/catalog/adopt") {
+    await handleAdopt(request, response);
+    return;
+  }
+
+  if (method === "POST" && pathname === "/folders") {
+    const body = await readJson<{ parentId?: unknown; name?: unknown; existingOk?: unknown }>(request);
+    const name = normalizeFolderName(body.name);
+    if (!name) throw new HttpError(400, "Invalid folder name");
+    const parentId = folderIdFromBody(body.parentId);
+    sendJson(response, { folder: catalog.createFolder(parentId, name, { existingOk: body.existingOk === true }) }, 201);
+    return;
+  }
+
+  const folderId = pathname.match(FOLDER_ROUTE)?.[1];
+  if (folderId && method === "PATCH") {
+    const id = Number(folderId);
+    const body = await readJson<{ name?: unknown; parentId?: unknown }>(request);
+    if (body.name !== undefined) {
+      const name = normalizeFolderName(body.name);
+      if (!name) throw new HttpError(400, "Invalid folder name");
+      catalog.renameFolder(id, name);
+    }
+    if (body.parentId !== undefined) catalog.moveFolder(id, folderIdFromBody(body.parentId));
+    sendJson(response, { folder: catalog.getFolder(id) });
+    return;
+  }
+  if (folderId && method === "DELETE") {
+    const removed = catalog.deleteFolder(Number(folderId));
+    await removePhotoDirs(removed);
+    sendJson(response, { ok: true, removed });
+    return;
+  }
+
+  const listId = pathname.match(FOLDER_PHOTOS_ROUTE)?.[1];
+  if (listId && method === "GET") {
+    if (!catalog.getFolder(Number(listId))) throw new HttpError(404, "Unknown folder");
+    sendJson(response, { photos: catalog.listPhotos(Number(listId)).map(publicPhoto) });
+    return;
+  }
+
+  if (method === "POST" && pathname === "/photos") {
+    await handlePhotoUpload(request, response);
+    return;
+  }
+  if (method === "PATCH" && pathname === "/photos/move") {
+    const body = await readJson<{ ids?: unknown; folderId?: unknown }>(request);
+    const moved = catalog.movePhotos(photoIdsFromBody(body.ids), folderIdFromBody(body.folderId));
+    sendJson(response, { moved });
+    return;
+  }
+  if (method === "POST" && pathname === "/photos/delete") {
+    const body = await readJson<{ ids?: unknown }>(request);
+    const removed = catalog.deletePhotos(photoIdsFromBody(body.ids));
+    await removePhotoDirs(removed);
+    sendJson(response, { ok: true, removed });
+    return;
+  }
+
+  const imageMatch = pathname.match(PHOTO_IMAGE_ROUTE);
+  if (imageMatch && method === "GET") {
+    if (!catalog.getPhoto(imageMatch[1])) throw new HttpError(404, "Unknown photo");
+    await streamImmutable(response, resolve(sessionDirFor(imageMatch[1]), `${imageMatch[2]}.jpg`));
+    return;
+  }
+
+  const editId = pathname.match(PHOTO_EDIT_ROUTE)?.[1];
+  if (editId && method === "GET") {
+    // `edit: null` (not a 404) for a photo still at its defaults: that is the
+    // common case for a fresh import, not an error worth a console line.
+    if (!catalog.getPhoto(editId)) throw new HttpError(404, "Unknown photo");
+    sendJson(response, { edit: catalog.getEdit(editId) });
+    return;
+  }
+  if (editId && method === "PUT") {
+    const body = await readJson<{ snapshot?: unknown; history?: unknown; historyIndex?: unknown }>(request);
+    catalog.putEdit(editId, validateEdit(body));
+    sendJson(response, { ok: true });
+    return;
+  }
+
+  const photoId = pathname.match(PHOTO_ROUTE)?.[1];
+  if (photoId && method === "GET") {
+    const photo = catalog.getPhoto(photoId);
+    if (!photo) throw new HttpError(404, "Unknown photo");
+    sendJson(response, { photo: publicPhoto(photo) });
+    return;
+  }
+  if (photoId && method === "DELETE") {
+    const removed = catalog.deletePhotos([photoId]);
+    await removePhotoDirs(removed);
+    sendJson(response, { ok: true, removed });
+    return;
+  }
+
+  sendJson(response, { error: "Not found", path: pathname }, 404);
+}
+
+function folderIdFromBody(value: unknown): number {
+  if (value === undefined || value === null) return ROOT_FOLDER_ID;
+  if (typeof value === "number" && Number.isInteger(value) && value > 0) return value;
+  if (typeof value === "string" && isValidFolderId(value)) return Number(value);
+  throw new HttpError(400, "Invalid folderId");
+}
+
+function photoIdsFromBody(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > IDS_LIMIT) throw new HttpError(400, "Invalid ids");
+  for (const id of value) {
+    if (typeof id !== "string" || !isValidSourceId(id)) throw new HttpError(400, "Invalid ids");
+  }
+  return value as string[];
+}
+
+function validateEdit(body: { snapshot?: unknown; history?: unknown; historyIndex?: unknown }): { snapshot: unknown; history: unknown[]; historyIndex: number } {
+  const { snapshot, history, historyIndex } = body;
+  if (!snapshot || typeof snapshot !== "object" || !Array.isArray(history)) throw new HttpError(400, "Invalid edit");
+  if (typeof historyIndex !== "number" || !Number.isInteger(historyIndex) || historyIndex < 0 || historyIndex >= Math.max(1, history.length)) {
+    throw new HttpError(400, "Invalid historyIndex");
+  }
+  return { snapshot, history, historyIndex };
+}
+
+// The record as the browser sees it: the row plus where its images are.
+function publicPhoto(p: PhotoRow) {
+  return { ...p, embeddedUrl: `/photos/${p.id}/embedded.jpg`, thumbUrl: `/photos/${p.id}/thumb.jpg` };
+}
+
+// Rows are already gone by the time this runs; a directory that will not go
+// (Windows, while the worker still holds the RAW open) is left for the hourly
+// sweep, which removes any directory the catalog no longer names.
+async function removePhotoDirs(ids: string[]): Promise<void> {
+  for (const id of ids) {
+    try {
+      await rm(sessionDirFor(id), { recursive: true, force: true });
+    } catch (error) {
+      console.warn(`could not remove ${id}: ${errorMessage(error)}`);
+    }
+  }
+}
+
+// Copy the upload into its own session directory, ask the worker for the
+// camera preview + thumbnail + metadata, and only then answer — the record
+// the browser gets back is complete, so it never has to poll for a thumbnail.
+async function handlePhotoUpload(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const form = await readFormData(request);
   const file = form.get("file");
   if (!(file instanceof File)) {
     sendJson(response, { error: "Missing file field" }, 400);
     return;
   }
+  const folderId = folderIdFromBody(form.get("folderId") ?? undefined);
+  if (!catalog.getFolder(folderId)) throw new HttpError(404, "Unknown folder");
+  const lastModified = Number(form.get("lastModified"));
 
   const ext = pickExtension(file.name);
   if (!SUPPORTED_EXTENSIONS.has(ext)) {
@@ -250,38 +416,102 @@ async function handleSourceUpload(request: IncomingMessage, response: ServerResp
   const id = randomUUID();
   const sessionDir = resolve(sessionsRoot, id);
   await mkdir(sessionDir, { recursive: true });
-
-  const sourcePath = resolve(sessionDir, `source${ext}`);
-  await writeFile(sourcePath, Buffer.from(await file.arrayBuffer()));
-
-  const embeddedPath = resolve(sessionDir, "embedded.jpg");
-  await daemon.send({ command: "extract-preview", input: sourcePath, output: embeddedPath });
-
-  sendJson(response, {
-    id,
-    name: file.name,
-    size: file.size,
-    embeddedUrl: `/sources/${id}/embedded.jpg`,
-    renderUrl: null
-  }, 201);
+  try {
+    const sourcePath = resolve(sessionDir, `source${ext}`);
+    await writeFile(sourcePath, Buffer.from(await file.arrayBuffer()));
+    catalog.insertPhoto({ id, folderId, name: file.name, ext, size: file.size });
+    const photo = await extractPreviews(id, sourcePath, sessionDir, lastModified);
+    sendJson(response, { photo: publicPhoto(photo) }, 201);
+  } catch (error) {
+    // Nothing half-imported stays: no row without previews, no directory
+    // without a row.
+    catalog.deletePhotos([id]);
+    await rm(sessionDir, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
 }
 
-const SOURCE_ROUTE = new RegExp(`^/sources/(${SOURCE_ID})$`);
-const EMBEDDED_ROUTE = new RegExp(`^/sources/(${SOURCE_ID})/embedded\\.jpg$`);
+async function extractPreviews(id: string, sourcePath: string, sessionDir: string, lastModified: number): Promise<PhotoRow> {
+  const result = await daemon.send({
+    command: "extract-preview",
+    input: sourcePath,
+    output: resolve(sessionDir, "embedded.jpg"),
+    thumbOutput: resolve(sessionDir, "thumb.jpg"),
+    meta: true,
+  });
+  const meta = (result.meta ?? {}) as PhotoMeta;
+  // A file with no EXIF clock (a screenshot, a scan) still has a mtime, and
+  // that is a better "when" than nothing.
+  if (!meta.capturedAt && Number.isFinite(lastModified) && lastModified > 0) {
+    meta.capturedAt = new Date(lastModified).toISOString().slice(0, 19);
+  }
+  const photo = catalog.setPhotoMeta(id, meta, "ready");
+  if (!photo) throw new HttpError(500, "Photo vanished during import");
+  return photo;
+}
+
+// One-time adoption of the pre-catalog library: the browser's IndexedDB knew
+// the ids, names and edits, and the files are still in sessions/<id>/. Ids
+// whose directory is gone are reported back and dropped. Idempotent, so a tab
+// that crashed halfway can simply run it again.
+async function handleAdopt(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const body = await readJson<{ photos?: unknown }>(request);
+  if (!Array.isArray(body.photos) || body.photos.length > IDS_LIMIT) throw new HttpError(400, "Invalid photos");
+  const adopted: string[] = [];
+  const missing: string[] = [];
+  for (const entry of body.photos as { id?: unknown; name?: unknown; size?: unknown; edit?: unknown }[]) {
+    const id = typeof entry.id === "string" && isValidSourceId(entry.id) ? entry.id : null;
+    if (!id) continue;
+    const sessionDir = resolve(sessionsRoot, id);
+    const sourcePath = await findSource(sessionDir);
+    if (!sourcePath) {
+      missing.push(id);
+      continue;
+    }
+    try {
+      if (!catalog.getPhoto(id)) {
+        const name = typeof entry.name === "string" && entry.name ? entry.name : `source${pickExtension(sourcePath)}`;
+        const size = typeof entry.size === "number" ? entry.size : (await stat(sourcePath)).size;
+        catalog.insertPhoto({ id, folderId: ROOT_FOLDER_ID, name, ext: pickExtension(sourcePath), size });
+        await extractPreviews(id, sourcePath, sessionDir, 0);
+      }
+      if (entry.edit && typeof entry.edit === "object") {
+        try {
+          catalog.putEdit(id, validateEdit(entry.edit as Record<string, unknown>));
+        } catch {
+          // A malformed stored edit is not worth failing the whole adoption.
+        }
+      }
+      adopted.push(id);
+    } catch (error) {
+      console.warn(`could not adopt ${id}: ${errorMessage(error)}`);
+      catalog.deletePhotos([id]);
+      missing.push(id);
+    }
+  }
+  catalog.set("legacy_adopted", "1");
+  sendJson(response, { adopted, missing });
+}
 
 function sessionDirFor(sourceId: string): string {
   if (!isValidSourceId(sourceId)) throw new HttpError(400, "Invalid sourceId");
   return resolve(sessionsRoot, sourceId);
 }
 
-// Every handler that works on an uploaded source opens the same three doors:
-// the id must be there, it must be well-formed, and the file must still exist
-// (sessions are swept on a TTL, so a long-idle tab can outlive its upload).
+// Every handler that works on a photo opens the same doors: the id must be
+// there, the catalog must know it, and its file must still exist (a cleared
+// cache root leaves rows pointing at nothing — the browser marks those stale).
 async function resolveSource(sourceId: string | undefined): Promise<{ sessionDir: string; sourcePath: string }> {
   if (!sourceId) throw new HttpError(400, "Missing sourceId");
   const sessionDir = sessionDirFor(sourceId);
-  const sourcePath = await findSource(sessionDir);
-  if (!sourcePath) throw new HttpError(404, "Unknown sourceId");
+  const photo = catalog.getPhoto(sourceId);
+  if (!photo) throw new HttpError(404, "Unknown sourceId");
+  const sourcePath = resolve(sessionDir, `source${photo.ext}`);
+  try {
+    await access(sourcePath);
+  } catch {
+    throw new HttpError(404, "Source file is gone");
+  }
   return { sessionDir, sourcePath };
 }
 
@@ -414,12 +644,21 @@ async function cleanupSessions(): Promise<void> {
     return;
   }
   const now = Date.now();
+  // A directory the catalog does not name is a photo that was removed while
+  // something held its file open, or an import that died halfway. Until the
+  // pre-catalog library has been adopted, though, every directory is one the
+  // browser may still be about to claim — so the sweep waits for that.
+  const known = catalog.get("legacy_adopted") === "1" ? catalog.photoIds() : null;
   for (const entry of entries) {
     if (!entry.isDirectory()) {
       continue;
     }
     const dir = resolve(sessionsRoot, entry.name);
     try {
+      if (known && !known.has(entry.name)) {
+        if (now - (await stat(dir)).mtimeMs > SCRATCH_TTL_MS) await rm(dir, { recursive: true, force: true });
+        continue;
+      }
       await sweepScratch(dir, now);
     } catch (error) {
       console.warn(`session cleanup failed for ${dir}: ${errorMessage(error)}`);
@@ -491,7 +730,7 @@ class WorkerDaemon {
     const id = randomUUID();
     const request: InflightRequest = {
       command: typeof payload.command === "string" ? payload.command : "",
-      outputs: [payload.output, payload.target].filter((value): value is string => typeof value === "string"),
+      outputs: [payload.output, payload.thumbOutput, payload.target].filter((value): value is string => typeof value === "string"),
       handler: null
     };
     // Registered before the boot await so outstanding() already counts it: a
@@ -735,6 +974,29 @@ async function streamFile(response: ServerResponse, path: string): Promise<void>
   await pipeline(stream, response);
 }
 
+// A photo's previews never change once written and their URL carries a UUID,
+// so the browser may keep them for good: a grid of thousands of thumbnails
+// then costs one request each, ever, and a scroll back up costs none.
+async function streamImmutable(response: ServerResponse, path: string): Promise<void> {
+  let size: number;
+  try {
+    size = (await stat(path)).size;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      sendJson(response, { error: "Not found" }, 404);
+    } else {
+      sendJson(response, { error: errorMessage(error) }, 500);
+    }
+    return;
+  }
+  response.writeHead(200, {
+    "content-type": "image/jpeg",
+    "content-length": size,
+    "cache-control": "public, max-age=31536000, immutable"
+  });
+  await pipeline(createReadStream(path), response);
+}
+
 function sendJson(response: ServerResponse, body: unknown, status = 200): void {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
   response.end(JSON.stringify(body, null, 2));
@@ -758,7 +1020,7 @@ function setCors(request: IncomingMessage, response: ServerResponse): void {
   }
   response.setHeader("Access-Control-Allow-Origin", origin);
   response.setHeader("Access-Control-Allow-Headers", "content-type");
-  response.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
+  response.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
 }
 
 // The destination end of a pipeline() failing once the client is gone.

@@ -8,9 +8,35 @@ import {
   isAllowedHost,
   isJsonContentType,
   isLocalOrigin,
+  isValidFolderId,
   isValidSourceId,
+  normalizeFolderName,
   pickExtension,
 } from "../protocol.js";
+
+describe("isValidFolderId", () => {
+  it("accepts rowids only", () => {
+    expect(isValidFolderId("1")).toBe(true);
+    expect(isValidFolderId("123456789012")).toBe(true);
+    for (const id of ["", "-1", "1.5", "a", "1234567890123", " 1"]) {
+      expect(isValidFolderId(id), id).toBe(false);
+    }
+  });
+});
+
+describe("normalizeFolderName", () => {
+  it("trims and bounds", () => {
+    expect(normalizeFolderName("  Trip 2024 ")).toBe("Trip 2024");
+    expect(normalizeFolderName("x".repeat(128))).toHaveLength(128);
+    expect(normalizeFolderName("x".repeat(129))).toBeNull();
+  });
+
+  it("rejects empty, non-string and control characters", () => {
+    for (const name of ["", "   ", 12, null, undefined, "a\nb", "a\u0000b"]) {
+      expect(normalizeFolderName(name), String(name)).toBeNull();
+    }
+  });
+});
 
 describe("isValidSourceId", () => {
   it("accepts server-minted UUIDs", () => {

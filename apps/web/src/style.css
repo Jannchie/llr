@@ -64,6 +64,7 @@
   --stage-inset: 0px;
   --topbar-h: 38px;
   --rail-w: 352px;
+  --left-w: 232px;          /* folder tree */
   --tabbar-w: 36px;
 
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
@@ -112,22 +113,22 @@ button {
 
 .app {
   display: grid;
-  grid-template-columns: 1fr var(--rail-w);
+  grid-template-columns: var(--left-w) 1fr var(--rail-w);
   grid-template-rows: var(--topbar-h) 1fr auto;
   grid-template-areas:
-    "topbar  topbar"
-    "center  right"
-    "filmstrip right";
+    "topbar topbar    topbar"
+    "left   center    right"
+    "left   filmstrip right";
   height: 100vh;
   background: var(--bg);
 }
 
-/* Nothing imported yet: drop the filmstrip row so the stage owns the height. */
+/* No filmstrip (empty folder, or the library grid is up): the stage owns the height. */
 .app.no-filmstrip {
   grid-template-rows: var(--topbar-h) 1fr;
   grid-template-areas:
-    "topbar topbar"
-    "center right";
+    "topbar topbar topbar"
+    "left   center right";
 }
 
 /* ---------- Topbar ---------- */
@@ -165,6 +166,38 @@ button {
 .topbar-actions {
   display: flex;
   gap: 2px;
+}
+
+/* Library / Develop: the two views of the centre pane. */
+.view-switch {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: var(--radius);
+  background: var(--segment-track);
+}
+
+.view-tab {
+  padding: 3px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text-dim);
+  transition: background 120ms, color 120ms;
+}
+
+.view-tab:hover:not(:disabled) {
+  color: var(--text);
+}
+
+.view-tab.is-on {
+  background: var(--segment-on);
+  color: var(--text);
+}
+
+.view-tab:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 .icon-btn {
@@ -452,6 +485,12 @@ button {
   display: flex;
   align-items: center;
   height: 100%;
+}
+
+.status-cell .spinner {
+  width: 12px;
+  height: 12px;
+  margin-right: 6px;
 }
 
 .status-right {
@@ -1341,6 +1380,324 @@ input[type="range"]:focus::-moz-range-thumb {
   cursor: default;
 }
 
+/* ---------- Folder tree ---------- */
+
+.folder-tree {
+  grid-area: left;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  background: var(--card);
+  border-right: 1px solid var(--line);
+  min-height: 0;
+  user-select: none;
+}
+
+.tree-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 32px;
+  padding: 0 6px 0 12px;
+  border-bottom: 1px solid var(--sep);
+}
+
+.tree-title {
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-mute);
+}
+
+.tree-actions {
+  display: flex;
+  gap: 1px;
+}
+
+.tree-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  transition: color 120ms, background 120ms;
+}
+
+.tree-btn svg {
+  width: 15px;
+  height: 15px;
+}
+
+.tree-btn:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--control);
+}
+
+.tree-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.tree-btn-sm {
+  width: 20px;
+  height: 20px;
+}
+
+.tree-btn-sm svg {
+  width: 13px;
+  height: 13px;
+}
+
+.tree-list {
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.tree-row {
+  --depth: 0;
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  padding-left: calc(6px + var(--depth) * 14px);
+  padding-right: 6px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  cursor: default;
+  white-space: nowrap;
+}
+
+.tree-row:hover {
+  background: var(--card-hover);
+  color: var(--text);
+}
+
+.tree-row.is-selected {
+  background: var(--control);
+  color: var(--text);
+}
+
+.tree-row.is-drop-target {
+  box-shadow: inset 0 0 0 1px var(--accent);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.tree-row.is-blocked {
+  opacity: 0.4;
+}
+
+.tree-row:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.tree-twisty {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: var(--text-mute);
+  transition: transform 120ms;
+}
+
+.tree-twisty svg {
+  width: 11px;
+  height: 11px;
+}
+
+.tree-twisty.is-open {
+  transform: rotate(90deg);
+}
+
+.tree-twisty.is-leaf {
+  visibility: hidden;
+}
+
+.tree-icon {
+  width: 15px;
+  height: 15px;
+  flex: none;
+  color: var(--text-mute);
+}
+
+.tree-row.is-selected .tree-icon,
+.tree-row.is-drop-target .tree-icon {
+  color: var(--accent);
+}
+
+.tree-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tree-count {
+  flex: none;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-mute);
+}
+
+.tree-row-actions {
+  display: none;
+  flex: none;
+  gap: 1px;
+}
+
+.tree-row:hover .tree-row-actions,
+.tree-row:focus-within .tree-row-actions {
+  display: flex;
+}
+
+.tree-row:hover .tree-count {
+  display: none;
+}
+
+.tree-edit {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 20px;
+  padding: 0 4px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+}
+
+.tree-edit:focus {
+  outline: none;
+}
+
+/* ---------- Photo grid (library view) ---------- */
+
+.photo-grid {
+  position: absolute;
+  inset: 0;
+  overflow-y: auto;
+  padding: 12px;
+  outline: none;
+  /* Reserve the scrollbar so a folder that just crosses one screen does not
+     reflow the columns. */
+  scrollbar-gutter: stable;
+}
+
+.photo-grid:focus-visible {
+  box-shadow: inset 0 0 0 1px var(--accent-ring);
+}
+
+.grid-inner {
+  position: relative;
+}
+
+.grid-empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--text-mute);
+  font-size: 13px;
+  text-align: center;
+  padding: 24px;
+}
+
+/* Geometry is fixed and mirrored in PhotoGrid.vue GRID_CELL (176 × 140, gap 8). */
+.grid-cell {
+  display: grid;
+  grid-template-rows: 112px 17px;
+  gap: 3px;
+  padding: 4px;
+  border-radius: var(--radius-sm);
+  cursor: default;
+  transition: background 120ms, box-shadow 120ms;
+}
+
+.grid-cell:hover {
+  background: var(--card-hover);
+}
+
+.grid-cell.is-selected {
+  background: var(--control);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.grid-cell.is-active .grid-name {
+  color: var(--accent-strong);
+}
+
+.grid-cell.is-invalid img {
+  opacity: 0.4;
+}
+
+.grid-thumb {
+  position: relative;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border-radius: var(--radius-sm);
+  background: var(--viewport-bg);
+}
+
+.grid-thumb img {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.grid-name {
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: center;
+}
+
+.grid-cell.is-selected .grid-name {
+  color: var(--text);
+}
+
+/* The drag image for a multi-photo drag: a count pill, rendered off-screen
+   for the one frame setDragImage needs it. */
+.grid-drag-badge {
+  position: fixed;
+  top: -100px;
+  left: -100px;
+  padding: 4px 10px;
+  border-radius: var(--radius-pill);
+  background: var(--accent-fill);
+  color: var(--on-accent);
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.photo-grid::-webkit-scrollbar {
+  width: 10px;
+}
+
+.photo-grid::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+.photo-grid::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.24);
+  background-clip: padding-box;
+}
+
 /* ---------- Filmstrip ---------- */
 
 .filmstrip {
@@ -1375,20 +1732,22 @@ input[type="range"]:focus::-moz-range-thumb {
 }
 
 .filmstrip-track {
-  display: flex;
-  gap: 4px;
   padding: 6px 8px;
   overflow-x: auto;
   overflow-y: hidden;
   /* Reserve the scrollbar row so the strip doesn't grow by 10px once the
      library is wide enough to scroll. */
   scrollbar-gutter: stable;
-  align-items: flex-start;
+}
+
+/* The strip is windowed (Filmstrip.vue FILM_CELL: 108 × 96, gap 4): cells are
+   positioned absolutely inside a track as wide as the whole folder. */
+.filmstrip-inner {
+  position: relative;
 }
 
 .film-cell {
   position: relative;
-  flex: 0 0 auto;
   width: 108px;
 }
 
@@ -1584,9 +1943,11 @@ input[type="range"]:focus::-moz-range-thumb {
 
 /* ---------- Drag overlay ---------- */
 
+/* Leaves the folder tree uncovered: a file drag can land on a folder there,
+   and the row it is over has to stay visible to say so. */
 .drag-overlay {
   position: fixed;
-  inset: 0;
+  inset: var(--topbar-h) 0 0 var(--left-w);
   display: grid;
   place-items: center;
   background: rgba(13, 13, 14, 0.66);

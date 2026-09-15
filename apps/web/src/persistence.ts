@@ -1,24 +1,20 @@
-// Local persistence for the editor session, so a refresh keeps the imported
-// image list and each image's edit state + undo history.
+// The pre-catalog session store, kept only to migrate it. Before the API grew
+// a catalog (apps/api/src/catalog.ts), the library index, each image's edit +
+// undo history and the thumbnails lived here in IndexedDB; useCatalog.boot()
+// reads it once, hands the photos to the API (POST /catalog/adopt), then
+// clears it. New builds never write here.
 //
-// Backed by IndexedDB: writes are asynchronous (the previous localStorage
-// store serialized the whole session synchronously on the main thread, right
-// in the gaps of a slider drag) and values are structured-cloned, so there is
-// no JSON round-trip and no 5 MB quota shared with the thumbnails.
-//
-// Layout — one key per record so the hot edit-save path clones only what
-// actually changed (a v1 layout kept every image's edit + history in a single
-// record, so each debounced save structured-cloned the whole library):
+// Layout — one key per record:
 //   - `llr.session.v2` — small index: sources, activeId, view settings.
 //   - `llr.edit.<id>`  — one image's edit (snapshot + capped undo history).
-//   - `llr.thumb.<id>` — one image's downscaled JPEG thumbnail, as a Blob
-//      (v1 stored all thumbnails as base64 data URLs in one record).
+//   - `llr.thumb.<id>` — one image's downscaled JPEG thumbnail, as a Blob.
 //   - `llr.orphans.v1` — id→timestamp ledger of edit records not referenced by
 //      the index, so they can be aged out instead of deleted on sight.
-// v1 records (IndexedDB and the older localStorage store) migrate on load.
-//
-// Image pixels are NOT stored here: the RAW files live server-side under
-// the API's cache root and are re-decoded on demand by their (persisted) id.
+// v1 records (IndexedDB and the older localStorage store) migrate on load, so
+// a library from any earlier build reaches the catalog.
+
+import { trimEdit, type PersistedEdit } from "./edits";
+export type { PersistedEdit } from "./edits";
 
 const DB_NAME = "llr";
 const DB_VERSION = 1;
@@ -31,10 +27,6 @@ const ORPHAN_KEY = "llr.orphans.v1";
 const STATE_KEY_V1 = "llr.state.v1";
 const THUMBS_KEY_V1 = "llr.thumbs.v1";
 
-// Cap per-image undo history in the persisted payload to keep the record
-// bounded; the in-memory history is unaffected.
-const PERSIST_HISTORY_CAP = 50;
-
 // How long an edit record may stay unreferenced by the session index before it
 // is deleted — long enough to outlive a stale tab writing an index that omits
 // another tab's imports.
@@ -45,12 +37,6 @@ export type PersistedSource = {
   name: string;
   size: number;
   embeddedUrl: string;
-};
-
-export type PersistedEdit<S> = {
-  snapshot: S;        // current live edit
-  history: S[];       // undo/redo stack
-  historyIndex: number;
 };
 
 export type PersistedSession<V> = {
@@ -271,25 +257,8 @@ export async function saveSession<V>(session: PersistedSession<V>, removedIds: I
   });
 }
 
-function trimEdit<S>(e: PersistedEdit<S>): PersistedEdit<S> {
-  if (!Array.isArray(e.history) || e.history.length <= PERSIST_HISTORY_CAP) return e;
-  // The window drops the oldest entries, but never so many that it excludes the
-  // entry the snapshot sits on: a record whose snapshot is outside its own
-  // history restores an image with someone else's undo stack.
-  const start = Math.min(e.history.length - PERSIST_HISTORY_CAP, Math.max(0, e.historyIndex));
-  return {
-    snapshot: e.snapshot,
-    history: e.history.slice(start, start + PERSIST_HISTORY_CAP),
-    historyIndex: Math.max(0, e.historyIndex - start),
-  };
-}
-
 export async function saveEdit<S>(id: string, edit: PersistedEdit<S>): Promise<void> {
   await idbSet(EDIT_PREFIX + id, trimEdit(edit));
-}
-
-export async function deleteEdit(id: string): Promise<void> {
-  await idbDelete(EDIT_PREFIX + id);
 }
 
 export async function clearState(): Promise<void> {
@@ -300,69 +269,9 @@ export async function clearState(): Promise<void> {
 
 // --- Thumbnails ---
 
-/** Load all cached thumbnails as displayable URLs (object URLs for Blobs). */
-export async function loadThumbs(): Promise<Record<string, string>> {
-  const out: Record<string, string> = {};
-  const stored = await idbGetByPrefix<Blob>(THUMB_PREFIX);
-  for (const [id, blob] of stored) {
-    if (blob instanceof Blob) out[id] = URL.createObjectURL(blob);
-  }
-  if (Object.keys(out).length) return out;
-
-  // One-time migration from the v1 all-thumbnails-in-one-record data-URL map.
-  const v1 = (await idbGet<Record<string, string>>(THUMBS_KEY_V1)) ?? readLegacy<Record<string, string>>(THUMBS_KEY_V1);
-  if (!v1) return out;
-  for (const [id, dataUrl] of Object.entries(v1)) {
-    out[id] = dataUrl;
-    const blob = dataUrlToBlob(dataUrl);
-    if (blob) await saveThumb(id, blob);
-  }
-  await idbDelete(THUMBS_KEY_V1);
+/** Drop every cached thumbnail (v2 per-image Blobs and the v1 map). The API serves them now. */
+export async function clearThumbs(): Promise<void> {
+  const stored = await idbGetByPrefix<unknown>(THUMB_PREFIX);
+  await idbDelete(THUMBS_KEY_V1, ...[...stored.keys()].map(id => THUMB_PREFIX + id));
   dropLegacy(THUMBS_KEY_V1);
-  return out;
-}
-
-export async function saveThumb(id: string, blob: Blob): Promise<void> {
-  await idbSet(THUMB_PREFIX + id, blob);
-}
-
-export async function deleteThumb(id: string): Promise<void> {
-  await idbDelete(THUMB_PREFIX + id);
-}
-
-function dataUrlToBlob(dataUrl: string): Blob | null {
-  try {
-    const comma = dataUrl.indexOf(",");
-    const mime = /^data:([^;,]+)/.exec(dataUrl)?.[1] ?? "image/jpeg";
-    const bin = atob(dataUrl.slice(comma + 1));
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    return new Blob([bytes], { type: mime });
-  } catch {
-    return null;
-  }
-}
-
-// Downscale an image URL to a compact JPEG Blob for offline thumbnail caching.
-// Returns null if the image can't be loaded/decoded.
-export async function generateThumb(url: string, max = 320): Promise<Blob | null> {
-  try {
-    const img = new Image();
-    img.crossOrigin = "anonymous";
-    img.src = url;
-    await img.decode();
-    const longEdge = Math.max(img.naturalWidth, img.naturalHeight) || 1;
-    const scale = Math.min(1, max / longEdge);
-    const w = Math.max(1, Math.round(img.naturalWidth * scale));
-    const h = Math.max(1, Math.round(img.naturalHeight * scale));
-    const cvs = document.createElement("canvas");
-    cvs.width = w;
-    cvs.height = h;
-    const ctx = cvs.getContext("2d");
-    if (!ctx) return null;
-    ctx.drawImage(img, 0, 0, w, h);
-    return await new Promise<Blob | null>((resolve) => cvs.toBlob(resolve, "image/jpeg", 0.7));
-  } catch {
-    return null;
-  }
 }

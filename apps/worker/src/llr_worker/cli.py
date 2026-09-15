@@ -25,6 +25,7 @@ import rawpy
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from . import denoise as denoise_module
+from .catalog_meta import catalog_meta_from_exif
 from .creative_style import normalize_style
 from .dcp import DcpProfile, apply_dcp_profile, load_dcp_profile
 from .denoise import (
@@ -970,8 +971,17 @@ def daemon_look_profile(request: dict[str, Any], root: Path) -> dict[str, Any]:
 def daemon_extract_preview(request: dict[str, Any], root: Path) -> dict[str, Any]:
     input_path = resolve_path(root, request["input"])
     output_path = resolve_path(root, request["output"])
-    extract_preview(input_path, output_path)
-    return {"output": str(output_path)}
+    thumb_output = request.get("thumbOutput")
+    thumb_path = resolve_path(root, thumb_output) if thumb_output else None
+    size = extract_preview(input_path, output_path, thumb_path, int(request.get("thumbMaxSize") or THUMB_MAX_SIZE))
+    response: dict[str, Any] = {"output": str(output_path)}
+    if thumb_path is not None:
+        response["thumbOutput"] = str(thumb_path)
+    if request.get("meta"):
+        # One exiftool call, memoised: the decode that follows the import asks
+        # the same cache for the same file.
+        response["meta"] = {**catalog_meta_from_exif(read_exiftool_metadata(input_path)), **size}
+    return response
 
 
 # ── Export: embed edit settings into the rendered JPEG as XMP ──
@@ -1361,9 +1371,23 @@ def merge_recipe(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, A
     return {**base, **{key: value for key, value in overrides.items() if value is not None}}
 
 
-def extract_preview(input_path: Path, output_path: Path) -> None:
+# Long edge of the catalog thumbnail: a filmstrip/grid cell on a 2x display.
+THUMB_MAX_SIZE = 384
+
+
+def extract_preview(
+    input_path: Path, output_path: Path, thumb_path: Path | None = None, thumb_max: int = THUMB_MAX_SIZE
+) -> dict[str, int]:
+    """Write the camera's preview JPEG to `output_path` and, if asked, a small
+    thumbnail beside it from the same decode. Returns the preview's oriented
+    size: the aspect a grid cell reserves before the thumbnail arrives."""
     image = extract_preview_image(input_path) if is_raw(input_path) else open_rgb(input_path)
     save_jpeg(image, output_path, quality=92)
+    if thumb_path is not None:
+        thumb = image.copy()
+        thumb.thumbnail((thumb_max, thumb_max), Image.Resampling.LANCZOS)
+        save_jpeg(thumb, thumb_path, quality=80)
+    return {"width": image.width, "height": image.height}
 
 
 def extract_preview_image(input_path: Path) -> Image.Image:
@@ -2195,6 +2219,14 @@ def _read_exiftool_metadata_cached(path: str, size: int, mtime_ns: int) -> dict[
                 # separate them. Without -a exiftool returns the first, which is
                 # the mode, and that is the one wanted here.
                 "-DynamicRangeOptimizer",
+                # The catalog's own fields (catalog_meta.py). `#` asks for the
+                # raw number instead of exiftool's pretty print ("1/250").
+                "-DateTimeOriginal",
+                "-OffsetTimeOriginal",
+                "-Orientation#",
+                "-ExposureTime#",
+                "-FNumber#",
+                "-FocalLength#",
                 str(input_path),
             ],
             env=exiftool_env(),
@@ -2224,6 +2256,12 @@ def _read_exiftool_metadata_cached(path: str, size: int, mtime_ns: int) -> dict[
         "SharpnessRange",
         "ISO",
         "DynamicRangeOptimizer",
+        "DateTimeOriginal",
+        "OffsetTimeOriginal",
+        "Orientation",
+        "ExposureTime",
+        "FNumber",
+        "FocalLength",
     ]:
         out[key] = record.get(key)
     return out

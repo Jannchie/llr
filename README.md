@@ -77,9 +77,12 @@ Drop a RAW on the page. Then, optionally:
 - The Assistant: export `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` (or another
   provider's usual variable) before `pnpm dev`, then pick the model in the
   panel.
-- Everything the server keeps — imports, decode cache — lives under
-  `~/.cache/llr` (`LLR_CACHE_DIR`), never in the checkout, and imports stay
-  until you remove them from the library.
+- Everything the server keeps — the catalog (folders, photos, edits), the
+  imported files, decode cache — lives under `~/.cache/llr`
+  (`LLR_CACHE_DIR`), never in the checkout, and imports stay until you remove
+  them from the library. Drop files or whole folders onto the folder tree to
+  import them (a dropped folder keeps its structure); `G` and `E` switch
+  between the library grid and the develop view.
 
 ## More
 

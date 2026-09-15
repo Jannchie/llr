@@ -1,8 +1,37 @@
 // Small UI helpers and types shared between App.vue and its child components.
 
-// `invalid` is frontend-only (set when the server can no longer decode the
-// source, e.g. the API's cache root was cleared); never persisted.
-export type Source = { id: string; name: string; size: number; embeddedUrl: string; invalid?: boolean };
+// One photo as the catalog (API catalog.ts) records it, plus where its two
+// server-rendered images live. Metadata fields are null when the file carried
+// no EXIF for them. Plain data, never made reactive: a folder holds thousands.
+export type Photo = {
+  id: string;
+  folderId: number;
+  name: string;
+  ext: string;
+  size: number;
+  importedAt: number;
+  width: number | null;
+  height: number | null;
+  orientation: number | null;
+  capturedAt: string | null;
+  make: string | null;
+  model: string | null;
+  lens: string | null;
+  iso: number | null;
+  exposure: number | null;
+  fnumber: number | null;
+  focal: number | null;
+  thumbState: "pending" | "ready" | "failed";
+  /** Camera preview JPEG, API-relative. */
+  embeddedUrl: string;
+  /** 384px thumbnail, API-relative. */
+  thumbUrl: string;
+};
+
+// The active photo as the editor sees it. `invalid` is frontend-only (set
+// when the server can no longer decode the source, e.g. the API's cache root
+// was cleared); never persisted.
+export type Source = Photo & { invalid?: boolean };
 
 export function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
@@ -40,6 +69,9 @@ const IMPORT_FORMATS: { label: string; ext: string[] }[] = [
   { label: "PNG", ext: ["png"] },
   { label: "TIFF", ext: ["tif", "tiff"] },
 ];
+
+/** Importable extensions, lower-case, without the dot. */
+export const IMPORT_EXTENSIONS = new Set(IMPORT_FORMATS.flatMap(f => f.ext));
 
 /** `accept` for the hidden file input. */
 export const IMPORT_ACCEPT = IMPORT_FORMATS.flatMap(f => f.ext.map(e => `.${e}`)).join(",");

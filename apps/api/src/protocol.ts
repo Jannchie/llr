@@ -17,6 +17,28 @@ export function isValidSourceId(sourceId: string): boolean {
   return SOURCE_ID_RE.test(sourceId);
 }
 
+// Folder ids are SQLite rowids; the route patterns accept only digits so a
+// malformed id never reaches the catalog.
+export const FOLDER_ID = String.raw`\d{1,12}`;
+const FOLDER_ID_RE = new RegExp(`^${FOLDER_ID}$`);
+
+export function isValidFolderId(folderId: string): boolean {
+  return FOLDER_ID_RE.test(folderId);
+}
+
+export const FOLDER_NAME_MAX = 128;
+
+// A folder name is display-only (never a path), so the only rules are the
+// ones that keep the tree readable: non-empty once trimmed, bounded, and no
+// control characters. Returns the trimmed name or null.
+export function normalizeFolderName(name: unknown): string | null {
+  if (typeof name !== "string") return null;
+  const trimmed = name.trim();
+  if (!trimmed || trimmed.length > FOLDER_NAME_MAX) return null;
+  if (/[\u0000-\u001f\u007f]/.test(trimmed)) return null;
+  return trimmed;
+}
+
 // The Creative Look tweaks, on Imaging Edge Edit's own panel scale (every
 // slider -100..100, 褪色 and 清晰 0..100). Sent only for the fields the client
 // is actually overriding: the worker fills the rest in from what the body

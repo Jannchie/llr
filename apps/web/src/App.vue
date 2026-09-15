@@ -17,7 +17,7 @@ import {
   type AspectPreset, type CropState,
 } from "./rendering/crop";
 import { API, fetchLinear, fetchLookProfile, type ColorProfileMeta, type DenoisePayload, type LookTweaks, type LookTweakKey } from "./api";
-import { type PersistedEdit } from "./persistence";
+import { type PersistedEdit } from "./edits";
 import { gradingTint, gradingHueDeg } from "./rendering/grading";
 import { parseLensCorr, mixLensTable, LENS_IDENTITY, type LensCorr } from "./rendering/lens";
 import {
@@ -29,12 +29,14 @@ import { t, locale, setLocale, LOCALES, type MessageKey } from "./i18n";
 import SliderRow from "./components/SliderRow.vue";
 import SelectMenu from "./components/SelectMenu.vue";
 import Filmstrip from "./components/Filmstrip.vue";
+import FolderTree from "./components/FolderTree.vue";
+import PhotoGrid from "./components/PhotoGrid.vue";
 import { useViewport } from "./composables/useViewport";
 import { useHistory } from "./composables/useHistory";
 import { useToneCurve } from "./composables/useToneCurve";
 import { useCropEditor, DEFAULT_ASPECT } from "./composables/useCropEditor";
 import { useMaskEditor } from "./composables/useMaskEditor";
-import { useLibrary } from "./composables/useLibrary";
+import { useCatalog } from "./composables/useCatalog";
 import { useHistogram } from "./composables/useHistogram";
 import { useExport, type ExportPlan } from "./composables/useExport";
 import { useAssistant, modelKey, THINKING_LEVELS, type AssistantTool, type ToolContent, type TurnUsage } from "./composables/useAssistant";
@@ -162,6 +164,7 @@ const status = ref<"idle"|"uploading"|"rendering"|"error">("idle");
 const errorMessage = ref<string | null>(null);
 const isDragging = ref(false);
 const fileInput = ref<HTMLInputElement | null>(null);
+const folderInput = ref<HTMLInputElement | null>(null);
 const canvasRef = ref<HTMLCanvasElement | null>(null);
 const timing = ref<number | null>(null);
 const dcpCode = ref("");  // empty = auto-detect
@@ -922,16 +925,18 @@ function applyStoredEdit(e: ImageEdit | null): void {
 }
 
 const {
-  sources, activeId, activeSource,
-  persistNow, schedulePersist,
-  thumbSrc, resolveUrl, markInvalid,
-  selectSource, removeSource,
-  restoreSession, loadThumbCache, releaseThumbs, uploadFiles,
-} = useLibrary<Snapshot, typeof viewSettings>({
+  folders, tree, selectedFolderId, expanded, view: libraryView, folderLoading,
+  folderPhotos, activeId, activeSource, selectedIds, importProgress,
+  photoById, resolveUrl, thumbSrc, markInvalid, clearInvalid,
+  persistNow, persistOnUnload: persistForUnload, schedulePersist,
+  selectSource, openPhoto, setView,
+  selectFolder, toggleExpanded, createFolder, renameFolder, moveFolder, deleteFolder,
+  removePhotos, movePhotos, importFiles, importDropped, importPickedDirectory,
+  boot,
+} = useCatalog<Snapshot, typeof viewSettings>({
   api: API,
   status, errorMessage, cropMode,
   captureEdit: () => ({ snapshot: captureSnapshot(), history: history.value.slice(), historyIndex: historyIndex.value }),
-  defaultEdit: (src) => { const snap = defaultSnapshot(src.name); return { snapshot: snap, history: [snap], historyIndex: 0 }; },
   loadEdit: (e) => applyStoredEdit(e),
   loadPixels: (id, o) => loadSource(id, o),
   flushPendingHistory: () => flushPendingHistory(),
@@ -954,7 +959,7 @@ const {
     errorMessage.value = null;
   },
   isRestoring: () => isRestoring,
-  // Restore only keys this build still has: a stored session outlives the
+  // Restore only keys this build still has: stored UI state outlives the
   // settings it was written with (it carried a view-transform choice until the
   // AgX look was dropped), and a blind assign would revive dead state.
   sessionExtras: {
@@ -1155,8 +1160,7 @@ function denoisePayload(d: typeof denoise = denoise): DenoisePayload {
 // await, otherwise the slower decode would land last and show stale pixels.
 let loadSeq = 0;
 async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promise<boolean> {
-  const src = sources.value.find(s => s.id === id);
-  if (!src) return false;
+  if (!photoById(id)) return false;
   currentSourceId = id;
   const seq = ++loadSeq;
   const stale = () => seq !== loadSeq;
@@ -1250,7 +1254,7 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     applySonyCameraMatch();
     // Apply the current crop/straighten (sets output dims, fit, draws, histogram).
     applyCropRender();
-    src.invalid = false;
+    clearInvalid(id);
     status.value = "idle";
     timing.value = Math.round(performance.now() - t0);
     return true;
@@ -1799,9 +1803,16 @@ function onKeyDown(e: KeyboardEvent): void {
     e.preventDefault(); spaceHeld.value = true; return;
   }
 
+  // G / E switch between the library grid and the develop view (Lightroom's
+  // own keys). Only when the grid does not own the key itself.
+  if (!inEditableText && !e.ctrlKey && !e.metaKey && !e.altKey && !cropMode.value) {
+    if (e.key === "g" || e.key === "G") { e.preventDefault(); setView("library"); return; }
+    if ((e.key === "e" || e.key === "E") && activeSource.value) { e.preventDefault(); setView("develop"); return; }
+  }
+
   // Crop tool: R toggles, Esc / Enter commit & exit, X swaps orientation,
   // O cycles the guide overlay, Shift+O mirrors it (Lightroom-style).
-  if (!inEditableText && activeSource.value && !e.ctrlKey && !e.metaKey && !e.altKey) {
+  if (!inEditableText && activeSource.value && !e.ctrlKey && !e.metaKey && !e.altKey && libraryView.value === "develop") {
     if (e.key === "r" || e.key === "R") { e.preventDefault(); toggleCropMode(); return; }
     if (cropMode.value && lineTool.value && e.key === "Escape") { e.preventDefault(); lineTool.value = null; return; }
     if (cropMode.value && (e.key === "Delete" || e.key === "Backspace") && crop.xf.guides.length) { e.preventDefault(); removeLastGuide(); return; }
@@ -1983,10 +1994,10 @@ watch(denoise, () => {
   if (!suppressDcpReload && currentSourceId && lookCurrent) installLookProfile(lookCurrent);
 }, { deep: true });
 
-// Flush the latest edit on tab close. The IndexedDB write is async, so also
-// flush whenever the tab goes hidden — that fires earlier and more reliably
-// than beforeunload (mobile tab switches, window close).
-function persistOnUnload(): void { persistNow(); }
+// Flush the latest edit on tab close. Only a keepalive request survives the
+// unload, so also flush whenever the tab goes hidden — that fires earlier and
+// more reliably than beforeunload (mobile tab switches, window close).
+function persistOnUnload(): void { persistForUnload(); }
 function persistOnHidden(): void { if (document.visibilityState === "hidden") persistNow(); }
 
 onBeforeUnmount(() => {
@@ -1999,7 +2010,6 @@ onBeforeUnmount(() => {
   canvasRef.value?.removeEventListener('webglcontextrestored', onContextRestored);
   resizeObs?.disconnect();
   histogram.dispose();
-  releaseThumbs();
   destroyWebGL();
 });
 
@@ -2014,19 +2024,27 @@ onMounted(async () => {
   resizeObs = new ResizeObserver(() => recomputeFit());
   if (viewportRef.value) resizeObs.observe(viewportRef.value);
 
-  await loadThumbCache();
-
-  // Restore a previous session if one exists; a fresh one starts at the
-  // dropzone rather than with a sample import.
-  await restoreSession();
+  // Load the catalog (adopting a pre-catalog IndexedDB library first, if this
+  // browser has one) and reopen where the last session left off; a fresh
+  // library starts at the dropzone.
+  await boot();
 });
 
+// The hidden pickers import into the folder that is open in the tree.
 function pickFiles(): void { fileInput.value?.click(); }
+function pickFolder(): void { folderInput.value?.click(); }
 
 async function onFileChange(e: Event): Promise<void> {
   const t = e.target as HTMLInputElement;
   if (!t.files) return;
-  await uploadFiles(Array.from(t.files));
+  await importFiles(Array.from(t.files).map(file => ({ file, folderId: selectedFolderId.value })));
+  t.value = "";
+}
+
+async function onFolderChange(e: Event): Promise<void> {
+  const t = e.target as HTMLInputElement;
+  if (!t.files) return;
+  await importPickedDirectory(Array.from(t.files), selectedFolderId.value);
   t.value = "";
 }
 
@@ -2044,12 +2062,30 @@ function onDragLeave(e: DragEvent): void {
   if (!e.relatedTarget) isDragging.value = false;
 }
 
+// A drop anywhere on the shell imports into the open folder; drops on a tree
+// row are handled (and stopped) there. A photo dragged out of the grid or
+// filmstrip and let go on the stage is not an import — nor anything.
 async function onDrop(e: DragEvent): Promise<void> {
   e.preventDefault();
   isDragging.value = false;
-  const files = e.dataTransfer?.files;
-  if (!files?.length) return;
-  await uploadFiles(Array.from(files));
+  const dt = e.dataTransfer;
+  if (!dt || dt.types.includes("application/x-llr-photos") || dt.types.includes("application/x-llr-folder")) return;
+  if (!dt.types.includes("Files")) return;
+  await importDropped(dt, selectedFolderId.value);
+}
+
+// A drop the tree took (it stops propagation, so the shell's own drop
+// handler never clears the overlay).
+function onTreeDrop(dt: DataTransfer, folderId: number): void {
+  isDragging.value = false;
+  void importDropped(dt, folderId);
+}
+
+// Removal asks first when it is more than one photo: a Delete on a multi-select
+// in the grid should not silently take a whole shoot out of the library.
+async function removePhotosConfirmed(ids: string[]): Promise<void> {
+  if (ids.length > 1 && !window.confirm(t("grid.removeConfirm", { n: ids.length }))) return;
+  await removePhotos(ids);
 }
 
 function resetRecipe(): void {
@@ -2735,7 +2771,7 @@ const vWheelAdjust = {
 </script>
 
 <template>
-  <div class="app" :class="{ 'is-drag': isDragging, 'no-filmstrip': !sources.length }"
+  <div class="app" :class="{ 'is-drag': isDragging, 'no-filmstrip': libraryView === 'library' || !folderPhotos.length, 'view-library': libraryView === 'library' }"
     @dragover="onDragOver"
     @dragleave="onDragLeave"
     @drop="onDrop">
@@ -2743,6 +2779,12 @@ const vWheelAdjust = {
       <div class="brand">
         <span class="brand-mark" aria-hidden="true" />
         <span class="brand-name">LLR</span>
+      </div>
+      <div class="view-switch" role="tablist">
+        <button type="button" class="view-tab" role="tab" :class="{ 'is-on': libraryView === 'library' }"
+          :aria-selected="libraryView === 'library'" @click="setView('library')">{{ t('view.library') }}</button>
+        <button type="button" class="view-tab" role="tab" :class="{ 'is-on': libraryView === 'develop' }"
+          :aria-selected="libraryView === 'develop'" :disabled="!activeSource" @click="setView('develop')">{{ t('view.develop') }}</button>
       </div>
       <div class="topbar-actions">
         <button class="icon-btn" :disabled="!canUndo" @click="undo" :title="t('action.undo')" :aria-label="t('aria.undo')">
@@ -2801,8 +2843,20 @@ const vWheelAdjust = {
       </button>
     </header>
 
+    <FolderTree class="left" :folders="folders" :tree="tree" :expanded="expanded" :selected-id="selectedFolderId"
+      :busy="!!importProgress"
+      @select="selectFolder" @toggle="toggleExpanded"
+      @create="(parentId, name) => createFolder(parentId, name)" @rename="renameFolder" @delete="deleteFolder"
+      @move-photos="movePhotos" @move-folder="moveFolder"
+      @drop-files="onTreeDrop" @import-files="pickFiles" @import-folder="pickFolder" />
+
     <main class="center">
-      <div class="viewport" ref="viewportRef"
+      <!-- The grid and the stage swap by v-show, not v-if: the canvas and its
+           WebGL context stay alive across the toggle. -->
+      <PhotoGrid v-show="libraryView === 'library'" :photos="folderPhotos" :active-id="activeId"
+        :selected-ids="selectedIds" :loading="folderLoading" :thumb-src="thumbSrc" :is-invalid="(id) => activeSource?.id === id && !!activeSource.invalid"
+        @open="openPhoto" @remove="removePhotosConfirmed" />
+      <div class="viewport" ref="viewportRef" v-show="libraryView === 'develop'"
         @wheel="onWheel"
         @mousedown="startPan"
         @mousemove="doPan"
@@ -2810,7 +2864,7 @@ const vWheelAdjust = {
         @mouseleave="stopPan"
         @dblclick="onDoubleClick"
         :class="{ 'is-grabbing': isPanning, 'is-grab': spaceHeld && !isPanning }">
-        <div class="dropzone" v-show="!activeSource" @click="pickFiles">
+        <div class="dropzone" v-show="!activeSource && status !== 'uploading'" @click="pickFiles">
           <div class="dropzone-inner">
             <svg class="dropzone-icon" viewBox="0 0 48 48" fill="none" aria-hidden="true">
               <rect x="6" y="10" width="36" height="28" rx="4" stroke="currentColor" stroke-width="2" />
@@ -2923,7 +2977,7 @@ const vWheelAdjust = {
             </g>
           </template>
         </svg>
-        <img v-show="activeSource && !activeSource.invalid && !webglRenderer && status !== 'rendering'" class="preview" :style="{ transform: displayTransform }" :src="activeSource ? thumbSrc(activeSource) : ''" :alt="t('aria.preview')" />
+        <img v-show="activeSource && !activeSource.invalid && !webglRenderer && status !== 'rendering'" class="preview" :style="{ transform: displayTransform }" :src="activeSource ? resolveUrl(activeSource.embeddedUrl) : ''" :alt="t('aria.preview')" />
         <div v-if="activeSource?.invalid" class="invalid-state">
           <img v-if="activeSource && thumbSrc(activeSource)" :src="thumbSrc(activeSource)" :alt="activeSource.name" />
           <p class="invalid-title">{{ t('invalid.missingTitle') }}</p>
@@ -2935,15 +2989,22 @@ const vWheelAdjust = {
         </div>
       </div>
 
-      <footer class="status" v-show="activeSource">
+      <footer class="status" v-show="activeSource || libraryView === 'library'">
         <div class="status-left">
-          <div class="status-cell">
+          <div class="status-cell" v-if="libraryView === 'develop'">
             <span class="status-label">{{ t('status.label') }}</span>
             <span class="status-value" :data-state="status">{{ timing ? t('status.decodedIn', { ms: timing }) : status }}</span>
           </div>
+          <div class="status-cell" v-else-if="selectedIds.size">
+            <span class="status-value">{{ t('grid.selected', { n: selectedIds.size }) }}</span>
+          </div>
+          <div class="status-cell" v-if="importProgress">
+            <span class="spinner" aria-hidden="true" />
+            <span class="status-value">{{ t('status.importProgress', { done: importProgress.done, total: importProgress.total }) }}</span>
+          </div>
         </div>
         <div class="status-right">
-          <div class="status-cell zoom-cell" v-if="activeSource">
+          <div class="status-cell zoom-cell" v-if="activeSource && libraryView === 'develop'">
             <button class="zoom-btn" @click="zoomOut" :disabled="zoom <= 0.1">−</button>
             <span class="zoom-percent">{{ zoomPercent }}%</span>
             <button class="zoom-btn" @click="zoomIn" :disabled="zoom >= 50">+</button>
@@ -3561,11 +3622,12 @@ const vWheelAdjust = {
       </nav>
     </aside>
 
-    <Filmstrip v-if="sources.length" :sources="sources" :active-id="activeId"
-      :rendering="status === 'rendering'" :thumb-src="thumbSrc"
-      @select="selectSource" @remove="removeSource" @import="pickFiles" />
+    <Filmstrip v-if="folderPhotos.length && libraryView === 'develop'" :photos="folderPhotos" :active-id="activeId"
+      :rendering="status === 'rendering'" :thumb-src="thumbSrc" :is-invalid="(id) => activeSource?.id === id && !!activeSource.invalid"
+      @select="selectSource" @remove="(id) => removePhotosConfirmed([id])" @import="pickFiles" />
 
     <input ref="fileInput" type="file" :accept="IMPORT_ACCEPT" hidden multiple @change="onFileChange" />
+    <input ref="folderInput" type="file" hidden multiple webkitdirectory @change="onFolderChange" />
     <transition name="fade"><div v-if="isDragging" class="drag-overlay">{{ t('drag.overlay') }}</div></transition>
     <transition name="fade">
       <div v-if="errorMessage && !activeSource?.invalid" class="error-toast" @click="errorMessage = null" :title="t('toast.dismiss')">

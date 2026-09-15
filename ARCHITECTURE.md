@@ -57,6 +57,24 @@ session skips the decode after a worker restart too. Sources and that cache
 live under `$LLR_CACHE_DIR` (default `~/.cache/llr`), outside the checkout, and
 stay until the photo is removed from the library.
 
+## Catalog: api (`apps/api/src/catalog.ts`)
+
+What is in the library lives in one SQLite file, `$LLR_CACHE_DIR/catalog.db`
+(Node's built-in `node:sqlite`, WAL): the virtual folder tree, every photo
+with the EXIF a library view sorts and labels by, and each photo's edit —
+snapshot plus capped undo history — as JSON. The browser holds none of it
+beyond what is on screen, so two tabs cannot disagree and a cleared browser
+profile loses nothing. A photo's files stay in `sessions/<id>/`: the copied
+source, the camera preview (`embedded.jpg`), a 384px `thumb.jpg` the worker
+cuts from the same decode at import, and the decode cache above. Import is
+`POST /photos`: copy the bytes, insert the row, ask the worker for previews
+and metadata (one exiftool call, memoised for the decode that follows), and
+answer with the finished record — the browser never polls for a thumbnail.
+Removal deletes rows first and files best-effort; a directory the catalog no
+longer names is swept on the hour (Windows will not delete a RAW the worker
+still has open). Previews are served `immutable` under their UUID, so a grid
+of thousands costs one request per thumbnail, ever.
+
 ## Render: web (`apps/web`)
 
 `rendering/pipeline-renderer.ts` owns a single fused WebGL2 shader pass, split
@@ -80,10 +98,19 @@ and blends the *parameters* (exposure, WB, tonal, clarity, dehaze,
 saturation/vibrance, hue) before those blocks run once.
 
 `App.vue` holds the editing state; the mechanics live in composables
-(`useLibrary`, `useHistory`, `useViewport`, `useCropEditor`, `useToneCurve`,
+(`useCatalog`, `useHistory`, `useViewport`, `useCropEditor`, `useToneCurve`,
 `useHistogram`, `useExport`) and `api.ts` (the binary protocol client).
-Sessions, per-image edits, and thumbnails persist in IndexedDB
-(`persistence.ts`).
+`useCatalog` is the browser's half of the catalog: the folder tree, the open
+folder's photos as plain (non-reactive) records, the active photo — which need
+not be in that folder — and the edits touched this session, saved with a
+debounce (`PUT /photos/:id/edit`; a keepalive request on unload). The library
+grid and the filmstrip are windowed (`useVirtualGrid`: fixed cells, so an
+index maps to a position by arithmetic and a folder of thousands mounts a
+screenful). Folders, photos and OS drops all move by HTML5 drag-and-drop onto
+the tree. What is UI state — open folder, expanded folders, active photo, view
+settings — stays in `localStorage`. `persistence.ts` is the pre-catalog
+IndexedDB store, kept to migrate it: on first boot the browser hands its
+photos and edits to `POST /catalog/adopt` and clears it.
 
 ## Export
 
@@ -108,8 +135,9 @@ var.
 
 ## Testing
 
-Pure logic is tested where it lives: vitest for the web rendering maths and
-persistence (`apps/web/src/**/__tests__`), vitest for the API's protocol
-module, pytest for the worker's DCP/XMP/crop/Bayer code (`apps/worker/tests`).
+Pure logic is tested where it lives: vitest for the web rendering maths,
+folder-tree helpers and the legacy store (`apps/web/src/**/__tests__`), vitest
+for the API's protocol module and the catalog (against an in-memory SQLite),
+pytest for the worker's DCP/XMP/crop/Bayer/metadata code (`apps/worker/tests`).
 Pixel-level verification is manual/driven (see `.claude/skills/verify`) since
 the render output is a GPU artifact.
