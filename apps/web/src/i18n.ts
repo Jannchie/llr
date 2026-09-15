@@ -355,6 +355,7 @@ const en = {
 
   // Shared + errors
   "common.reset": "Reset",
+  "panel.switch": "Panel on/off — hides this panel's adjustments for a comparison without resetting them",
   "error.sourceGone": "Source file no longer available (the server cache may have been cleared) — re-import this photo.",
   "error.exportSourceGone": "Source is no longer available server-side",
   "error.contextLost": "Graphics context lost — recovering…",
@@ -680,6 +681,7 @@ const zh: Record<MessageKey, string> = {
   "status.importFailed": "{n} 个文件导入失败",
 
   "common.reset": "复位",
+  "panel.switch": "面板开关——临时关闭本面板的调整以便对比，不复位数值",
   "error.sourceGone": "源文件已不可用（服务器缓存可能已被清理）——请重新导入这张照片。",
   "error.exportSourceGone": "源文件在服务端已不可用",
   "error.contextLost": "图形上下文丢失——正在恢复…",

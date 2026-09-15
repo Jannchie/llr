@@ -13,7 +13,7 @@ import {
   defaultCrop, cloneCrop, isDefaultCrop, imageDims, buildCropTransform,
   cropOutputRect, cropOutputSize, straightenedBBox, cssRecomposeMatrix, recomposeMatrix,
   applyAspectRatio, resolveAspectFraction, cropOutputSizeForAspect, CROP_GUIDES, constrainCrop,
-  ASPECT_PRESETS,
+  ASPECT_PRESETS, defaultTransform,
   type AspectPreset, type CropState,
 } from "./rendering/crop";
 import { API, fetchLinear, fetchLookProfile, type ColorProfileMeta, type DenoisePayload, type LookTweaks, type LookTweakKey } from "./api";
@@ -157,6 +157,39 @@ const aspectOptions = computed(() => [
 // isEdited both compare against these).
 const SLIDER_DEFAULTS: Record<string, number> = { ...defaultRecipe() };
 
+// ── Panel switches ──
+//
+// Lightroom's per-panel on/off: an adjustment stays where it is but leaves
+// the render, so a before/after of one panel is a click, not a reset and an
+// undo. Part of the edit — snapshot, history, persistence and export all carry
+// it, so a photo exported with a panel off exports without that panel, as it
+// would from Lightroom. The keys are the panels that have a Reset, minus the
+// crop box (which has no switch in Lightroom either: an off crop is a
+// different image, not a comparison).
+type BypassKey = "tone" | "presence" | "color" | "lens" | "noise" | "hsl" | "grading" | "curve" | "transform" | "look" | "masks";
+const bypass = reactive(new Set<BypassKey>());
+function isBypassed(key: BypassKey): boolean { return bypass.has(key); }
+function toggleBypass(key: BypassKey): void { if (bypass.has(key)) bypass.delete(key); else bypass.add(key); }
+
+// The recipe as the render should see it: every slider of a switched-off
+// group at its default. Returns `r` itself when nothing is off, so the hot
+// per-draw path allocates nothing then.
+function effectiveRecipe(r: Recipe, b: ReadonlySet<BypassKey> = bypass): Recipe {
+  let out = r;
+  for (const g of groups) {
+    if (!b.has(g.title)) continue;
+    if (out === r) out = { ...r };
+    for (const item of g.items) (out as Record<string, number>)[item.key] = SLIDER_DEFAULTS[item.key];
+  }
+  return out;
+}
+
+// The crop with its Transform (the keystone/scale/offset half) at rest when
+// that panel is off; the box itself is never switched.
+function effectiveCrop(c: CropState, b: ReadonlySet<BypassKey> = bypass): CropState {
+  return b.has("transform") ? { ...c, xf: defaultTransform() } : c;
+}
+
 // ── state ──
 
 const recipe = reactive<Recipe>(defaultRecipe());
@@ -214,14 +247,14 @@ const lookBorrowed = ref(false);
 // fine end, which is worth saying rather than showing a stage that is off.
 const sharpening = ref<{ level: number; range: number; fine: boolean } | null>(null);
 const lookStyle = ref<string | null>(null);
-const effectiveLookStyle = computed(() => lookStyle.value ?? lookAsShotStyle.value);
+const effectiveLookStyle = computed(() => (bypass.has("look") ? null : lookStyle.value) ?? lookAsShotStyle.value);
 const lookStyleEdited = computed(() =>
   !!lookStyle.value && !!lookAsShotStyle.value && lookStyle.value !== lookAsShotStyle.value);
 // A type-level floor, not a state the panel can reach: everything that reads
 // effectiveLook is gated on lookAsShot. Derived from LOOK_TWEAK_ORDER so the
 // key list is written once (as SLIDER_DEFAULTS is, and for the same reason).
 const ZERO_LOOK = Object.fromEntries(LOOK_TWEAK_ORDER.map(key => [key, 0])) as LookTweaks;
-const effectiveLook = computed<LookTweaks>(() => look.value ?? lookAsShot.value ?? ZERO_LOOK);
+const effectiveLook = computed<LookTweaks>(() => (bypass.has("look") ? null : look.value) ?? lookAsShot.value ?? ZERO_LOOK);
 // One reset for the whole panel: the look and its six tweaks are one setting
 // as far as the camera is concerned, and resetting to "as shot" means both.
 function resetLook(): void {
@@ -257,6 +290,11 @@ const effectiveDro = computed(() => droStrength.value ?? droAsShot.value);
 const DRO_AUTO = -1;
 const droLevel = ref(DRO_AUTO);
 const droLevels = ref<number[]>([]);
+// DRO belongs to the same panel, so the switch puts it back to what the camera
+// applied (null / Auto) along with the look and its tweaks.
+const renderDro = computed(() => bypass.has("look")
+  ? { strength: null as number | null, level: DRO_AUTO }
+  : { strength: droStrength.value, level: droLevel.value });
 // Off / Auto / a level. Off is a strength of zero whatever the level says,
 // which is how the worker resolves the same three states.
 const droMode = computed<"off" | "auto" | "level">(() =>
@@ -695,8 +733,8 @@ function bakeCurveLUT(): void {
     bakedBasic = null;
     return;
   }
-  const basic = currentBasic();
-  webglRenderer.uploadCurveLUT(buildToneCurveLUT(toneCurve.value, basic));
+  const basic = currentBasic(effectiveRecipe(recipe));
+  webglRenderer.uploadCurveLUT(buildToneCurveLUT(bypass.has("curve") ? defaultToneCurve() : toneCurve.value, basic));
   bakedBasic = basic;
 }
 
@@ -737,6 +775,8 @@ type Snapshot = {
   sonyCameraMatch?: boolean;
   // Local adjustments; absent in sessions that predate them, which is empty.
   masks?: MaskGroup[];
+  // Panels switched off (see BypassKey); absent in older sessions, i.e. none.
+  bypass?: BypassKey[];
 };
 
 let isRestoring = false;
@@ -772,6 +812,7 @@ function defaultSnapshot(name?: string): Snapshot {
     sonyAdvancedColour: false,
     sonyCameraMatch: true,
     masks: [],
+    bypass: [],
   };
 }
 
@@ -805,6 +846,7 @@ function captureSnapshot(): Snapshot {
     sonyAdvancedColour: sonyAdvancedColour.value,
     sonyCameraMatch: sonyCameraMatch.value,
     masks: cloneMasks(masks),
+    bypass: [...bypass],
   };
 }
 
@@ -818,6 +860,8 @@ function setEditState(s: Snapshot): void {
   Object.assign(grading, s.grading);
   toneCurve.value = normalizeToneCurve(s.curve);
   curveActive.value = -1;
+  bypass.clear();
+  for (const key of s.bypass ?? []) bypass.add(key);
   Object.assign(crop, s.crop ? cloneCrop(s.crop) : defaultCrop());
   // Older snapshots have no aspect: fall back to "free" so a legacy crop box
   // that doesn't match the new default lock isn't reshaped by the next drag.
@@ -1178,7 +1222,7 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     // buffer by on-screen device pixels, so a fit view shades the same number of
     // fragments it always did. What it does cost is transfer and VRAM (~140 MB
     // for 24 MP, ~360 MB for 61 MP, as float16).
-    const lin = await fetchLinear({ sourceId: id, halfSize: false, maxSize: 0, profileId: profileId.value, dcpCode: dcpCode.value, denoise: denoisePayload(), look: look.value ?? undefined, style: lookStyle.value ?? undefined, dro: droStrength.value ?? undefined, droLevel: droLevel.value });
+    const lin = await fetchLinear({ sourceId: id, halfSize: false, maxSize: 0, profileId: profileId.value, dcpCode: dcpCode.value, denoise: denoisePayload(), look: bypass.has("look") ? undefined : look.value ?? undefined, style: bypass.has("look") ? undefined : lookStyle.value ?? undefined, dro: renderDro.value.strength ?? undefined, droLevel: renderDro.value.level });
     if (stale()) return false;
     if (!lin) { markInvalid(id); return false; }
     const { meta: linMeta, pixels: linearFloat } = lin;
@@ -1288,8 +1332,7 @@ function rebuildLookLocally(): ColorProfileMeta | null {
   if (!lookBase || !family || !lookAsShot.value) return null;
   // Another look is another calibration, which only the worker can read.
   if (effectiveLookStyle.value !== lookBase.creativeLook) return null;
-  return rebuildLookProfile(lookBase, effectiveLook.value,
-    { strength: droStrength.value, level: droLevel.value }, family);
+  return rebuildLookProfile(lookBase, effectiveLook.value, renderDro.value, family);
 }
 
 // The tail both paths share: the profile onto the renderer and a redraw. The
@@ -1329,8 +1372,8 @@ async function reloadLookProfile(): Promise<void> {
   const seq = ++lookProfileSeq;
   try {
     const profile = await fetchLookProfile(
-      currentSourceId, effectiveLook.value, lookStyle.value ?? undefined,
-      droStrength.value ?? undefined, droLevel.value);
+      currentSourceId, effectiveLook.value, bypass.has("look") ? undefined : lookStyle.value ?? undefined,
+      renderDro.value.strength ?? undefined, renderDro.value.level);
     // A newer slider position (or a different image) owns the renderer now.
     if (seq !== lookProfileSeq || !profile || !webglRenderer) return;
     lookBase = profile;
@@ -1354,9 +1397,13 @@ async function reloadLookProfile(): Promise<void> {
 // (no-snapshot) caller that must not see it — the assistant's view_image —
 // says so; a snapshot never carries it, and hold-to-compare has no masks at all.
 function buildPipelineParams(s?: Snapshot, opts: { preview?: boolean } = {}): Partial<EditParams> {
-  const r = s?.recipe ?? recipe;
-  const [hue, sat, lum] = s ? [s.hslHue, s.hslSat, s.hslLum] : [hslHue, hslSat, hslLum];
-  const g = s?.grading ?? grading;
+  // Switched-off panels render at their defaults; a snapshot carries its own
+  // switches, the live state its live ones.
+  const b: ReadonlySet<BypassKey> = s ? new Set(s.bypass ?? []) : bypass;
+  const r = effectiveRecipe(s?.recipe ?? recipe, b);
+  const zero = () => [0, 0, 0, 0, 0, 0, 0, 0];
+  const [hue, sat, lum] = b.has("hsl") ? [zero(), zero(), zero()] : s ? [s.hslHue, s.hslSat, s.hslLum] : [hslHue, hslSat, hslLum];
+  const g = b.has("grading") ? defaultGrading() : (s?.grading ?? grading);
   // Per-shot lens tables with the slider amounts mixed in. The renderer derives
   // the fill scale from these, so easing the slider eases the scale with it.
   const lensDist = lensCorr ? mixLensTable(lensCorr.distortion, (r.lensDistortion ?? 100) / 100) : [...LENS_IDENTITY];
@@ -1386,7 +1433,7 @@ function buildPipelineParams(s?: Snapshot, opts: { preview?: boolean } = {}): Pa
     cameraMatch: cameraMatch.value ? 1 : 0,
     nrLuminance: r.nrLuminance ?? 0,
     nrDetail: r.nrDetail ?? 50,
-    ...packMasks(s?.masks ?? masks, s?.crop ?? crop, srcW.value, srcH.value,
+    ...packMasks(b.has("masks") ? [] : (s?.masks ?? masks), effectiveCrop(s?.crop ?? crop, b), srcW.value, srcH.value,
       { temperature: r.temperature, tint: r.tint },
       !s && opts.preview !== false && maskPreview.value ? selectedMask.value : null),
   };
@@ -1662,7 +1709,7 @@ function drawWebGL(): void {
   // Contrast/Blacks/Whites all live in the curve LUT bake, not shader uniforms.
   // Draws are rAF-coalesced (scheduleWebGLDraw), so this rebakes at most once
   // per frame during a slider drag (sub-millisecond on the CPU).
-  if (!showOriginal.value && (bakedBasic === null || !sameBasic(bakedBasic, currentBasic()))) {
+  if (!showOriginal.value && (bakedBasic === null || !sameBasic(bakedBasic, currentBasic(effectiveRecipe(recipe))))) {
     bakeCurveLUT();
   }
   updateRenderWindow();
@@ -1722,9 +1769,10 @@ function destroyWebGL(opts: { keepContext?: boolean } = {}): void {
 function renderNormal(): void {
   if (!webglRenderer || !srcW.value || !srcH.value) return;
   const [iw, ih] = currentImageDims();
-  const rect = cropOutputRect(crop, iw, ih);
-  const [ow, oh] = cropOutputSize(crop, srcW.value, srcH.value);
-  webglRenderer.setOutput(ow, oh, buildCropTransform(crop, srcW.value, srcH.value, rect), WORKSPACE_BG);
+  const c = effectiveCrop(crop);
+  const rect = cropOutputRect(c, iw, ih);
+  const [ow, oh] = cropOutputSize(c, srcW.value, srcH.value);
+  webglRenderer.setOutput(ow, oh, buildCropTransform(c, srcW.value, srcH.value, rect), WORKSPACE_BG);
   imageW.value = ow;
   imageH.value = oh;
   recomputeFit();
@@ -1887,11 +1935,16 @@ watch(showOriginal, () => {
 // second deep watcher over the same objects would re-traverse them on every
 // slider input for no benefit (history/persist scheduling self-guards on
 // isRestoring and is debounced).
-watch([recipe, hslHue, hslSat, hslLum, grading, masks], () => {
+watch([recipe, hslHue, hslSat, hslLum, grading, masks, () => [...bypass]], () => {
   if (!isRestoring) scheduleWebGLDraw();
   scheduleHistoryCommit();
   schedulePersist();
 }, { deep: true });
+// The switches that reach something other than a draw parameter: the curve
+// LUT bake (the tone group's Basic terms rebake on their own, drawWebGL
+// compares them per frame) and the output geometry.
+watch(() => bypass.has("curve"), () => { if (webglRenderer && !isRestoring) bakeCurveLUT(); });
+watch(() => bypass.has("transform"), () => { if (!isRestoring) scheduleCropRender(); });
 // The overlay is a draw parameter, not an edit: redraw, no history.
 watch([maskPreview, selectedMask], () => scheduleWebGLDraw());
 watch(viewSettings, () => { scheduleWebGLDraw(); schedulePersist(); }, { deep: true });
@@ -1954,7 +2007,7 @@ watch(sonyCameraMatch, () => {
 // itself) — undo/redo must go through here, exactly as it does for dcpCode.
 // The promise is kept so the assistant can await the render it caused.
 let lookReload: Promise<void> = Promise.resolve();
-watch([look, lookStyle, droStrength, droLevel], () => {
+watch([look, lookStyle, droStrength, droLevel, () => bypass.has("look")], () => {
   if (!suppressDcpReload) lookReload = refreshLook();
 }, { deep: true });
 
@@ -2163,7 +2216,10 @@ function describeEdit(): unknown {
 function renderFrame(s: Snapshot | null, maxEdge: number): PipelineRenderer {
   requireImage();
   if (!webglRenderer) throw new Error("WebGL renderer unavailable");
-  webglRenderer.uploadCurveLUT(buildToneCurveLUT(s?.curve ?? toneCurve.value, currentBasic(s?.recipe ?? recipe)));
+  const b: ReadonlySet<BypassKey> = s ? new Set(s.bypass ?? []) : bypass;
+  webglRenderer.uploadCurveLUT(buildToneCurveLUT(
+    b.has("curve") ? defaultToneCurve() : (s?.curve ?? toneCurve.value),
+    currentBasic(effectiveRecipe(s?.recipe ?? recipe, b))));
   webglRenderer.setViewWindow(null);
   webglRenderer.setPreviewScale(maxEdge / Math.max(imageW.value, imageH.value));
   webglRenderer.draw(buildPipelineParams(s ?? undefined, { preview: false }));
@@ -2671,7 +2727,8 @@ function exportFilename(): string {
 function buildExportPlan(): ExportPlan | null {
   if (!currentSourceId || !activeSource.value) return null;
   const settings = captureSnapshot();
-  const cropSnap = settings.crop;
+  const off = new Set(settings.bypass ?? []);
+  const cropSnap = effectiveCrop(settings.crop, off);
   return {
     sourceId: currentSourceId,
     filename: exportFilename(),
@@ -2682,13 +2739,14 @@ function buildExportPlan(): ExportPlan | null {
     denoise: denoisePayload(settings.denoise),
     // Absent means as shot, same as everywhere else — the full-res decode then
     // rebuilds the profile the preview was showing (plan.profileLUT).
-    look: settings.look ?? undefined,
-    lookStyle: settings.lookStyle ?? undefined,
-    dro: settings.dro ?? undefined,
+    look: off.has("look") ? undefined : settings.look ?? undefined,
+    lookStyle: off.has("look") ? undefined : settings.lookStyle ?? undefined,
+    dro: off.has("look") ? undefined : settings.dro ?? undefined,
     sonyAdvancedColour: settings.sonyAdvancedColour ?? false,
     sonyCameraMatch: settings.sonyCameraMatch ?? false,
     params: buildPipelineParams(settings),
-    curveLUT: buildToneCurveLUT(settings.curve, currentBasic(settings.recipe)),
+    curveLUT: buildToneCurveLUT(off.has("curve") ? defaultToneCurve() : settings.curve,
+      currentBasic(effectiveRecipe(settings.recipe, off))),
     profileLUT: (meta) => buildProfileLUT(meta.colorProfile),
     output: (meta) => {
       const [iw, ih] = imageDims(meta.width, meta.height, cropSnap.orientation);
@@ -3181,8 +3239,12 @@ const vWheelAdjust = {
             </svg>
           </button>
         </div>
-        <header class="panel-head crop-sub">
-          <span>{{ t('xf.title') }}</span>
+        <header class="panel-head crop-sub" :class="{ 'is-off': isBypassed('transform') }">
+          <span class="panel-title">
+            <button type="button" class="panel-switch" :class="{ 'is-on': !isBypassed('transform') }"
+              :aria-pressed="!isBypassed('transform')" :title="t('panel.switch')" @click="toggleBypass('transform')" />
+            {{ t('xf.title') }}
+          </span>
           <button class="ghost" type="button" @click="resetTransform">{{ t('common.reset') }}</button>
         </header>
         <div class="xf-guided">
@@ -3285,9 +3347,11 @@ const vWheelAdjust = {
       <!-- The shot's in-camera Creative Look tweaks. Its own panel because these
            are Sony's stages, not ours: they start at what the body recorded and
            reset back to it, which is why they cannot share the Tone panel. -->
-      <section class="panel" v-if="editTab === 'look' && lookAsShot">
+      <section class="panel" v-if="editTab === 'look' && lookAsShot" :class="{ 'is-off': isBypassed('look') }">
         <header class="panel-head">
           <span class="panel-title">
+            <button type="button" class="panel-switch" :class="{ 'is-on': !isBypassed('look') }"
+              :aria-pressed="!isBypassed('look')" :title="t('panel.switch')" @click="toggleBypass('look')" />
             {{ t('panel.creativeLook') }}
             <span v-if="lookEdited" class="panel-dot" aria-hidden="true" />
           </span>
@@ -3378,9 +3442,11 @@ const vWheelAdjust = {
           <p class="control-note" v-else-if="droMode === 'level'">{{ t('look.droLevelHint') }}</p>
         </template>
       </section>
-      <section v-for="group in tabGroups" :key="group.title" class="panel">
+      <section v-for="group in tabGroups" :key="group.title" class="panel" :class="{ 'is-off': isBypassed(group.title) }">
         <header class="panel-head">
           <span class="panel-title">
+            <button type="button" class="panel-switch" :class="{ 'is-on': !isBypassed(group.title) }"
+              :aria-pressed="!isBypassed(group.title)" :title="t('panel.switch')" @click="toggleBypass(group.title)" />
             {{ t(`panel.${group.title}`) }}
             <span v-if="groupEdited(group)" class="panel-dot" aria-hidden="true" />
           </span>
@@ -3437,9 +3503,11 @@ const vWheelAdjust = {
           :label="t('detail.edgeNr')" input-id="denoise-edge" :min="0" :max="100" :reset-value="50" />
       </section>
 
-      <section class="panel" v-if="editTab === 'color' && activeSource">
+      <section class="panel" v-if="editTab === 'color' && activeSource" :class="{ 'is-off': isBypassed('hsl') }">
         <header class="panel-head">
           <span class="panel-title">
+            <button type="button" class="panel-switch" :class="{ 'is-on': !isBypassed('hsl') }"
+              :aria-pressed="!isBypassed('hsl')" :title="t('panel.switch')" @click="toggleBypass('hsl')" />
             {{ t('panel.hsl') }}
             <span v-if="hslEdited" class="panel-dot" aria-hidden="true" />
           </span>
@@ -3456,9 +3524,11 @@ const vWheelAdjust = {
           :min="-100" :max="100" show-modified />
       </section>
 
-      <section class="panel" v-if="editTab === 'color' && activeSource">
+      <section class="panel" v-if="editTab === 'color' && activeSource" :class="{ 'is-off': isBypassed('grading') }">
         <header class="panel-head">
           <span class="panel-title">
+            <button type="button" class="panel-switch" :class="{ 'is-on': !isBypassed('grading') }"
+              :aria-pressed="!isBypassed('grading')" :title="t('panel.switch')" @click="toggleBypass('grading')" />
             {{ t('panel.grading') }}
             <span v-if="gradingEdited" class="panel-dot" aria-hidden="true" />
           </span>
@@ -3476,9 +3546,13 @@ const vWheelAdjust = {
         <SliderRow v-model="grading.balance" :label="t('grading.balance')" :min="-100" :max="100" />
       </section>
 
-      <section class="panel" v-if="editTab === 'light' && activeSource">
+      <section class="panel" v-if="editTab === 'light' && activeSource" :class="{ 'is-off': isBypassed('curve') }">
         <header class="panel-head">
-          <span>{{ t('panel.curve') }}</span>
+          <span class="panel-title">
+            <button type="button" class="panel-switch" :class="{ 'is-on': !isBypassed('curve') }"
+              :aria-pressed="!isBypassed('curve')" :title="t('panel.switch')" @click="toggleBypass('curve')" />
+            {{ t('panel.curve') }}
+          </span>
           <button class="ghost" type="button" @click="resetCurve">{{ t('common.reset') }}</button>
         </header>
         <div class="curve-tabs">
@@ -3523,9 +3597,11 @@ const vWheelAdjust = {
 
       <!-- Masks: the group list, then the selected group's components, the
            matte-preview switch and its local sliders (rendering/masks.ts). -->
-      <section class="panel" v-if="editTab === 'masks' && activeSource">
+      <section class="panel" v-if="editTab === 'masks' && activeSource" :class="{ 'is-off': isBypassed('masks') }">
         <header class="panel-head">
           <span class="panel-title">
+            <button type="button" class="panel-switch" :class="{ 'is-on': !isBypassed('masks') }"
+              :aria-pressed="!isBypassed('masks')" :title="t('panel.switch')" @click="toggleBypass('masks')" />
             {{ t('panel.masks') }}
             <span v-if="masks.length" class="panel-dot" aria-hidden="true" />
           </span>
