@@ -255,8 +255,9 @@ type SonyPostTargets = {
   // and Spica is untouched until someone turns it on.
   marble: {
     down: RenderTarget; mean: RenderTarget; blur: RenderTarget; out: RenderTarget;
-    // The 1/4-res grid the first three run on: ceil(w/4) x ceil(h/4), because a
-    // partial 4x4 block at the far edge still gets a texel, as the engine's does.
+    // The 1/f-res grid the first three run on, f the calibration's decimation
+    // factor (4 or 8): ceil(w/f) x ceil(h/f), because a partial block at the far
+    // edge still gets a texel, as the engine's does.
     w: number; h: number;
   } | null;
   // Camera match (passes.ts CAMERA_MATCH_SHADER), the stage after Marble: it
@@ -1454,7 +1455,7 @@ export class PipelineRenderer {
     if (this.sonyMarble
       && this.postProgram("marbleDown") && this.postProgram("marbleMean")
       && this.postProgram("marbleBlur") && this.postProgram("marbleCompose")) {
-      marble = this.cachedMarbleTargets(w, h);
+      marble = this.cachedMarbleTargets(w, h, this.sonyMarble.factor);
     }
     // The match, last. It needs a buffer of its own only when the compose
     // would otherwise be reading `scene` while writing the match's input —
@@ -1584,14 +1585,16 @@ export class PipelineRenderer {
    * no GL error to find. RGBA16F is filterable in core WebGL2, so it always
    * works.
    *
-   * The grid is ceil(w/4) x ceil(h/4): a partial 4x4 block at the far edge
-   * still gets its own texel, as the engine's box does.
+   * The grid is ceil(w/f) x ceil(h/f) for the shot's decimation factor f: a
+   * partial block at the far edge still gets its own texel, as the engine's
+   * box does. The factor is part of the key, since a shot at ISO 6400 and one
+   * at ISO 2000 of the same size want different targets.
    */
-  private cachedMarbleTargets(w: number, h: number): SonyPostTargets["marble"] {
+  private cachedMarbleTargets(w: number, h: number, factor: 4 | 8): SonyPostTargets["marble"] {
     const gl = this.gl;
-    const lo = Math.max(1, Math.ceil(w / 4));
-    const loH = Math.max(1, Math.ceil(h / 4));
-    const key = `${w}x${h}`;
+    const lo = Math.max(1, Math.ceil(w / factor));
+    const loH = Math.max(1, Math.ceil(h / factor));
+    const key = `${w}x${h}/${factor}`;
     const shape = (set: RenderTarget[]): SonyPostTargets["marble"] =>
       ({ down: set[0], mean: set[1], blur: set[2], out: set[3], w: lo, h: loH });
     const hit = this.sonyMarbleTargets.get(key);
@@ -1921,7 +1924,9 @@ export class PipelineRenderer {
     const compose = this.sonyPostProgs.get("marbleCompose")!;
 
     gl.viewport(0, 0, m.w, m.h);
-    this.blitQuad(down.prog, m.out.tex, m.down.fbo);
+    this.blitQuad(down.prog, m.out.tex, m.down.fbo, () => {
+      gl.uniform1i(down.u["u_factor"]!, p.factor);
+    });
     this.blitQuad(mean.prog, m.down.tex, m.mean.fbo, () => {
       gl.uniform3f(mean.u["u_thrY"]!, p.thrY[0], p.thrY[1], p.thrY[2]);
       gl.uniform3f(mean.u["u_thrC1"]!, p.thrC1[0], p.thrC1[1], p.thrC1[2]);
@@ -1942,6 +1947,7 @@ export class PipelineRenderer {
       gl.uniform4f(compose.u["u_protect"]!, p.protect[0], p.protect[1], p.protect[2], p.protect[3]);
       gl.uniform1f(compose.u["u_strength"]!, p.strength);
       gl.uniform1f(compose.u["u_amount"]!, p.amount);
+      gl.uniform1i(compose.u["u_factor"]!, p.factor);
     });
   }
 

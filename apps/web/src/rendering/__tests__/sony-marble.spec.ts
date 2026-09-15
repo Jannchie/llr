@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MARBLE_SLIDER_AUTO, marbleBlendAmount, marbleSliderParams, marbleUniforms }
+import { MARBLE_SLIDER_AUTO, marbleBlendAmount, marbleBlendAmountRamp, marbleSliderParams, marbleUniforms }
   from "../sony-marble";
 import type { MarbleCalib } from "../sony-marble";
 
@@ -58,21 +58,32 @@ describe("marbleSliderParams", () => {
 });
 
 describe("marbleBlendAmount", () => {
-  it("rises from a half at ISO 100 to the whole filter at 1600", () => {
+  it("is the whole filter at every ISO and slider, as every export measured", () => {
+    // Engine 0x140395dd0's export path (mode word 3) returns 1.0 outright; the
+    // ISO 320 capture reproduces only at 1.0 (highiso-denoise-gap.md 9.3).
     expect(marbleBlendAmount(2000, 5)).toBe(1);
-    expect(marbleBlendAmount(1600, 5)).toBe(1);
-    expect(marbleBlendAmount(100, 5)).toBe(0.5);
-    expect(marbleBlendAmount(800, 5)).toBeCloseTo(0.73333, 4);
+    expect(marbleBlendAmount(100, 5)).toBe(1);
+    expect(marbleBlendAmount(320, 0)).toBe(1);
+    expect(marbleBlendAmount(100, 10)).toBe(1);
+  });
+});
+
+describe("marbleBlendAmountRamp", () => {
+  it("rises from a half at ISO 100 to the whole filter at 1600", () => {
+    expect(marbleBlendAmountRamp(2000, 5)).toBe(1);
+    expect(marbleBlendAmountRamp(1600, 5)).toBe(1);
+    expect(marbleBlendAmountRamp(100, 5)).toBe(0.5);
+    expect(marbleBlendAmountRamp(800, 5)).toBeCloseTo(0.73333, 4);
   });
 
   it("is ramped towards the whole filter by the slider above Auto", () => {
-    expect(marbleBlendAmount(100, 10)).toBeCloseTo(0.7, 6);
-    expect(marbleBlendAmount(1600, 10)).toBe(1);
+    expect(marbleBlendAmountRamp(100, 10)).toBeCloseTo(0.7, 6);
+    expect(marbleBlendAmountRamp(1600, 10)).toBe(1);
   });
 
   it("leaves the ISO curve alone at and below Auto", () => {
-    expect(marbleBlendAmount(100, 0)).toBe(marbleBlendAmount(100, 5));
-    expect(marbleBlendAmount(800, 4)).toBe(marbleBlendAmount(800, 5));
+    expect(marbleBlendAmountRamp(100, 0)).toBe(marbleBlendAmountRamp(100, 5));
+    expect(marbleBlendAmountRamp(800, 4)).toBe(marbleBlendAmountRamp(800, 5));
   });
 });
 
@@ -98,9 +109,22 @@ describe("marbleUniforms", () => {
     expect(u.strength).toBe(205);
   });
 
-  it("takes its amount from the ISO and the slider together", () => {
+  it("blends the cleaned chroma in fully at every ISO and slider, as the export does", () => {
+    // Engine 0x140395dd0's export path returns 1.0; the ISO ramp is the other
+    // path (marbleBlendAmountRamp), measured not to be the export's.
     expect(marbleUniforms(profile, 5).amount).toBe(1);
-    expect(marbleUniforms({ ...profile, iso: 100 }, 5).amount).toBe(0.5);
-    expect(marbleUniforms({ ...profile, iso: 100 }, 10).amount).toBeCloseTo(0.7, 6);
+    expect(marbleUniforms({ ...profile, iso: 100 }, 5).amount).toBe(1);
+    expect(marbleUniforms({ ...profile, iso: 100 }, 10).amount).toBe(1);
+    expect(marbleBlendAmountRamp(100, 5)).toBe(0.5);
+    expect(marbleBlendAmountRamp(100, 10)).toBeCloseTo(0.7, 6);
+    expect(marbleBlendAmountRamp(2000, 5)).toBe(1);
+  });
+
+  it("carries the shot's decimation factor, 4 unless the tags say 8", () => {
+    // SR2 tag 0x795e: 1 on the ISO 25600 frame (marble.py calib_from_sr2), so
+    // the small passes run at 1/8 and the compose samples at the 1/16 phases.
+    expect(marbleUniforms(profile, 5).factor).toBe(4);
+    expect(marbleUniforms({ ...profile, calib: { ...CALIB_7CM2, factor: 8 } }, 5).factor).toBe(8);
+    expect(marbleUniforms({ ...profile, calib: { ...CALIB_7CM2, factor: 6 } }, 5).factor).toBe(4);
   });
 });

@@ -11,11 +11,19 @@
  * approximation of them.
  */
 
-/** Wire form of the threshold calibration (marble.py CALIB_7CM2, per body). */
+/**
+ * Wire form of the threshold calibration (marble.py calib_from_sr2): the
+ * shot's own, read from the RAW's SR2 tags 0x794a..0x795e, which is where the
+ * camera writes them per frame. `factor` is the decimation the engine runs the
+ * cleanup at, 4 or 8 (tag 0x795e; 8 from ISO 6400 up on the bodies dumped):
+ * at 8 every filter reaches twice as far at full resolution. Absent (an older
+ * worker) it is 4.
+ */
 export interface MarbleCalib {
   p30: number; p34: number; p38: number; p3c: number; p40: number; p44: number; p48: number;
   base_4c: number; base_50: number; base_54: number; base_58: number;
   lo1: number; hi1: number; lo2: number; hi2: number; strength: number;
+  factor?: number;
 }
 
 /** `profileMarble` as the worker sends it (marble.py marble_block). */
@@ -67,11 +75,24 @@ export function marbleSliderParams(calib: MarbleCalib, slider: number = MARBLE_S
 
 /**
  * How much of the cleaned chroma replaces the original (marble.py
- * blend_amount, engine 0x140395dd0): 0.5 at ISO <= 100 rising linearly to 1.0
- * at ISO 1600, then ramped towards 1 by the slider above its midpoint. float32
- * throughout like the engine, so the numbers agree to the last bit.
+ * blend_amount, engine 0x140395dd0): 1.0. The engine's function has an
+ * ISO-ramped path (marbleBlendAmountRamp below) and a path that returns 1.0
+ * whatever the ISO and slider; every export captured takes the second — at
+ * ISO 320 the output reproduces only at 1.0 (highiso-denoise-gap.md 9.3).
  */
 export function marbleBlendAmount(iso: number, slider: number = MARBLE_SLIDER_AUTO): number {
+  void iso;
+  void slider;
+  return 1;
+}
+
+/**
+ * The other path of 0x140395dd0, which no export has been seen to take: 0.5
+ * at ISO <= 100 rising linearly to 1.0 at ISO 1600, then ramped towards 1 by
+ * the slider above its midpoint. float32 throughout, so the numbers agree to
+ * the last bit. Kept for reference (marble.py blend_amount_ramp).
+ */
+export function marbleBlendAmountRamp(iso: number, slider: number = MARBLE_SLIDER_AUTO): number {
   const f = Math.fround;
   const isoInt = Math.round(iso);
   let x4: number;
@@ -111,6 +132,14 @@ export interface MarbleUniforms {
   protect: [number, number, number, number];
   strength: number;
   amount: number;
+  // The decimation factor, 4 or 8: marbleDown's block and marbleCompose's
+  // sample phases follow it, and so does the size of the small targets.
+  factor: 4 | 8;
+}
+
+/** The calibration's decimation factor, 4 unless the shot says 8. */
+export function marbleFactor(calib: MarbleCalib): 4 | 8 {
+  return calib.factor === 8 ? 8 : 4;
 }
 
 export function marbleUniforms(profile: ProfileMarble, slider: number = MARBLE_SLIDER_AUTO): MarbleUniforms {
@@ -125,5 +154,6 @@ export function marbleUniforms(profile: ProfileMarble, slider: number = MARBLE_S
     protect: [p.lo1 * 256, r1, p.lo2 * 256, r2],
     strength: p.strength,
     amount: marbleBlendAmount(profile.iso, slider),
+    factor: marbleFactor(profile.calib),
   };
 }

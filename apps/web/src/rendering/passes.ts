@@ -1461,14 +1461,17 @@ void main() {
 //   YCC         Y = (2884R+3523G+625B)/2048 + 4096, C1/C2 the two colour
 //               differences on a 32768 centre — the thresholds below are in
 //               these units, so the shaders keep them rather than normalising.
-//   marbleDown  chroma pair-mean 2:1 then a 4x4 box: everything to 1/4 res.
-//   marbleMean  cnr2: a 5x5 stride-2 window (+-4 texels at 1/4 res) whose
+//   marbleDown  chroma pair-mean 2:1 then an f x f box: everything to 1/f res,
+//               f = 4 or 8 as the shot's calibration says (sony-marble.ts
+//               marbleFactor; the engine's cnr1_b760 / cnr1_c070).
+//   marbleMean  cnr2: a 5x5 stride-2 window (+-4 texels at 1/f res) whose
 //               neighbours are admitted only when their Y and chroma sit within
 //               thresholds derived from the centre's Y level and chroma
 //               magnitude; the mean of the admitted ones.
 //   marbleBlur  cnr3: [1 2 1;2 4 2;1 2 1]/16, mixed with the centre by p/256.
 //   marbleCompose  cnr4: bilinear upsample at the engine's centred phases (row
-//               phases 1/8..7/8, column phases 1/4, 3/4), a protect term that
+//               phases (2r+1)/2f, column phases (2c+1)/f: 1/8..7/8 and 1/4, 3/4
+//               at f = 4), a protect term that
 //               hands strongly red pixels their original C2 back, nearest 2x
 //               horizontal expansion (both pixels of a pair take the same
 //               cleaned chroma), blend with the original chroma by `amount`
@@ -1536,28 +1539,33 @@ vec3 marbleYccToRgb(vec3 ycc) {
 }`;
 
 /**
- * Full-res display RGB -> (Y, C1, C2) at 1/4 resolution. One texel here is the
- * 4x4 block of scene texels starting at 4x its coordinate; the engine's 2:1
- * chroma pair mean followed by its 4x4 box is, in float, just this 16-mean.
- * Blocks past the edge (a width or height not divisible by 4) repeat the edge
- * texel.
+ * Full-res display RGB -> (Y, C1, C2) at 1/f resolution, f the shot's
+ * decimation factor (4 or 8, sony-marble.ts marbleFactor). One texel here is
+ * the f x f block of scene texels starting at f times its coordinate; the
+ * engine's 2:1 chroma pair mean followed by its f x f box is, in float, just
+ * this mean. Blocks past the edge (a width or height not divisible by f)
+ * repeat the edge texel.
  */
 export const MARBLE_DOWN_SHADER = `#version 300 es
 precision highp float;
 out vec4 outColor;
 uniform sampler2D u_scene;
+uniform int u_factor;        // 4 or 8
 ${MARBLE_GLSL_COMMON}
 void main() {
   ivec2 size = textureSize(u_scene, 0);
-  ivec2 cell = ivec2(gl_FragCoord.xy) * 4;
+  int f = u_factor;
+  ivec2 cell = ivec2(gl_FragCoord.xy) * f;
   vec3 acc = vec3(0.0);
-  for (int j = 0; j < 4; j++) {
-    for (int i = 0; i < 4; i++) {
+  for (int j = 0; j < 8; j++) {
+    if (j >= f) break;
+    for (int i = 0; i < 8; i++) {
+      if (i >= f) break;
       ivec2 p = min(cell + ivec2(i, j), size - 1);
       acc += marbleYcc(marbleGamutFwd(texelFetch(u_scene, p, 0).rgb));
     }
   }
-  outColor = vec4(acc / 16.0, 1.0);
+  outColor = vec4(acc / float(f * f), 1.0);
 }`;
 
 /**
@@ -1631,12 +1639,14 @@ void main() {
  * amount blend, ycc_to_rgb, gamut_inv), one pass at full resolution.
  *
  * The upsample is the hardware's bilinear read of marbleBlur's target at the
- * engine's phases. Half-res column hx (= x/2, the chroma pair) sits at 1/4-res
- * texel coordinate hx/2 - 0.25 — phases 1/4 and 3/4 — and full-res row y at
- * (y - 1.5)/4 — phases 1/8, 3/8, 5/8, 7/8 — so with texel i centred at index i
- * the UV is ((hx/2 + 0.25)/W, ((y + 0.5)/4)/H) over the 1/4-res size. Those
- * are the weights the engine's table holds (84/28/12/4 over 128) and the
- * "+2, +1" grid offset its writes show. CLAMP_TO_EDGE is the engine's
+ * engine's phases. With decimation f, half-res column hx (= x/2, the chroma
+ * pair) sits at 1/f-res texel coordinate (2hx + 1)/f - 0.5 — phases
+ * (2c+1)/f — and full-res row y at (2y + 1)/(2f) - 0.5 — phases (2r+1)/2f —
+ * so with texel i centred at index i the UV is ((2hx + 1)/f / W,
+ * (2y + 1)/(2f) / H) over the 1/f-res size; at f = 4 that is (hx/2 + 0.25,
+ * (y + 0.5)/4), the weights the engine's table holds (84/28/12/4 over 128)
+ * and the "+2, +1" grid offset its writes show; at f = 8 it is the second
+ * table (105/75/45/15..) and a "+4, +2" offset. CLAMP_TO_EDGE is the engine's
  * replicated far row and column. Both pixels of a pair read the same sample,
  * which is the nearest 2x expansion.
  *
@@ -1652,6 +1662,7 @@ uniform sampler2D u_blur;    // marbleBlur's output, sampled LINEAR
 uniform vec4 u_protect;      // lo1*256, r1, lo2*256, r2 (sony-marble.ts)
 uniform float u_strength;    // 0..255, alpha = k*strength over 32768
 uniform float u_amount;      // 0 = off, 1 = fully cleaned
+uniform int u_factor;        // 4 or 8, the decimation marbleDown ran at
 ${MARBLE_GLSL_COMMON}
 void main() {
   ivec2 size = textureSize(u_scene, 0);
@@ -1663,7 +1674,8 @@ void main() {
   float tmp = 0.5 * (own.z + other.z);
 
   vec2 lo = vec2(textureSize(u_blur, 0));
-  vec2 uv = vec2((float(hx) * 0.5 + 0.25) / lo.x, (float(at.y) + 0.5) * 0.25 / lo.y);
+  float f = float(u_factor);
+  vec2 uv = vec2((2.0 * float(hx) + 1.0) / f / lo.x, (2.0 * float(at.y) + 1.0) / (2.0 * f) / lo.y);
   vec2 u = texture(u_blur, uv).yz;
 
   // Protect: k = ((min(s1, c2) + 32768) >> 16) in 0..128, alpha = k*strength.
@@ -1833,12 +1845,12 @@ export const SONY_POST_PROGRAMS = {
     fsSource: SPICA_SHADER,
     uniforms: ["u_scene", "u_weights", "u_lut", "u_sceneTexel", "u_amount", "u_isoGain", "u_gainScale", "u_rangeShift"],
   },
-  marbleDown: { fsSource: MARBLE_DOWN_SHADER, uniforms: ["u_scene"] },
+  marbleDown: { fsSource: MARBLE_DOWN_SHADER, uniforms: ["u_scene", "u_factor"] },
   marbleMean: { fsSource: MARBLE_MEAN_SHADER, uniforms: ["u_input", "u_thrY", "u_thrC1", "u_thrC2"] },
   marbleBlur: { fsSource: MARBLE_BLUR_SHADER, uniforms: ["u_input", "u_centreMix"] },
   marbleCompose: {
     fsSource: MARBLE_COMPOSE_SHADER,
-    uniforms: ["u_scene", "u_blur", "u_protect", "u_strength", "u_amount"],
+    uniforms: ["u_scene", "u_blur", "u_protect", "u_strength", "u_amount", "u_factor"],
   },
   // The two tables are samplers (units 1 and 2, bound in runCameraMatch).
   cameraMatch: { fsSource: CAMERA_MATCH_SHADER, uniforms: ["u_scene", "u_cmGrid", "u_cmHue"] },

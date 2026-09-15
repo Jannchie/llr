@@ -55,7 +55,7 @@ from .sony import itp as sony_itp
 from .sony.chromasuppres import chroma_suppres_from_file
 from .sony.dro import dro_gain_table, dro_grid, dro_grid_json
 from .sony.dro_presets import DRO_LEVEL_AUTO, DRO_LEVEL_MAX
-from .sony.marble import marble_block
+from .sony.marble import calib_from_sr2, marble_block
 from .sony.profile import camera_match_table, look_render_info
 from .sony.rawnr import detail_restore as sony_detail_restore
 from .sony.rawnr import noise_model as sony_noise_model
@@ -962,7 +962,7 @@ def daemon_look_profile(request: dict[str, Any], root: Path) -> dict[str, Any]:
                             sharpen=sharpness_from_exif(exif, input_path),
                             spica=spica_from_exif(exif),
                             chroma_suppres=chroma_suppres_block(input_path),
-                            marble=marble_from_exif(exif),
+                            marble=marble_from_exif(exif, input_path),
                             # Keys the camera-match table, which is per look and
                             # so has to follow a look change through here.
                             body=camera_body_from_exif(exif))
@@ -1888,7 +1888,7 @@ def read_raw_metadata(input_path: Path, raw: rawpy.RawPy) -> RawMetadata:
         sharpen=sharpness_from_exif(exif, input_path),
         spica=spica_from_exif(exif),
         chroma_suppres=chroma_suppres_block(input_path),
-        marble=marble_from_exif(exif),
+        marble=marble_from_exif(exif, input_path),
         dro_active=dro_from_exif(exif, input_path),
         dro_gain=dro_gain,
         dro_grid=grid,
@@ -1964,14 +1964,21 @@ def chroma_suppres_block(input_path: Path) -> dict[str, Any] | None:
     return terms.to_json() if terms is not None else None
 
 
-def marble_from_exif(exif: dict[str, Any]) -> dict[str, Any] | None:
+def marble_from_exif(exif: dict[str, Any], input_path: Path | None = None) -> dict[str, Any] | None:
     """Marble's chroma cleanup for this shot: ISO (the blend amount's only
-    per-shot input) plus the body's threshold calibration (sony/marble.py).
-    None without an ISO, and the stage stays off rather than guess a strength."""
+    per-shot input) plus the shot's threshold calibration -- the camera writes
+    it into the RAW's SR2 block, tags 0x794a..0x795e, decimation factor
+    included (sony/marble.py calib_from_sr2); a file without them gets the ISO
+    table. None without an ISO, and the stage stays off rather than guess a
+    strength. Here beside sharpness_from_exif because opening the file is this
+    module's job."""
     iso = _exif_int(exif.get("ISO")) or None
     if not iso:
         return None
-    return marble_block(int(iso))
+    calib = calib_from_sr2(input_path) if input_path is not None else None
+    if calib is not None and not calib.get("enabled", True):
+        return None
+    return marble_block(int(iso), calib)
 
 
 def camera_body_from_exif(exif: dict[str, Any]) -> str | None:
