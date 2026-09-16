@@ -318,6 +318,12 @@ class SonyRenderInfo:
     # (0.5 at ISO 100, 1.0 from ISO 1600), and the body's threshold calibration.
     # None for a profile built without exif, which renders with the stage off.
     marble: dict[str, Any] | None = None
+    # BSNR_Y on an M/S-size (YCbCr) frame (lumanr.py ycc_luma_nr_block): the
+    # RawNR tags the browser builds the stage's parameters from for the Amount
+    # and Edge sliders (rendering/sony-lumanr.ts). The body's answer, so it
+    # rides through a rebuild untouched like `sharpen`. None for a mosaic
+    # frame, whose luma NR is the worker's RAW-domain stage.
+    luma_nr: dict[str, Any] | None = None
     # The exif Model, which keys the camera-match table (camera_match_table):
     # the residual between this pipeline's finished frame and the body's own
     # JPEG was fitted per body and per look, and a table fitted on one body
@@ -437,6 +443,10 @@ class SonyRenderInfo:
             # in the shader. Off is spelled by spica_off, not by running the
             # formula on absent tags — see there for why they differ.
             "profileSpica": self.spica or spica_off(),
+            # BSNR_Y for a YCbCr frame, between sharpening and Spica. Absent
+            # (null) on a mosaic frame, which is the switch: the browser runs
+            # the stage exactly when the block is there.
+            "profileLumaNr": self.luma_nr,
             # What the engine's own luma is worth on normalised RGB for the
             # grid path. The same number as droLumaWhite now that both are
             # measured against the stage's real input plane (sony/dro.py);
@@ -828,7 +838,7 @@ def look_render_info(
     dro_grid: dict[str, Any] | None = None, dro_level: int = DRO_LEVEL_AUTO,
     sharpen: dict[str, Any] | None = None, spica: dict[str, Any] | None = None,
     chroma_suppres: dict[str, Any] | None = None, marble: dict[str, Any] | None = None,
-    body: str | None = None,
+    body: str | None = None, luma_nr: dict[str, Any] | None = None,
 ) -> SonyRenderInfo:
     """Everything about a shot's rendering that runs in the browser.
 
@@ -929,6 +939,7 @@ def look_render_info(
         spica=spica,
         chroma_suppres=chroma_suppres,
         marble=marble,
+        luma_nr=luma_nr,
         body=body,
         # Every Sony RAW can take a manual level, because the preset curves are
         # the engine's rather than the file's — and this function only ever runs
@@ -980,7 +991,7 @@ def apply_sony_profile(
     dro_gain: list[float] | None = None, dro_grid: dict[str, Any] | None = None,
     sharpen: dict[str, Any] | None = None, spica: dict[str, Any] | None = None,
     chroma_suppres: dict[str, Any] | None = None, marble: dict[str, Any] | None = None,
-    body: str | None = None,
+    body: str | None = None, luma_nr: dict[str, Any] | None = None,
 ) -> tuple[np.ndarray, SonyRenderInfo]:
     """Camera RGB -> scene-linear ProPhoto (D50), plus the matching tone curve.
 
@@ -1005,7 +1016,7 @@ def apply_sony_profile(
     return linear_prophoto, look_render_info(cal, style, tweaks, dro=dro, dro_gain=dro_gain,
                                              dro_grid=dro_grid, sharpen=sharpen,
                                              spica=spica, chroma_suppres=chroma_suppres,
-                                             marble=marble, body=body)
+                                             marble=marble, body=body, luma_nr=luma_nr)
 
 
 def apply_look_overrides(
@@ -1077,6 +1088,7 @@ def apply_look_overrides(
         spica=profile.get("profileSpica"),
         chroma_suppres=profile.get("profileChromaSuppres"),
         marble=profile.get("profileMarble"),
+        luma_nr=profile.get("profileLumaNr"),
         # The body rides forward too: it keys the camera-match table, which is
         # per-look and so has to be re-picked for the look this rebuild is for.
         body=profile.get("cameraBody")).to_json()}

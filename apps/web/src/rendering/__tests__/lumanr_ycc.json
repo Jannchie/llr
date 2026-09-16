@@ -1,0 +1,1924 @@
+{
+"cases": [
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 0,
+"edge": 0,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 0,
+"slope": 0,
+"weight": 0,
+"gain": 256,
+"limit": 8184
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 0,
+"edge": 25,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 0,
+"slope": 0,
+"weight": 0,
+"gain": 185,
+"limit": 4603
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 0,
+"edge": 50,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 0,
+"slope": 0,
+"weight": 0,
+"gain": 115,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 0,
+"edge": 75,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 0,
+"slope": 0,
+"weight": 0,
+"gain": 57,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 0,
+"edge": 100,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 0,
+"slope": 0,
+"weight": 0,
+"gain": 0,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 10,
+"edge": 0,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 6,
+"slope": 36,
+"weight": 143,
+"gain": 256,
+"limit": 8184
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 10,
+"edge": 25,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 6,
+"slope": 36,
+"weight": 143,
+"gain": 185,
+"limit": 4603
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 10,
+"edge": 50,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 6,
+"slope": 36,
+"weight": 143,
+"gain": 115,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 10,
+"edge": 75,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 6,
+"slope": 36,
+"weight": 143,
+"gain": 57,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 10,
+"edge": 100,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 6,
+"slope": 36,
+"weight": 143,
+"gain": 0,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 25,
+"edge": 0,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 16,
+"slope": 99,
+"weight": 358,
+"gain": 256,
+"limit": 8184
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 25,
+"edge": 25,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 16,
+"slope": 99,
+"weight": 358,
+"gain": 185,
+"limit": 4603
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 25,
+"edge": 50,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 16,
+"slope": 99,
+"weight": 358,
+"gain": 115,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 25,
+"edge": 75,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 16,
+"slope": 99,
+"weight": 358,
+"gain": 57,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 25,
+"edge": 100,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 16,
+"slope": 99,
+"weight": 358,
+"gain": 0,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 40,
+"edge": 0,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 26,
+"slope": 157,
+"weight": 573,
+"gain": 256,
+"limit": 8184
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 40,
+"edge": 25,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 26,
+"slope": 157,
+"weight": 573,
+"gain": 185,
+"limit": 4603
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 40,
+"edge": 50,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 26,
+"slope": 157,
+"weight": 573,
+"gain": 115,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 40,
+"edge": 75,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 26,
+"slope": 157,
+"weight": 573,
+"gain": 57,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 40,
+"edge": 100,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 26,
+"slope": 157,
+"weight": 573,
+"gain": 0,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 50,
+"edge": 0,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 33,
+"slope": 198,
+"weight": 716,
+"gain": 256,
+"limit": 8184
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 50,
+"edge": 25,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 33,
+"slope": 198,
+"weight": 716,
+"gain": 185,
+"limit": 4603
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 50,
+"edge": 50,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 33,
+"slope": 198,
+"weight": 716,
+"gain": 115,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 50,
+"edge": 75,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 33,
+"slope": 198,
+"weight": 716,
+"gain": 57,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 50,
+"edge": 100,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 33,
+"slope": 198,
+"weight": 716,
+"gain": 0,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 60,
+"edge": 0,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 36,
+"slope": 216,
+"weight": 778,
+"gain": 256,
+"limit": 8184
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 60,
+"edge": 25,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 36,
+"slope": 216,
+"weight": 778,
+"gain": 185,
+"limit": 4603
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 60,
+"edge": 50,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 36,
+"slope": 216,
+"weight": 778,
+"gain": 115,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 60,
+"edge": 75,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 36,
+"slope": 216,
+"weight": 778,
+"gain": 57,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 60,
+"edge": 100,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 36,
+"slope": 216,
+"weight": 778,
+"gain": 0,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 70,
+"edge": 0,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 39,
+"slope": 234,
+"weight": 839,
+"gain": 256,
+"limit": 8184
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 70,
+"edge": 25,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 39,
+"slope": 234,
+"weight": 839,
+"gain": 185,
+"limit": 4603
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 70,
+"edge": 50,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 39,
+"slope": 234,
+"weight": 839,
+"gain": 115,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 70,
+"edge": 75,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 39,
+"slope": 234,
+"weight": 839,
+"gain": 57,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 70,
+"edge": 100,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 39,
+"slope": 234,
+"weight": 839,
+"gain": 0,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 100,
+"edge": 0,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 48,
+"slope": 288,
+"weight": 1024,
+"gain": 256,
+"limit": 8184
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 100,
+"edge": 25,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 48,
+"slope": 288,
+"weight": 1024,
+"gain": 185,
+"limit": 4603
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 100,
+"edge": 50,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 48,
+"slope": 288,
+"weight": 1024,
+"gain": 115,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 100,
+"edge": 75,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 48,
+"slope": 288,
+"weight": 1024,
+"gain": 57,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2560,
+"baseCoeff": 64,
+"slopeCoeff": 384,
+"strength": 32,
+"gain": 192,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 100,
+"edge": 100,
+"params": {
+"lo": 0,
+"hi": 2560,
+"base": 48,
+"slope": 288,
+"weight": 1024,
+"gain": 0,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 0,
+"edge": 0,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 0,
+"slope": 0,
+"weight": 0,
+"gain": 256,
+"limit": 8184
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 0,
+"edge": 25,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 0,
+"slope": 0,
+"weight": 0,
+"gain": 204,
+"limit": 4603
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 0,
+"edge": 50,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 0,
+"slope": 0,
+"weight": 0,
+"gain": 153,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 0,
+"edge": 75,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 0,
+"slope": 0,
+"weight": 0,
+"gain": 76,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 0,
+"edge": 100,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 0,
+"slope": 0,
+"weight": 0,
+"gain": 0,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 10,
+"edge": 0,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 1,
+"slope": 7,
+"weight": 143,
+"gain": 256,
+"limit": 8184
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 10,
+"edge": 25,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 1,
+"slope": 7,
+"weight": 143,
+"gain": 204,
+"limit": 4603
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 10,
+"edge": 50,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 1,
+"slope": 7,
+"weight": 143,
+"gain": 153,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 10,
+"edge": 75,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 1,
+"slope": 7,
+"weight": 143,
+"gain": 76,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 10,
+"edge": 100,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 1,
+"slope": 7,
+"weight": 143,
+"gain": 0,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 25,
+"edge": 0,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 3,
+"slope": 21,
+"weight": 358,
+"gain": 256,
+"limit": 8184
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 25,
+"edge": 25,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 3,
+"slope": 21,
+"weight": 358,
+"gain": 204,
+"limit": 4603
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 25,
+"edge": 50,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 3,
+"slope": 21,
+"weight": 358,
+"gain": 153,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 25,
+"edge": 75,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 3,
+"slope": 21,
+"weight": 358,
+"gain": 76,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 25,
+"edge": 100,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 3,
+"slope": 21,
+"weight": 358,
+"gain": 0,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 40,
+"edge": 0,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 4,
+"slope": 33,
+"weight": 573,
+"gain": 256,
+"limit": 8184
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 40,
+"edge": 25,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 4,
+"slope": 33,
+"weight": 573,
+"gain": 204,
+"limit": 4603
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 40,
+"edge": 50,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 4,
+"slope": 33,
+"weight": 573,
+"gain": 153,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 40,
+"edge": 75,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 4,
+"slope": 33,
+"weight": 573,
+"gain": 76,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 40,
+"edge": 100,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 4,
+"slope": 33,
+"weight": 573,
+"gain": 0,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 50,
+"edge": 0,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 6,
+"slope": 42,
+"weight": 716,
+"gain": 256,
+"limit": 8184
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 50,
+"edge": 25,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 6,
+"slope": 42,
+"weight": 716,
+"gain": 204,
+"limit": 4603
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 50,
+"edge": 50,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 6,
+"slope": 42,
+"weight": 716,
+"gain": 153,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 50,
+"edge": 75,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 6,
+"slope": 42,
+"weight": 716,
+"gain": 76,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 50,
+"edge": 100,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 6,
+"slope": 42,
+"weight": 716,
+"gain": 0,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 60,
+"edge": 0,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 6,
+"slope": 46,
+"weight": 778,
+"gain": 256,
+"limit": 8184
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 60,
+"edge": 25,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 6,
+"slope": 46,
+"weight": 778,
+"gain": 204,
+"limit": 4603
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 60,
+"edge": 50,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 6,
+"slope": 46,
+"weight": 778,
+"gain": 153,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 60,
+"edge": 75,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 6,
+"slope": 46,
+"weight": 778,
+"gain": 76,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 60,
+"edge": 100,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 6,
+"slope": 46,
+"weight": 778,
+"gain": 0,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 70,
+"edge": 0,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 7,
+"slope": 49,
+"weight": 839,
+"gain": 256,
+"limit": 8184
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 70,
+"edge": 25,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 7,
+"slope": 49,
+"weight": 839,
+"gain": 204,
+"limit": 4603
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 70,
+"edge": 50,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 7,
+"slope": 49,
+"weight": 839,
+"gain": 153,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 70,
+"edge": 75,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 7,
+"slope": 49,
+"weight": 839,
+"gain": 76,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 70,
+"edge": 100,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 7,
+"slope": 49,
+"weight": 839,
+"gain": 0,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 100,
+"edge": 0,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 9,
+"slope": 61,
+"weight": 1024,
+"gain": 256,
+"limit": 8184
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 100,
+"edge": 25,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 9,
+"slope": 61,
+"weight": 1024,
+"gain": 204,
+"limit": 4603
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 100,
+"edge": 50,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 9,
+"slope": 61,
+"weight": 1024,
+"gain": 153,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 100,
+"edge": 75,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 9,
+"slope": 61,
+"weight": 1024,
+"gain": 76,
+"limit": 1023
+}
+},
+{
+"block": {
+"lo": 0,
+"hi": 2092,
+"baseCoeff": 12,
+"slopeCoeff": 82,
+"strength": 32,
+"gain": 256,
+"limit": 1023,
+"amountBias": 40.0,
+"gainScale": 0.6
+},
+"amount": 100,
+"edge": 100,
+"params": {
+"lo": 0,
+"hi": 2092,
+"base": 9,
+"slope": 61,
+"weight": 1024,
+"gain": 0,
+"limit": 1023
+}
+}
+]
+}

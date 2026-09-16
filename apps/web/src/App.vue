@@ -25,6 +25,8 @@ import {
   type MaskGroup, type MaskType, type MaskAdjust, type MaskPresetName, type MaskComponent,
 } from "./rendering/masks";
 import { trackFill, formatBytes, clamp, IMPORT_ACCEPT, IMPORT_FORMAT_HINT } from "./ui";
+import { buildSections, GROUP_KEYS, SORT_KEYS, type GroupKey, type SortKey } from "./librarySort";
+import { pathOf, type FolderNode } from "./catalogTree";
 import { t, locale, setLocale, LOCALES, type MessageKey } from "./i18n";
 import SliderRow from "./components/SliderRow.vue";
 import SelectMenu from "./components/SelectMenu.vue";
@@ -36,7 +38,7 @@ import { useHistory } from "./composables/useHistory";
 import { useToneCurve } from "./composables/useToneCurve";
 import { useCropEditor, DEFAULT_ASPECT } from "./composables/useCropEditor";
 import { useMaskEditor } from "./composables/useMaskEditor";
-import { useCatalog } from "./composables/useCatalog";
+import { ROOT_FOLDER_ID, useCatalog } from "./composables/useCatalog";
 import { useHistogram } from "./composables/useHistogram";
 import { useExport, type ExportPlan } from "./composables/useExport";
 import { useAssistant, modelKey, THINKING_LEVELS, type AssistantTool, type ToolContent, type TurnUsage } from "./composables/useAssistant";
@@ -970,12 +972,13 @@ function applyStoredEdit(e: ImageEdit | null): void {
 
 const {
   folders, tree, selectedFolderId, expanded, view: libraryView, folderLoading,
+  sortKey, sortDir, groupKey, setSort, setGroup,
   folderPhotos, activeId, activeSource, selectedIds, importProgress,
   photoById, resolveUrl, thumbSrc, markInvalid, clearInvalid,
   persistNow, persistOnUnload: persistForUnload, schedulePersist,
   selectSource, openPhoto, setView,
   selectFolder, toggleExpanded, createFolder, renameFolder, moveFolder, deleteFolder,
-  removePhotos, movePhotos, importFiles, importDropped, importPickedDirectory,
+  removePhotos, renamePhoto, movePhotos, importFiles, importDropped, importPickedDirectory,
   boot,
 } = useCatalog<Snapshot, typeof viewSettings>({
   api: API,
@@ -1015,6 +1018,52 @@ const {
     },
   },
 });
+
+// ── Library view: the grid's order, and what its menu can do ──
+
+// The open folder as the grid lays it out: sorted by the picked field, then cut
+// into groups (which is also where "is grouping on" is decided, so the grid
+// never has to know a group key). Pure and cheap enough to redo on every change
+// of the pickers — the catalog's own listing order is what `sortKey: "default"`
+// shows.
+const library = computed(() => buildSections(folderPhotos.value, sortKey.value, sortDir.value, groupKey.value));
+
+const sortOptions = computed<{ value: SortKey; label: string }[]>(() =>
+  SORT_KEYS.map(key => ({ value: key, label: t(`library.sortBy.${key}`) })));
+const groupOptions = computed<{ value: GroupKey; label: string }[]>(() =>
+  GROUP_KEYS.map(key => ({ value: key, label: t(`library.groupBy.${key}`) })));
+
+// The root is the library itself, and says so in the user's language wherever
+// its name is shown.
+function folderLabel(folder: { id: number; name: string }): string {
+  return folder.id === ROOT_FOLDER_ID ? t("tree.root") : folder.name;
+}
+
+const folderCrumbs = computed(() => pathOf(folders.value, selectedFolderId.value).map(folderLabel));
+
+// Where a "move to" can send the selection: every folder in the tree, named by
+// its path, minus the one that is open (moving into itself is not a move).
+const moveTargets = computed(() => {
+  const out: { id: number; label: string }[] = [];
+  const walk = (nodes: FolderNode[], prefix: string) => {
+    for (const node of nodes) {
+      const label = prefix ? `${prefix} / ${folderLabel(node)}` : folderLabel(node);
+      if (node.id !== selectedFolderId.value) out.push({ id: node.id, label });
+      walk(node.children, label);
+    }
+  };
+  walk(tree.value, "");
+  return out;
+});
+
+// The tree owns the inline new-folder editor, so the grid's menu asks it to
+// start one under the folder that is open rather than inventing a name here.
+const folderTree = ref<InstanceType<typeof FolderTree> | null>(null);
+
+function toggleSortDir(): void { setSort(sortKey.value, sortDir.value === "asc" ? "desc" : "asc"); }
+function onGridRename(id: string, name: string): void { void renamePhoto(id, name); }
+function onGridMove(ids: string[], folderId: number): void { void movePhotos(ids, folderId); }
+function onGridNewFolder(): void { folderTree.value?.startCreate(selectedFolderId.value); }
 
 // Styles this camera actually ships, from the worker. Empty for a body we have
 // no profiles for, which hides the picker rather than offering dead options.
@@ -1393,10 +1442,11 @@ async function reloadLookProfile(): Promise<void> {
 // frozen edit instead (export). viewSettings stays live either way — it is
 // view-only state and not part of a per-image snapshot.
 //
-// `preview: false` drops the mask overlay: it is view-only, so the one live
-// (no-snapshot) caller that must not see it — the assistant's view_image —
-// says so; a snapshot never carries it, and hold-to-compare has no masks at all.
-function buildPipelineParams(s?: Snapshot, opts: { preview?: boolean } = {}): Partial<EditParams> {
+// `matte` is the mask group drawn as a black-and-white weight instead of the
+// photo: undefined follows the Masks panel's live overlay (view-only, so a
+// snapshot never carries it), null draws none (the assistant's captures), a
+// group id draws that one (view_mask).
+function buildPipelineParams(s?: Snapshot, opts: { matte?: string | null } = {}): Partial<EditParams> {
   // Switched-off panels render at their defaults; a snapshot carries its own
   // switches, the live state its live ones.
   const b: ReadonlySet<BypassKey> = s ? new Set(s.bypass ?? []) : bypass;
@@ -1408,8 +1458,13 @@ function buildPipelineParams(s?: Snapshot, opts: { preview?: boolean } = {}): Pa
   // the fill scale from these, so easing the slider eases the scale with it.
   const lensDist = lensCorr ? mixLensTable(lensCorr.distortion, (r.lensDistortion ?? 100) / 100) : [...LENS_IDENTITY];
   const lensVig = lensCorr ? mixLensTable(lensCorr.vignetting, (r.lensVignetting ?? 100) / 100) : [...LENS_IDENTITY];
+  // Lateral CA has no slider: the body's switch decides (the worker sends the
+  // tables only when it is on), as in Edit, where it is part of the same
+  // geometric stage as the distortion. A switched-off panel renders at its
+  // defaults, and the default is the camera's own correction, so it stays.
+  const lensCa = lensCorr?.caR && lensCorr.caB ? { lensCaR: lensCorr.caR, lensCaB: lensCorr.caB } : {};
   return {
-    lensDist, lensVig,
+    lensDist, lensVig, ...lensCa,
     exposure: r.exposure,
     saturation: 1 + r.saturation / 100,
     highlights: r.highlights / 100,
@@ -1435,7 +1490,7 @@ function buildPipelineParams(s?: Snapshot, opts: { preview?: boolean } = {}): Pa
     nrDetail: r.nrDetail ?? 50,
     ...packMasks(b.has("masks") ? [] : (s?.masks ?? masks), effectiveCrop(s?.crop ?? crop, b), srcW.value, srcH.value,
       { temperature: r.temperature, tint: r.tint },
-      !s && opts.preview !== false && maskPreview.value ? selectedMask.value : null),
+      opts.matte !== undefined ? opts.matte : (!s && maskPreview.value ? selectedMask.value : null)),
   };
 }
 
@@ -1539,6 +1594,15 @@ function buildProfileLUT(cp: ColorProfileMeta | null | undefined): ProfileCurve 
     // reaches the stage — it moves both the thresholds and the blend.
     marble: cp?.profileMarble && denoise.enabled
       ? { ...cp.profileMarble, slider: sonyChromaNrSlider(denoise.chroma, denoiseAuto.value) }
+      : null,
+    // BSNR_Y, the luma NR of an M/S-size (YCbCr) frame — the one the worker
+    // cannot run, because the engine runs it after sharpening on the
+    // tone-mapped Y, which only exists in the shader. Gated like Marble on the
+    // NR switch (captured: with NR off the engine never enters the stage), and
+    // driven by the same Amount and Edge sliders as the RAW stage would be;
+    // the block is only ever sent for such a frame.
+    lumaNr: cp?.profileLumaNr && denoise.enabled
+      ? { ...cp.profileLumaNr, amount: denoise.amount, edge: denoiseAuto.value ? 50 : denoise.edge }
       : null,
     // Camera match, after Marble. The table alone travels here; whether it runs
     // is the switch, pushed at the renderer by applySonyCameraMatch. Null for a
@@ -2213,7 +2277,7 @@ function describeEdit(): unknown {
 // or history. Borrows the preview renderer for one draw: window off, scale set
 // from the target size, the snapshot's own curve LUT uploaded; then bakedBasic
 // is dropped so the next frame rebakes the live LUT and puts the view back.
-function renderFrame(s: Snapshot | null, maxEdge: number): PipelineRenderer {
+function renderFrame(s: Snapshot | null, maxEdge: number, matte?: string): PipelineRenderer {
   requireImage();
   if (!webglRenderer) throw new Error("WebGL renderer unavailable");
   const b: ReadonlySet<BypassKey> = s ? new Set(s.bypass ?? []) : bypass;
@@ -2222,14 +2286,14 @@ function renderFrame(s: Snapshot | null, maxEdge: number): PipelineRenderer {
     currentBasic(effectiveRecipe(s?.recipe ?? recipe, b))));
   webglRenderer.setViewWindow(null);
   webglRenderer.setPreviewScale(maxEdge / Math.max(imageW.value, imageH.value));
-  webglRenderer.draw(buildPipelineParams(s ?? undefined, { preview: false }));
+  webglRenderer.draw(buildPipelineParams(s ?? undefined, { matte: matte ?? null }));
   bakedBasic = null;
   scheduleWebGLDraw();
   return webglRenderer;
 }
 
-async function captureFrame(s: Snapshot | null, maxEdge: number): Promise<Blob> {
-  return renderFrame(s, maxEdge).toBlob("image/jpeg", 0.85);
+async function captureFrame(s: Snapshot | null, maxEdge: number, matte?: string): Promise<Blob> {
+  return renderFrame(s, maxEdge, matte).toBlob("image/jpeg", 0.85);
 }
 
 async function blobToBase64(blob: Blob): Promise<string> {
@@ -2241,8 +2305,18 @@ async function blobToBase64(blob: Blob): Promise<string> {
 
 // Before/after side by side on one canvas, labels burnt in, the way a person
 // would flick hold-to-compare — the model gets both halves in one look.
-async function compareFrames(before: Snapshot, halfEdge = 512): Promise<Blob> {
-  const [a, b] = await Promise.all([captureFrame(before, halfEdge), captureFrame(null, halfEdge)].map(p => p.then(createImageBitmap)));
+function compareFrames(before: Snapshot, halfEdge = 512): Promise<Blob> {
+  return sideBySide(captureFrame(before, halfEdge), captureFrame(null, halfEdge), ["before", "after"]);
+}
+
+// The photo next to one mask's matte (white = the adjustment applies in
+// full), so the model can check a selection before it trusts it.
+function matteFrames(maskId: string, halfEdge = 512): Promise<Blob> {
+  return sideBySide(captureFrame(null, halfEdge), captureFrame(null, halfEdge, maskId), ["photo", "mask"]);
+}
+
+async function sideBySide(left: Promise<Blob>, right: Promise<Blob>, [leftLabel, rightLabel]: readonly [string, string]): Promise<Blob> {
+  const [a, b] = await Promise.all([left, right].map(p => p.then(createImageBitmap)));
   const gap = 4;
   const cvs = document.createElement("canvas");
   cvs.width = a.width + gap + b.width;
@@ -2255,7 +2329,7 @@ async function compareFrames(before: Snapshot, halfEdge = 512): Promise<Blob> {
   ctx.drawImage(b, a.width + gap, 0);
   ctx.font = "bold 16px sans-serif";
   ctx.textBaseline = "top";
-  for (const [label, x] of [["before", 0], ["after", a.width + gap]] as const) {
+  for (const [label, x] of [[leftLabel, 0], [rightLabel, a.width + gap]] as const) {
     const w = ctx.measureText(label).width + 12;
     ctx.fillStyle = "rgba(0,0,0,0.6)";
     ctx.fillRect(x, 0, w, 24);
@@ -2309,7 +2383,7 @@ async function measureFrame(): Promise<unknown> {
 
 const num = (min: number, max: number, description?: string) => ({ type: "number", minimum: min, maximum: max, ...(description ? { description } : {}) });
 const HSL_BAND_SCHEMA = { type: "object", properties: { hue: num(-100, 100), sat: num(-100, 100), lum: num(-100, 100) } };
-const GRADING_BAND_SCHEMA = { type: "object", properties: { hue: num(-180, 180, "hue angle"), sat: num(0, 100) } };
+const GRADING_BAND_SCHEMA = { type: "object", properties: { hue: num(-180, 180, "sRGB hue: 0 red, 30 orange, 60 yellow, 120 green, 180 cyan/teal, -120 blue, -60 magenta"), sat: num(0, 100, "strength; 0 = no tint") } };
 const POINTS_SCHEMA = { type: "array", description: "Point curve, 2+ points with x,y in 0..1 sorted by x (identity is [{x:0,y:0},{x:1,y:1}])", items: { type: "object", properties: { x: num(0, 1), y: num(0, 1) }, required: ["x", "y"] } };
 const SET_EDIT_SCHEMA = {
   type: "object",
@@ -2320,7 +2394,7 @@ const SET_EDIT_SCHEMA = {
       properties: Object.fromEntries(SLIDER_SPECS.map(sp => [sp.key, num(sp.min, sp.max)])),
     },
     hsl: { type: "object", description: "Per-colour HSL, each band {hue,sat,lum} in -100..100", properties: Object.fromEntries(HSL_RANGES.map(r => [r.key, HSL_BAND_SCHEMA])) },
-    grading: { type: "object", description: "Colour grading", properties: { shadows: GRADING_BAND_SCHEMA, midtones: GRADING_BAND_SCHEMA, highlights: GRADING_BAND_SCHEMA, blend: num(0, 100), balance: num(-100, 100) } },
+    grading: { type: "object", description: "Colour grading (split toning): a tint per tonal band. blend 0..100 = how far the shadow and highlight tints overlap into the midtones; balance -100..100 shifts the crossover towards shadows (negative) or highlights (positive).", properties: { shadows: GRADING_BAND_SCHEMA, midtones: GRADING_BAND_SCHEMA, highlights: GRADING_BAND_SCHEMA, blend: num(0, 100), balance: num(-100, 100) } },
     curve: {
       type: "object", description: "Tone curve: parametric regions and/or point curves (each channel replaces the whole curve)",
       properties: {
@@ -2524,6 +2598,18 @@ const assistantTools: Record<string, AssistantTool> = {
       return imageContent(compareFrames(before));
     },
   },
+  // No role: seeing the matte is not seeing the result, so the API's
+  // "you changed the edit but did not look" nudge still counts a compare owed.
+  view_mask: {
+    description: "The photo next to one mask's matte (white = selected in full, black = untouched). Call it after adding or changing a mask to check the selection covers what you meant — the sky and not the white wall, the face and not the hand — before judging its adjustments with compare. `index` is the mask's position in get_edit's list (0-based; default: the last one).",
+    parameters: { type: "object", properties: { index: { type: "integer", minimum: 0 } } },
+    run: (args) => {
+      requireImage();
+      if (!masks.length) throw new Error("no masks");
+      const g = masks[Math.trunc(numOr(args?.index, masks.length - 1, 0, masks.length - 1))];
+      return imageContent(matteFrames(g.id));
+    },
+  },
   measure: {
     role: "inspect",
     description: "Numbers about the current render, display-encoded 0..255: luminance percentiles and mean, clipped shadow/highlight percentages with the railed channels, mean luminance of the top/middle/bottom thirds, mean chroma, and a hint when something trips a threshold.",
@@ -2564,15 +2650,17 @@ function assistantSystemPrompt(): string {
     "3. Judge with compare (before/after side by side) and measure (numbers). Ask: is it too much, too little, did anything clip?",
     "4. Refine with another set_edit, then compare again. Expect 2–4 rounds; stop when compare shows the intent without over-correction. Never finish a turn with a set_edit you have not looked at.",
     "Strength calibration (Lightroom semantics): exposure ±0.3 EV is one visible step, ±1 EV is dramatic. On -100..100 sliders, ±10 is subtle (visible only in compare), ±30 clearly visible, ±60 strong, beyond that is a special effect. Temperature: ±300 K subtle, ±1000 K obviously warm/cool. Start at the subtle-to-visible end and increase only if compare shows too little.",
-    "Slider semantics: exposure in stops; contrast, highlights, shadows, whites, blacks, clarity, dehaze, vibrance, saturation in -100..100; temperature in Kelvin (higher = warmer rendering), tint negative = green, positive = magenta. For crops, think about composition (subject placement, horizon, distractions at the edges) and use angle to straighten.",
-    "masks: use presets (sky needs a blue sky; for grey skies use highlights or a linear gradient from the top); adjust values are local deltas added to the global sliders.",
+    "Slider semantics: exposure in stops; contrast, highlights, shadows, whites, blacks, clarity, dehaze, vibrance, saturation in -100..100; temperature in Kelvin (higher = warmer rendering), tint negative = green, positive = magenta. For crops, think about composition (subject placement, horizon, distractions at the edges) and use angle to straighten. Keep the original aspect ratio (aspect 'orig') unless the user asks for a specific ratio or free crop: the frame may be headed for a print.",
+    "Styles are built in the colour and curve tools, not in Basic: a 'cinematic', 'film', 'moody' or 'vintage' ask means grading (shadows/highlights split tones: teal −160..180 in the shadows with orange 25..35 in the highlights is the classic cinematic pair, warm shadows + cool highlights reads as film), the tone curve (lift the black point for a faded look, an S for punch), HSL for taming or shifting single colours, and vibrance/saturation for the overall chroma. Grading sat 10–15 is subtle, 25–35 a clear look, above 50 a colour cast. Basic sliders then only set the overall brightness and contrast the style sits on.",
+    "Local before global: when the problem is in one part of the picture — a dull sky over a fine foreground, a backlit face, a bright distraction at the edge, shadows that need lifting without flattening the highlights — reach for masks instead of pushing a global slider that then has to be undone elsewhere. Start from a preset when one fits — the luminance ones pick the lit or the shaded side, sky wants a blue sky (a grey sky is a highlights or top-down linear job). Compose components for anything else: luminance range ∩ colour hue ∩ linear/radial position, e.g. a warm-lit face = skin ∩ highlights, the foreground = an inverted top-down linear. Adjust values are local deltas added to the global sliders. Always view_mask a new selection before trusting it, then compare its effect.",
     "look (Sony shots only): the camera's own rendering — pick a style for a wholesale character change (VV vivid, PT portrait skin, FL film), and prefer its tweaks over the Basic sliders when the user asks for 'the camera's look' or an in-camera style. DRO already lifts shadows on many frames: check it before adding shadows/exposure, and turn it off when the user wants the flat decode.",
     `Answer briefly, in the user's language (UI locale: ${locale.value}). Say what you changed and why; do not list every value.`,
   ].join("\n");
 }
 
 const {
-  entries: chatEntries, busy: chatBusy, models: chatModels, selected: chatModel, providers: chatProviders,
+  entries: chatEntries, busy: chatBusy, models: chatModels, selected: chatModel,
+  catalog: chatCatalog, providers: chatProviders,
   send: sendChat, abort: abortChat, reset: resetChat,
 } = useAssistant({
   tools: () => assistantTools, systemPrompt: assistantSystemPrompt, scope: () => activeId.value,
@@ -2588,7 +2676,7 @@ const chatThinking = computed({
   set: thinking => { chatModels.value = chatModels.value.map(m => modelKey(m) === chatModel.value ? { ...m, thinking } : m); },
 });
 const chatThinkingOptions = computed(() => THINKING_LEVELS.map(v => ({ value: v, label: t(`chat.thinking.${v}`) })));
-const CHAT_CHIPS = ["chat.chip.1", "chat.chip.2", "chat.chip.3", "chat.chip.4"] as const;
+const CHAT_CHIPS = ["chat.chip.1", "chat.chip.2", "chat.chip.3"] as const;
 const modelSettingsOpen = ref(false);
 const chatDraft = ref("");
 const chatLogRef = ref<HTMLElement | null>(null);
@@ -2907,7 +2995,7 @@ const vWheelAdjust = {
       </button>
     </header>
 
-    <FolderTree class="left" :folders="folders" :tree="tree" :expanded="expanded" :selected-id="selectedFolderId"
+    <FolderTree class="left" ref="folderTree" :folders="folders" :tree="tree" :expanded="expanded" :selected-id="selectedFolderId"
       :busy="!!importProgress"
       @select="selectFolder" @toggle="toggleExpanded"
       @create="(parentId, name) => createFolder(parentId, name)" @rename="renameFolder" @delete="deleteFolder"
@@ -2917,9 +3005,35 @@ const vWheelAdjust = {
     <main class="center">
       <!-- The grid and the stage swap by v-show, not v-if: the canvas and its
            WebGL context stay alive across the toggle. -->
-      <PhotoGrid v-show="libraryView === 'library'" :photos="folderPhotos" :active-id="activeId"
+      <!-- The library's own bar: where the grid is, and how it is ordered. It
+           takes the top of the stage, so .photo-grid starts below it. -->
+      <div class="library-bar" v-show="libraryView === 'library'">
+        <span class="library-path" :title="folderCrumbs.join(' / ')">{{ folderCrumbs.join(' / ') }}</span>
+        <span class="library-count">{{ t('library.count', { n: folderPhotos.length }) }}</span>
+        <span class="library-gap" />
+        <span class="library-field">
+          <span class="library-field-label">{{ t('library.sort') }}</span>
+          <SelectMenu :model-value="sortKey" :options="sortOptions" :title="t('library.sort')"
+            :aria-label="t('library.sort')" @update:model-value="setSort" />
+          <button class="icon-btn library-dir" type="button" :title="sortDir === 'asc' ? t('library.asc') : t('library.desc')"
+            :aria-label="sortDir === 'asc' ? t('library.asc') : t('library.desc')" @click="toggleSortDir">
+            <svg viewBox="0 0 12 12" aria-hidden="true" :class="{ 'is-desc': sortDir === 'desc' }">
+              <path d="M6 2v8M2.5 6.5L6 10l3.5-3.5" fill="none" stroke="currentColor" stroke-width="1.5"
+                stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </button>
+        </span>
+        <span class="library-field">
+          <span class="library-field-label">{{ t('library.group') }}</span>
+          <SelectMenu :model-value="groupKey" :options="groupOptions" :title="t('library.group')"
+            :aria-label="t('library.group')" @update:model-value="setGroup" />
+        </span>
+      </div>
+      <PhotoGrid v-show="libraryView === 'library'" :sections="library.sections" :grouped="library.grouped" :active-id="activeId"
         :selected-ids="selectedIds" :loading="folderLoading" :thumb-src="thumbSrc" :is-invalid="(id) => activeSource?.id === id && !!activeSource.invalid"
-        @open="openPhoto" @remove="removePhotosConfirmed" />
+        :move-targets="moveTargets"
+        @open="openPhoto" @remove="removePhotosConfirmed" @rename="onGridRename" @move="onGridMove"
+        @new-folder="onGridNewFolder" @import-files="pickFiles" />
       <div class="viewport" ref="viewportRef" v-show="libraryView === 'develop'"
         @wheel="onWheel"
         @mousedown="startPan"
@@ -3094,7 +3208,7 @@ const vWheelAdjust = {
           </button>
           <button class="ghost" type="button" :disabled="!chatEntries.length || chatBusy" @click="resetChat">{{ t('chat.clear') }}</button>
         </header>
-        <ModelSettings :open="modelSettingsOpen" :models="chatModels" :providers="chatProviders"
+        <ModelSettings :open="modelSettingsOpen" :models="chatModels" :catalog="chatCatalog"
           @update:models="v => chatModels = v" @close="modelSettingsOpen = false" />
         <div class="chat-log" ref="chatLogRef">
           <div class="chat-empty" v-if="!chatEntries.length">

@@ -27,6 +27,11 @@ Commands: `ping`, `extract-preview`, `render-linear`, `export`.
   skipped). One denoiser, chosen here rather than by the request: `DEFAULT_MODEL`
   is a transcription of Sony's own filter, with the wavelet as `FALLBACK_MODEL`
   for frames that carry no Sony noise tags.
+- `sony/ycc_frame.py` — Sony's M/S-size ARWs are chroma-subsampled YCbCr, not
+  mosaics; this interpolates the chroma LibRaw replicated, in place before the
+  postprocess, so coloured edges stop stepping two pixels at a time. Their luma
+  NR is `sony/lumanr.py`'s BSNR_Y, run by the browser at the engine's position
+  (after sharpening) from the tags this sends as `profileLumaNr`.
 
 Output pixels are written as float16 (the precision the browser's RGB16F
 textures use); in-memory caches stay float32.

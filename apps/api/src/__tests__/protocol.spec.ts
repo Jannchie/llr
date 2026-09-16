@@ -5,12 +5,14 @@ import {
   buildLinearFrameHeader,
   clampDroStrength,
   clampRenderParams,
+  PHOTO_NAME_MAX,
   isAllowedHost,
   isJsonContentType,
   isLocalOrigin,
   isValidFolderId,
   isValidSourceId,
   normalizeFolderName,
+  normalizePhotoName,
   pickExtension,
 } from "../protocol.js";
 
@@ -281,5 +283,34 @@ describe("pickExtension", () => {
   it("returns empty for missing extensions and dotfiles", () => {
     expect(pickExtension("noext")).toBe("");
     expect(pickExtension(".bashrc")).toBe("");
+  });
+});
+
+describe("normalizePhotoName", () => {
+  it("keeps the name as typed, extension and all", () => {
+    expect(normalizePhotoName("  DSC01157.ARW ", ".arw")).toBe("DSC01157.ARW");
+  });
+
+  it("puts the file's own extension back on a bare stem", () => {
+    expect(normalizePhotoName("sunset", ".arw")).toBe("sunset.arw");
+    expect(normalizePhotoName("  Sunset  ", ".dng")).toBe("Sunset.dng");
+  });
+
+  // The file behind the name does not change type, so a typed extension has to
+  // be the photo's own — refusing it says so instead of quietly keeping both.
+  it("refuses a different extension rather than keeping it", () => {
+    expect(normalizePhotoName("sunset.jpg", ".arw")).toBeNull();
+    expect(normalizePhotoName("a.b", ".dng")).toBeNull();
+    expect(normalizePhotoName(".arw", ".arw")).toBeNull();
+  });
+
+  it("refuses what is not a file name", () => {
+    expect(normalizePhotoName("", ".arw")).toBeNull();
+    expect(normalizePhotoName("   ", ".arw")).toBeNull();
+    expect(normalizePhotoName("a/b.ARW", ".arw")).toBeNull();
+    expect(normalizePhotoName("a\\b.ARW", ".arw")).toBeNull();
+    expect(normalizePhotoName("a\u0000b.ARW", ".arw")).toBeNull();
+    expect(normalizePhotoName("x".repeat(PHOTO_NAME_MAX) + ".arw", ".arw")).toBeNull();
+    expect(normalizePhotoName(7, ".arw")).toBeNull();
   });
 });

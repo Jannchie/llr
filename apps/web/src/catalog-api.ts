@@ -78,6 +78,11 @@ export async function uploadPhoto(file: File, folderId: number): Promise<Photo> 
   return (await request<{ photo: Photo }>("/photos", { method: "POST", body: form })).photo;
 }
 
+/** Rename one photo (its display label; the copy behind it does not move). */
+export async function renamePhoto(id: string, name: string): Promise<Photo> {
+  return (await request<{ photo: Photo }>(`/photos/${id}`, json("PATCH", { name }))).photo;
+}
+
 export async function movePhotos(ids: string[], folderId: number): Promise<number> {
   return (await request<{ moved: number }>("/photos/move", json("PATCH", { ids, folderId }))).moved;
 }

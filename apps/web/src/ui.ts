@@ -10,6 +10,8 @@ export type Photo = {
   ext: string;
   size: number;
   importedAt: number;
+  /** The file's own mtime (the original's, as the import saw it). */
+  modifiedAt: number;
   width: number | null;
   height: number | null;
   orientation: number | null;

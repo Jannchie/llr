@@ -4,6 +4,7 @@
  */
 
 import type { LinearPixels, ProfileClarity, ProfileSharpen, ProfileSpica } from "./rendering/pipeline-renderer";
+import type { ProfileLumaNr } from "./rendering/sony-lumanr";
 import type { ProfileMarble } from "./rendering/sony-marble";
 
 export const API = (import.meta.env.VITE_API_URL as string | undefined) ?? "/api";
@@ -146,6 +147,12 @@ export type ColorProfileMeta = {
   // amount rather than using amountAuto, because only it knows where the
   // colour-NR slider sits. Null for a render with no Marble to reproduce.
   profileMarble?: ProfileMarble | null;
+  // BSNR_Y, the luma NR of an M/S-size (YCbCr) frame (worker sony/lumanr.py
+  // ycc_luma_nr_block): the frame's RawNR tags, from which the browser builds
+  // the stage's parameters for the Amount and Edge sliders
+  // (rendering/sony-lumanr.ts). Absent on a mosaic frame, whose luma NR is
+  // the worker's RAW-domain stage — its presence is the switch.
+  profileLumaNr?: ProfileLumaNr | null;
   // Camera match, the stage after Marble (worker sony/profile.py
   // camera_match_table): three small CIELAB tables fitted per body and
   // Creative Look against the camera's own JPEG. Null when no table was

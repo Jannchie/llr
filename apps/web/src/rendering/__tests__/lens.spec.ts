@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { LENS_IDENTITY, LENS_KNOTS, LENS_KNOT_SPAN, lensFillScale, lensInterp, mixLensTable, parseLensCorr } from "../lens";
+import { LENS_IDENTITY, LENS_KNOTS, LENS_KNOT_SPAN, lensCaFillScale, lensFillScale, lensInterp, mixLensTable, parseLensCorr } from "../lens";
 
 // Worker output for samples/DSC01157.ARW (FE 50-150mm F2 GM @150mm) — Sony
 // int16 tables through the fixed-point maps (distortion p*2^-14+1, vignetting
@@ -123,5 +123,37 @@ describe("lensFillScale", () => {
         expect(s * lensInterp(table, s * Math.min(r, 1))).toBeLessThanOrEqual(1 + 1e-6);
       }
     }
+  });
+});
+
+// Lateral CA, DSC01143.ARW (E 28-200mm F2.8-5.6 A071 @57mm, ILCE-7CM2):
+// Sony's ChromaticAberrationCorrParams through p*2^-21+1, red then blue.
+const CA_R_RAW = [-768, -640, -640, -640, -640, -512, -512, -512, -512, -512, -512, -512, -384, -384, -128, 128];
+const CA_B_RAW = [1024, 1024, 1152, 1152, 1152, 1152, 1280, 1280, 1280, 1280, 1152, 1152, 1152, 896, 640, 512];
+const CA_R = CA_R_RAW.map(p => p * 2 ** -21 + 1);
+const CA_B = CA_B_RAW.map(p => p * 2 ** -21 + 1);
+
+describe("lateral CA", () => {
+  it("parses the two planes' tables when the worker sends them, and only then", () => {
+    const withCa = parseLensCorr({ ...sonyMeta, caR: CA_R, caB: CA_B })!;
+    expect(withCa.caR).toHaveLength(LENS_KNOTS);
+    expect(withCa.caB).toHaveLength(LENS_KNOTS);
+    expect(withCa.caR![0]).toBeCloseTo(CA_R[0], 12);
+    expect(withCa.caB![6]).toBeCloseTo(CA_B[6], 12);
+    expect(parseLensCorr(sonyMeta)!.caR).toBeUndefined();
+    // One plane without the other, or a short table, is not a correction.
+    expect(parseLensCorr({ ...sonyMeta, caR: CA_R })!.caR).toBeUndefined();
+    expect(parseLensCorr({ ...sonyMeta, caR: CA_R, caB: CA_B.slice(0, 8) })!.caB).toBeUndefined();
+  });
+
+  it("fills by the largest factor anywhere in the tables, as the engine does", () => {
+    // Edit.exe's own geometric stage on this frame resampled green at
+    // 1/(1 + 1280 * 2^-21) — the peak of blue's table, not its corner value.
+    const s = lensCaFillScale(CA_R, CA_B);
+    expect(s).toBeCloseTo(1 / (1 + 1280 * 2 ** -21), 12);
+    expect(s - 1).toBeCloseTo(-6.10e-4, 6);
+    // Identity tables, or none, leave the scale alone.
+    expect(lensCaFillScale(LENS_IDENTITY, LENS_IDENTITY)).toBe(1);
+    expect(lensCaFillScale(undefined, undefined)).toBe(1);
   });
 });

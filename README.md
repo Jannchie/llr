@@ -82,7 +82,13 @@ Drop a RAW on the page. Then, optionally:
   (`LLR_CACHE_DIR`), never in the checkout, and imports stay until you remove
   them from the library. Drop files or whole folders onto the folder tree to
   import them (a dropped folder keeps its structure); `G` and `E` switch
-  between the library grid and the develop view.
+  between the library grid and the develop view. In the grid, the bar above it
+  sorts by capture time, file modified time, camera, ISO and the rest, and
+  groups by day, month, year, camera, lens or type. It behaves like a file
+  manager: marquee-select from the empty space, `Ctrl`/`Shift` click and the
+  arrow keys, `F2` to rename in place, `Delete` to remove, and a right-click
+  menu on a photo (or on the empty space) to open, rename, move to a folder,
+  select, or import into the folder you are in.
 
 ## More
 

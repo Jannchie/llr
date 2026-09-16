@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { REC709_Y, glslFloat } from "../color-spaces";
 import {
+  CLARITY_DOWN_SHADER,
   MASK_VERTEX_SHADER,
   PASSES,
   PROCESS_SHADER,
@@ -118,7 +120,16 @@ describe("SONY_POST_SHADER sharpen kernel", () => {
     // its branch must come second and read the accumulated delta.
     const body = SONY_POST_SHADER.slice(SONY_POST_SHADER.indexOf("void main()"));
     expect(body.indexOf("u_sharpen > 0.0")).toBeLessThan(body.indexOf("u_gain > 0.0"));
-    expect(body).toContain("float ys = y + delta;");
+    expect(body).toContain("float ys = dot(rgb, LUMA_CLARITY) + delta;");
+  });
+
+  it("builds Clarity's detail on the luma its base layer uses", () => {
+    // Sharpening reads the engine's Y (SONY_YCC_Y); the Clarity base comes
+    // from CLARITY_DOWN_SHADER in Rec. 709. Mixing the two would add their
+    // colour-dependent difference back as detail — reds went flat that way.
+    const rec709 = `vec3(${glslFloat(REC709_Y[0])}, ${glslFloat(REC709_Y[1])}, ${glslFloat(REC709_Y[2])})`;
+    expect(SONY_POST_SHADER).toContain(`const vec3 LUMA_CLARITY = ${rec709};`);
+    expect(CLARITY_DOWN_SHADER).toContain(`const vec3 LUMA = ${rec709};`);
   });
 });
 

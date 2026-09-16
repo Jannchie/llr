@@ -11,7 +11,7 @@ import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 
 import {
-  agentProviders,
+  agentCatalog,
   handleAgentAbort,
   handleAgentSteer,
   handleAgentPrompt,
@@ -37,6 +37,7 @@ import {
   isValidFolderId,
   isValidSourceId,
   normalizeFolderName,
+  normalizePhotoName,
   pickExtension,
   type RenderLinearBody,
 } from "./protocol.js";
@@ -185,8 +186,8 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
 // The editing assistant (see agent.ts). Bodies are JSON; /prompt answers with
 // an SSE stream that lasts for the whole agent run.
 async function routeAgent(action: string, method: string, request: IncomingMessage, response: ServerResponse): Promise<void> {
-  if (method === "GET" && action === "providers") {
-    sendJson(response, { providers: agentProviders() });
+  if (method === "GET" && action === "models") {
+    sendJson(response, { providers: agentCatalog() });
     return;
   }
   if (method !== "POST") throw new HttpError(404, "Not found");
@@ -341,6 +342,15 @@ async function routeCatalog(pathname: string, method: string, request: IncomingM
     sendJson(response, { photo: publicPhoto(photo) });
     return;
   }
+  if (photoId && method === "PATCH") {
+    const photo = catalog.getPhoto(photoId);
+    if (!photo) throw new HttpError(404, "Unknown photo");
+    const body = await readJson<{ name?: unknown }>(request);
+    const name = normalizePhotoName(body.name, photo.ext);
+    if (!name) throw new HttpError(400, "Invalid photo name");
+    sendJson(response, { photo: publicPhoto(catalog.renamePhoto(photoId, name)) });
+    return;
+  }
   if (photoId && method === "DELETE") {
     const removed = catalog.deletePhotos([photoId]);
     await removePhotoDirs(removed);
@@ -419,7 +429,11 @@ async function handlePhotoUpload(request: IncomingMessage, response: ServerRespo
   try {
     const sourcePath = resolve(sessionDir, `source${ext}`);
     await writeFile(sourcePath, Buffer.from(await file.arrayBuffer()));
-    catalog.insertPhoto({ id, folderId, name: file.name, ext, size: file.size });
+    // The original's own mtime, which is what the library's "modified" sort
+    // and grouping mean; a file that arrived without one falls back to the
+    // import's clock inside insertPhoto.
+    const modifiedAt = Number.isFinite(lastModified) && lastModified > 0 ? lastModified : null;
+    catalog.insertPhoto({ id, folderId, name: file.name, ext, size: file.size, modifiedAt });
     const photo = await extractPreviews(id, sourcePath, sessionDir, lastModified);
     sendJson(response, { photo: publicPhoto(photo) }, 201);
   } catch (error) {

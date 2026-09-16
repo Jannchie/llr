@@ -268,3 +268,66 @@ def test_a_stronger_amount_denoises_more():
     core = (slice(MARGIN, -MARGIN), slice(MARGIN, -MARGIN))
     stds = [apply_luma_nr(plane, MODEL, RESTORE, ui)[0][core].std() for ui in (50, 75, 100)]
     assert stds[0] > stds[1] > stds[2]
+
+
+# ── the YCbCr (M/S-size) frame's stage, against the engine's own tiles ──────
+#
+# tests/fixtures/bsnr_ycc_tile.npz: crops of ZcTaskSIMDBSNR_Y's input and
+# output planes captured from Edit.exe (sony_repro/tools/bsnr_simd_probe.py)
+# on two S-size frames at several Amount / Edge positions, with the tags the
+# frames carry and the arguments the engine was seen to pass.
+
+
+def _ycc_cases():
+    import json
+    from pathlib import Path
+
+    z = np.load(Path(__file__).parent / "fixtures" / "bsnr_ycc_tile.npz")
+    i = 0
+    while f"c{i}_in" in z.files:
+        meta = json.loads(str(z[f"c{i}_meta"]))
+        yield meta["source"], z[f"c{i}_in"], z[f"c{i}_out"], meta
+        i += 1
+
+
+@pytest.mark.parametrize(("source", "plane_in", "plane_out", "meta"), list(_ycc_cases()),
+                         ids=lambda v: v if isinstance(v, str) else "")
+def test_the_ycc_frame_s_parameters_are_the_engine_s(source, plane_in, plane_out, meta):
+    p = lumanr.ycc_luma_nr_params(meta["block"], meta["amount"], meta["edge"])
+    engine = meta["engine"]
+    assert (p["weight"], p["gain"], p["limit"]) == (engine["weight"], engine["gain"], engine["limit"])
+    thr = NoiseModel(lo=p["lo"], hi=p["hi"], base=p["base"], slope=p["slope"]).threshold(np.arange(0x4000))
+    assert thr[:8].tolist() == engine["thr_head"]
+    assert int(thr.max()) == engine["thr_max"]
+
+
+@pytest.mark.parametrize(("source", "plane_in", "plane_out", "meta"), list(_ycc_cases()),
+                         ids=lambda v: v if isinstance(v, str) else "")
+def test_the_ycc_frame_s_stage_matches_the_engine_bit_for_bit(source, plane_in, plane_out, meta):
+    got = lumanr.apply_ycc_luma_nr(plane_in.astype(np.int32), meta["block"], meta["amount"], meta["edge"])
+    m = 6
+    np.testing.assert_array_equal(got[m:-m, m:-m], plane_out.astype(np.int32)[m:-m, m:-m])
+    # And it is not a no-op that happens to agree.
+    assert (got[m:-m, m:-m] != plane_in.astype(np.int32)[m:-m, m:-m]).mean() > 0.5
+
+
+@pytest.mark.parametrize(("ui", "expected"), [(0, -100.0), (25, -30.0), (50, 40.0), (70, 64.0), (100, 100.0)])
+def test_the_ycc_amount_remap_pins_neutral_at_the_bias_and_keeps_both_ends(ui, expected):
+    assert lumanr.ycc_effective_amount(ui) == pytest.approx(expected)
+
+
+def test_a_black_pixel_admits_the_zeroed_centre_lane_as_a_ninth_tap():
+    # The SIMD kernel's quirk: with ref below the threshold a zero joins the
+    # average. A flat plane at 0 with one bright neighbour shows it — the
+    # engine's average has nine terms where the scalar reading had eight.
+    plane = np.zeros((16, 16), np.int32)
+    plane[8, 9] = 40
+    thr = np.full(0x4000, 50, np.int32)
+    out = _bsnr_strip(plane, thr, 512, 0, 1023, 0.0)
+    low = binomial_lowpass(plane)
+    centre = low[8, 8]
+    # ref = (low + mean) / 2 < 50 here, so the phantom zero is accepted along
+    # with all eight real neighbours: nine of them plus the centre.
+    taps = [low[8 + dy, 8 + dx] for dy in (-1, 0, 1) for dx in (-1, 0, 1)]
+    assert out[8, 8] == (sum(taps) + 0) // 10
+    assert centre == low[8, 8]

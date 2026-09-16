@@ -3,6 +3,7 @@ import * as api from "../catalog-api";
 import { buildTree, pathOf, type FolderRow } from "../catalogTree";
 import { fitForKeepalive, trimEdit, type PersistedEdit } from "../edits";
 import { t } from "../i18n";
+import { GROUP_KEYS, SORT_KEYS, type GroupKey, type SortDir, type SortKey } from "../librarySort";
 import { clearState, clearThumbs, loadSession } from "../persistence";
 import { IMPORT_EXTENSIONS, type Photo, type Source } from "../ui";
 
@@ -36,7 +37,17 @@ type UiState<V> = {
   expanded: number[];
   view: LibraryView;
   viewSettings: V | null;
+  /** How the grid is ordered and grouped. Same key as the rest of the session. */
+  sort: SortKey;
+  sortDir: SortDir;
+  group: GroupKey;
 };
+
+// A stored state outlives the build that wrote it: a key this one no longer
+// offers falls back to the default rather than emptying the grid.
+function stored<T extends string>(value: unknown, keys: readonly T[], fallback: T): T {
+  return typeof value === "string" && (keys as readonly string[]).includes(value) ? value as T : fallback;
+}
 
 function isAbsoluteUrl(u: string): boolean {
   return u.startsWith("blob:") || u.startsWith("data:") || u.startsWith("http");
@@ -82,6 +93,11 @@ export function useCatalog<S, V>(opts: {
   const expanded = reactive(new Set<number>([ROOT_FOLDER_ID]));
   const view = ref<LibraryView>("develop");
   const folderLoading = ref(false);
+
+  // ── Grid order ──
+  const sortKey = ref<SortKey>("default");
+  const sortDir = ref<SortDir>("asc");
+  const groupKey = ref<GroupKey>("none");
 
   // ── Photos ──
   const folderPhotos = shallowRef<Photo[]>([]);
@@ -143,6 +159,9 @@ export function useCatalog<S, V>(opts: {
       expanded: [...expanded],
       view: view.value,
       viewSettings: opts.sessionExtras.get(),
+      sort: sortKey.value,
+      sortDir: sortDir.value,
+      group: groupKey.value,
     };
     try { localStorage.setItem(UI_STATE_KEY, JSON.stringify(state)); } catch { /* quota / private mode */ }
   }
@@ -154,6 +173,18 @@ export function useCatalog<S, V>(opts: {
     } catch {
       return {};
     }
+  }
+
+  /** The grid's order and grouping, remembered with the rest of the session. */
+  function setSort(key: SortKey, dir: SortDir = sortDir.value): void {
+    sortKey.value = key;
+    sortDir.value = dir;
+    saveUiState();
+  }
+
+  function setGroup(key: GroupKey): void {
+    groupKey.value = key;
+    saveUiState();
   }
 
   function persistNow(): void {
@@ -346,6 +377,37 @@ export function useCatalog<S, V>(opts: {
   }
 
   // ── Photo operations ──
+
+  // Rename the display label (the copy behind it is named after its id). The
+  // grid shows the new name at once; a refusal — a sibling already has it —
+  // puts the old one back and says why.
+  async function renamePhoto(id: string, name: string): Promise<void> {
+    const photo = photosById.get(id);
+    if (!photo || photo.name === name) return;
+    // One way in for a record: the session's map, the open folder's listing and
+    // the active photo are three copies of the same row.
+    const apply = (p: Photo) => {
+      photosById.set(id, p);
+      const i = folderPhotos.value.findIndex(f => f.id === id);
+      if (i >= 0) {
+        const next = folderPhotos.value.slice();
+        next[i] = p;
+        folderPhotos.value = next;
+      }
+      if (activePhoto.value?.id === id) activePhoto.value = p;
+    };
+    apply({ ...photo, name });
+    try {
+      const renamed = await api.renamePhoto(id, name);
+      // The server may answer with a different name than was asked for (it puts
+      // the file's own extension back), and only then does the listing need
+      // rewriting a second time.
+      if (renamed.name !== name) apply(renamed);
+    } catch (error) {
+      apply(photo);
+      fail(error);
+    }
+  }
 
   // Remove photos from the library: their rows, edits, thumbnails and the
   // server-side cached copies. The originals on the user's disk are never
@@ -586,6 +648,9 @@ export function useCatalog<S, V>(opts: {
     const saved = loadUiState();
     if (saved.view === "library" || saved.view === "develop") view.value = saved.view;
     if (Array.isArray(saved.expanded)) for (const id of saved.expanded) if (typeof id === "number") expanded.add(id);
+    sortKey.value = stored(saved.sort, SORT_KEYS, "default");
+    sortDir.value = stored(saved.sortDir, ["asc", "desc"] as const, "asc");
+    groupKey.value = stored(saved.group, GROUP_KEYS, "none");
     const viewSettings = saved.viewSettings ?? carried.viewSettings;
     if (viewSettings) opts.sessionExtras.apply(viewSettings);
     try {
@@ -617,12 +682,13 @@ export function useCatalog<S, V>(opts: {
 
   return {
     folders, tree, selectedFolderId, expanded, view, folderLoading,
+    sortKey, sortDir, groupKey, setSort, setGroup,
     folderPhotos, activeId, activeSource, selectedIds, importProgress,
     photoById, resolveUrl, thumbSrc, markInvalid, clearInvalid,
     persistNow, persistOnUnload, schedulePersist,
     activateSource, selectSource, openPhoto, setView,
     selectFolder, toggleExpanded, createFolder, renameFolder, moveFolder, deleteFolder,
-    removePhotos, movePhotos, importFiles, importDropped, importPickedDirectory,
+    removePhotos, renamePhoto, movePhotos, importFiles, importDropped, importPickedDirectory,
     boot,
   };
 }

@@ -55,6 +55,7 @@ from .sony import itp as sony_itp
 from .sony.chromasuppres import chroma_suppres_from_file
 from .sony.dro import dro_gain_table, dro_grid, dro_grid_json
 from .sony.dro_presets import DRO_LEVEL_AUTO, DRO_LEVEL_MAX
+from .sony.lumanr import ycc_luma_nr_block
 from .sony.marble import calib_from_sr2, marble_block
 from .sony.profile import camera_match_table, look_render_info
 from .sony.rawnr import detail_restore as sony_detail_restore
@@ -68,6 +69,7 @@ from .sony.sharpness import (
 )
 from .sony.spica import spica_block, spica_gain_scale, spica_iso_gain, spica_range_shift
 from .sony.sr2 import LookCalibration, dro_strength, ycc_wb_scale
+from .sony.ycc_frame import interpolate_chroma_inplace, is_ycc_frame
 
 RAW_EXTENSIONS = {".arw", ".srf", ".sr2", ".dng", ".cr2", ".cr3", ".nef", ".raf", ".rw2", ".orf"}
 LOCAL_CAMERA_PROFILE_ROOT = Path("vendor/adobe-camera-profiles/Camera")
@@ -116,6 +118,11 @@ class RawMetadata:
     # Marble's chroma cleanup: the shot's ISO and the body's thresholds
     # (sony/marble.py), in wire form. None when the exif carries no ISO.
     marble: dict[str, Any] | None = None
+    # The luma NR stage of an M/S-size (YCbCr) frame, in wire form
+    # (sony/lumanr.py ycc_luma_nr_block): the RawNR tags the browser builds
+    # BSNR_Y's parameters from. None for a mosaic frame, whose luma NR is the
+    # RAW-domain stage, and for a file without the tags.
+    luma_nr: dict[str, Any] | None = None
     # Whether DRO actually shaped this shot — not merely whether the body was in
     # Auto, which is a weaker claim (see dro_from_exif).
     dro_active: bool = False
@@ -1506,7 +1513,7 @@ def render_color(
             tweaks=metadata.look, dro=metadata.dro_active, dro_gain=metadata.dro_gain,
             dro_grid=metadata.dro_grid, sharpen=metadata.sharpen,
             spica=metadata.spica, chroma_suppres=metadata.chroma_suppres,
-            marble=metadata.marble,
+            marble=metadata.marble, luma_nr=metadata.luma_nr,
             # The exif Model keys the camera-match table (sony/profile.py
             # camera_match_table); a body the fit never saw gets none.
             body=camera_body_from_exif({"Model": metadata.model}),
@@ -1639,6 +1646,14 @@ def prepare_linear(
                     f"noise={stats.noise_source}{kept}" if stats is not None
                     else "skipped, sensor CFA is not 2x2 Bayer")
             sys.stderr.write(f"denoise {input_path.name}: {note}\n")
+            sys.stderr.flush()
+        # An M/S-size Sony frame is not a mosaic but a chroma-subsampled YCbCr
+        # image LibRaw has already converted; its replicated chroma is
+        # interpolated here, in place like the denoise above, so every
+        # postprocess below reads the smooth version (sony/ycc_frame.py).
+        chroma_note = interpolate_chroma_inplace(raw)
+        if chroma_note is not None:
+            sys.stderr.write(f"ycc {input_path.name}: {chroma_note}\n")
             sys.stderr.flush()
         renderer = resolve_color_renderer(root, dcp_arg, disable_dcp, recipe, metadata, input_path)
         if not renderer.active:
@@ -1895,6 +1910,7 @@ def read_raw_metadata(input_path: Path, raw: rawpy.RawPy) -> RawMetadata:
         # Only the YCbCr frames carry the tag, and only they lack a CFA pattern;
         # a mosaic file is not worth the read.
         wb_scale=ycc_wb_scale(input_path) if getattr(raw, "raw_pattern", None) is None else None,
+        luma_nr=ycc_luma_nr_from_file(input_path) if is_ycc_frame(raw) else None,
     )
 
 
@@ -1979,6 +1995,17 @@ def marble_from_exif(exif: dict[str, Any], input_path: Path | None = None) -> di
     if calib is not None and not calib.get("enabled", True):
         return None
     return marble_block(int(iso), calib)
+
+
+def ycc_luma_nr_from_file(input_path: Path) -> dict[str, Any] | None:
+    """BSNR_Y's inputs for an M/S-size frame: the RawNR tags, which the file
+    carries whether or not it is a mosaic (sony/lumanr.py). None without them,
+    and the stage stays off rather than guess a strength. Here beside
+    marble_from_exif because opening the file is this module's job."""
+    model, restore = sony_noise_model(input_path), sony_detail_restore(input_path)
+    if model is None or restore is None:
+        return None
+    return ycc_luma_nr_block(model, restore)
 
 
 def camera_body_from_exif(exif: dict[str, Any]) -> str | None:

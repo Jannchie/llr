@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, nextTick, ref } from "vue";
+import { computed, ref } from "vue";
+import InlineEdit from "./InlineEdit.vue";
 import { descendantIds, visibleRows, type FolderNode, type FolderRow } from "../catalogTree";
 import { t } from "../i18n";
 
@@ -35,40 +36,28 @@ const ROOT_ID = 1;
 const rows = computed(() => visibleRows(props.tree, props.expanded));
 
 // ── Inline editing: a rename in place, or a new folder typed into a row that
-// appears under its parent. One editor at a time.
+// appears under its parent. One editor at a time; the field itself (focus,
+// select, Enter/Escape/blur) is the shared InlineEdit.
 const editing = ref<{ kind: "rename"; id: number } | { kind: "create"; parentId: number; depth: number } | null>(null);
-const editText = ref("");
-const editInput = ref<HTMLInputElement | null>(null);
 
 function startCreate(parentId: number): void {
   const parent = props.folders.find(f => f.id === parentId);
   const depth = parent ? rows.value.find(r => r.id === parentId)?.depth ?? 0 : 0;
   if (!props.expanded.has(parentId)) emit("toggle", parentId);
   editing.value = { kind: "create", parentId, depth: depth + 1 };
-  editText.value = t("tree.newFolderName");
-  focusEditor();
 }
 
 function startRename(node: FolderNode): void {
   if (node.id === ROOT_ID) return;
   editing.value = { kind: "rename", id: node.id };
-  editText.value = node.name;
-  focusEditor();
 }
 
-// A function ref: a plain `ref="..."` inside v-for collects an array, and
-// there is only ever one editor open.
-function setEditInput(el: unknown): void { editInput.value = el instanceof HTMLInputElement ? el : null; }
-
-function focusEditor(): void {
-  void nextTick(() => { editInput.value?.focus(); editInput.value?.select(); });
-}
-
-function commitEdit(): void {
+function commitEdit(name: string): void {
   const e = editing.value;
   editing.value = null;
-  const name = editText.value.trim();
-  if (!e || !name) return;
+  if (!e) return;
+  // A new folder is created whatever it is called; a rename that changes
+  // nothing is dropped.
   if (e.kind === "create") emit("create", e.parentId, name);
   else if (name !== props.folders.find(f => f.id === e.id)?.name) emit("rename", e.id, name);
 }
@@ -175,6 +164,11 @@ function onRowKeyDown(e: KeyboardEvent, node: FolderNode): void {
   else if (e.key === "ArrowRight" && node.children.length && !props.expanded.has(node.id)) { e.preventDefault(); emit("toggle", node.id); }
   else if (e.key === "ArrowLeft" && props.expanded.has(node.id)) { e.preventDefault(); emit("toggle", node.id); }
 }
+
+// The new-folder editor lives here (it is a tree row), and the library grid's
+// context menu offers the same action — so the grid asks the tree to start one
+// instead of opening a second, differently-behaving prompt.
+defineExpose({ startCreate });
 </script>
 
 <template>
@@ -232,8 +226,8 @@ function onRowKeyDown(e: KeyboardEvent, node: FolderNode): void {
           <svg class="tree-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true">
             <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
           </svg>
-          <input v-if="editing?.kind === 'rename' && editing.id === node.id" :ref="setEditInput" class="tree-edit"
-            v-model="editText" @keydown.enter.prevent="commitEdit" @keydown.esc.prevent="cancelEdit" @blur="commitEdit" @click.stop />
+          <InlineEdit v-if="editing?.kind === 'rename' && editing.id === node.id" class="tree-edit"
+            :value="node.name" @commit="commitEdit" @cancel="cancelEdit" @click.stop />
           <span v-else class="tree-name">{{ label(node) }}</span>
           <!-- Collapsed: everything below; expanded: the folder's own photos,
                the children carry theirs (Lightroom's convention). -->
@@ -258,8 +252,7 @@ function onRowKeyDown(e: KeyboardEvent, node: FolderNode): void {
           <svg class="tree-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true">
             <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
           </svg>
-          <input :ref="setEditInput" class="tree-edit" v-model="editText"
-            @keydown.enter.prevent="commitEdit" @keydown.esc.prevent="cancelEdit" @blur="commitEdit" />
+          <InlineEdit class="tree-edit" :value="t('tree.newFolderName')" @commit="commitEdit" @cancel="cancelEdit" />
         </div>
       </template>
     </div>

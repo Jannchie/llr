@@ -4,6 +4,7 @@ r"""全自动驱动 Edit.exe 导出:设降噪模式 → 打开导出框 → 选�
 导出对话框是模态的,弹出时会在最前面停几秒。
 
     python edit_export.py <off|auto|manual> <文件名不含扩展名> [--jpg] [--dir E:\temp_photo]
+                          [--dro off|auto|manual] [--dro-level 0..100]   # DRO 组;手动档滑块值 = 引擎 level
     python edit_export.py inspect          # 只打开导出框并列出下拉框选项,不保存
 
 前提:Edit.exe 已经打开了目标 ARW(主窗口标题 'Edit')。
@@ -141,6 +142,28 @@ def set_nr_sliders(top, spec):
             raise SystemExit(f"{name} 没设上:滑块 {got},数值框 {txt!r}")
 
 
+def set_dro_level(top, pos):
+    """DRO 组(第一组「关」)下面那根 0..100 的 trackbar。手动档才启用;滑块值就是引擎的 level。"""
+    y0 = sorted(win32gui.GetWindowRect(h)[1] for h in children(top)
+                if win32gui.GetClassName(h) == "Button" and win32gui.GetWindowText(h) == "关")[0]
+    sl = [h for h in children(top) if win32gui.GetClassName(h) == "msctls_trackbar32"
+          and 0 < win32gui.GetWindowRect(h)[1] - y0 < 120]
+    if len(sl) != 1 or not win32gui.IsWindowEnabled(sl[0]):
+        raise SystemExit("DRO 滑块没找到或未启用(要先 --dro manual)")
+    h = sl[0]
+    win32gui.SendMessage(h, 0x0405, 1, pos)
+    parent = win32gui.GetParent(h)
+    win32gui.SendMessage(parent, win32con.WM_HSCROLL, (pos << 16) | 4, h)
+    win32gui.SendMessage(parent, win32con.WM_HSCROLL, 8, h)
+    time.sleep(0.8)
+    got = win32gui.SendMessage(h, 0x0400, 0, 0)
+    box = slider_value_box(top, h)
+    txt = EditWrapper(box).window_text() if box else "?"
+    print(f"  DRO level → {got}(数值框 {txt!r})")
+    if got != pos:
+        raise SystemExit(f"DRO level 没设上:滑块 {got}")
+
+
 def open_export(top):
     L, T, _, _ = win32gui.GetWindowRect(top)
     tx, ty = L + EXPORT_BTN_OFFSET[0], T + EXPORT_BTN_OFFSET[1]
@@ -245,6 +268,8 @@ def main():
 
     if "--dro" in sys.argv:
         set_nr_mode(top, sys.argv[sys.argv.index("--dro") + 1], group=0, label="DRO")
+    if "--dro-level" in sys.argv:
+        set_dro_level(top, int(sys.argv[sys.argv.index("--dro-level") + 1]))
     set_nr_mode(top, mode)
     if "--sliders" in sys.argv:
         if mode != "manual":

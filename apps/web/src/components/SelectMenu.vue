@@ -1,5 +1,6 @@
 <script setup lang="ts" generic="T extends string | number">
 import { computed, nextTick, onBeforeUnmount, ref, useId, watch } from "vue";
+import { useFixedPlacement } from "../composables/useFixedPlacement";
 
 // A listbox picker that replaces the native <select>. The native control draws
 // its popup at the OS level: it ignores the app's dark palette, cannot show a
@@ -31,46 +32,15 @@ const listId = `${uid}-list`;
 const optionId = (i: number) => `${uid}-opt${i}`;
 
 const open = ref(false);
-// Set one frame after opening, once the popup has been measured and placed —
-// until then it is transparent, so it never flashes at the wrong coordinates.
-const placed = ref(false);
 const activeIndex = ref(-1);
 const triggerEl = ref<HTMLButtonElement | null>(null);
 const listEl = ref<HTMLDivElement | null>(null);
-const popStyle = ref<Record<string, string>>({});
+// Fixed coordinates, recomputed on scroll and resize while open; the popup is
+// transparent until `placed`, so it never flashes at the wrong spot.
+const { placed, style: popStyle, show: showPopup, hide: hidePopup } = useFixedPlacement(triggerEl, listEl);
 
 const selectedIndex = computed(() => props.options.findIndex(o => o.value === props.modelValue));
 const selectedLabel = computed(() => props.options[selectedIndex.value]?.label ?? props.placeholder);
-
-/* ---------- placement ---------- */
-
-const GAP = 4;      // between trigger and popup
-const EDGE = 8;     // keep off the window edges
-const MAX_H = 420;  // ~14 rows: the longest list here (aspect ratios) is 13
-
-// Called on open and on every scroll/resize while open: the rail scrolls, and a
-// fixed popup would otherwise part company with its trigger.
-function place(): void {
-  const trigger = triggerEl.value;
-  const list = listEl.value;
-  if (!trigger || !list) return;
-  const r = trigger.getBoundingClientRect();
-  const below = window.innerHeight - r.bottom - GAP - EDGE;
-  const above = r.top - GAP - EDGE;
-  // Prefer dropping down; flip up only when that genuinely buys more room.
-  const up = below < Math.min(MAX_H, above) && above > below;
-  const style: Record<string, string> = {
-    minWidth: `${r.width}px`,
-    maxHeight: `${Math.max(96, Math.min(MAX_H, up ? above : below))}px`,
-  };
-  if (up) style.bottom = `${window.innerHeight - r.top + GAP}px`;
-  else style.top = `${r.bottom + GAP}px`;
-  // Width is content-driven (a label can be wider than the trigger), so the
-  // left edge is only known after a measure — pull it back in off the window.
-  const w = list.offsetWidth;
-  style.left = `${Math.max(EDGE, Math.min(r.left, window.innerWidth - EDGE - w))}px`;
-  popStyle.value = style;
-}
 
 function scrollActiveIntoView(): void {
   const el = listEl.value?.querySelector<HTMLElement>(".select-option.is-active");
@@ -85,23 +55,16 @@ async function openMenu(seek: "selected" | "first" | "last" = "selected"): Promi
   activeIndex.value = seek === "first" ? firstEnabled(1)
     : seek === "last" ? firstEnabled(-1)
       : selectedIndex.value >= 0 ? selectedIndex.value : firstEnabled(1);
-  window.addEventListener("resize", place);
-  // Capture: an ancestor scrolling (the settings rail) does not bubble.
-  window.addEventListener("scroll", place, true);
   document.addEventListener("pointerdown", onDocPointerDown, true);
-  await nextTick();
-  place();
+  await showPopup();
   scrollActiveIntoView();
-  placed.value = true;
 }
 
 function close(refocus: boolean): void {
   if (!open.value) return;
   open.value = false;
-  placed.value = false;
   activeIndex.value = -1;
-  window.removeEventListener("resize", place);
-  window.removeEventListener("scroll", place, true);
+  hidePopup();
   document.removeEventListener("pointerdown", onDocPointerDown, true);
   if (refocus) triggerEl.value?.focus();
 }

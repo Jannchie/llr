@@ -23,6 +23,12 @@ assume no same-source concurrency). The decode path:
 1. rawpy/LibRaw decode (optionally half-size / long-edge capped).
 2. Optional RAW-domain denoise on the Bayer mosaic *before* demosaic
    (`denoise.py`; 2×2 Bayer CFAs only — X-Trans is detected and skipped).
+   Sony's M/S-size ARWs are not mosaics but chroma-subsampled YCbCr images
+   the body already demosaiced; LibRaw replicates their chroma in 2-pixel
+   steps, and `sony/ycc_frame.py` interpolates it at the same point instead.
+   They take no RAW-domain denoise: their luma NR is Edit's `BSNR_Y`, which
+   runs on the tone-mapped frame and so lives in the browser's post chain
+   (`sony/lumanr.py` supplies the parameters as `profileLumaNr`).
 3. Auto-selected Adobe DCP camera profile (`dcp.py`: color matrix,
    HueSatMap, LookTable) into **linear ProPhoto (D50)**.
 4. Result written to disk as **float16** and framed by the API into the
@@ -86,7 +92,10 @@ log-luminance mask — then dehaze, vibrance/saturation, HSL. The view transform
 curves (as baked LUT textures) and color grading run *after* it, on [0,1], as
 does the final gamut map and sRGB/P3 encode. Uniform-only edits redraw in real
 time; Contrast/Blacks are display-referred and re-bake the curve LUT; crop is a
-per-frame affine on the sampling UVs (`u_texXform`), no re-decode; denoise/DCP
+per-frame affine on the sampling UVs (`u_texXform`), no re-decode; lens
+distortion, vignetting and lateral CA are the shot's own tables sampled per
+channel at the fetch (`lens.ts`), with Edit's fill scale — which also gives the
+frame the sub-pixel resampling its exports owe part of their smoothness to; denoise/DCP
 changes re-request linear data. Noise reduction is two-tier, as in Lightroom:
 the RAW-domain stage above is the decode's, and a display-side luminance stage
 (`passes.ts` `NOISE_LUMA_SHADER`, a bilateral on the finished frame, first in
@@ -97,6 +106,14 @@ packed into a uniform block; the shader evaluates each group's weight per pixel
 and blends the *parameters* (exposure, WB, tonal, clarity, dehaze,
 saturation/vibrance, hue) before those blocks run once.
 
+The preview renders at the on-screen scale while a slider moves, and the
+neighbourhood stages (sharpening, Spica, the luma NR passes, Marble) see a
+different frame at that scale than at export. So once the edit holds still for
+200 ms the renderer re-renders the visible frame at full resolution — the
+export's own render — and shows a mipmapped downscale of it
+(`PipelineRenderer.scheduleRefine`); what the preview settles on is what the
+export looks like on screen.
+
 `App.vue` holds the editing state; the mechanics live in composables
 (`useCatalog`, `useHistory`, `useViewport`, `useCropEditor`, `useToneCurve`,
 `useHistogram`, `useExport`) and `api.ts` (the binary protocol client).
@@ -104,11 +121,17 @@ saturation/vibrance, hue) before those blocks run once.
 folder's photos as plain (non-reactive) records, the active photo — which need
 not be in that folder — and the edits touched this session, saved with a
 debounce (`PUT /photos/:id/edit`; a keepalive request on unload). The library
-grid and the filmstrip are windowed (`useVirtualGrid`: fixed cells, so an
-index maps to a position by arithmetic and a folder of thousands mounts a
-screenful). Folders, photos and OS drops all move by HTML5 drag-and-drop onto
-the tree. What is UI state — open folder, expanded folders, active photo, view
-settings — stays in `localStorage`. `persistence.ts` is the pre-catalog
+grid is ordered by `librarySort.ts` (a sort key and direction, then grouping
+into sections) and windowed a row at a time (`useVirtualRows`: group headers
+over bands of cells, so a row that was never mounted can still be hit-tested —
+which is what a marquee drag selects through); the filmstrip windows its fixed
+cells with `useVirtualStrip`, and both ride `useVirtualWindow`'s scroll/resize
+plumbing with their own geometry. The grid's menu (`components/ContextMenu.vue`)
+renames (`PATCH /photos/:id`), moves and removes the selection, and the folder
+tree's inline new-folder editor is the one the grid's menu opens. Folders,
+photos and OS drops all move by HTML5 drag-and-drop onto the tree. What is UI
+state — open folder, expanded folders, active photo, view settings, sort and
+grouping — stays in `localStorage`. `persistence.ts` is the pre-catalog
 IndexedDB store, kept to migrate it: on first boot the browser hands its
 photos and edits to `POST /catalog/adopt` and clears it.
 

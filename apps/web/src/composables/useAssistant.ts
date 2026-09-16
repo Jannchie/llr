@@ -26,6 +26,10 @@ export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 export type ModelSpec = { provider: string; id: string; thinking?: ThinkingLevel };
 export const modelKey = (m: ModelSpec): string => `${m.provider}/${m.id}`;
 
+// One provider the API knows, with the ids its registry ships for it and
+// whether this server holds that provider's key (mirrors the API's own type).
+export type ProviderCatalog = { id: string; hasKey: boolean; models: { id: string; name: string }[] };
+
 // Tokens and cost of one turn, summed over its LLM calls (pi-ai's Usage).
 export type TurnUsage = { input: number; output: number; cacheRead: number; cost: number };
 
@@ -103,9 +107,12 @@ export function useAssistant(opts: {
 
   const models = ref<ModelSpec[]>(loadModels());
   const selected = ref(localStorage.getItem(SELECTED_KEY) ?? modelKey(models.value[0]));
-  // Providers the API has a key for; the picker greys out the rest.
-  const providers = ref<string[] | null>(null);
-  void fetch(`${API}/agent/providers`).then(r => r.ok ? r.json() : null).then(m => { providers.value = m?.providers ?? []; }).catch(() => {});
+  // The API's registry: what the model dialog offers to pick from.
+  const catalog = ref<ProviderCatalog[] | null>(null);
+  void fetch(`${API}/agent/models`).then(r => r.ok ? r.json() : null).then(m => { catalog.value = m?.providers ?? []; }).catch(() => {});
+  // Providers the API has a key for; the picker greys out the rest. Null until
+  // the catalog lands, so nothing is greyed out before we can know.
+  const providers = computed(() => catalog.value?.filter(p => p.hasKey).map(p => p.id) ?? null);
   watch(models, list => {
     localStorage.setItem(MODELS_KEY, JSON.stringify(list));
     if (list.length && !list.some(m => modelKey(m) === selected.value)) selected.value = modelKey(list[0]);
@@ -215,7 +222,7 @@ export function useAssistant(opts: {
   function abort(): void { void post(current.value.session, "abort", {}); }
   function reset(): void { current.value.entries = []; void post(current.value.session, "reset", {}); }
 
-  return { entries, busy, models, selected, providers, send, abort, reset };
+  return { entries, busy, models, selected, catalog, providers, send, abort, reset };
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

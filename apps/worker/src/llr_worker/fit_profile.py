@@ -43,6 +43,7 @@ from .dcp import (
     srgb_encode_float,
 )
 from .sony.sr2 import ycc_wb_scale
+from .sony.ycc_frame import interpolate_chroma_inplace
 
 # Grid resolution. Hue gets the most cells because hue error is the dominant
 # residual; value gets the fewest because the inverse tone curve makes the
@@ -173,6 +174,9 @@ def postprocess_camera_native(
 
 def decode_camera_rgb(raw_path: Path, half_size: bool = True) -> np.ndarray:
     with rawpy.imread(str(raw_path)) as raw:
+        # The renderer interpolates an M/S-size frame's chroma before this same
+        # postprocess (cli.prepare_linear); the fitter must see the same pixels.
+        interpolate_chroma_inplace(raw)
         return postprocess_camera_native(raw, half_size, ycc_wb_scale(raw_path))
 
 

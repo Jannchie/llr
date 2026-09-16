@@ -29,6 +29,13 @@ export type PhotoRow = {
   ext: string;
   size: number;
   importedAt: number;
+  /**
+   * The file's own modification time — the original's mtime as the import saw
+   * it, for a file that arrived without one the time it was imported. Distinct
+   * from `importedAt` for a photo whose file was last touched before it was
+   * brought in, which is what a user means by "modified".
+   */
+  modifiedAt: number;
   width: number | null;
   height: number | null;
   orientation: number | null;
@@ -67,7 +74,7 @@ export class CatalogError extends Error {
   }
 }
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 const SCHEMA = `
 CREATE TABLE folders (
@@ -83,6 +90,7 @@ CREATE TABLE photos (
   ext TEXT NOT NULL,
   size INTEGER NOT NULL,
   imported_at INTEGER NOT NULL,
+  modified_at INTEGER,
   width INTEGER,
   height INTEGER,
   orientation INTEGER,
@@ -110,8 +118,8 @@ CREATE TABLE meta (
 );
 `;
 
-const PHOTO_COLUMNS = `id, folder_id, name, ext, size, imported_at, width, height, orientation, captured_at,
-  make, model, lens, iso, exposure, fnumber, focal, thumb_state`;
+const PHOTO_COLUMNS = `id, folder_id, name, ext, size, imported_at, modified_at, width, height, orientation,
+  captured_at, make, model, lens, iso, exposure, fnumber, focal, thumb_state`;
 
 // Chronological where the shot has a capture time, import order for the rest
 // (a screenshot, a file with no EXIF) — those sort last rather than by an
@@ -136,6 +144,7 @@ function toPhoto(r: Row): PhotoRow {
     ext: str(r.ext) ?? "",
     size: num(r.size) ?? 0,
     importedAt: num(r.imported_at) ?? 0,
+    modifiedAt: num(r.modified_at) ?? num(r.imported_at) ?? 0,
     width: num(r.width),
     height: num(r.height),
     orientation: num(r.orientation),
@@ -188,6 +197,14 @@ export class Catalog {
       if (version < 1) {
         this.db.exec(SCHEMA);
         this.db.prepare("INSERT INTO folders (id, parent_id, name) VALUES (?, NULL, ?)").run(ROOT_FOLDER_ID, "Library");
+      }
+      // v2: the file's own modification time (see PhotoRow). A library that
+      // predates the column holds imported copies, written when they were
+      // imported, so their import time is their mtime — backfilling it beats
+      // leaving every row of an existing library ungroupable by date.
+      if (version === 1) {
+        this.db.exec("ALTER TABLE photos ADD COLUMN modified_at INTEGER");
+        this.db.exec("UPDATE photos SET modified_at = imported_at");
       }
       this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
       this.db.exec("COMMIT");
@@ -318,11 +335,32 @@ export class Catalog {
     return row ? toPhoto(row) : null;
   }
 
-  insertPhoto(p: Pick<PhotoRow, "id" | "folderId" | "name" | "ext" | "size">, importedAt = Date.now()): PhotoRow {
+  insertPhoto(
+    p: Pick<PhotoRow, "id" | "folderId" | "name" | "ext" | "size"> & { modifiedAt?: number | null },
+    importedAt = Date.now(),
+  ): PhotoRow {
     if (!this.getFolder(p.folderId)) throw new CatalogError(404, "Unknown folder");
-    this.db.prepare("INSERT INTO photos (id, folder_id, name, ext, size, imported_at) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(p.id, p.folderId, p.name, p.ext, p.size, importedAt);
+    if (p.modifiedAt != null && !Number.isFinite(p.modifiedAt)) throw new CatalogError(400, "Invalid modifiedAt");
+    this.db.prepare("INSERT INTO photos (id, folder_id, name, ext, size, imported_at, modified_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(p.id, p.folderId, p.name, p.ext, p.size, importedAt, p.modifiedAt ?? importedAt);
     return this.getPhoto(p.id)!;
+  }
+
+  /**
+   * Rename a photo. `name` is the display label the grid shows, including its
+   * extension (the copy on disk is named after the id, so nothing moves); a
+   * sibling of the same name is a 409, as in a file manager.
+   */
+  renamePhoto(id: string, name: string): PhotoRow {
+    return this.transaction(() => {
+      const photo = this.getPhoto(id);
+      if (!photo) throw new CatalogError(404, "Unknown photo");
+      const clash = this.db.prepare("SELECT id FROM photos WHERE folder_id = ? AND name = ? AND id != ?")
+        .get(photo.folderId, name, id);
+      if (clash) throw new CatalogError(409, "A photo of that name already exists here");
+      this.db.prepare("UPDATE photos SET name = ? WHERE id = ?").run(name, id);
+      return this.getPhoto(id)!;
+    });
   }
 
   /** Fill in what the preview extraction learned; absent keys are left alone. */

@@ -11,6 +11,7 @@ import {
   MASK_BLUR_SHADER, MASK_DOWNSAMPLE_SHADER, MASK_VERTEX_SHADER, PASSES, VERTEX_SHADER,
 } from "./passes";
 import { type MarbleUniforms, type ProfileMarble, marbleUniforms } from "./sony-marble";
+import { type LumaNrParams, type ProfileLumaNr, lumaNrParams } from "./sony-lumanr";
 import { StaticAsset } from "./static-asset";
 import {
   CAMERA_MATCH_C_STEPS, CAMERA_MATCH_H_SECTORS, CAMERA_MATCH_L_STEPS,
@@ -19,7 +20,7 @@ import {
 import {
   SPICA_CODE_COUNT, SPICA_LUT, SPICA_TABLE_COUNT, SPICA_TAP_COUNT, SPICA_WEIGHTS,
 } from "./spica-tables";
-import { LENS_IDENTITY, LENS_KNOTS, lensFillScale } from "./lens";
+import { LENS_IDENTITY, LENS_KNOTS, lensCaFillScale, lensFillScale } from "./lens";
 import { computeWbMatrix } from "./color-spaces";
 import { LUT_SIZE, buildToneCurveLUT, defaultToneCurve } from "./curve";
 import { LOG2_MID } from "./tonal-model";
@@ -50,6 +51,9 @@ export interface EditParams {
   // on the frame's aspect ratio (lens.ts lensFillScale), which only the
   // renderer knows, so it is derived here from lensDist and the texture dims.
   lensDist: number[]; lensVig: number[];
+  // Lateral CA tables (lens.ts LensCorr.caR/caB), identity or absent = off.
+  // Their fill scale multiplies the distortion's (lens.ts lensCaFillScale).
+  lensCaR?: number[]; lensCaB?: number[];
   // Whether to apply the fitted camera-match HueSatMap (1) or show Adobe's
   // uncorrected rendering (0). A parameter rather than a per-image upload
   // because it is a user toggle, and it no longer costs a decode to flip.
@@ -242,6 +246,8 @@ type SonyPostTargets = {
   mid: RenderTarget | null;
   // YNR's mix, 0..1; 0 = the pass does not run (prepareSonyPost).
   ynr: number;
+  // BSNR_Y's parameters when the pass runs, null otherwise (prepareSonyPost).
+  bsnr: LumaNrParams | null;
   // Marble's other half, the chroma cleanup (passes.ts marble* shaders,
   // reference and calibration in worker sony/marble.py). `down`, `mean` and
   // `blur` are the three 1/4-resolution planes the engine's cnr1..cnr3 work on,
@@ -256,9 +262,11 @@ type SonyPostTargets = {
   marble: {
     down: RenderTarget; mean: RenderTarget; blur: RenderTarget; out: RenderTarget;
     // The 1/f-res grid the first three run on, f the calibration's decimation
-    // factor (4 or 8): ceil(w/f) x ceil(h/f), because a partial block at the far
-    // edge still gets a texel, as the engine's does.
-    w: number; h: number;
+    // factor (4 or 8) in *sensor* pixels: ceil(w/cell) x ceil(h/cell), because
+    // a partial block at the far edge still gets a texel, as the engine's does.
+    // `cell` is f scaled to the render (f at export), which pins the grid to
+    // the frame the way Clarity's is — see MARBLE_DOWN_SHADER for why.
+    w: number; h: number; cell: number;
   } | null;
   // Camera match (passes.ts CAMERA_MATCH_SHADER), the stage after Marble: it
   // reads the frame the chain finished and writes the destination. Null when
@@ -282,6 +290,11 @@ export type ProfileCurve =
     // The median pass Edit adds above amount 50 (passes.ts YNR_SHADER), as the
     // percent of it to mix in: (amount - 50) * 2, so 0 (the default) is off.
     ynr?: number | null;
+    // BSNR_Y, the luma NR of an M/S-size (YCbCr) frame (passes.ts BSNR_SHADER):
+    // the frame's RawNR tags as the worker sent them plus where the Amount and
+    // Edge sliders sit, from which sony-lumanr.ts builds the kernel's numbers.
+    // Null — a mosaic frame, or noise reduction off — leaves the chain as it was.
+    lumaNr?: (ProfileLumaNr & { amount: number; edge: number }) | null;
     // Marble's chroma cleanup: the shot's ISO and threshold calibration as the
     // worker sent them, plus where Edit's 色彩降噪 control (0..10, 5 = Auto)
     // sits. Everything the four marble* passes need is derived from these by
@@ -446,6 +459,18 @@ const HISTO_LONG_CPU = 256;
 // the grain away already, and the kernel would be reading one texel.
 const NOISE_SIGMA_BASE = 0.025;
 const NOISE_MIN_STEP = 0.25;
+// The idle refine (PipelineRenderer.scheduleRefine): how long the edit has to
+// hold still first, and the preview scale above which it is not worth it —
+// close enough to 1:1 that every stage already runs as it does at export.
+const REFINE_DELAY_MS = 200;
+const REFINE_SKIP_ABOVE = 0.95;
+// The refine's final blit: the mipmapped full-resolution frame onto the canvas.
+const REFINE_COPY_SHADER = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 outColor;
+uniform sampler2D u_input;
+void main() { outColor = texture(u_input, v_uv); }`;
 
 // Long-edge cap for the blurred log-luminance mask (Highlights/Shadows
 // locality). Fixed regardless of source size so the blur is a constant
@@ -542,6 +567,13 @@ export class PipelineRenderer {
   // Sub-rectangle of the output frame the canvas covers; null = the whole frame.
   // Only the canvas honours it — histogram and export always see everything.
   private viewWindow: ViewWindow | null = null;
+  // The idle refine (see draw): a full-resolution render of what the canvas
+  // shows, mipmapped and drawn over the reduced-scale preview once the sliders
+  // stop. `target` is that frame, reused while the output size holds.
+  private refineTimer = 0;
+  private refineTarget: (RenderTarget & { w: number; h: number }) | null = null;
+  private refineProg: WebGLProgram | null = null;
+  private refineEnabled = true;
   // Affine output→source-texcoord map (crop / straighten / flip / rotate) and
   // the workspace fill used for out-of-image areas in the crop editor.
   private texXform: Float32Array = new Float32Array([1, 0, 0, 0, -1, 0, 0, 1, 1]); // identity (full frame)
@@ -592,6 +624,8 @@ export class PipelineRenderer {
   private sonyMarble: MarbleUniforms | null = null;
   // YNR's percent, 0..100 (passes.ts YNR_SHADER); 0 = off.
   private sonyYnr = 0;
+  // BSNR_Y's numbers for the current sliders (passes.ts BSNR_SHADER); null = off.
+  private sonyBsnr: LumaNrParams | null = null;
   // Camera match: the table the profile carries, and whether the switch is
   // on. Both have to hold for the stage to run (cameraMatchOn); the table
   // stays put while the switch is off so flipping it back is a redraw.
@@ -971,6 +1005,11 @@ export class PipelineRenderer {
     const spica = curve?.spica ?? null;
     this.sonySpica = spica && spica.amount > 0 ? spica : null;
     this.sonyYnr = Math.max(0, Math.min(100, curve?.ynr ?? 0));
+    // BSNR_Y runs at every slider position once the block is there — at
+    // Amount 0 its tables are zero but the detail restore still applies, as
+    // in the engine — so presence is the switch.
+    const lumaNr = curve?.lumaNr ?? null;
+    this.sonyBsnr = lumaNr ? lumaNrParams(lumaNr, lumaNr.amount, lumaNr.edge) : null;
     // Marble's numbers are the slider applied to the body's calibration
     // (sony-marble.ts). An amount of zero means the blend would put the
     // original chroma back untouched, so the stage is dropped outright.
@@ -1305,6 +1344,88 @@ export class PipelineRenderer {
     if (this.canvas.width !== cw) this.canvas.width = cw;
     if (this.canvas.height !== ch) this.canvas.height = ch;
     this.renderPass(null, cw, ch, p, win ? this.windowXform(win) : undefined);
+    this.scheduleRefine(p, win, cw, ch);
+  }
+
+  /**
+   * Whether draw() follows a reduced-scale preview with a full-resolution
+   * refine once the edit settles. On by default; an offscreen renderer (the
+   * export, the histogram) has no canvas to refine and turns it off.
+   */
+  setRefine(enabled: boolean): void {
+    this.refineEnabled = enabled;
+    if (!enabled) this.cancelRefine();
+  }
+
+  private cancelRefine(): void {
+    if (this.refineTimer) { clearTimeout(this.refineTimer); this.refineTimer = 0; }
+  }
+
+  /**
+   * The preview is rendered at previewScale, and every stage that reads its
+   * neighbours — sharpening, Spica, the luma NR passes, Marble — sees a
+   * different picture there than at export: taps that reach across several
+   * sensor pixels, grain the point-sampled minification never averaged, the
+   * scale-dependent amplitudes that compensate. So the preview and the export
+   * were only ever the same *kind* of picture. The refine closes that: once
+   * the sliders have been still for REFINE_DELAY it renders the visible frame
+   * at full resolution — exactly the export's render — and shows a proper
+   * mipmapped downscale of it, which is what the export looks like on screen.
+   * A drag still redraws at preview scale, so it stays interactive; the
+   * refined frame lands a moment after it stops.
+   */
+  private scheduleRefine(p: EditParams, win: ViewWindow | null, cw: number, ch: number): void {
+    this.cancelRefine();
+    if (!this.refineEnabled || this.destroyed || this.previewScale >= REFINE_SKIP_ABOVE) return;
+    this.refineTimer = window.setTimeout(() => {
+      this.refineTimer = 0;
+      this.refine(p, win, cw, ch);
+    }, REFINE_DELAY_MS);
+  }
+
+  private refine(p: EditParams, win: ViewWindow | null, cw: number, ch: number): void {
+    const gl = this.gl;
+    if (this.destroyed || !this.sourceTex) return;
+    // The canvas has moved on (a resize, another draw): that draw scheduled
+    // its own refine, this one is stale.
+    if (this.canvas.width !== cw || this.canvas.height !== ch) return;
+    const w = Math.max(1, Math.round(win ? win.w : this.outWidth));
+    const h = Math.max(1, Math.round(win ? win.h : this.outHeight));
+    const max = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
+    if (w > max || h > max) return;
+    if (this.refineTarget && (this.refineTarget.w !== w || this.refineTarget.h !== h)) this.releaseRefine();
+    if (!this.refineTarget) {
+      const made = this.makeRenderTarget(w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE);
+      if (!made) return;
+      this.refineTarget = { ...made, w, h };
+    }
+    if (!this.refineProg) {
+      this.refineProg = this.compileProgramVS(MASK_VERTEX_SHADER, REFINE_COPY_SHADER);
+    }
+    const target = this.refineTarget;
+    // The export's render, into the target instead of the canvas.
+    this.renderPass(target.fbo, w, h, p, win ? this.windowXform(win) : undefined);
+    // Then the downscale: a full mip chain and trilinear sampling, so every
+    // canvas pixel is an area average of the frame rather than one sample of it.
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.bindTexture(gl.TEXTURE_2D, target.tex);
+    gl.generateMipmap(gl.TEXTURE_2D);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.viewport(0, 0, cw, ch);
+    gl.bindVertexArray(this.unitQuadVao());
+    this.blitQuad(this.refineProg, target.tex, null, (prog) => {
+      gl.uniform1i(gl.getUniformLocation(prog, "u_input"), 0);
+    });
+    gl.bindVertexArray(null);
+  }
+
+  private releaseRefine(): void {
+    const gl = this.gl;
+    if (this.refineTarget) {
+      gl.deleteTexture(this.refineTarget.tex);
+      gl.deleteFramebuffer(this.refineTarget.fbo);
+      this.refineTarget = null;
+    }
   }
 
   /**
@@ -1418,7 +1539,7 @@ export class PipelineRenderer {
     // runs on whatever the chain leaves — with nothing else on, it reads the
     // main pass's scene directly. Nothing on at all: no chain, and renderPass
     // draws straight to its target.
-    if (!this.sonyClarity && !this.sonySharpen && !this.sonySpica && !this.sonyMarble && !this.cameraMatchOn() && !nr && !this.sonyYnr) return null;
+    if (!this.sonyClarity && !this.sonySharpen && !this.sonySpica && !this.sonyMarble && !this.cameraMatchOn() && !nr && !this.sonyYnr && !this.sonyBsnr) return null;
     if (!this.postProgram("compose")) return null;
 
     const float = this.sceneNeedsFloat(nr !== null);
@@ -1446,16 +1567,26 @@ export class PipelineRenderer {
     // YNR takes the same intermediate; like the bilateral it is skipped at a
     // render scale small enough to have averaged the grain away.
     const ynrReady = this.sonyYnr > 0 && detailScale >= NOISE_MIN_STEP && this.postProgram("ynr");
-    if (spicaReady || ynrReady) mid = this.cachedMidTarget(w, h, float);
+    // BSNR_Y likewise: the same slot, the same intermediate, the same reason
+    // to sit out a preview too small to hold the grain it would remove.
+    const bsnrReady = !!this.sonyBsnr && detailScale >= NOISE_MIN_STEP && this.postProgram("bsnr");
+    if (spicaReady || ynrReady || bsnrReady) mid = this.cachedMidTarget(w, h, float);
     if (this.sonySpica && !(spicaReady && mid)) this.sonySpica = null;
     const ynr = ynrReady && mid ? this.sonyYnr / 100 : 0;
+    const bsnr = bsnrReady && mid ? this.sonyBsnr : null;
     // Same all-or-nothing rule as Spica's: if the stage's programs or buffers
     // will not build, it drops out and the rest of the chain still runs.
     let marble: SonyPostTargets["marble"] = null;
     if (this.sonyMarble
       && this.postProgram("marbleDown") && this.postProgram("marbleMean")
       && this.postProgram("marbleBlur") && this.postProgram("marbleCompose")) {
-      marble = this.cachedMarbleTargets(w, h, this.sonyMarble.factor);
+      // f sensor pixels in render pixels. Snapped to the integer when it is
+      // within float noise of one (the export, where detailScale is 1 up to
+      // the crop transform's rounding), so the down pass keeps its exact
+      // texel-centre box and the export stays bit-identical.
+      const raw = this.sonyMarble.factor * detailScale;
+      const cell = Math.abs(raw - Math.round(raw)) < 1e-3 ? Math.round(raw) : raw;
+      marble = this.cachedMarbleTargets(w, h, cell);
     }
     // The match, last. It needs a buffer of its own only when the compose
     // would otherwise be reading `scene` while writing the match's input —
@@ -1468,7 +1599,7 @@ export class PipelineRenderer {
       const buffer = own ? this.cachedMidTarget(w, h, float) : null;
       if (!own || buffer) match = { buffer };
     }
-    if (!this.sonyClarity) return { scene, noise, base: null, mid, ynr, marble, match, detailScale };
+    if (!this.sonyClarity) return { scene, noise, base: null, mid, ynr, bsnr, marble, match, detailScale };
     if (!this.postProgram("down") || !this.postProgram("edge") || !this.postProgram("blur")) return null;
 
     const down = this.sonyClarity.downsample;
@@ -1476,7 +1607,7 @@ export class PipelineRenderer {
     const bh = Math.max(1, Math.min(h, Math.round((this.texHeight * zoom) / down)));
     const pair = this.cachedBasePair(bw, bh);
     if (!pair) return null;
-    return { scene, noise, base: { pair, w: bw, h: bh }, mid, ynr, marble, match, detailScale };
+    return { scene, noise, base: { pair, w: bw, h: bh }, mid, ynr, bsnr, marble, match, detailScale };
   }
 
   /**
@@ -1585,18 +1716,20 @@ export class PipelineRenderer {
    * no GL error to find. RGBA16F is filterable in core WebGL2, so it always
    * works.
    *
-   * The grid is ceil(w/f) x ceil(h/f) for the shot's decimation factor f: a
+   * The grid is ceil(w/cell) x ceil(h/cell) for the shot's decimation factor
+   * as it lands on this render (`cell` render pixels per f sensor pixels): a
    * partial block at the far edge still gets its own texel, as the engine's
-   * box does. The factor is part of the key, since a shot at ISO 6400 and one
-   * at ISO 2000 of the same size want different targets.
+   * box does. The cell is part of the key, since a shot at ISO 6400 and one
+   * at ISO 2000 of the same size want different targets, and so does the
+   * same shot at another render scale.
    */
-  private cachedMarbleTargets(w: number, h: number, factor: 4 | 8): SonyPostTargets["marble"] {
+  private cachedMarbleTargets(w: number, h: number, cell: number): SonyPostTargets["marble"] {
     const gl = this.gl;
-    const lo = Math.max(1, Math.ceil(w / factor));
-    const loH = Math.max(1, Math.ceil(h / factor));
-    const key = `${w}x${h}/${factor}`;
+    const lo = Math.max(1, Math.ceil(w / cell));
+    const loH = Math.max(1, Math.ceil(h / cell));
+    const key = `${w}x${h}/${cell}`;
     const shape = (set: RenderTarget[]): SonyPostTargets["marble"] =>
-      ({ down: set[0], mean: set[1], blur: set[2], out: set[3], w: lo, h: loH });
+      ({ down: set[0], mean: set[1], blur: set[2], out: set[3], w: lo, h: loH, cell });
     const hit = this.sonyMarbleTargets.get(key);
     if (hit) {
       this.sonyMarbleTargets.delete(key);
@@ -1755,7 +1888,7 @@ export class PipelineRenderer {
     }
     // The match with nothing in front of it reads the scene itself — one draw,
     // no compose blit to make a copy for it.
-    if (match && !this.sonyClarity && !this.sonySharpen && !this.sonySpica && !t.marble && !t.ynr) {
+    if (match && !this.sonyClarity && !this.sonySharpen && !this.sonySpica && !t.marble && !t.ynr && !t.bsnr) {
       gl.viewport(0, 0, w, h);
       this.runCameraMatch(scene.tex, fbo);
       return;
@@ -1804,6 +1937,25 @@ export class PipelineRenderer {
           gl.uniform1f(compose.u["u_gain"]!, 0);
         });
         src = mid;
+      }
+      // BSNR_Y on a YCbCr frame, after sharpening and before Spica, where the
+      // engine runs it (YNR, when the amount opens it, follows it there too).
+      if (t.bsnr) {
+        const bsnr = this.sonyPostProgs.get("bsnr")!;
+        const p = t.bsnr;
+        const dst = src === scene ? mid : scene;
+        this.blitQuad(bsnr.prog, src.tex, dst.fbo, () => {
+          gl.uniform2f(bsnr.u["u_sceneTexel"]!, 1 / w, 1 / h);
+          gl.uniform1f(bsnr.u["u_step"]!, t.detailScale);
+          gl.uniform1i(bsnr.u["u_lo"]!, p.lo);
+          gl.uniform1i(bsnr.u["u_hi"]!, p.hi);
+          gl.uniform1i(bsnr.u["u_base"]!, p.base);
+          gl.uniform1i(bsnr.u["u_slope"]!, p.slope);
+          gl.uniform1i(bsnr.u["u_weight"]!, p.weight);
+          gl.uniform1i(bsnr.u["u_gain"]!, p.gain);
+          gl.uniform1i(bsnr.u["u_limit"]!, p.limit);
+        });
+        src = dst;
       }
       // YNR between the two halves of sharpening, where the engine runs it:
       // the sharpened frame's luma through the median, into whichever buffer
@@ -1925,7 +2077,10 @@ export class PipelineRenderer {
 
     gl.viewport(0, 0, m.w, m.h);
     this.blitQuad(down.prog, m.out.tex, m.down.fbo, () => {
-      gl.uniform1i(down.u["u_factor"]!, p.factor);
+      gl.uniform1f(down.u["u_cell"]!, m.cell);
+      // As many taps as the cell spans texels: f at export, fewer on a
+      // preview, where extra taps would only re-read the same texels.
+      gl.uniform1i(down.u["u_taps"]!, Math.max(1, Math.min(8, Math.round(m.cell))));
     });
     this.blitQuad(mean.prog, m.down.tex, m.mean.fbo, () => {
       gl.uniform3f(mean.u["u_thrY"]!, p.thrY[0], p.thrY[1], p.thrY[2]);
@@ -1947,7 +2102,7 @@ export class PipelineRenderer {
       gl.uniform4f(compose.u["u_protect"]!, p.protect[0], p.protect[1], p.protect[2], p.protect[3]);
       gl.uniform1f(compose.u["u_strength"]!, p.strength);
       gl.uniform1f(compose.u["u_amount"]!, p.amount);
-      gl.uniform1i(compose.u["u_factor"]!, p.factor);
+      gl.uniform1f(compose.u["u_cell"]!, m.cell);
     });
   }
 
@@ -2040,6 +2195,7 @@ export class PipelineRenderer {
 
   /** Free every cached post-chain render target. */
   private releaseSonyPostTargets(): void {
+    this.releaseRefine();
     this.evictOldest(this.sonySceneTargets, 0);
     this.evictOldest(this.sonyBaseTargets, 0);
     this.evictOldest(this.sonyMidTargets, 0);
@@ -2347,6 +2503,9 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
   release(): void {
     const gl = this.gl;
     this.destroyed = true;
+    this.cancelRefine();
+    this.releaseRefine();
+    if (this.refineProg) { gl.deleteProgram(this.refineProg); this.refineProg = null; }
     if (this.sourceTex) gl.deleteTexture(this.sourceTex);
     if (this.curveLutTex) gl.deleteTexture(this.curveLutTex);
     if (this.profileLutTex) gl.deleteTexture(this.profileLutTex);
@@ -2526,20 +2685,30 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     s("u_grad_blend", p.gradBlend ?? 0); s("u_grad_balance", p.gradBalance ?? 0);
     // Lens corrections: skip the per-knot uploads entirely at identity — the
     // shader never reads the tables when u_lensActive is 0.
+    const caActive = (p.lensCaR?.some((v) => v !== 1) ?? false)
+      || (p.lensCaB?.some((v) => v !== 1) ?? false);
     const lensActive = (p.lensDist?.some((v) => v !== 1) ?? false)
-      || (p.lensVig?.some((v) => v !== 1) ?? false);
+      || (p.lensVig?.some((v) => v !== 1) ?? false) || caActive;
     i("u_lensActive", lensActive ? 1 : 0);
+    i("u_lensCaActive", caActive ? 1 : 0);
     if (lensActive) {
       for (let k = 0; k < LENS_KNOTS; k++) {
         s(`u_lensDist[${k}]`, p.lensDist?.[k] ?? 1);
         s(`u_lensVig[${k}]`, p.lensVig?.[k] ?? 1);
+        if (caActive) {
+          s(`u_lensCaR[${k}]`, p.lensCaR?.[k] ?? 1);
+          s(`u_lensCaB[${k}]`, p.lensCaB?.[k] ?? 1);
+        }
       }
       const diag = Math.hypot(this.texWidth, this.texHeight) || 1;
       // The short edge's midpoint radius — the constraint that binds for barrel
       // correction, and the reason the fill scale is computed here rather than
       // handed in: it is a property of this texture's aspect ratio.
       const shortEdge = Math.min(this.texWidth, this.texHeight) / diag;
-      s("u_lensScale", lensFillScale(p.lensDist ?? LENS_IDENTITY, shortEdge));
+      // The CA planes reach past the distortion's fill; their own scale
+      // (Edit's rule, lens.ts) stacks on it so blue stays inside the frame.
+      s("u_lensScale", lensFillScale(p.lensDist ?? LENS_IDENTITY, shortEdge)
+        * (caActive ? lensCaFillScale(p.lensCaR, p.lensCaB) : 1));
       const normLoc = this.uniforms["u_lensNorm"];
       if (normLoc) {
         gl.uniform2f(normLoc, (2 * this.texWidth) / diag, (2 * this.texHeight) / diag);

@@ -1,3 +1,8 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { Catalog, CatalogError, ROOT_FOLDER_ID } from "../catalog.js";
@@ -7,8 +12,8 @@ let catalog: Catalog;
 beforeEach(() => { catalog = new Catalog(":memory:"); });
 afterEach(() => { catalog.close(); });
 
-function addPhoto(id: string, folderId = ROOT_FOLDER_ID, importedAt = 1000) {
-  return catalog.insertPhoto({ id, folderId, name: `${id}.arw`, ext: ".arw", size: 10 }, importedAt);
+function addPhoto(id: string, folderId = ROOT_FOLDER_ID, importedAt = 1000, modifiedAt?: number) {
+  return catalog.insertPhoto({ id, folderId, name: `${id}.arw`, ext: ".arw", size: 10, modifiedAt }, importedAt);
 }
 
 describe("folders", () => {
@@ -101,6 +106,31 @@ describe("photos", () => {
     addPhoto("q");
     expect(() => catalog.movePhotos(["q"], 999)).toThrow(CatalogError);
   });
+
+  it("keeps the file's own modified time, falling back to the import's", () => {
+    addPhoto("shot", ROOT_FOLDER_ID, 1000, 500);
+    addPhoto("scan", ROOT_FOLDER_ID, 2000);
+    expect(catalog.getPhoto("shot")).toMatchObject({ importedAt: 1000, modifiedAt: 500 });
+    expect(catalog.getPhoto("scan")).toMatchObject({ importedAt: 2000, modifiedAt: 2000 });
+    expect(() => addPhoto("bad", ROOT_FOLDER_ID, 3000, Number.NaN)).toThrow(CatalogError);
+  });
+
+  it("renames within the folder, refusing a sibling's name", () => {
+    const a = catalog.createFolder(ROOT_FOLDER_ID, "A");
+    addPhoto("p1", a.id);
+    addPhoto("p2", a.id);
+    addPhoto("elsewhere");
+
+    expect(catalog.renamePhoto("p1", "sunset.arw").name).toBe("sunset.arw");
+    // A photo in another folder is not a sibling, so its name is free here.
+    expect(catalog.renamePhoto("p2", "elsewhere.arw").name).toBe("elsewhere.arw");
+    // Renaming to its own name is not a clash with itself.
+    expect(catalog.renamePhoto("p2", "elsewhere.arw").name).toBe("elsewhere.arw");
+    expect(() => catalog.renamePhoto("p2", "sunset.arw")).toThrow(/already exists/);
+    expect(() => catalog.renamePhoto("ghost", "x.arw")).toThrow(CatalogError);
+    // The file on disk is named after the id, so nothing moved.
+    expect(catalog.listPhotos(a.id).map(p => p.name).sort()).toEqual(["elsewhere.arw", "sunset.arw"]);
+  });
 });
 
 describe("edits", () => {
@@ -124,5 +154,31 @@ describe("meta", () => {
     catalog.set("legacy_adopted", "1");
     catalog.set("legacy_adopted", "2");
     expect(catalog.get("legacy_adopted")).toBe("2");
+  });
+});
+
+describe("migration", () => {
+  // A library written by the build before `modified_at` existed: the column is
+  // dropped and the version rolled back, which is exactly what opening a v1
+  // catalog file looks like.
+  it("backfills the modified time from the import time", () => {
+    const dir = mkdtempSync(join(tmpdir(), "llr-catalog-"));
+    const path = join(dir, "catalog.db");
+    try {
+      const v2 = new Catalog(path);
+      v2.insertPhoto({ id: "p", folderId: ROOT_FOLDER_ID, name: "p.arw", ext: ".arw", size: 1 }, 4242);
+      v2.close();
+
+      const raw = new DatabaseSync(path);
+      raw.exec("ALTER TABLE photos DROP COLUMN modified_at");
+      raw.exec("PRAGMA user_version = 1");
+      raw.close();
+
+      const migrated = new Catalog(path);
+      expect(migrated.getPhoto("p")).toMatchObject({ importedAt: 4242, modifiedAt: 4242 });
+      migrated.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -2,7 +2,7 @@
 import { computed, ref, toRef, watch } from "vue";
 import { formatBytes, type Photo } from "../ui";
 import { t } from "../i18n";
-import { useVirtualGrid } from "../composables/useVirtualGrid";
+import { useVirtualStrip } from "../composables/useVirtualStrip";
 
 // The library strip along the bottom: the open folder's photos, one row,
 // windowed — a folder of thousands mounts a screen's worth of cells. A
@@ -27,8 +27,8 @@ const FILM_CELL = { w: 108, h: 96, gap: 4 };
 
 const track = ref<HTMLElement | null>(null);
 const count = computed(() => props.photos.length);
-const { range, totalSize, itemStyle, scrollToIndex } = useVirtualGrid({
-  container: track, count, cell: FILM_CELL, axis: "x", overscan: 3,
+const { range, totalSize, itemStyle, scrollToIndex } = useVirtualStrip({
+  container: track, count, cell: FILM_CELL, overscan: 3,
 });
 
 const visible = computed(() => {
@@ -46,6 +46,14 @@ watch(toRef(props, "activeId"), (id) => {
   if (i >= 0) scrollToIndex(i);
 }, { immediate: true });
 
+// A plain mouse wheel only has a vertical axis; on a one-row strip that is the
+// scroll. Trackpads that already send deltaX are left to native scrolling.
+function onWheel(e: WheelEvent): void {
+  if (e.deltaX !== 0) return;
+  e.preventDefault();
+  (e.currentTarget as HTMLElement).scrollLeft += e.deltaY;
+}
+
 function onDragStart(e: DragEvent, id: string): void {
   e.dataTransfer?.setData("application/x-llr-photos", JSON.stringify([id]));
   if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
@@ -60,7 +68,7 @@ function onDragStart(e: DragEvent, id: string): void {
       </svg>
       {{ t('film.import') }}
     </button>
-    <div class="filmstrip-track" ref="track">
+    <div class="filmstrip-track" ref="track" @wheel="onWheel">
       <div class="filmstrip-inner" :style="{ width: totalSize + 'px', height: FILM_CELL.h + 'px' }">
         <div v-for="{ photo, index } in visible" :key="photo.id"
           class="film-cell" :style="itemStyle(index)"

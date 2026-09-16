@@ -8,6 +8,18 @@
  */
 
 import { COLOR_GLSL, PROPHOTO_Y, REC709_Y, glslFloat } from "./color-spaces";
+
+/**
+ * The luma Sony's engine filters: RGB2YCC's Y, (2432, 4864, 896) / 8192 of the
+ * tone-mapped display RGB (sony_repro/PIPELINE.md 7.1, and the same weights
+ * the main pass's sonyChroma uses). Sharpness, BSNR_Y, YNR and Spica all run
+ * on that plane in the engine, so the ports below take their luma from it
+ * rather than from Rec. 709: on a tungsten frame the two weightings put a
+ * different share of the noisy red channel through the luma stages, which
+ * showed as llr's exports staying ~10% grainier than Edit's after every stage
+ * had been matched bit for bit on its own plane.
+ */
+export const SONY_YCC_Y: readonly [number, number, number] = [2432 / 8192, 4864 / 8192, 896 / 8192];
 import { LENS_KNOTS, LENS_KNOT_SPAN } from "./lens";
 import {
   CAMERA_MATCH_C_PITCH, CAMERA_MATCH_C_STEPS,
@@ -216,6 +228,11 @@ uniform float u_lensDist[${LENS_KNOTS}];
 uniform float u_lensVig[${LENS_KNOTS}];
 uniform float u_lensScale;
 uniform vec2 u_lensNorm;
+// Lateral CA: red and blue fetch at their own factor on top of the
+// distortion's, green stays on it (lens.ts LensCorr.caR/caB). Off = 0.
+uniform int u_lensCaActive;
+uniform float u_lensCaR[${LENS_KNOTS}];
+uniform float u_lensCaB[${LENS_KNOTS}];
 // Masks (masks.ts, docs/masking.md). The per-group data is the Masks uniform
 // block declared in MASK_GLSL; these say how many groups are packed, which
 // blocks any of them touch (MASK_USE_* bits, OR'd into the skip gates), and
@@ -609,15 +626,29 @@ void main() {
   // property of the recorded pixel, not of where correction displays it.
   vec2 lensUV = v_texCoord;
   float lensGain = 1.0;
+  vec3 c;
   if (u_lensActive == 1) {
     vec2 d = (v_texCoord - 0.5) * u_lensNorm * u_lensScale;
-    d *= lensInterp(u_lensDist, length(d));
+    float r = length(d);
+    d *= lensInterp(u_lensDist, r);
     lensGain = lensInterp(u_lensVig, length(d));
     lensUV = 0.5 + d / u_lensNorm;
+    if (u_lensCaActive == 1) {
+      // Each plane from its own radius: the CA factor is indexed by the
+      // corrected radius like the distortion's and multiplies the same
+      // displacement, so green reads exactly what the line below would.
+      vec2 uvR = 0.5 + d * lensInterp(u_lensCaR, r) / u_lensNorm;
+      vec2 uvB = 0.5 + d * lensInterp(u_lensCaB, r) / u_lensNorm;
+      c = vec3(texture(u_input, uvR).r, texture(u_input, lensUV).g, texture(u_input, uvB).b);
+    } else {
+      c = texture(u_input, lensUV).rgb;
+    }
+  } else {
+    c = texture(u_input, lensUV).rgb;
   }
 
   // Input is scene-linear ProPhoto (D50). Edit here in wide-gamut scene-linear.
-  vec3 c = max(texture(u_input, lensUV).rgb, 0.0) * lensGain;
+  c = max(c, 0.0) * lensGain;
 
   // --- DCP HueSatMaps --- Adobe's order, and the position the worker applied
   // them in: straight after the colour matrix, before anything tonal. Each is
@@ -1015,6 +1046,101 @@ void main() {
   outColor = vec4(clamp(out3, 0.0, 1.0), 1.0);
 }`;
 
+// ===== Sony luma NR on an M/S-size (YCbCr) frame: ZcTaskSIMDBSNR_Y =====
+// The one luma noise-reduction stage Edit runs on a frame the body demosaiced
+// itself (worker sony/lumanr.py, sony_repro/notes/ycc-frame-luma-nr.md): no
+// RawNR exists for it, so this sits where the RAW stage would have been felt
+// — after sharpening and before Spica, on the tone-mapped Y — and it is why a
+// Sony S-size export from the camera's own software is clean where a plain
+// decode is grain. Reproduced bit for bit against the engine's tiles by the
+// worker's apply_ycc_luma_nr, which this transcribes:
+//
+//   low   = 3x3 binomial of Y / 16 (truncated)       (Y on the 14-bit scale)
+//   high  = Y - low
+//   mean  = 9x9 box of low / 81 (truncated)
+//   ref   = (low * w + (1024 - w) * mean) >> 10       w = u_weight
+//   thr   = base + ((clamp(low, lo, hi) - lo) * slope >> 12)
+//   avg   = (low + sum of 3x3 neighbours n with |n - ref| < thr) / count
+//           plus a zero-valued ninth tap wherever ref < thr (the SIMD
+//           kernel's centre lane, multiplied by zero and then compared like
+//           any neighbour; the worker's tests show the pixels it moves)
+//   out   = clamp(avg + clamp((high * gain) >> 8, -limit, limit), 0, 16383)
+//
+// Every quantity is an integer and every division truncates, as in the
+// engine; the shader keeps to ints for the same reason the worker does. The
+// parameters come from the frame's own RawNR tags through the Amount and Edge
+// sliders (sony-lumanr.ts). One pass, 11x11 = 121 luma reads per pixel: the
+// 9x9 of lowpassed values the mean needs, each a 3x3 of Y. Taps step by the
+// render scale like YNR's, and the output is the input shifted by the luma
+// change, chroma untouched.
+export const BSNR_SHADER = `#version 300 es
+precision highp float;
+precision highp int;
+in vec2 v_uv;
+out vec4 outColor;
+uniform sampler2D u_scene;      // the sharpened frame, display-encoded
+uniform vec2 u_sceneTexel;      // one scene texel in UV
+uniform float u_step;           // tap spacing in scene texels (the render scale)
+uniform int u_lo;               // the threshold curve: flat below lo,
+uniform int u_hi;               //   flat above hi,
+uniform int u_base;             //   base at lo,
+uniform int u_slope;            //   rising slope/4096 per level between
+uniform int u_weight;           // centre-vs-mean reference weight, 0..1024
+uniform int u_gain;             // detail restore: 8.8 gain
+uniform int u_limit;            //   and the clamp on the excursion
+const vec3 LUMA = vec3(${glslFloat(SONY_YCC_Y[0])}, ${glslFloat(SONY_YCC_Y[1])}, ${glslFloat(SONY_YCC_Y[2])});
+const float FULL = 16383.0;
+int lumaAt(int i, int j) {
+  vec2 o = vec2(float(i), float(j)) * u_step * u_sceneTexel;
+  return int(dot(texture(u_scene, v_uv + o).rgb, LUMA) * FULL + 0.5);
+}
+void main() {
+  vec3 rgb = texture(u_scene, v_uv).rgb;
+  // Y over 11x11, then its 3x3 binomial over the inner 9x9.
+  int y[121];
+  for (int j = 0; j < 11; j++) {
+    for (int i = 0; i < 11; i++) {
+      y[j * 11 + i] = lumaAt(i - 5, j - 5);
+    }
+  }
+  int low[81];
+  for (int j = 0; j < 9; j++) {
+    for (int i = 0; i < 9; i++) {
+      int c = (j + 1) * 11 + (i + 1);
+      int inner = 2 * y[c] + y[c - 1] + y[c + 1] + y[c - 11] + y[c + 11];
+      int total = 2 * inner + y[c - 12] + y[c - 10] + y[c + 10] + y[c + 12];
+      low[j * 9 + i] = total / 16;
+    }
+  }
+  int sum = 0;
+  for (int k = 0; k < 81; k++) sum += low[k];
+  int mean = sum / 81;
+  int centre = low[40];
+  int high = y[60] - centre;
+  int ref = (centre * u_weight + (1024 - u_weight) * mean) >> 10;
+  int thr = clamp(((clamp(centre, u_lo, u_hi) - u_lo) * u_slope >> 12) + u_base, 0, 16383);
+  int total = centre;
+  int count = 1;
+  for (int j = -1; j <= 1; j++) {
+    for (int i = -1; i <= 1; i++) {
+      if (i == 0 && j == 0) continue;
+      int n = low[40 + j * 9 + i];
+      if (abs(n - ref) < thr) { total += n; count += 1; }
+    }
+  }
+  if (ref < thr) count += 1;
+  int avg = total / count;
+  // (high * gain) >> 8 as an arithmetic shift: floor, also for a negative
+  // high-pass — spelled as a division so no implementation-defined shift of
+  // a negative int is relied on.
+  int d = high * u_gain;
+  d = (d - (d < 0 ? 255 : 0)) / 256;
+  int outY = clamp(avg + clamp(d, -u_limit, u_limit), 0, 16383);
+  float y0 = float(y[60]) / FULL;
+  float yf = float(outY) / FULL;
+  outColor = vec4(clamp(rgb + vec3(yf - y0), 0.0, 1.0), 1.0);
+}`;
+
 // ===== Sony manual Noise Reduction above 50: ZcTaskYNR =====
 // The engine's second luma stage (worker sony/lumanr.py, notes/static-ynr.md):
 // a 3x3 median of Y, mixed into Y by P percent, everywhere the Sobel gradient
@@ -1036,7 +1162,7 @@ uniform sampler2D u_scene;      // the sharpened frame, display-encoded
 uniform vec2 u_sceneTexel;      // one scene texel in UV
 uniform float u_step;           // tap spacing in scene texels (the render scale)
 uniform float u_percent;        // 0..1, how much of the median to take
-const vec3 LUMA = vec3(${glslFloat(REC709_Y[0])}, ${glslFloat(REC709_Y[1])}, ${glslFloat(REC709_Y[2])});
+const vec3 LUMA = vec3(${glslFloat(SONY_YCC_Y[0])}, ${glslFloat(SONY_YCC_Y[1])}, ${glslFloat(SONY_YCC_Y[2])});
 const float SOBEL_T = 8191.0 / 16383.0;
 void swap(inout float a, inout float b) { float t = min(a, b); b = max(a, b); a = t; }
 // Median of nine by a sorting network (19 compare-exchanges).
@@ -1231,7 +1357,12 @@ uniform vec2 u_sceneTexel;            // one scene texel — the sharpen kernel'
 uniform float u_gain;                 // Clarity: AMP[clarity]/1024, 0 = off
 uniform float u_knee;                 // Clarity rolloff knee, 0.125
 uniform float u_sharpen;              // Sharpness: the amplitude, 0 = off
-const vec3 LUMA = vec3(${glslFloat(REC709_Y[0])}, ${glslFloat(REC709_Y[1])}, ${glslFloat(REC709_Y[2])});
+// Sharpening works on the engine's Y (SONY_YCC_Y); Clarity's detail term must
+// use the luma its base layer was built with (CLARITY_DOWN_SHADER, Rec. 709),
+// or the difference between the two weightings — colour-dependent, largest on
+// saturated reds — is added back as a false detail and lifts every red.
+const vec3 LUMA = vec3(${glslFloat(SONY_YCC_Y[0])}, ${glslFloat(SONY_YCC_Y[1])}, ${glslFloat(SONY_YCC_Y[2])});
+const vec3 LUMA_CLARITY = vec3(${glslFloat(REC709_Y[0])}, ${glslFloat(REC709_Y[1])}, ${glslFloat(REC709_Y[2])});
 const float BIN[7] = float[7](${BINOMIAL_GLSL});
 const float DEADZONE = ${glslFloat(SHARPEN_DEADZONE)};
 void main() {
@@ -1282,7 +1413,7 @@ void main() {
     // layer does not need to: an 8x box mean has nothing left of a +-3 pixel
     // high-pass whose taps already cancel, so building it from the unsharpened
     // scene gives the same picture without a second full-resolution pass.
-    float ys = y + delta;
+    float ys = dot(rgb, LUMA_CLARITY) + delta;
     // min(4Y, 4(1-Y), 0.5)/0.5 — full strength through the midtones, tapering to
     // nothing in the last eighth at either end so highlights cannot halo.
     float roll = clamp(min(ys, 1.0 - ys) / u_knee, 0.0, 1.0);
@@ -1365,7 +1496,7 @@ uniform float u_amount;         // how much of the filtered value survives, 0 = 
 uniform float u_isoGain;        // detail scale for this shot's ISO
 uniform float u_gainScale;      // cfg[0xc4] / 2048 for this shot's ISO (SPICA_GAIN_SCALE at base ISO)
 uniform float u_rangeShift;     // how far the range trapezoid's a and b move up for this ISO
-const vec3 LUMA = vec3(${glslFloat(REC709_Y[0])}, ${glslFloat(REC709_Y[1])}, ${glslFloat(REC709_Y[2])});
+const vec3 LUMA = vec3(${glslFloat(SONY_YCC_Y[0])}, ${glslFloat(SONY_YCC_Y[1])}, ${glslFloat(SONY_YCC_Y[2])});
 const float WHITE = ${glslFloat(SPICA_WHITE)};
 const float RANGE_THRESHOLD = ${glslFloat(SPICA_RANGE_THRESHOLD)};
 ${trapGlsl("C_DETAIL", SPICA_CURVE_DETAIL)}
@@ -1541,31 +1672,48 @@ vec3 marbleYccToRgb(vec3 ycc) {
 /**
  * Full-res display RGB -> (Y, C1, C2) at 1/f resolution, f the shot's
  * decimation factor (4 or 8, sony-marble.ts marbleFactor). One texel here is
- * the f x f block of scene texels starting at f times its coordinate; the
+ * the f x f block of *sensor* pixels starting at f times its coordinate; the
  * engine's 2:1 chroma pair mean followed by its f x f box is, in float, just
  * this mean. Blocks past the edge (a width or height not divisible by f)
  * repeat the edge texel.
+ *
+ * The grid is pinned to the frame, like Clarity's: a cell is f sensor pixels
+ * whatever size the frame is being rendered at, so `u_cell` is its size in
+ * scene texels (f at export, f times the render scale on a preview) and the
+ * taps spread over it. At export a cell is f texels, the taps land on texel
+ * centres and this is the exact box mean it always was. On a fit-to-window
+ * preview a cell is a texel or less and the box degrades toward a bilinear
+ * point sample, which the mean and blur that follow smooth out — what must
+ * not happen is the alternative, a cell of f *render* pixels: at a seventh of
+ * the size that is a chroma blur seven times wider than the engine's, which
+ * blanched every small coloured thing (lips) in the preview and not in the
+ * export.
  */
 export const MARBLE_DOWN_SHADER = `#version 300 es
 precision highp float;
 out vec4 outColor;
 uniform sampler2D u_scene;
-uniform int u_factor;        // 4 or 8
+uniform float u_cell;        // one grid cell in scene texels (f at export)
+uniform int u_taps;          // taps per axis across the cell, 1..8
 ${MARBLE_GLSL_COMMON}
 void main() {
-  ivec2 size = textureSize(u_scene, 0);
-  int f = u_factor;
-  ivec2 cell = ivec2(gl_FragCoord.xy) * f;
+  vec2 size = vec2(textureSize(u_scene, 0));
+  vec2 origin = floor(gl_FragCoord.xy) * u_cell;
+  float step = u_cell / float(u_taps);
+  // A whole texel per tap (export) is read exactly, as the engine's box is;
+  // anything else goes through the bilinear sampler.
+  bool whole = abs(u_cell - float(u_taps)) < 1e-4;
   vec3 acc = vec3(0.0);
   for (int j = 0; j < 8; j++) {
-    if (j >= f) break;
+    if (j >= u_taps) break;
     for (int i = 0; i < 8; i++) {
-      if (i >= f) break;
-      ivec2 p = min(cell + ivec2(i, j), size - 1);
-      acc += marbleYcc(marbleGamutFwd(texelFetch(u_scene, p, 0).rgb));
+      if (i >= u_taps) break;
+      vec2 p = min(origin + (vec2(float(i), float(j)) + 0.5) * step, size - 0.5);
+      vec3 rgb = whole ? texelFetch(u_scene, ivec2(p), 0).rgb : texture(u_scene, p / size).rgb;
+      acc += marbleYcc(marbleGamutFwd(rgb));
     }
   }
-  outColor = vec4(acc / float(f * f), 1.0);
+  outColor = vec4(acc / float(u_taps * u_taps), 1.0);
 }`;
 
 /**
@@ -1662,7 +1810,7 @@ uniform sampler2D u_blur;    // marbleBlur's output, sampled LINEAR
 uniform vec4 u_protect;      // lo1*256, r1, lo2*256, r2 (sony-marble.ts)
 uniform float u_strength;    // 0..255, alpha = k*strength over 32768
 uniform float u_amount;      // 0 = off, 1 = fully cleaned
-uniform int u_factor;        // 4 or 8, the decimation marbleDown ran at
+uniform float u_cell;        // one grid cell in scene texels, as marbleDown ran it
 ${MARBLE_GLSL_COMMON}
 void main() {
   ivec2 size = textureSize(u_scene, 0);
@@ -1674,7 +1822,7 @@ void main() {
   float tmp = 0.5 * (own.z + other.z);
 
   vec2 lo = vec2(textureSize(u_blur, 0));
-  float f = float(u_factor);
+  float f = u_cell;
   vec2 uv = vec2((2.0 * float(hx) + 1.0) / f / lo.x, (2.0 * float(at.y) + 1.0) / (2.0 * f) / lo.y);
   vec2 u = texture(u_blur, uv).yz;
 
@@ -1834,6 +1982,10 @@ void main() {
 export const SONY_POST_PROGRAMS = {
   noise: { fsSource: NOISE_LUMA_SHADER, uniforms: ["u_scene", "u_sceneTexel", "u_step", "u_sigma", "u_amount"] },
   ynr: { fsSource: YNR_SHADER, uniforms: ["u_scene", "u_sceneTexel", "u_step", "u_percent"] },
+  bsnr: {
+    fsSource: BSNR_SHADER,
+    uniforms: ["u_scene", "u_sceneTexel", "u_step", "u_lo", "u_hi", "u_base", "u_slope", "u_weight", "u_gain", "u_limit"],
+  },
   down: { fsSource: CLARITY_DOWN_SHADER, uniforms: ["u_input", "u_cell", "u_taps"] },
   edge: { fsSource: CLARITY_EDGE_SHADER, uniforms: ["u_input", "u_texel", "u_threshold"] },
   blur: { fsSource: CLARITY_BLUR_SHADER, uniforms: ["u_input", "u_texel", "u_centerMix"] },
@@ -1845,12 +1997,12 @@ export const SONY_POST_PROGRAMS = {
     fsSource: SPICA_SHADER,
     uniforms: ["u_scene", "u_weights", "u_lut", "u_sceneTexel", "u_amount", "u_isoGain", "u_gainScale", "u_rangeShift"],
   },
-  marbleDown: { fsSource: MARBLE_DOWN_SHADER, uniforms: ["u_scene", "u_factor"] },
+  marbleDown: { fsSource: MARBLE_DOWN_SHADER, uniforms: ["u_scene", "u_cell", "u_taps"] },
   marbleMean: { fsSource: MARBLE_MEAN_SHADER, uniforms: ["u_input", "u_thrY", "u_thrC1", "u_thrC2"] },
   marbleBlur: { fsSource: MARBLE_BLUR_SHADER, uniforms: ["u_input", "u_centreMix"] },
   marbleCompose: {
     fsSource: MARBLE_COMPOSE_SHADER,
-    uniforms: ["u_scene", "u_blur", "u_protect", "u_strength", "u_amount", "u_factor"],
+    uniforms: ["u_scene", "u_blur", "u_protect", "u_strength", "u_amount", "u_cell"],
   },
   // The two tables are samplers (units 1 and 2, bound in runCameraMatch).
   cameraMatch: { fsSource: CAMERA_MATCH_SHADER, uniforms: ["u_scene", "u_cmGrid", "u_cmHue"] },
@@ -1890,8 +2042,10 @@ export const PASSES: PassDef[] = [
     "u_droGridActive", "u_dro_grid", "u_droGridDims", "u_droGridU", "u_droGridV",
     "u_dcp_hsm", "u_dcp_look", "u_dcp_match",
     "u_dcpHsmDims", "u_dcpLookDims", "u_dcpMatchDims", "u_dcpMatchActive",
-    "u_lensActive", "u_lensScale", "u_lensNorm",
+    "u_lensActive", "u_lensScale", "u_lensNorm", "u_lensCaActive",
     ...Array.from({ length: LENS_KNOTS }, (_, k) => `u_lensDist[${k}]`),
     ...Array.from({ length: LENS_KNOTS }, (_, k) => `u_lensVig[${k}]`),
+    ...Array.from({ length: LENS_KNOTS }, (_, k) => `u_lensCaR[${k}]`),
+    ...Array.from({ length: LENS_KNOTS }, (_, k) => `u_lensCaB[${k}]`),
   ]},
 ];

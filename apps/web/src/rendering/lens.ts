@@ -38,6 +38,15 @@ export interface LensCorrMeta {
 export interface LensCorr {
   distortion: number[];
   vignetting: number[];
+  // Lateral chromatic aberration: the red and blue planes' own sampling
+  // factors, green being the reference (Sony's ChromaticAberrationCorrParams
+  // through p*2^-21+1, knots as above). Absent when the body's switch was off
+  // or the file carries none. Measured against Edit.exe's own geometric
+  // stage on an ILCE-7CM2 frame (sony_repro/notes/ycc-frame-luma-nr.md 5):
+  // the red-green and blue-green radial shifts follow these tables to within
+  // 0.03 px out to the corner.
+  caR?: number[];
+  caB?: number[];
 }
 
 export const LENS_IDENTITY: readonly number[] = Object.freeze(new Array<number>(LENS_KNOTS).fill(1));
@@ -76,7 +85,33 @@ export function parseLensCorr(meta: unknown): LensCorr | null {
   if (![...m.knots, ...m.distortion, ...m.vignetting].every(Number.isFinite)) return null;
   const resample = (values: number[]): number[] =>
     Array.from({ length: LENS_KNOTS }, (_, i) => splineAt(m.knots, values, knotR(i)));
-  return { distortion: resample(m.distortion), vignetting: resample(m.vignetting) };
+  const out: LensCorr = { distortion: resample(m.distortion), vignetting: resample(m.vignetting) };
+  const ca = (values: unknown): number[] | null =>
+    Array.isArray(values) && values.length === n && values.every(Number.isFinite) ? resample(values as number[]) : null;
+  const caR = ca(m.caR);
+  const caB = ca(m.caB);
+  if (caR && caB) { out.caR = caR; out.caB = caB; }
+  return out;
+}
+
+/**
+ * The fill scale lateral CA adds: Edit.exe scales every plane so that the
+ * plane reaching furthest — blue, usually — stays inside the recorded frame,
+ * and it takes the *largest factor anywhere in the table* rather than the
+ * factor at the border. Read off the engine's geometric stage on the frame
+ * above: green's own resampling came out at 1/(1 + max(caB)) = 0.99939
+ * (-6.1e-4; measured -6.0e-4 +/- 0.5e-4 from the shift field), where the
+ * border-bound alternative, 1/(1 + caB(corner)), would be -2.4e-4. The
+ * difference is invisible geometrically (a pixel at the corner) and is the
+ * whole reason it matters: every plane, green included, is resampled at a
+ * drifting sub-pixel phase, and bilinear resampling at random phase averages
+ * grain down by about a third (measured 0.66-0.74x on the engine's own
+ * tiles) — which is where Edit's exports get most of their extra smoothness
+ * over a decode that samples on the pixel grid.
+ */
+export function lensCaFillScale(caR: readonly number[] | undefined, caB: readonly number[] | undefined): number {
+  const peak = Math.max(1, ...(caR ?? []), ...(caB ?? []));
+  return 1 / peak;
 }
 
 /** Blend a factor table toward identity by the slider amount (0..1). */

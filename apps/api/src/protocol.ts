@@ -28,15 +28,20 @@ export function isValidFolderId(folderId: string): boolean {
 
 export const FOLDER_NAME_MAX = 128;
 
-// A folder name is display-only (never a path), so the only rules are the
-// ones that keep the tree readable: non-empty once trimmed, bounded, and no
-// control characters. Returns the trimmed name or null.
-export function normalizeFolderName(name: unknown): string | null {
+// A name here is display-only (never a path), so the only rules are the ones
+// that keep it readable: non-empty once trimmed, bounded, and no control
+// characters. Returns the trimmed name or null — what the caller does with it
+// (a folder's is the whole name, a photo's has rules of its own) is its own.
+function displayLabel(name: unknown, max: number): string | null {
   if (typeof name !== "string") return null;
   const trimmed = name.trim();
-  if (!trimmed || trimmed.length > FOLDER_NAME_MAX) return null;
+  if (!trimmed || trimmed.length > max) return null;
   if (/[\u0000-\u001f\u007f]/.test(trimmed)) return null;
   return trimmed;
+}
+
+export function normalizeFolderName(name: unknown): string | null {
+  return displayLabel(name, FOLDER_NAME_MAX);
 }
 
 // The Creative Look tweaks, on Imaging Edge Edit's own panel scale (every
@@ -287,4 +292,27 @@ export function pickExtension(filename: string): string {
   const base = filename.slice(dot).toLowerCase();
   // extname-compatible: a leading dot (".bashrc") is a name, not an extension.
   return dot === 0 ? "" : base;
+}
+
+export const PHOTO_NAME_MAX = 200;
+
+/**
+ * A photo's display name. Imports are copies, so the name is a label rather
+ * than a path — but it is the label the user types into the grid, so the rules
+ * are the ones that keep it readable as a file name: non-empty once trimmed,
+ * bounded, no control characters, no path separators. The file behind it does
+ * not change type, so a bare stem gets the photo's own extension back
+ * ("sunset" → "sunset.arw") and a *different* extension is refused rather than
+ * silently kept. Returns the name to store, or null.
+ */
+export function normalizePhotoName(name: unknown, ext: string): string | null {
+  const trimmed = displayLabel(name, PHOTO_NAME_MAX);
+  if (!trimmed) return null;
+  if (/[\\/]/.test(trimmed)) return null;
+  if (ext && trimmed.toLowerCase().endsWith(ext.toLowerCase())) {
+    // A name that is nothing but the extension ("‎.arw") has no stem left.
+    return trimmed.length > ext.length ? trimmed : null;
+  }
+  if (pickExtension(trimmed)) return null;
+  return `${trimmed}${ext}`;
 }

@@ -58,9 +58,20 @@ export function resolveModel(spec: ModelSpec): Model<Api> {
   return { ...sibling, id: spec.id, name: spec.id, input: ["text", "image"] };
 }
 
-/** Providers whose key is present in the environment. */
-export function agentProviders(): string[] {
-  return getProviders().filter(p => !!getEnvApiKey(p));
+/**
+ * What the model dialog offers: every provider the registry knows, the ids it
+ * ships for it, and whether this server holds that provider's key. An id newer
+ * than the registry can still be typed — the browser only needs the list to
+ * show what is usual.
+ */
+export type ProviderCatalogEntry = { id: string; hasKey: boolean; models: { id: string; name: string }[] };
+
+export function agentCatalog(): ProviderCatalogEntry[] {
+  return getProviders().map(p => ({
+    id: p,
+    hasKey: !!getEnvApiKey(p),
+    models: getModels(p).map(m => ({ id: m.id, name: m.name })),
+  }));
 }
 
 function getSession(id: string): Session {
