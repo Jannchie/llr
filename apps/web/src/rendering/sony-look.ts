@@ -176,7 +176,7 @@ export function lumaLevels(black: number, white: number): [number, number] {
 
 const SATURATION_PANEL_LIMIT = 100;
 
-/** chroma.saturation_factor: the factor both halves of the stage use; 0 at -100. */
+/** chroma.saturation_factor: capture normalization or edited multiplier; 0 at -100. */
 export function saturationFactor(value: number): number {
   const v = Math.max(-SATURATION_PANEL_LIMIT, Math.min(SATURATION_PANEL_LIMIT, value));
   return 1 + v / 100;
@@ -340,14 +340,15 @@ export function rebuildLookProfile(
   }
 
   const sat = saturationFactor(t.saturation);
+  const reference = saturationFactor(base.lookAsShot?.saturation ?? 0);
   const [lumaPivot, lumaContrast] = lumaTerms(cal.lumaPivot, cal.lumaContrast, t.fade);
   const [lumaBlack, lumaScale] = lumaLevels(t.black, t.white);
   return {
     ...base,
     profileToneCurve: toneCurvePoints(factory, family, t.highlights, t.shadows, t.contrast),
-    // 饱和度 -100 is a factor of 0: the gains go out undivided, the shader's
-    // multiply-back zeroes the chroma regardless.
-    profileChromaGain: sat > 0 ? cal.chromaGain.map(g => g / sat) : [...cal.chromaGain],
+    // Normalize by the capture setting, never by the changing edit. The
+    // shader already clamps these gains before multiplying by edited saturation.
+    profileChromaGain: reference > 0 ? cal.chromaGain.map(g => g / reference) : [...cal.chromaGain],
     profileChromaSaturation: sat,
     profileChromaHue: hueDegrees(t.hue),
     profileLumaPivot: lumaPivot,

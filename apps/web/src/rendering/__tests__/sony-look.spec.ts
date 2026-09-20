@@ -151,3 +151,22 @@ describe("the scalar stages", () => {
     expect(scaleDroGain([2], 5)).toEqual([4]); // clamped to 2
   });
 });
+
+
+describe("capture saturation normalization", () => {
+  for (const capture of [0, 25, -55, 55]) {
+    it(`keeps gain fixed at capture ${capture} across edits and repeated rebuilds`, () => {
+      const base = { ...FIXTURE.base, lookAsShot: { ...FIXTURE.base.lookAsShot!, saturation: capture } };
+      const cal = parseLookCalibration(base.lookCalibration)!;
+      let previous = base as ColorProfileMeta;
+      for (const saturation of [-100, -90, -50, 0, 25, 50, 100, capture]) {
+        const got = rebuildLookProfile(previous, { ...base.lookAsShot, saturation },
+          { strength: null, level: -1 }, FAMILY)!;
+        same(got.profileChromaGain, cal.chromaGain.map(g => g / saturationFactor(capture)), "capture gains");
+        expect(got.profileChromaSaturation).toBe(saturationFactor(saturation));
+        expect(got.lookAsShot).toEqual(base.lookAsShot);
+        previous = got;
+      }
+    });
+  }
+});

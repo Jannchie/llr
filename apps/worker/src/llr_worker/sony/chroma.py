@@ -248,44 +248,33 @@ SATURATION_PANEL_LIMIT = 100
 
 
 def saturation_factor(value: float) -> float:
-    """One Saturation value, on Edit's -100..100 scale, -> the factor both halves
-    of the stage use.
-
-    Sony applies this twice in opposite directions: RGB2YCC divides its gains by
-    it, and ZcTaskSIMDHueSaturation multiplies both chroma planes back by it
-    afterwards. The two nearly cancel, so the slider's whole visible effect is
-    what the clamp in between does — about 1% at the camera's +9 (55 here), and
-    about 5% at -9, where the intermediate chroma is 2.3x larger and clips. At
-    -100 the factor is 0: the chroma is gone, and rgb_to_ycc says so explicitly
-    rather than dividing by it.
-    """
+    """Edit panel -100..100 to a chroma multiplier; -100 removes chroma."""
     v = max(-SATURATION_PANEL_LIMIT, min(SATURATION_PANEL_LIMIT, float(value)))
     return 1.0 + v / 100.0
 
 
 def rgb_to_ycc(rgb: np.ndarray, cross: np.ndarray, gain: np.ndarray,
-               saturation: float = 1.0,
+               saturation: float = 1.0, saturation_reference: float = 1.0,
                ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Display-encoded RGB in [0, 1] -> Y, Cb, Cr (chroma centred on zero).
 
-    `saturation` is applied the way the engine applies it: the gains are divided
-    by it before the clamp and the result multiplied back after, which is why
-    the setting is nearly a no-op except where the clamp bites.
+    Divide calibrated gains by the fixed capture `saturation_reference`, then
+    clamp and multiply by the edited `saturation`.
     """
     r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
     y = (r * LUMA_WEIGHTS[0] + g * LUMA_WEIGHTS[1] + b * LUMA_WEIGHTS[2]) / LUMA_SHIFT
     if saturation <= 0.0:
-        # 饱和度 -100: the multiply-back is by zero, so whatever the divided
-        # gains did the chroma leaves as nothing. Said outright, since the
-        # division below would otherwise be by zero.
+        # Saturation -100 removes both chroma planes.
         z = np.zeros_like(y)
         return y, z, z
+    if not np.isfinite(saturation_reference) or saturation_reference <= 0:
+        raise ValueError("capture saturation reference must be finite and positive")
     u, v = r - g, b - g
     v2 = np.where(u >= 0, cross[1], cross[3]) * u + v
     u2 = np.where(v >= 0, cross[0], cross[2]) * v + u
-    cr = np.clip(np.where(u2 >= 0, gain[1], gain[3]) / saturation * u2,
+    cr = np.clip(np.where(u2 >= 0, gain[1], gain[3]) / saturation_reference * u2,
                  -CHROMA_LIMIT, CHROMA_LIMIT) * saturation
-    cb = np.clip(np.where(v2 >= 0, gain[0], gain[2]) / saturation * v2,
+    cb = np.clip(np.where(v2 >= 0, gain[0], gain[2]) / saturation_reference * v2,
                  -CHROMA_LIMIT, CHROMA_LIMIT) * saturation
     return y, cb, cr
 
@@ -458,7 +447,8 @@ def apply_chroma(rgb: np.ndarray, cross: np.ndarray, gain: np.ndarray,
                  lut_advanced: np.ndarray | None = None,
                  contrast_advanced: float | None = None,
                  hue: float = 0.0,
-                 black: float = 0.0, scale: float = 1.0) -> np.ndarray:
+                 black: float = 0.0, scale: float = 1.0,
+                 saturation_reference: float = 1.0) -> np.ndarray:
     """The whole YCC section: display-encoded RGB in, the same out.
 
     `hue` is the 色相 rotation in degrees (hue_degrees), applied right after
@@ -498,7 +488,7 @@ def apply_chroma(rgb: np.ndarray, cross: np.ndarray, gain: np.ndarray,
 
     The pivot is shared between the two settings — see luma_terms for why.
     """
-    y, cb, cr = rgb_to_ycc(rgb, cross, gain, saturation)
+    y, cb, cr = rgb_to_ycc(rgb, cross, gain, saturation, saturation_reference)
     cb, cr = rotate_chroma(cb, cr, hue)
     if suppress is not None:
         f = chroma_suppres_gain(y, suppress)
