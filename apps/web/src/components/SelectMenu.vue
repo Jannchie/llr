@@ -19,6 +19,8 @@ const props = withDefaults(defineProps<{
   disabled?: boolean;
   title?: string;
   ariaLabel?: string;
+  /** Replaces the value text in the trigger while retaining the full menu. */
+  icon?: "sort" | "group";
   /** Shown when the model holds a value no option carries (e.g. mid-decode). */
   placeholder?: string;
 }>(), { disabled: false, placeholder: "" });
@@ -200,12 +202,26 @@ onBeforeUnmount(() => close(false));
 </script>
 
 <template>
-  <button ref="triggerEl" :id="id" type="button" class="control-select" :class="{ 'is-open': open }"
+  <button ref="triggerEl" :id="id" type="button" class="control-select"
+    :class="{ 'is-open': open, 'is-icon-trigger': icon }"
     :disabled="disabled" :title="title" :aria-label="ariaLabel" role="combobox" aria-haspopup="listbox"
     :aria-expanded="open" :aria-controls="open ? listId : undefined"
     :aria-activedescendant="open && activeIndex >= 0 ? optionId(activeIndex) : undefined" @click="onTriggerClick"
     @keydown="onKeydown">
-    <span class="control-select-value">{{ selectedLabel }}</span>
+    <template v-if="icon === 'sort'">
+      <svg class="control-select-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M5 7h14M5 12h10M5 17h6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+      </svg>
+    </template>
+    <template v-else-if="icon === 'group'">
+      <svg class="control-select-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="4" y="5" width="6" height="6" rx="1" fill="none" stroke="currentColor" stroke-width="1.8" />
+        <rect x="14" y="5" width="6" height="6" rx="1" fill="none" stroke="currentColor" stroke-width="1.8" />
+        <rect x="4" y="14" width="6" height="6" rx="1" fill="none" stroke="currentColor" stroke-width="1.8" />
+        <rect x="14" y="14" width="6" height="6" rx="1" fill="none" stroke="currentColor" stroke-width="1.8" />
+      </svg>
+    </template>
+    <span v-else class="control-select-value">{{ selectedLabel }}</span>
     <svg class="control-select-caret" viewBox="0 0 10 6" aria-hidden="true">
       <path d="M1 1l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
         stroke-linejoin="round" />

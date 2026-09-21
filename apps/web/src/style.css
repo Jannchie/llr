@@ -1744,27 +1744,43 @@ input[type="range"]:focus::-moz-range-thumb {
   flex: 1;
 }
 
-.library-field {
+/* The library actions are intentionally icon-first: the folder path remains
+   the bar's only persistent text, while title and aria labels keep every tool
+   discoverable. */
+.library-tools {
   flex: none;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
 }
 
-.library-field-label {
-  color: var(--text-mute);
-  font-size: 12px;
-}
-
-/* The direction toggle sits hard against the sort picker: one control with a
-   caret, as a file manager's column header reads. */
-/* The direction toggle carries .icon-btn; only its smaller arrow and the flip
-   are its own. */
+.library-tools .control-select,
 .library-dir {
-  width: 26px;
-  height: 26px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  justify-content: center;
   border: 1px solid var(--line);
   background: var(--control);
+}
+
+.library-tools .control-select {
+  gap: 0;
+}
+
+.control-select-icon {
+  width: 16px;
+  height: 16px;
+  color: var(--text-dim);
+}
+
+.library-tools .control-select-caret {
+  display: none;
+}
+
+.library-tools .control-select:hover .control-select-icon,
+.library-tools .control-select.is-open .control-select-icon {
+  color: var(--text);
 }
 
 .library-dir svg {

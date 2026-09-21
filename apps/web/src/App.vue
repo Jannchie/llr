@@ -1032,6 +1032,8 @@ const sortOptions = computed<{ value: SortKey; label: string }[]>(() =>
   SORT_KEYS.map(key => ({ value: key, label: t(`library.sortBy.${key}`) })));
 const groupOptions = computed<{ value: GroupKey; label: string }[]>(() =>
   GROUP_KEYS.map(key => ({ value: key, label: t(`library.groupBy.${key}`) })));
+const sortControlLabel = computed(() => `${t('library.sort')}: ${sortOptions.value.find(o => o.value === sortKey.value)?.label ?? ''}`);
+const groupControlLabel = computed(() => `${t('library.group')}: ${groupOptions.value.find(o => o.value === groupKey.value)?.label ?? ''}`);
 
 // The root is the library itself, and says so in the user's language wherever
 // its name is shown.
@@ -3011,10 +3013,9 @@ const vWheelAdjust = {
         <span class="library-path" :title="folderCrumbs.join(' / ')">{{ folderCrumbs.join(' / ') }}</span>
         <span class="library-count">{{ t('library.count', { n: folderPhotos.length }) }}</span>
         <span class="library-gap" />
-        <span class="library-field">
-          <span class="library-field-label">{{ t('library.sort') }}</span>
-          <SelectMenu :model-value="sortKey" :options="sortOptions" :title="t('library.sort')"
-            :aria-label="t('library.sort')" @update:model-value="setSort" />
+        <div class="library-tools" role="group" :aria-label="t('view.library')">
+          <SelectMenu icon="sort" :model-value="sortKey" :options="sortOptions"
+            :title="sortControlLabel" :aria-label="sortControlLabel" @update:model-value="setSort" />
           <button class="icon-btn library-dir" type="button" :title="sortDir === 'asc' ? t('library.asc') : t('library.desc')"
             :aria-label="sortDir === 'asc' ? t('library.asc') : t('library.desc')" @click="toggleSortDir">
             <svg viewBox="0 0 12 12" aria-hidden="true" :class="{ 'is-desc': sortDir === 'desc' }">
@@ -3022,12 +3023,9 @@ const vWheelAdjust = {
                 stroke-linecap="round" stroke-linejoin="round" />
             </svg>
           </button>
-        </span>
-        <span class="library-field">
-          <span class="library-field-label">{{ t('library.group') }}</span>
-          <SelectMenu :model-value="groupKey" :options="groupOptions" :title="t('library.group')"
-            :aria-label="t('library.group')" @update:model-value="setGroup" />
-        </span>
+          <SelectMenu icon="group" :model-value="groupKey" :options="groupOptions"
+            :title="groupControlLabel" :aria-label="groupControlLabel" @update:model-value="setGroup" />
+        </div>
       </div>
       <PhotoGrid v-show="libraryView === 'library'" :sections="library.sections" :grouped="library.grouped" :active-id="activeId"
         :selected-ids="selectedIds" :loading="folderLoading" :thumb-src="thumbSrc" :is-invalid="(id) => activeSource?.id === id && !!activeSource.invalid"
