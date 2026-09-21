@@ -30,15 +30,15 @@ from .creative_style import normalize_style
 from .dcp import ENCODING_SRGB, load_dcp_profile
 from .fit_profile import (
     DEFAULT_DIMS,
-    FitReport,
     MIN_SAMPLES,
+    FitReport,
     accumulate,
     apply_correction,
     camera_match_path,
     dcp_base_linear,
     decode_camera_rgb,
-    inverse_tone_curve,
     delta_e,
+    inverse_tone_curve,
     measure,
     save,
     solve,
@@ -209,7 +209,10 @@ def run_fit(root, args, dims, train, code, out: Path, holdout) -> None:
     for src, tgt in pairs:
         h0, s0 = measure(src, tgt, ENCODING_SRGB)
         h1, s1 = measure(apply_correction(src, table, dims, ENCODING_SRGB), tgt, ENCODING_SRGB)
-        hb += h0; sb += s0; ha += h1; sa += s1
+        hb += h0
+        sb += s0
+        ha += h1
+        sa += s1
     n = len(pairs)
     report = FitReport(
         cells_total=dims[0] * dims[1] * dims[2], cells_fitted=fitted,
@@ -227,11 +230,12 @@ def run_fit(root, args, dims, train, code, out: Path, holdout) -> None:
             corrected = apply_correction(src, table, dims, ENCODING_SRGB)
             e0 = delta_e(src, tgt, curve)
             e1 = delta_e(corrected, tgt, curve)
-            agg["before"].append(e0["mean"]); agg["after"].append(e1["mean"])
+            agg["before"].append(e0["mean"])
+            agg["after"].append(e1["mean"])
             print(f"  {raw.name}: dE {e0['mean']:.2f} -> {e1['mean']:.2f}  "
                   f"chroma {e0['chroma']:.2f} -> {e1['chroma']:.2f}  (dL {e1['lightness']:.2f})")
         b, a = np.mean(agg["before"]), np.mean(agg["after"])
-        wins = sum(x < y for x, y in zip(agg["after"], agg["before"]))
+        wins = sum(x < y for x, y in zip(agg["after"], agg["before"], strict=True))
         print(f"  holdout mean dE {b:.2f} -> {a:.2f}  ({100*(b-a)/b:+.0f}%)  "
               f"improved on {wins}/{len(holdout)} files")
 

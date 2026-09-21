@@ -149,6 +149,8 @@ SAMPLE_IN = SAMPLES / "DSC04568.ARW"
 SAMPLE_HIGH_ISO = SAMPLES / "fl_test.ARW"
 
 requires_sample = pytest.mark.skipif(not SAMPLE_FL.exists(), reason="sample ARW not checked out")
+requires_in_sample = pytest.mark.skipif(not SAMPLE_IN.exists(), reason="IN sample ARW not checked out")
+requires_high_iso_sample = pytest.mark.skipif(not SAMPLE_HIGH_ISO.exists(), reason="high-ISO sample not checked out")
 requires_exiftool = pytest.mark.skipif(detect_exiftool() is None, reason="exiftool not installed")
 
 
@@ -174,6 +176,7 @@ def test_dro_is_only_disclaimed_on_shots_that_used_it() -> None:
 
 @requires_sample
 @requires_exiftool
+@requires_in_sample
 def test_the_in_camera_look_tweaks_are_actually_read() -> None:
     """The tweaks reach the curve only if exiftool is *asked* for them.
 
@@ -537,6 +540,7 @@ def test_illuminant_deltas_ride_on_the_base() -> None:
 
 
 @requires_sample
+@requires_in_sample
 def test_the_illuminant_weights_come_out_of_the_frame_not_a_constant() -> None:
     """They are a property of the shot's light, so all ten looks share them.
 
@@ -555,6 +559,7 @@ def test_the_illuminant_weights_come_out_of_the_frame_not_a_constant() -> None:
 
 
 @requires_sample
+@requires_in_sample
 def test_recomputing_the_blend_agrees_with_the_camera() -> None:
     """The as-shot look carries the camera's own answer; ours must match it.
 
@@ -1201,7 +1206,7 @@ def test_a_borrowed_look_declares_itself() -> None:
 # --- DRO: what the body armed vs what it actually did -----------------------
 
 
-@requires_sample
+@requires_in_sample
 def test_the_dro_curve_comes_out_of_the_raw() -> None:
     """The camera writes its Auto decision as a curve, so nothing is guessed.
 
@@ -1224,6 +1229,7 @@ def test_the_dro_curve_comes_out_of_the_raw() -> None:
 
 @requires_sample
 @requires_exiftool
+@requires_in_sample
 def test_auto_is_not_the_same_question_as_applied() -> None:
     """Both samples say Auto; only one of them got any DRO.
 
@@ -1256,7 +1262,7 @@ def test_a_file_with_no_curve_reads_as_no_curve(tmp_path: Path) -> None:
     assert dro_from_exif({"DynamicRangeOptimizer": "Auto"}, blank)
 
 
-@requires_sample
+@requires_in_sample
 def test_dro_strength_scales_in_the_log_domain() -> None:
     """Doubling the strength squares the gain, and zero is exactly identity.
 
@@ -1278,7 +1284,7 @@ def test_dro_strength_scales_in_the_log_domain() -> None:
     assert scale_dro_gain(table, -1.0) == off
 
 
-@requires_sample
+@requires_in_sample
 def test_dro_lifts_shadows_and_leaves_white_alone() -> None:
     """What the control does to pixels, at the two ends that matter.
 
@@ -1447,7 +1453,7 @@ def test_the_dro_grid_map_follows_the_camera_flip() -> None:
     assert half_turn[5] == pytest.approx(-4688 / span_y)
 
 
-@requires_sample
+@requires_in_sample
 @requires_exiftool
 def test_the_dro_control_rebuilds_the_profile_without_a_decode() -> None:
     """Moving DRO is a profile rebuild, like the look and the five tweaks.
@@ -1524,6 +1530,7 @@ def test_the_dro_presets_reproduce_the_engines_own_ladder() -> None:
     assert np.allclose(dro_preset_curve(99), dro_preset_curve(90), atol=2e-3)
 
 
+@requires_in_sample
 def test_a_manual_dro_level_ignores_the_shots_own_curve_but_off_still_wins() -> None:
     """The three DRO states, and which one takes precedence.
 
@@ -1595,6 +1602,7 @@ def test_clarity_follows_the_engines_own_ladder_and_offers_no_inert_stop() -> No
     assert clarity_amount(999) == clarity_amount(CLARITY_MAX)
 
 
+@requires_in_sample
 def test_the_profile_carries_clarity_as_the_shaders_own_constants() -> None:
     """Clarity reaches the browser as a gain plus the blur chain's geometry.
 
@@ -1666,6 +1674,7 @@ def test_sharpening_walks_two_ladders_that_disagree_about_invalid_values() -> No
     assert ratios == sorted(ratios)
 
 
+@requires_in_sample
 def test_the_sharpen_scale_comes_out_of_the_raw_not_out_of_a_table() -> None:
     """`calib[0x1060]` is tag 0x78cd, which is what makes this stage offline.
 
@@ -1683,6 +1692,7 @@ def test_the_sharpen_scale_comes_out_of_the_raw_not_out_of_a_table() -> None:
     assert sharpness_calibration(SAMPLE_IN.with_name("no-such-file.ARW")) == SHARPNESS_CALIB_DEFAULT
 
 
+@requires_in_sample
 def test_the_profile_carries_sharpening_and_it_survives_a_look_change() -> None:
     """Sharpening reaches the browser as one amplitude, and stays put.
 
@@ -1903,6 +1913,7 @@ def test_a_file_without_the_tags_has_no_noise_model() -> None:
 
 
 @requires_sample
+@requires_high_iso_sample
 def test_the_three_plane_strengths_agree() -> None:
     """The assumption `noise_model` rests on: one curve speaks for the frame.
 
@@ -1918,6 +1929,7 @@ def test_the_three_plane_strengths_agree() -> None:
 
 
 @requires_sample
+@requires_high_iso_sample
 def test_the_three_plane_detail_pairs_agree() -> None:
     """`detail_restore` reads plane 0's gain and limit and speaks for the frame.
 
@@ -1934,6 +1946,7 @@ def test_the_three_plane_detail_pairs_agree() -> None:
 
 
 @requires_sample
+@requires_high_iso_sample
 def test_the_detail_gain_is_the_raw_tag_and_may_exceed_restore_everything() -> None:
     """Pins that the engine's own ``min(tag, 256)`` clamp is *not* applied.
 
@@ -1953,7 +1966,7 @@ def test_the_detail_gain_is_the_raw_tag_and_may_exceed_restore_everything() -> N
         assert restore.fraction == raw / DETAIL_GAIN_UNIT
 
 
-@requires_sample
+@requires_high_iso_sample
 def test_the_camera_curve_stabilises_through_the_denoiser_it_feeds() -> None:
     """The two halves only meet in cli.py, so bind them somewhere tested.
 
@@ -2062,6 +2075,7 @@ def test_the_ratio_multiplies_the_camera_s_multipliers() -> None:
 
 
 @requires_sample
+@requires_in_sample
 def test_the_file_s_own_stamp_names_the_shot_s_look() -> None:
     """The top-level chroma block is a copy of the as-shot look's, so the file
     can say which look it was — the route an "Off" frame takes to Standard."""

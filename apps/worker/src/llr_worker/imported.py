@@ -24,9 +24,10 @@ occur in photographic files.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 from PIL import Image, ImageCms, ImageOps
@@ -97,9 +98,9 @@ def _matrix_from_icc(profile: ImageCms.ImageCmsProfile) -> np.ndarray | None:
     inner: Any = profile.profile
     try:
         columns = [
-            getattr(inner, "red_colorant")[0],
-            getattr(inner, "green_colorant")[0],
-            getattr(inner, "blue_colorant")[0],
+            inner.red_colorant[0],
+            inner.green_colorant[0],
+            inner.blue_colorant[0],
         ]
     except (AttributeError, TypeError, IndexError):
         return None
