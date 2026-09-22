@@ -13,7 +13,7 @@
 ## 结论
 
 - **数据**：`Snapshot.masks?: MaskGroup[]`（缺省 → 空）。一个 group = ≤4 个解析式 component（luminance / color / linear / radial，各带 add / subtract / intersect + invert）+ 一组局部滑块（exposure, temperature, tint, saturation, vibrance, highlights, shadows, clarity, dehaze, hue）。上限 8 组。
-- **权重**：全部在 `PROCESS_SHADER` 内逐像素算，无新纹理；luminance range 用**逐像素**（4-tap 邻域均值）而不是 ≤256px 的模糊 mask——后者 σ≈3% 画幅，做选区会把亮部溢到暗部一圈。gradient 存在**oriented image-norm 空间**（与 `xf.guides` 同一坐标系，`crop.ts:38`），shader 用一个 `u_imgFromTex` mat3 把 `v_texCoord` 转过去，因此跟随 crop / 拉直 / 旋转 / 透视。
+- **权重**：全部在 `PROCESS_SHADER` 内逐像素算，无新纹理；luminance range 用**逐像素**（5×5 binomial 邻域均值，σ≈1 texel）而不是 ≤256px 的模糊 mask——后者 σ≈3% 画幅，做选区会把亮部溢到暗部一圈。gradient 存在**oriented image-norm 空间**（与 `xf.guides` 同一坐标系，`crop.ts:38`），shader 用一个 `u_imgFromTex` mat3 把 `v_texCoord` 转过去，因此跟随 crop / 拉直 / 旋转 / 透视。
 - **融合**：在 WB 之后、tonal block 之前（`passes.ts:601`–`609` 之间）算出所有 group 的 w，然后**混参数不混结果**：`p_px = p_global + Σ w_g·Δp_g`，现有 block 只跑一遍。temperature/tint 例外——WB 是线性矩阵，混矩阵 `M0 + Σ w_g (M_g − M0)` 等价于混结果，CPU 每组算一个 ΔM。
 - **预算**：现有 fragment uniform 已占 109 / 224 vec4（WebGL2 保底值），8 组打包还要 144 行，放不下。用一个 **std140 UBO**（2.3 KB，每帧 `bufferSubData`），不占 uniform 寄存器也不占纹理单元。CPU 端跳过"调整全零 / disabled / 无 component"的组；`u_maskGroups == 0` 时整块不执行，默认输出逐 bit 不变。
 - **不做**：Contrast / Blacks / Tone curve（display-referred LUT bake，见 §3.3），brush、AI 主体/天空、guided filter（Phase 2）。
@@ -52,7 +52,7 @@ export const MASK_GROUPS = 8, MASK_COMPS = 4, GROUP_STRIDE = 18; // vec4 行：h
 
 **Why**：现有 `u_mask_lum` 是 ≤256px 长边、σ=8px 的高斯（`passes.ts:820`–`868`，`pipeline-renderer.ts:418`），Highlights/Shadows 用它是为了"区域整体移动、局部对比保留"（`passes.ts:634`–`640`）。选区需要的是相反的性质——天空边上的树枝不能被算进天空。σ≈3% 画幅的模糊会让 -1 EV 的天空在树线上拖出一圈暗边。但纯单像素又会在阴影里按噪声抖（HSL 选区的同一问题，`passes.ts:695`–`702`）。
 
-**How**：选区亮度取自 HSL 已有的 4-tap 双线性邻域均值（`passes.ts:716`–`722`，抽成函数两处共用），经全局 WB 后取 `ppLuma`，加全局 exposure（忽略 shoulder，与 `u_maskShift` 同一近似，`pipeline-renderer.ts:2216`–`2220`），再走 `srgbEncode(clamp(Y,0,1))`——即 `toneRegions` 给区域权重用的同一条感知轴（`tonal-model.ts:108`–`110`）。lo/hi/feather 都在这条 0..1 轴上，滑块 0..100 直接映射。
+**How**：选区亮度取自 HSL 已有的邻域均值（`wbNeighbourhood`，两处共用；原为 ±0.75 texel 对角 4-tap，只平均对角邻居，Bayer 周期的去马赛克摩尔纹原样穿过、经羽化斜率放大后在过渡带印出网纹，已改为 9-tap 双线性拼成的 5×5 binomial），经全局 WB 后取 `ppLuma`，加全局 exposure（忽略 shoulder，与 `u_maskShift` 同一近似，`pipeline-renderer.ts:2216`–`2220`），再走 `srgbEncode(clamp(Y,0,1))`——即 `toneRegions` 给区域权重用的同一条感知轴（`tonal-model.ts:108`–`110`）。lo/hi/feather 都在这条 0..1 轴上，滑块 0..100 直接映射。
 
 **Trade-off**：不含 Highlights/Shadows 的反馈（它们和局部参数在同一个 block 里）；LR 也是这样。"Smoothness"（更宽邻域）留到 Phase 2 的 guided filter，不用模糊 mask 凑。
 

@@ -584,29 +584,43 @@ float droLocalMean(vec2 uv, float ylog) {
   return acc.y <= 0.0 ? u_droScale.x : acc.x / acc.y;
 }
 
-// The selection colour for the HSL mixer and the masks: four bilinear taps
-// around the pixel, averaged, then the same gain -> WB chain as the main
-// sample. Which band a pixel belongs to is a property of its *neighbourhood*,
-// not of the pixel: chroma noise swings a single pixel's hue by more than the
+// The selection colour for the HSL mixer and the masks: a 5x5 binomial of the
+// source around the pixel, then the same gain -> WB chain as the main sample.
+// Which band a pixel belongs to is a property of its *neighbourhood*, not of
+// the pixel: chroma noise swings a single pixel's hue by more than the
 // Red-Orange centres are apart (0.41 rad, the tightest pair), so per-pixel
 // weights speckle — adjacent pixels land in different bands and only some of
 // them take the move. The adjustment still applies to this pixel's own colour,
 // so detail and edges survive.
 //
-// Radius: half an output pixel, floored at 0.75 source texels. The preview
-// renders at previewScale, so in a fit-to-window view one output pixel spans
-// several texels; fwidth follows that and halves the worst-case residue there
-// (90th-percentile grain 0.21 -> 0.10), while at 1:1 and on export it drops to
-// the floor and the two agree. The floor is 0.75 rather than 0.5 because the
-// source texture falls back to NEAREST when RGB32F is not filterable: at 0.5
-// the taps can all round back to the centre texel and average nothing.
+// Kernel: nine bilinear taps at 0 and ±1.2 texels, weighted [5 6 5]/16 per
+// axis. The bilinear split of a ±1.2 tap (0.8 : 0.2 between texels 1 and 2)
+// makes that exactly [1 4 6 4 1]/16 — sigma ≈ 1 texel — when the fragment
+// sits on a texel, and a smooth interpolation of it in between. It replaced
+// four taps on the diagonals at ±0.75: those average a pixel with its
+// *diagonal* neighbours only, and anything at the Bayer period — demosaic
+// moiré on a fine weave (DSC03961's scarf), chroma noise — has the same sign
+// on every diagonal, so it passed straight through. A luminance range then
+// turned it into weight at the feather's slope (x4 at feather 25), and a
+// local exposure or shadows lift printed it as a crosshatch across the whole
+// transition band — invisible in the photo, obvious in the mask. The
+// binomial is zero at the Bayer period and a quarter at four texels.
+//
+// Spacing: 1.2 texels, or 0.6 of an output pixel when that is wider. The
+// preview renders at previewScale, so in a fit-to-window view one output
+// pixel spans several texels; fwidth follows that so the footprint still
+// covers the output pixel, while at 1:1 and on export it drops to the texel
+// spacing and the two agree. Under the NEAREST fallback (RGB32F without
+// OES_texture_float_linear) the ±1.2 taps round to ±1 and the kernel
+// degrades to a 3x3 [5 6 5] — still a quarter at the Bayer period, not one.
 vec3 wbNeighbourhood(vec2 lensUV, float lensGain) {
-  vec2 ts = max(0.75 / vec2(textureSize(u_input, 0)), 0.5 * fwidth(lensUV));
-  vec3 nb = texture(u_input, lensUV + vec2( ts.x,  ts.y)).rgb
-          + texture(u_input, lensUV + vec2(-ts.x,  ts.y)).rgb
-          + texture(u_input, lensUV + vec2( ts.x, -ts.y)).rgb
-          + texture(u_input, lensUV + vec2(-ts.x, -ts.y)).rgb;
-  return max(u_wbMatrix * (max(nb * 0.25, 0.0) * lensGain), 0.0);
+  vec2 s = max(1.2 / vec2(textureSize(u_input, 0)), 0.6 * fwidth(lensUV));
+  const float w[3] = float[3](0.3125, 0.375, 0.3125);
+  vec3 nb = vec3(0.0);
+  for (int j = -1; j <= 1; j++)
+    for (int i = -1; i <= 1; i++)
+      nb += (w[i + 1] * w[j + 1]) * texture(u_input, lensUV + vec2(float(i), float(j)) * s).rgb;
+  return max(u_wbMatrix * (max(nb, 0.0) * lensGain), 0.0);
 }
 
 void main() {
