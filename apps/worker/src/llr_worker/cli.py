@@ -342,6 +342,15 @@ def _warm_kernels() -> None:
 
 
 def run_daemon(root: Path) -> None:
+    # The API writes the request pipe as UTF-8 and reads the reply pipe as
+    # UTF-8, but a piped Python stdin/stdout on Windows defaults to the ANSI
+    # code page (cp932 on a Japanese machine). Non-ASCII in a request — a mask
+    # the user renamed in Chinese — then either mis-decodes into mojibake that
+    # gets baked into the export's XMP, or lands as a surrogate-escaped byte
+    # that later blows up the UTF-8 encode of the XMP packet.
+    for stream in (sys.stdin, sys.stdout):
+        if isinstance(stream, io.TextIOWrapper):
+            stream.reconfigure(encoding="utf-8", errors="strict")
     sys.stderr.write("llr-worker daemon ready\n")
     sys.stderr.flush()
     threading.Thread(target=_warm_kernels, name="kernel-warmup", daemon=True).start()
@@ -2583,7 +2592,11 @@ def run_capture(command: list[str], env: dict[str, str] | None = None) -> str:
     # The daemon's stdin is the API's request pipe; a child that inherits it
     # never sees EOF, and on Windows exiftool then never exits — so the decode
     # hung at the metadata read until the API's 120s timeout.
-    result = subprocess.run(command, check=True, env=env, text=True, capture_output=True, stdin=subprocess.DEVNULL)
+    # exiftool prints UTF-8 regardless of the console code page; `text=True`
+    # alone would decode it with the ANSI one and turn a non-ASCII lens name
+    # into a decode error.
+    result = subprocess.run(command, check=True, env=env, encoding="utf-8", errors="replace",
+                            capture_output=True, stdin=subprocess.DEVNULL)
     return result.stdout
 
 
