@@ -7,7 +7,7 @@
  *   PRINT_TABLES=1 npx vitest run --disable-console-intercept
  */
 import { describe, expect, it } from "vitest";
-import { CLAR_MID1, CLAR_SIGMA, LOG2_MID, TONE_HEAD, clarityShift, expoShoulder, toneOp, tonalLuma, type TonalParams } from "../tonal-model";
+import { CLAR_MID1, CLAR_SIGMA, LOG2_MID, TONAL_GLSL, TONE_HEAD, clarityShift, expoShoulder, toneOp, tonalLuma, type TonalParams } from "../tonal-model";
 import { DEFAULT_BASIC, basicCurve, buildToneCurveLUT, defaultToneCurve, srgbDecode, srgbEncode, type BasicAdjust } from "../curve";
 
 // basicCurve is linear-in/linear-out but acts on the perceptual axis, so the
@@ -92,6 +92,47 @@ describe("highlights / shadows", () => {
         expect(toneOp(toneOp(x, -a, 1.0), a, 1.0)).toBeCloseTo(x, 9);
       }
     }
+  });
+  it("stays the identity as amt -> 0, in float32 (a mask's outer edge)", () => {
+    // Where this bites: a radial mask's weight passes through every value down
+    // to zero, so `amt = slider * w` sweeps the whole small range on a
+    // one-pixel band. The shader runs in float32, and the old
+    // (1 - exp(-c x)) / (1 - exp(-c)) cancelled down to about one significant
+    // digit there — a visible ring of luminance errors around the selection.
+    // f32() stands in for the shader's precision; the assertion is that the
+    // curve degrades *to the identity*, not to noise.
+    const f32 = Math.fround;
+    for (const amt of [1e-7, 1e-6, 1e-5, 1e-4, 1e-3]) {
+      for (const x of [0.05, 0.25, 0.5, 0.75, 0.95]) {
+        for (const s of [1, -1]) {
+          const y = f32(toneOp(f32(x), f32(s * amt), 1));
+          expect(Math.abs(y - x)).toBeLessThan(2e-3);
+        }
+      }
+    }
+    // amt exactly 0 is the identity, not a 0/0 NaN.
+    for (const x of [0, 0.3, 1]) expect(toneOp(x, 0, 1)).toBe(x);
+  });
+  it("the GLSL series match the library expm1/log1p over their branch", () => {
+    // toneOp's TS mirror calls Math.expm1/Math.log1p; the shader cannot, so
+    // TONAL_GLSL carries fourth-order series (expm1s/log1ps) below |t| = 0.05.
+    // Nothing else pins those coefficients to the mirror they claim to follow,
+    // and the whole fix rests on them — so restate them here and compare.
+    const expm1s = (t: number) => t * (1 + t * (0.5 + t * (1 / 6 + t * (1 / 24))));
+    const log1ps = (y: number) => y * (1 + y * (-0.5 + y * (1 / 3 - y * 0.25)));
+    // Relative, because that is what the shader's comment claims and what the
+    // caller feels: the series are only ever divided by something of their own
+    // order. expm1s has to land under float32 eps (6e-8) — below that the
+    // truncation is free, which is the whole argument for the series.
+    const rel = (got: number, want: number) => Math.abs(got - want) / Math.abs(want);
+    for (let t = -0.05; t <= 0.05; t += 0.0025) {
+      if (Math.abs(t) < 1e-9) continue;   // 0/0 in the ratio, and both are 0
+      expect(rel(expm1s(t), Math.expm1(t))).toBeLessThan(6e-8);
+      expect(rel(log1ps(t), Math.log1p(t))).toBeLessThan(1.5e-6);
+    }
+    // And the series are the ones the emitted GLSL actually contains.
+    expect(TONAL_GLSL).toContain("t * (1.0 + t * (0.5 + t * (1.0 / 6.0 + t * (1.0 / 24.0))))");
+    expect(TONAL_GLSL).toContain("y * (1.0 + y * (-0.5 + y * (1.0 / 3.0 - y * 0.25)))");
   });
   it("black stays black and the deep lift stays bounded (no fog floor)", () => {
     // The operator fixes both endpoints, so this needs no floor taper: zero

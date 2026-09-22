@@ -82,16 +82,16 @@ export function expoShoulder(x: number): number {
  * negative applies the exact inverse. Mirrors toneOp in TONAL_GLSL.
  */
 export function toneOp(x: number, amt: number, k: number): number {
-  // Below this the curve is the identity to within float noise, and c -> 0
-  // would divide by zero.
-  if (Math.abs(amt) < 1e-6) return x;
   // expm1/log1p rather than exp/log around 1: see expm1s in TONAL_GLSL for
   // what the cancellation in `1 - exp(-c)` does at a mask's edge.
   const c = 2 * Math.expm1(k * Math.abs(amt) * Math.LN2);
+  // The only case the stable form cannot take: amt 0 (or c underflowed to it)
+  // is the identity curve and would divide 0 by 0. An amt too small to be
+  // worth a threshold is no longer a case — that is what the rewrite bought.
+  if (c === 0) return x;
   const g = -Math.expm1(-c);
-  return amt > 0
-    ? -Math.expm1(-c * x) / g
-    : -Math.log1p(Math.max(-x * g, -1 + 1e-12)) / c;
+  // x*g < 1 strictly (x <= 1, g < 1), so log1p's argument stays above -1.
+  return amt > 0 ? -Math.expm1(-c * x) / g : -Math.log1p(-x * g) / c;
 }
 
 /**
@@ -207,24 +207,30 @@ float expoShoulder(float x) {
 // zero: along a radial mask's outer edge the weight passes through every
 // value down to 0, and the band where amt sat in 1e-6..1e-4 rendered as a
 // one-pixel ring of ±10% luminance errors (exp2(k·amt + 1) - 2 loses the
-// same way). Fourth-order series below |t| = 0.05 (truncation ~5e-8, the
-// same order as float noise), the library call above it.
+// same way). Fourth-order series below |t| = 0.05, the library call above it.
+// Worst relative truncation over that branch: 5.3e-8 for expm1s — under
+// float32's own eps, so it costs nothing here — and 1.2e-6 for log1ps.
+//
+// What makes a 1 - exp(t) worth routing through here is a *second* term
+// vanishing with it: toneOp divides by g ≈ c, which turns the absolute
+// float32 epsilon into an O(1) relative error. expoShoulder above computes
+// the same shape with no such divisor — its error stays at EXPO_P·eps ≈ 1e-7
+// stop — so it is deliberately left on the plain exp.
 float expm1s(float t) {
   return abs(t) < 0.05 ? t * (1.0 + t * (0.5 + t * (1.0 / 6.0 + t * (1.0 / 24.0)))) : exp(t) - 1.0;
 }
 float log1ps(float y) {
-  return abs(y) < 0.05 ? y * (1.0 - y * (0.5 - y * (1.0 / 3.0 - y * 0.25))) : log(1.0 + y);
+  return abs(y) < 0.05 ? y * (1.0 + y * (-0.5 + y * (1.0 / 3.0 - y * 0.25))) : log(1.0 + y);
 }
 
 // The Highlights/Shadows compressor (mirrors toneOp in tonal-model.ts).
 // Positive lifts, negative applies the exact inverse; both endpoints fixed.
 float toneOp(float x, float amt, float k) {
-  if (abs(amt) < 1e-6) return x; // identity, and c -> 0 would divide by zero
   float c = 2.0 * expm1s(k * abs(amt) * ${glf(Math.LN2)});
+  if (c == 0.0) return x;        // the identity curve; 0/0 below otherwise
   float g = -expm1s(-c);
-  return amt > 0.0
-    ? -expm1s(-c * x) / g
-    : -log1ps(max(-x * g, -1.0 + 1e-12)) / c;
+  // x*g < 1 strictly (x <= 1, g < 1), so log1ps' argument stays above -1.
+  return amt > 0.0 ? -expm1s(-c * x) / g : -log1ps(-x * g) / c;
 }
 
 // Highlights/Shadows on scene luminance (mirrors toneRegions in tonal-model.ts).
