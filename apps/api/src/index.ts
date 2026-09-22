@@ -799,7 +799,13 @@ class WorkerDaemon {
   private async boot(): Promise<void> {
     const child = spawn("uv", ["run", "--project", "apps/worker", "llr-worker", "daemon"], {
       cwd: this.cwd,
-      env: { ...process.env, INIT_CWD: this.cwd, PYTHONUNBUFFERED: "1" }
+      // The request/reply pipes and the worker's own cache sidecars are UTF-8;
+      // without this a piped Python on Windows decodes them with the ANSI code
+      // page (cp932 here), and a mask named in Chinese arrives as mojibake or
+      // as surrogates that later fail the XMP encode. UTF-8 mode settles
+      // stdin/stdout/stderr and every open() at once, so it holds for whatever
+      // the worker reads or writes next, not just the two streams.
+      env: { ...process.env, INIT_CWD: this.cwd, PYTHONUNBUFFERED: "1", PYTHONUTF8: "1" }
     });
 
     child.stderr.setEncoding("utf8");

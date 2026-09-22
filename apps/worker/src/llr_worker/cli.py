@@ -194,6 +194,17 @@ class UnsupportedSourceError(ValueError):
 
 
 def main() -> None:
+    # Everything this process exchanges with its caller is UTF-8: the daemon's
+    # JSON pipes, the paths the other subcommands print, the tracebacks. A
+    # piped Python on Windows would otherwise use the ANSI code page (cp932
+    # here) and turn a non-ASCII mask name into mojibake or into surrogates
+    # that fail the XMP encode downstream. The API sets PYTHONUTF8 when it
+    # spawns the worker, which covers file IO too; this is the same guarantee
+    # for a worker started by hand, and a no-op when the env already gave it.
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper):
+            stream.reconfigure(encoding="utf-8")
+
     argv = sys.argv[1:]
     if argv[:1] == ["--"]:
         argv = argv[1:]
@@ -342,15 +353,6 @@ def _warm_kernels() -> None:
 
 
 def run_daemon(root: Path) -> None:
-    # The API writes the request pipe as UTF-8 and reads the reply pipe as
-    # UTF-8, but a piped Python stdin/stdout on Windows defaults to the ANSI
-    # code page (cp932 on a Japanese machine). Non-ASCII in a request — a mask
-    # the user renamed in Chinese — then either mis-decodes into mojibake that
-    # gets baked into the export's XMP, or lands as a surrogate-escaped byte
-    # that later blows up the UTF-8 encode of the XMP packet.
-    for stream in (sys.stdin, sys.stdout):
-        if isinstance(stream, io.TextIOWrapper):
-            stream.reconfigure(encoding="utf-8", errors="strict")
     sys.stderr.write("llr-worker daemon ready\n")
     sys.stderr.flush()
     threading.Thread(target=_warm_kernels, name="kernel-warmup", daemon=True).start()
