@@ -85,11 +85,13 @@ export function toneOp(x: number, amt: number, k: number): number {
   // Below this the curve is the identity to within float noise, and c -> 0
   // would divide by zero.
   if (Math.abs(amt) < 1e-6) return x;
-  const c = 2 ** (k * Math.abs(amt) + 1) - 2;
-  const g = 1 - Math.exp(-c);
+  // expm1/log1p rather than exp/log around 1: see expm1s in TONAL_GLSL for
+  // what the cancellation in `1 - exp(-c)` does at a mask's edge.
+  const c = 2 * Math.expm1(k * Math.abs(amt) * Math.LN2);
+  const g = -Math.expm1(-c);
   return amt > 0
-    ? (1 - Math.exp(-c * x)) / g
-    : -Math.log(Math.max(1 - x * g, 1e-12)) / c;
+    ? -Math.expm1(-c * x) / g
+    : -Math.log1p(Math.max(-x * g, -1 + 1e-12)) / c;
 }
 
 /**
@@ -198,15 +200,31 @@ float expoShoulder(float x) {
        : EXPO_KNEE + EXPO_P * (1.0 - exp(-(x - EXPO_KNEE) / EXPO_P));
 }
 
+// exp(t) - 1 and log(1 + y) without the cancellation that eats them near
+// zero. A float32 exp(-1e-6) is 0.999999 to seven digits, so the compressor's
+// old (1 - exp(-c x)) / (1 - exp(-c)) kept about one digit of x once c was
+// small — and c *is* small wherever a mask hands the slider a weight near
+// zero: along a radial mask's outer edge the weight passes through every
+// value down to 0, and the band where amt sat in 1e-6..1e-4 rendered as a
+// one-pixel ring of ±10% luminance errors (exp2(k·amt + 1) - 2 loses the
+// same way). Fourth-order series below |t| = 0.05 (truncation ~5e-8, the
+// same order as float noise), the library call above it.
+float expm1s(float t) {
+  return abs(t) < 0.05 ? t * (1.0 + t * (0.5 + t * (1.0 / 6.0 + t * (1.0 / 24.0)))) : exp(t) - 1.0;
+}
+float log1ps(float y) {
+  return abs(y) < 0.05 ? y * (1.0 - y * (0.5 - y * (1.0 / 3.0 - y * 0.25))) : log(1.0 + y);
+}
+
 // The Highlights/Shadows compressor (mirrors toneOp in tonal-model.ts).
 // Positive lifts, negative applies the exact inverse; both endpoints fixed.
 float toneOp(float x, float amt, float k) {
   if (abs(amt) < 1e-6) return x; // identity, and c -> 0 would divide by zero
-  float c = exp2(k * abs(amt) + 1.0) - 2.0;
-  float g = 1.0 - exp(-c);
+  float c = 2.0 * expm1s(k * abs(amt) * ${glf(Math.LN2)});
+  float g = -expm1s(-c);
   return amt > 0.0
-    ? (1.0 - exp(-c * x)) / g
-    : -log(max(1.0 - x * g, 1e-12)) / c;
+    ? -expm1s(-c * x) / g
+    : -log1ps(max(-x * g, -1.0 + 1e-12)) / c;
 }
 
 // Highlights/Shadows on scene luminance (mirrors toneRegions in tonal-model.ts).
