@@ -606,6 +606,12 @@ float droLocalMean(vec2 uv, float ylog) {
 // transition band — invisible in the photo, obvious in the mask. The
 // binomial is zero at the Bayer period and a quarter at four texels.
 //
+// The moiré cannot be taken out upstream instead: NR, Marble and sharpening
+// all live in the post chain (pipeline-renderer.ts prepareSonyPost), which
+// runs *after* this pass, and u_input is the worker's raw demosaic. Widening
+// the selection's own neighbourhood is the only place in this architecture
+// where it can be attenuated before a mask's feather amplifies it.
+//
 // Spacing: 1.2 texels, or 0.6 of an output pixel when that is wider. The
 // preview renders at previewScale, so in a fit-to-window view one output
 // pixel spans several texels; fwidth follows that so the footprint still
@@ -615,12 +621,15 @@ float droLocalMean(vec2 uv, float ylog) {
 // degrades to a 3x3 [5 6 5] — still a quarter at the Bayer period, not one.
 vec3 wbNeighbourhood(vec2 lensUV, float lensGain) {
   vec2 s = max(1.2 / vec2(textureSize(u_input, 0)), 0.6 * fwidth(lensUV));
-  const float w[3] = float[3](0.3125, 0.375, 0.3125);
+  // Separable, so the weight is a product of two 1D taps (6,5) — same shape
+  // as the Clarity blur's (2,1) below, and it keeps [5 6 5] readable in the
+  // code rather than hiding it in a pair of decimal constants.
   vec3 nb = vec3(0.0);
   for (int j = -1; j <= 1; j++)
     for (int i = -1; i <= 1; i++)
-      nb += (w[i + 1] * w[j + 1]) * texture(u_input, lensUV + vec2(float(i), float(j)) * s).rgb;
-  return max(u_wbMatrix * (max(nb, 0.0) * lensGain), 0.0);
+      nb += (6.0 - abs(float(i))) * (6.0 - abs(float(j)))
+          * texture(u_input, lensUV + vec2(float(i), float(j)) * s).rgb;
+  return max(u_wbMatrix * (max(nb / 256.0, 0.0) * lensGain), 0.0);
 }
 
 void main() {
@@ -702,11 +711,19 @@ void main() {
   // perceptual axis toneRegions uses, so a noisy shadow does not speckle the
   // range. u_maskGroups is a uniform: the branch is coherent, and at 0 the
   // default path below is untouched — bit for bit.
+  // The masks and the HSL mixer read the same neighbourhood, at the same
+  // position, through the same WB — 9 taps and an Oklab round-trip that both
+  // would otherwise fetch for themselves on any frame where both are on.
+  // Still behind a uniform branch, so a frame with neither pays nothing.
+  vec3 labSel = vec3(0.0);
+  float pLum = 0.0;
+  if (u_maskGroups > 0 || u_hslActive == 1) {
+    vec3 cSel = wbNeighbourhood(lensUV, lensGain);
+    pLum = srgbEncode(clamp(ppLuma(cSel) * exp2(u_exposure), 0.0, 1.0));
+    labSel = proPhotoToOklab(cSel);
+  }
   float dExpo = 0.0, dHi = 0.0, dSh = 0.0, dClar = 0.0, dHaze = 0.0, dSat = 0.0, dVib = 0.0, dHue = 0.0, wPrev = 0.0;
   if (u_maskGroups > 0) {
-    vec3 cSel = wbNeighbourhood(lensUV, lensGain);
-    float pLum = srgbEncode(clamp(ppLuma(cSel) * exp2(u_exposure), 0.0, 1.0));
-    vec3 labSel = proPhotoToOklab(cSel);
     vec2 pImg = (u_imgFromTex * vec3(v_texCoord, 1.0)).xy;
     mat3 dWb = mat3(0.0); vec3 dTint = vec3(0.0);
     for (int g = 0; g < u_maskGroups; g++) {
@@ -845,12 +862,12 @@ void main() {
   // pixel every frame. Branch is on a uniform, so it is coherent across the draw.
   if (u_hslActive == 1) {
     vec3 lab = proPhotoToOklab(c);
-    // The selection colour is the neighbourhood's, not the pixel's
-    // (wbNeighbourhood says why). Sampling after white balance is enough:
-    // everything between it and here (exposure, tonal regions, vibrance)
-    // scales luminance or chroma without rotating hue, and the gate reads the
-    // ratio C/L, which those scalings leave near enough alone.
-    vec3 labSel = proPhotoToOklab(wbNeighbourhood(lensUV, lensGain));
+    // The selection colour (labSel, computed once above) is the
+    // neighbourhood's, not the pixel's (wbNeighbourhood says why). Sampling
+    // after white balance is enough: everything between it and here
+    // (exposure, tonal regions, vibrance) scales luminance or chroma without
+    // rotating hue, and the gate reads the ratio C/L, which those scalings
+    // leave near enough alone.
     // Chroma gate: hue is meaningless where chroma is, so near-neutral pixels
     // must fall out of every band rather than land in a random one
     // (hsl-bands.ts). Hue/Saturation and Luminance smoothstep the same ratio

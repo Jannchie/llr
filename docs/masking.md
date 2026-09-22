@@ -52,7 +52,7 @@ export const MASK_GROUPS = 8, MASK_COMPS = 4, GROUP_STRIDE = 18; // vec4 行：h
 
 **Why**：现有 `u_mask_lum` 是 ≤256px 长边、σ=8px 的高斯（`passes.ts:820`–`868`，`pipeline-renderer.ts:418`），Highlights/Shadows 用它是为了"区域整体移动、局部对比保留"（`passes.ts:634`–`640`）。选区需要的是相反的性质——天空边上的树枝不能被算进天空。σ≈3% 画幅的模糊会让 -1 EV 的天空在树线上拖出一圈暗边。但纯单像素又会在阴影里按噪声抖（HSL 选区的同一问题，`passes.ts:695`–`702`）。
 
-**How**：选区亮度取自 HSL 已有的邻域均值（`wbNeighbourhood`，两处共用；原为 ±0.75 texel 对角 4-tap，只平均对角邻居，Bayer 周期的去马赛克摩尔纹原样穿过、经羽化斜率放大后在过渡带印出网纹，已改为 9-tap 双线性拼成的 5×5 binomial），经全局 WB 后取 `ppLuma`，加全局 exposure（忽略 shoulder，与 `u_maskShift` 同一近似，`pipeline-renderer.ts:2216`–`2220`），再走 `srgbEncode(clamp(Y,0,1))`——即 `toneRegions` 给区域权重用的同一条感知轴（`tonal-model.ts:108`–`110`）。lo/hi/feather 都在这条 0..1 轴上，滑块 0..100 直接映射。
+**How**：选区亮度取自 HSL 已有的邻域均值（`wbNeighbourhood`，两处共用；9 个双线性 tap 拼成的 5×5 binomial，取这个核的理由见 passes.ts 上的注释），经全局 WB 后取 `ppLuma`，加全局 exposure（忽略 shoulder，与 `u_maskShift` 同一近似，`pipeline-renderer.ts:2216`–`2220`），再走 `srgbEncode(clamp(Y,0,1))`——即 `toneRegions` 给区域权重用的同一条感知轴（`tonal-model.ts:108`–`110`）。lo/hi/feather 都在这条 0..1 轴上，滑块 0..100 直接映射。
 
 **Trade-off**：不含 Highlights/Shadows 的反馈（它们和局部参数在同一个 block 里）；LR 也是这样。"Smoothness"（更宽邻域）留到 Phase 2 的 guided filter，不用模糊 mask 凑。
 
@@ -100,7 +100,7 @@ float maskComponent(int base, vec2 pImg, float pLum, vec3 labSel) {
 
 ```glsl
 vec3 cPre = c;
-vec3 cSel = wbNeighbourhood(lensUV, lensGain);               // 抽出的 4-tap（passes.ts:716-722）
+vec3 cSel = wbNeighbourhood(lensUV, lensGain);               // 抽出的邻域均值，masks / HSL 共用一次
 float pLum = srgbEncode(clamp(ppLuma(cSel) * exp2(u_exposure), 0.0, 1.0));
 vec3 labSel = proPhotoToOklab(cSel);
 vec2 pImg = (u_imgFromTex * vec3(v_texCoord, 1.0)).xy;
