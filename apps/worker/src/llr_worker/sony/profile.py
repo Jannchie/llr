@@ -855,16 +855,14 @@ def look_render_info(
     # 高级's own contrast, beside the shot's. Both go on the wire because the
     # setting is a switch in the browser rather than something the decode knows.
     _, luma_contrast_advanced = luma_terms(cal, tweaks.fade, advanced=True)
-    # The engine divides the gains before the clamp and multiplies the chroma
-    # back after it. The shader can only do the multiply, so the division
-    # happens here and it gets the divided gains. chroma.rgb_to_ycc, which is
-    # not passing anything to a shader, does both halves itself and so takes the
-    # look's own gains — do not feed it these.
+    # Capture normalization is fixed while the user moves the edit slider.
+    # Initial decode passes capture settings as tweaks; rebuilds pass as_shot.
+    capture = tweaks if as_shot is None else as_shot
+    reference = saturation_factor(capture.saturation)
     sat = saturation_factor(tweaks.saturation)
-    # 饱和度 -100 is a factor of 0: the shader's multiply-back zeroes the
-    # chroma whatever the divided gains say, so the gains go out undivided
-    # rather than through a division by zero.
-    gain_wire = [float(x) / sat if sat > 0.0 else float(x) for x in gain]
+    # A zero capture factor is not emitted by camera metadata, but tolerate
+    # synthetic profiles without introducing division by zero.
+    gain_wire = [float(x) / reference if reference > 0.0 else float(x) for x in gain]
     luma_black, luma_scale = luma_levels(tweaks.black, tweaks.white)
     # As-shot is 1.0 exactly when the body applied DRO. A frame it rendered
     # without DRO still ships the table, so the control has something to scale,

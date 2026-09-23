@@ -437,45 +437,36 @@ def test_ygamma_moves_luma_and_nothing_else() -> None:
     assert np.ptp(shift, axis=-1).max() < 1e-6, "the same shift on R, G and B"
 
 
-def test_saturation_is_applied_twice_and_nearly_cancels() -> None:
-    """Sony's Saturation slider divides at RGB2YCC and multiplies back later.
+@pytest.mark.parametrize("capture", [0, 25, -55, 55])
+def test_edit_saturation_scales_chroma_without_changing_capture_gains(capture: int) -> None:
+    cross = np.zeros(4, dtype=np.float32)
+    gain = np.ones(4, dtype=np.float32)
+    img = np.array([[[0.45, 0.40, 0.35], [0.38, 0.40, 0.42]]], dtype=np.float32)
+    reference = saturation_factor(capture)
+    y0, cb0, cr0 = rgb_to_ycc(img, cross, gain, reference, reference)
+    for value in (-100, -90, -50, -20, 0, 20, 25, 50, 100):
+        factor = saturation_factor(value)
+        y, cb, cr = rgb_to_ycc(img, cross, gain, factor, reference)
+        assert np.array_equal(y, y0)
+        assert np.allclose(cb, cb0 * factor / reference, atol=1e-7)
+        assert np.allclose(cr, cr0 * factor / reference, atol=1e-7)
+        out = apply_chroma(img, cross, gain, saturation=factor, saturation_reference=reference)
+        assert np.isfinite(out).all()
+        if value == -100:
+            assert np.ptp(out, axis=-1).max() < 1e-7
+    # Captured gains are normalized before clipping, independently of edits.
+    saturated = np.array([[[1.0, 0.0, 0.0]]], dtype=np.float32)
+    _, _, cr = rgb_to_ycc(saturated, cross, gain, 0.1, reference)
+    assert np.allclose(cr, 0.05)
 
-    The two halves are the same factor, so the setting is close to a no-op — the
-    clamp between them is its whole visible effect. Measured on the engine's own
-    finished frames: x0.99 at +9, and x1.05 at -9, where the intermediate chroma
-    is 2.3x larger and clips. Anything that applied only one half would be out
-    by 55%, which is why both belong in one place.
-    """
-    # The argument is Edit's 饱和度 value, which is the engine's own number: the
-    # camera's +9 is 55 there (stops_to_panel), and Edit's slider reaches 100.
-    assert saturation_factor(0) == 1.0
+
+def test_saturation_panel_mapping() -> None:
     assert saturation_factor(55) == pytest.approx(1.55)
     assert saturation_factor(-55) == pytest.approx(0.45)
-    assert saturation_factor(100) == pytest.approx(2.0)
-    assert saturation_factor(-100) == 0.0, "the multiply-back is by zero: no chroma"
-    assert saturation_factor(999) == saturation_factor(100), "clamped to the panel"
-    assert stops_to_panel(saturation=2)["saturation"] == 20, "10 per step below 2"
-    assert stops_to_panel(saturation=3)["saturation"] == 25, "5 per step above it"
+    assert saturation_factor(-100) == 0
+    assert saturation_factor(999) == 2
+    assert stops_to_panel(saturation=3)["saturation"] == 25
     assert stops_to_panel(saturation=-9)["saturation"] == -55
-
-    cross, gain = unpack_params(VV2_CHROMA)
-    rng = np.random.default_rng(11)
-    img = rng.random((64, 64, 3), dtype=np.float32) * 0.5 + 0.2
-    plain = apply_chroma(img, cross, gain, *FADE0)
-    # rgb_to_ycc does both halves itself, so it takes the look's own gains — the
-    # divided ones are only for the shader, which can only do the multiply.
-    for s in (25, 55, -25):
-        got = apply_chroma(img, cross, gain, *FADE0, saturation=saturation_factor(s))
-        moved = np.abs(got - plain)
-        # Identical wherever the intermediate chroma stayed inside the clamp,
-        # and different only where it did not.
-        assert np.median(moved) < 1e-6
-        assert moved.max() > 1e-3
-    # -100 is the one value where nothing cancels: grey out, finite everywhere.
-    grey = apply_chroma(img, cross, gain, *FADE0, saturation=0.0)
-    assert np.isfinite(grey).all()
-    assert np.abs(grey[..., 0] - grey[..., 1]).max() < 1e-6
-    assert np.abs(grey[..., 2] - grey[..., 1]).max() < 1e-6
 
 
 def test_the_pair_is_deliberately_not_an_identity() -> None:
