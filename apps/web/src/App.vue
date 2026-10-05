@@ -24,7 +24,7 @@ import {
   packMasks, presetGroup, defaultComponent, defaultAdjust, MASK_PRESETS, MASK_GROUPS, MASK_COMPS,
   type MaskGroup, type MaskType, type MaskAdjust, type MaskPresetName, type MaskComponent,
 } from "./rendering/masks";
-import { trackFill, formatBytes, clamp, IMPORT_ACCEPT, IMPORT_FORMAT_HINT } from "./ui";
+import { formatBytes, clamp, IMPORT_ACCEPT, IMPORT_FORMAT_HINT } from "./ui";
 import { buildSections, GROUP_KEYS, SORT_KEYS, type GroupKey, type SortKey } from "./librarySort";
 import { pathOf, type FolderNode } from "./catalogTree";
 import { t, locale, setLocale, LOCALES, type MessageKey } from "./i18n";
@@ -557,9 +557,11 @@ const MASK_ADJUST_SLIDERS: { key: MaskSliderKey; min: number; max: number; step:
 // The cast's hue slider shows the wheel it picks from; the strength slider the
 // colour it lands on.
 const HUE_TRACK = "linear-gradient(to right, #f0f, #00f, #0ff, #0f0, #ff0, #f00, #f0f)";
+// A saturation track: grey up to the full colour of the hue it saturates.
+const satTrack = (hue: number) => `linear-gradient(to right, #888, hsl(${gradingHueDeg(hue)}, 100%, 50%))`;
 function maskTintTrack(key: MaskSliderKey, adjust: MaskAdjust): string | undefined {
   if (key === "tintHue") return HUE_TRACK;
-  if (key === "tintSat") return `linear-gradient(to right, #888, hsl(${gradingHueDeg(adjust.tintHue)}, 100%, 50%))`;
+  if (key === "tintSat") return satTrack(adjust.tintHue);
   return WB_TRACK[key as RecipeKey];
 }
 // The Add menu: presets first (the common cases), then a bare component of
@@ -3651,7 +3653,7 @@ const vWheelAdjust = {
         </div>
         <SliderRow v-for="(range, i) in HSL_RANGES" :key="range.key"
           :model-value="hslValue(i)" @update:model-value="v => setHsl(i, v)"
-          :label="t(`hsl.${range.key}`)" :dot-color="range.color" row-class="hsl-row" number-class="hsl-number"
+          :label="t(`hsl.${range.key}`)" :dot-color="range.color" row-class="hsl-row"
           :min="-100" :max="100" show-modified />
       </section>
 
@@ -3670,8 +3672,10 @@ const vWheelAdjust = {
             <span class="grading-dot" :style="{ background: gradingColor(g.band) }" />
             <span>{{ t(`grading.${g.band}`) }}</span>
           </div>
-          <SliderRow v-model="grading[g.hueKey]" :label="t('grading.h')" row-class="grading-row" :min="-180" :max="180" />
-          <SliderRow v-model="grading[g.satKey]" :label="t('grading.s')" row-class="grading-row" :min="0" :max="100" />
+          <SliderRow v-model="grading[g.hueKey]" :label="t('grading.h')" row-class="grading-row" :min="-180" :max="180"
+            :track="HUE_TRACK" />
+          <SliderRow v-model="grading[g.satKey]" :label="t('grading.s')" row-class="grading-row" :min="0" :max="100"
+            :track="satTrack(grading[g.hueKey])" />
         </div>
         <SliderRow v-model="grading.blend" :label="t('grading.blend')" :min="0" :max="100" :reset-value="50" />
         <SliderRow v-model="grading.balance" :label="t('grading.balance')" :min="-100" :max="100" />
@@ -3702,20 +3706,24 @@ const vWheelAdjust = {
           <SliderRow v-for="r in PARAM_REGIONS" :key="r"
             :model-value="paramValue(r)" @update:model-value="v => setParam(r, v)"
             :label="t(`curveRegion.${r}`)" :min="-100" :max="100" />
+          <!-- The three region boundaries as three thumbs on one rail. The
+               inputs are stacked; only their thumbs take the pointer. -->
           <div class="curve-splits">
             <span class="curve-splits-label">{{ t('curve.splits') }}</span>
-            <input type="range" min="4" max="96" step="1" :title="t('slider.hint')"
-              :value="paramValue('shadowSplit')"
-              :style="{ '--track': trackFill(paramValue('shadowSplit'), 0, 100) }"
-              @input="setParam('shadowSplit', Math.min(($event.target as HTMLInputElement).valueAsNumber, paramValue('midtoneSplit') - 4))" />
-            <input type="range" min="4" max="96" step="1" :title="t('slider.hint')"
-              :value="paramValue('midtoneSplit')"
-              :style="{ '--track': trackFill(paramValue('midtoneSplit'), 0, 100) }"
-              @input="setParam('midtoneSplit', Math.min(Math.max(($event.target as HTMLInputElement).valueAsNumber, paramValue('shadowSplit') + 4), paramValue('highlightSplit') - 4))" />
-            <input type="range" min="4" max="96" step="1" :title="t('slider.hint')"
-              :value="paramValue('highlightSplit')"
-              :style="{ '--track': trackFill(paramValue('highlightSplit'), 0, 100) }"
-              @input="setParam('highlightSplit', Math.max(($event.target as HTMLInputElement).valueAsNumber, paramValue('midtoneSplit') + 4))" />
+            <div class="split-rail" :style="{
+              '--s1': (paramValue('shadowSplit') - 4) / 92,
+              '--s2': (paramValue('midtoneSplit') - 4) / 92,
+              '--s3': (paramValue('highlightSplit') - 4) / 92 }">
+              <input type="range" min="4" max="96" step="1" :title="t('slider.hint')"
+                :value="paramValue('shadowSplit')"
+                @input="setParam('shadowSplit', Math.min(($event.target as HTMLInputElement).valueAsNumber, paramValue('midtoneSplit') - 4))" />
+              <input type="range" min="4" max="96" step="1" :title="t('slider.hint')"
+                :value="paramValue('midtoneSplit')"
+                @input="setParam('midtoneSplit', Math.min(Math.max(($event.target as HTMLInputElement).valueAsNumber, paramValue('shadowSplit') + 4), paramValue('highlightSplit') - 4))" />
+              <input type="range" min="4" max="96" step="1" :title="t('slider.hint')"
+                :value="paramValue('highlightSplit')"
+                @input="setParam('highlightSplit', Math.max(($event.target as HTMLInputElement).valueAsNumber, paramValue('midtoneSplit') + 4))" />
+            </div>
           </div>
         </div>
 
