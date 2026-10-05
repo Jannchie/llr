@@ -32,9 +32,11 @@ pnpm dev   # starts @llr/api (port 8790) + @llr/web (vite, port 5173 or next fre
 
 ## Useful hooks
 
-- Crop editor: press `r` (Lightroom-style). Overlay is an SVG: `.crop-frame` rect
-  (read `width`/`height` attrs for the box ratio in output-frame px), `.crop-handle`
-  rects in order tl,t,tr,l,r,bl,b,br, `.crop-grid line` for guide lines.
+- Crop editor: press `r` (Lightroom-style). Overlay is an SVG: the
+  `.crop-catch:not(.crop-catch-rotate)` rect is the box (read `width`/`height` attrs
+  for the ratio in output-frame px); edges are infinite lines whose grips are
+  `.crop-edge-hit` lines in order t,l,r,b, corner grips are `.crop-grip-hit` rects in
+  order tl,tr,bl,br; `.crop-grid line` for guide lines.
 - Keyboard shortcuts are blocked while focus is in a text/number input — click the
   body/stage first before pressing single-key shortcuts (r/x/o/Enter).
 - Undo/redo: `Control+z` / `Control+Shift+z`.

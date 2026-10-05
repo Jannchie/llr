@@ -618,7 +618,7 @@ const {
   cropGuide, setCropGuide, cycleCropGuide, cycleCropGuideVariant, cropGuideShapes,
   isRotating, rotateGridLines, lineTool, setLineTool, straightenLine, readoutAngle,
   setTransform, resetTransform, removeLastGuide, guideLinesView,
-  cropBoxRect, CROP_HANDLES, ofPerScreen, cropViewBox, cropDimPath, cropHandlePos,
+  cropBoxRect, ofPerScreen, cropViewBox, cropDimPath, cropOverscan, cropGrips, activeCropHandle,
   onCropHandleDown, onCropOverlayDown, onGuideHandleDown,
 } = useCropEditor({
   crop, srcW, srcH, fitScale, zoom,
@@ -644,6 +644,12 @@ const cropReadout = computed(() => {
   if (isRotating.value) return `${readoutAngle.value.toFixed(2)}°`;
   if (lineTool.value === "straighten") return t("crop.straightenHint");
   return "";
+});
+
+// Output size tag pinned inside the crop box's bottom-right corner.
+const cropSizeLabel = computed(() => {
+  const [w, h] = cropOutputSize(crop, srcW.value, srcH.value);
+  return `${w} × ${h}`;
 });
 
 // The transform sliders, in panel order; each is one SliderRow.
@@ -3089,8 +3095,8 @@ const vWheelAdjust = {
           <!-- transparent catchers: anywhere outside the box rotates (the rect
                far exceeds the bbox so it covers the viewport at any zoom/pan;
                overflow is visible and the viewport clips), inside moves. -->
-          <rect class="crop-catch crop-catch-rotate" :x="cropBBox.x - 50 * cropBBox.w" :y="cropBBox.y - 50 * cropBBox.h"
-            :width="101 * cropBBox.w" :height="101 * cropBBox.h" />
+          <rect class="crop-catch crop-catch-rotate" :x="cropOverscan.x" :y="cropOverscan.y"
+            :width="cropOverscan.w" :height="cropOverscan.h" />
           <rect class="crop-catch" :x="cropBoxRect.x" :y="cropBoxRect.y" :width="cropBoxRect.w" :height="cropBoxRect.h" />
           <!-- dim outside the crop -->
           <path class="crop-dim" :d="cropDimPath" fill-rule="evenodd" />
@@ -3115,14 +3121,27 @@ const vWheelAdjust = {
           <line v-if="straightenLine.active" class="crop-straighten-line"
             :x1="straightenLine.x1" :y1="straightenLine.y1" :x2="straightenLine.x2" :y2="straightenLine.y2"
             :stroke-width="1.5 * ofPerScreen" />
-          <!-- crop box border -->
-          <rect class="crop-frame" :x="cropBoxRect.x" :y="cropBoxRect.y" :width="cropBoxRect.w" :height="cropBoxRect.h" :stroke-width="1.5 * ofPerScreen" />
-          <!-- handles -->
-          <rect v-for="h in CROP_HANDLES" :key="h.key" class="crop-handle"
-            :x="cropHandlePos(h).x - 5.5 * ofPerScreen" :y="cropHandlePos(h).y - 5.5 * ofPerScreen"
-            :width="11 * ofPerScreen" :height="11 * ofPerScreen"
-            :style="{ cursor: h.cursor }"
-            @mousedown="onCropHandleDown($event, h.key)" />
+          <!-- crop edges: two horizontals and two verticals running out past
+               the viewport rather than a closed frame; each line is its edge's
+               grip, the crossings are the corner grips. -->
+          <g :class="{ 'is-dragging': activeCropHandle != null }">
+            <template v-for="e in cropGrips.edges" :key="e.key">
+              <line class="crop-edge" :class="{ 'is-hot': e.hot }"
+                :x1="e.line.x1" :y1="e.line.y1" :x2="e.line.x2" :y2="e.line.y2" :stroke-width="1 * ofPerScreen" />
+              <rect class="crop-grip" :class="{ 'is-hot': e.hot }" :x="e.bar.x" :y="e.bar.y" :width="e.bar.w" :height="e.bar.h" />
+              <line class="crop-edge-hit" :x1="e.line.x1" :y1="e.line.y1" :x2="e.line.x2" :y2="e.line.y2"
+                :stroke-width="12 * ofPerScreen" :style="{ cursor: e.cursor }" @mousedown="onCropHandleDown($event, e.key)" />
+            </template>
+            <template v-for="c in cropGrips.corners" :key="c.key">
+              <rect class="crop-grip crop-grip-corner" :class="{ 'is-hot': c.hot }"
+                :x="c.mark.x" :y="c.mark.y" :width="c.mark.w" :height="c.mark.h" :stroke-width="1 * ofPerScreen" />
+              <rect class="crop-grip-hit" :x="c.hit.x" :y="c.hit.y" :width="c.hit.w" :height="c.hit.h"
+                :style="{ cursor: c.cursor }" @mousedown="onCropHandleDown($event, c.key)" />
+            </template>
+          </g>
+          <text class="crop-size" :x="cropBoxRect.x + cropBoxRect.w - 8 * ofPerScreen"
+            :y="cropBoxRect.y + cropBoxRect.h - 8 * ofPerScreen"
+            :font-size="11 * ofPerScreen" :stroke-width="3 * ofPerScreen">{{ cropSizeLabel }}</text>
         </svg>
         <div v-if="cropMode && cropReadout" class="crop-readout">{{ cropReadout }}</div>
         <!-- Mask gradient handles (useMaskEditor): same box as the crop

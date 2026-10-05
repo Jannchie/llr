@@ -1,3 +1,11 @@
+@font-face {
+  font-family: "Berkeley Mono";
+  src: url("https://cdn.jannchie.com/fonts/variants/BerkeleyMono-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
   color-scheme: dark;
 
@@ -67,6 +75,8 @@
   --rail-w: 352px;
   --left-w: 232px;          /* folder tree */
   --tabbar-w: 36px;
+
+  --font-mono: "Berkeley Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
     ui-sans-serif, "Inter", system-ui, sans-serif;
@@ -2381,8 +2391,7 @@ input[type="range"]:focus::-moz-range-thumb {
 
 /* Space held: the viewport underneath takes the drag as a pan. */
 .crop-overlay.is-passthrough * { pointer-events: none; }
-.crop-overlay.is-straighten .crop-catch,
-.crop-overlay.is-straighten .crop-handle { cursor: crosshair; }
+.crop-overlay.is-straighten .crop-catch { cursor: crosshair; }
 
 .crop-grid-fine line { stroke: rgba(255, 255, 255, 0.22); }
 
@@ -2454,20 +2463,56 @@ input[type="range"]:focus::-moz-range-thumb {
 
 .crop-grid line { shape-rendering: crispEdges; }
 
-.crop-frame {
-  fill: none;
-  stroke: rgba(255, 255, 255, 0.95);
+/* The crop edges: hairlines that run off the viewport, not a closed frame.
+   They brighten while a grip is held, and the lines that grip moves go accent. */
+.crop-edge {
+  stroke: rgba(255, 255, 255, 0.5);
   pointer-events: none;
+  vector-effect: non-scaling-stroke;
+  shape-rendering: crispEdges;
+  transition: stroke 120ms ease;
+}
+
+.is-dragging > .crop-edge { stroke: rgba(255, 255, 255, 0.75); }
+.crop-edge.is-hot { stroke: var(--accent); }
+
+.crop-edge-hit {
+  stroke: transparent;
+  fill: none;
+  pointer-events: stroke;
+}
+
+.crop-grip-hit {
+  fill: transparent;
+  pointer-events: all;
+}
+
+.crop-grip {
+  fill: #fff;
+  pointer-events: none;
+  shape-rendering: crispEdges;
+  transition: fill 120ms ease;
+}
+
+.crop-grip-corner {
+  fill: rgba(12, 12, 14, 0.9);
+  stroke: #fff;
   vector-effect: non-scaling-stroke;
 }
 
-.crop-handle {
-  fill: #fff;
-  stroke: rgba(0, 0, 0, 0.35);
-  stroke-width: 1;
-  vector-effect: non-scaling-stroke;
-  pointer-events: all;
-  rx: 1px;
+.crop-grip.is-hot { fill: var(--accent); }
+.crop-grip-corner.is-hot { stroke: var(--accent); }
+
+.crop-size {
+  fill: rgba(255, 255, 255, 0.85);
+  stroke: rgba(0, 0, 0, 0.55);
+  paint-order: stroke;
+  text-anchor: end;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.04em;
+  pointer-events: none;
+  user-select: none;
 }
 
 /* Crop panel controls */
@@ -2893,7 +2938,7 @@ input[type="range"]:focus::-moz-range-thumb {
   overflow-wrap: anywhere;
   max-height: 160px;
   overflow: auto;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
   color: var(--error);
 }
