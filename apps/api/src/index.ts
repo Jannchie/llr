@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
-import { access, mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
@@ -83,6 +83,8 @@ const SUPPORTED_EXTENSIONS = new Set([
 ]);
 
 const JSON_BODY_LIMIT = 10 * 1024 * 1024;
+// An edited preview is a ~1000px JPEG: a few hundred KB.
+const PREVIEW_BODY_LIMIT = 8 * 1024 * 1024;
 const FORM_BODY_LIMIT = 512 * 1024 * 1024;
 // linear-*.bin / export-*.jpg are per-request scratch that the request itself
 // deletes. Anything still there (the API died mid-render) is orphaned, so it is
@@ -243,7 +245,8 @@ const FOLDER_ROUTE = new RegExp(`^/folders/(${FOLDER_ID})$`);
 const FOLDER_PHOTOS_ROUTE = new RegExp(`^/folders/(${FOLDER_ID})/photos$`);
 const PHOTO_ROUTE = new RegExp(`^/photos/(${SOURCE_ID})$`);
 const PHOTO_EDIT_ROUTE = new RegExp(`^/photos/(${SOURCE_ID})/edit$`);
-const PHOTO_IMAGE_ROUTE = new RegExp(`^/photos/(${SOURCE_ID})/(thumb|embedded)\\.jpg$`);
+const PHOTO_IMAGE_ROUTE = new RegExp(`^/photos/(${SOURCE_ID})/(thumb|embedded|edited)\\.jpg$`);
+const PHOTO_PREVIEW_ROUTE = new RegExp(`^/photos/(${SOURCE_ID})/preview$`);
 
 // The most ids one request may name. A whole folder's worth is the realistic
 // maximum; anything larger is a runaway client.
@@ -320,6 +323,22 @@ async function routeCatalog(pathname: string, method: string, request: IncomingM
     return;
   }
 
+  // The client's rendering of the edit, as a bare JPEG body. Written beside
+  // the camera's thumbnail and swapped in whole, so a reader never sees half.
+  const previewId = pathname.match(PHOTO_PREVIEW_ROUTE)?.[1];
+  if (previewId && method === "PUT") {
+    if (!catalog.getPhoto(previewId)) throw new HttpError(404, "Unknown photo");
+    if (request.headers["content-type"] !== "image/jpeg") {
+      throw new HttpError(415, "Expected content-type: image/jpeg");
+    }
+    const body = await readBody(request, PREVIEW_BODY_LIMIT);
+    const path = resolve(sessionDirFor(previewId), "edited.jpg");
+    await writeFile(`${path}.part`, body);
+    await rename(`${path}.part`, path);
+    sendJson(response, { photo: publicPhoto(catalog.setPreviewAt(previewId, Date.now())!) });
+    return;
+  }
+
   const editId = pathname.match(PHOTO_EDIT_ROUTE)?.[1];
   if (editId && method === "GET") {
     // `edit: null` (not a 404) for a photo still at its defaults: that is the
@@ -385,9 +404,16 @@ function validateEdit(body: { snapshot?: unknown; history?: unknown; historyInde
   return { snapshot, history, historyIndex };
 }
 
-// The record as the browser sees it: the row plus where its images are.
+// The record as the browser sees it: the row plus where its images are. The
+// edited preview's URL carries its version, so it may be cached as immutably
+// as the camera's own previews and still be replaced.
 function publicPhoto(p: PhotoRow) {
-  return { ...p, embeddedUrl: `/photos/${p.id}/embedded.jpg`, thumbUrl: `/photos/${p.id}/thumb.jpg` };
+  return {
+    ...p,
+    embeddedUrl: `/photos/${p.id}/embedded.jpg`,
+    thumbUrl: `/photos/${p.id}/thumb.jpg`,
+    previewUrl: p.previewAt ? `/photos/${p.id}/edited.jpg?v=${p.previewAt}` : null,
+  };
 }
 
 // Rows are already gone by the time this runs; a directory that will not go
@@ -941,20 +967,24 @@ async function readFormData(request: IncomingMessage): Promise<FormData> {
   }
 }
 
-async function readJson<T>(request: IncomingMessage): Promise<T> {
-  if (!isJsonContentType(request.headers["content-type"])) {
-    throw new HttpError(415, "Expected content-type: application/json");
-  }
+async function readBody(request: IncomingMessage, limit: number): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of request) {
     total += (chunk as Buffer).length;
-    if (total > JSON_BODY_LIMIT) {
+    if (total > limit) {
       throw new HttpError(413, "Request body too large");
     }
     chunks.push(chunk as Buffer);
   }
-  const text = Buffer.concat(chunks).toString("utf8");
+  return Buffer.concat(chunks);
+}
+
+async function readJson<T>(request: IncomingMessage): Promise<T> {
+  if (!isJsonContentType(request.headers["content-type"])) {
+    throw new HttpError(415, "Expected content-type: application/json");
+  }
+  const text = (await readBody(request, JSON_BODY_LIMIT)).toString("utf8");
   if (!text) {
     return {} as T;
   }

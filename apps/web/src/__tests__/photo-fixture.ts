@@ -8,8 +8,8 @@ export function photo(over: Partial<Photo> & { id: string }): Photo {
   return {
     folderId: 1, name: `${over.id}.arw`, ext: ".arw", size: 1000, importedAt: 1000, modifiedAt: 1000,
     width: 6000, height: 4000, orientation: 1, capturedAt: null, make: null, model: null, lens: null,
-    iso: null, exposure: null, fnumber: null, focal: null, thumbState: "ready",
-    embeddedUrl: "", thumbUrl: "", ...over,
+    iso: null, exposure: null, fnumber: null, focal: null, thumbState: "ready", previewAt: null,
+    embeddedUrl: "", thumbUrl: "", previewUrl: null, ...over,
   };
 }
 

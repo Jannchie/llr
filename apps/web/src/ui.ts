@@ -24,10 +24,15 @@ export type Photo = {
   fnumber: number | null;
   focal: number | null;
   thumbState: "pending" | "ready" | "failed";
+  /** When the edited preview was last written; null if it never was. */
+  previewAt: number | null;
   /** Camera preview JPEG, API-relative. */
   embeddedUrl: string;
   /** 384px thumbnail, API-relative. */
   thumbUrl: string;
+  /** The app's own rendering of the edit (~1024px, versioned), API-relative;
+   *  null until the photo has been shown with an edit. */
+  previewUrl: string | null;
 };
 
 // The active photo as the editor sees it. `invalid` is frontend-only (set

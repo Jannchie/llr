@@ -493,8 +493,10 @@ function onMenuClose(): void {
   container.value?.focus(); // the menu had the keyboard; the grid wants it back
 }
 
+// Reserves the thumbnail's box before it loads. Only the camera's thumbnail
+// has the source's proportions; an edited preview may be cropped to any.
 function aspectStyle(p: Photo): Record<string, string> | undefined {
-  return p.width && p.height ? { aspectRatio: `${p.width} / ${p.height}` } : undefined;
+  return !p.previewUrl && p.width && p.height ? { aspectRatio: `${p.width} / ${p.height}` } : undefined;
 }
 </script>
 

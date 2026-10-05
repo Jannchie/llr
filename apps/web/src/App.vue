@@ -834,7 +834,7 @@ const {
   capture: () => captureSnapshot(),
   apply: (s) => applySnapshot(s),
   suspended: () => isRestoring,
-  onCommitted: () => schedulePersist(),
+  onCommitted: () => { schedulePersist(); schedulePreview(); },
 });
 
 function captureSnapshot(): Snapshot {
@@ -963,6 +963,7 @@ type ImageEdit = PersistedEdit<Snapshot>;
 // Push a stored edit (null = defaults) into the live reactive state.
 // Does not decode/draw — the library pairs this with loadSource().
 function applyStoredEdit(e: ImageEdit | null): void {
+  previewDirty = e != null && !activeSource.value?.previewUrl;
   isRestoring = true;
   suppressDcpReload = true;
   if (e) {
@@ -987,7 +988,7 @@ const {
   selectSource, openPhoto, setView,
   selectFolder, toggleExpanded, createFolder, renameFolder, moveFolder, deleteFolder,
   removePhotos, renamePhoto, movePhotos, importFiles, importDropped, importPickedDirectory,
-  boot,
+  savePreview, boot,
 } = useCatalog<Snapshot, typeof viewSettings>({
   api: API,
   status, errorMessage, cropMode,
@@ -996,8 +997,14 @@ const {
   loadPixels: (id, o) => loadSource(id, o),
   flushPendingHistory: () => flushPendingHistory(),
   // A pending denoise reload belongs to the outgoing image; firing it after the
-  // switch would re-decode the new image a second time.
-  beforeActivate: () => { if (denoiseReloadTimer) { clearTimeout(denoiseReloadTimer); denoiseReloadTimer = 0; } },
+  // switch would re-decode the new image a second time. A pending preview is
+  // the outgoing image's too, and this is the last moment its pixels and its
+  // edit are both still live: take it now rather than drop it.
+  beforeActivate: () => {
+    if (denoiseReloadTimer) { clearTimeout(denoiseReloadTimer); denoiseReloadTimer = 0; }
+    flushPreview();
+    previewDirty = false;
+  },
   onEmptied: () => {
     currentSourceId = "";
     hasLinearData = false;
@@ -1360,6 +1367,7 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     clearInvalid(id);
     status.value = "idle";
     timing.value = Math.round(performance.now() - t0);
+    if (previewDirty) armPreviewTimer();
     return true;
   } catch (err) {
     if (stale()) return false; // a newer load owns status/errorMessage now
@@ -2013,6 +2021,7 @@ watch([recipe, hslHue, hslSat, hslLum, grading, masks, () => [...bypass]], () =>
   if (!isRestoring) scheduleWebGLDraw();
   scheduleHistoryCommit();
   schedulePersist();
+  schedulePreview();
 }, { deep: true });
 // The switches that reach something other than a draw parameter: the curve
 // LUT bake (the tone group's Basic terms rebake on their own, drawWebGL
@@ -2051,13 +2060,14 @@ watch(crop, () => {
   if (!isRestoring) scheduleCropRender();
   scheduleHistoryCommit();
   schedulePersist();
+  schedulePreview();
 }, { deep: true });
 
 // History/persist for the edit state not covered above (redraws handled by
 // their own paths: curve LUT bake, dcp/denoise re-decode; aspect is snapshot
 // state but changes no pixels by itself).
 watch([toneCurve, dcpCode, profileId, denoise, cropAspect, look, lookStyle, droStrength, droLevel, sonyAdvancedColour, sonyCameraMatch],
-  () => { scheduleHistoryCommit(); schedulePersist(); }, { deep: true });
+  () => { scheduleHistoryCommit(); schedulePersist(); schedulePreview(); }, { deep: true });
 
 // Sony's advanced colour reproduction. The same trade the camera-match toggle
 // makes: the table is static and lives in a uniform's texture, so the switch
@@ -2304,6 +2314,48 @@ function renderFrame(s: Snapshot | null, maxEdge: number, matte?: string): Pipel
 
 async function captureFrame(s: Snapshot | null, maxEdge: number, matte?: string): Promise<Blob> {
   return renderFrame(s, maxEdge, matte).toBlob("image/jpeg", 0.85);
+}
+
+// ── Edited preview ──
+// Once an edit settles, a ~1024px rendering of it is stored as the photo's
+// preview: the filmstrip and the grid show it instead of the camera's
+// thumbnail, and opening the photo shows it while the RAW decodes.
+const PREVIEW_EDGE = 1024;
+const PREVIEW_SETTLE_MS = 1000;
+let previewDirty = false;
+let previewTimer = 0;
+
+function armPreviewTimer(): void {
+  clearTimeout(previewTimer);
+  previewTimer = window.setTimeout(flushPreview, PREVIEW_SETTLE_MS);
+}
+
+function schedulePreview(): void {
+  if (isRestoring) return;
+  previewDirty = true;
+  armPreviewTimer();
+}
+
+// Renders and reads the pixels synchronously (only the JPEG encode and the
+// upload are async), so beforeActivate can call it while the renderer still
+// holds the outgoing photo.
+function flushPreview(): void {
+  clearTimeout(previewTimer);
+  previewTimer = 0;
+  const id = activeSource.value?.id;
+  if (!previewDirty || !id || !webglRenderer || !hasLinearData) return;
+  // The pixels must be this photo's and the frame its final crop, not the
+  // crop editor's straighten box; otherwise wait for things to settle.
+  if (renderedId.value !== id || status.value !== "idle" || cropMode.value) {
+    armPreviewTimer();
+    return;
+  }
+  const [ow, oh] = cropOutputSize(effectiveCrop(crop), srcW.value, srcH.value);
+  if (imageW.value !== ow || imageH.value !== oh) renderNormal(); // a crop render still queued
+  previewDirty = false;
+  captureFrame(null, PREVIEW_EDGE).then(
+    jpeg => savePreview(id, jpeg),
+    err => console.warn("failed to render the preview:", err));
 }
 
 async function blobToBase64(blob: Blob): Promise<string> {
@@ -3071,7 +3123,7 @@ const vWheelAdjust = {
         <!-- The camera JPEG stands in while a *different* source decodes: the
              fit view is a plain contain, so it lands where the frame will. -->
         <img v-if="activeSource && !activeSource.invalid && status === 'rendering' && renderedId !== activeSource.id"
-          class="preview-placeholder" :src="activeSource.embeddedUrl ? resolveUrl(activeSource.embeddedUrl) : thumbSrc(activeSource)" :alt="t('aria.preview')" />
+          class="preview-placeholder" :src="activeSource.previewUrl || !activeSource.embeddedUrl ? thumbSrc(activeSource) : resolveUrl(activeSource.embeddedUrl)" :alt="t('aria.preview')" />
         <!-- Camera-JPEG compare: opaque overlay in the canvas's exact box, with
              the full-frame JPEG placed inside it through the edit's own crop /
              straighten / flip so both sides show the same framing. The src stays

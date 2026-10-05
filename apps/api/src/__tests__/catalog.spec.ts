@@ -171,11 +171,34 @@ describe("migration", () => {
 
       const raw = new DatabaseSync(path);
       raw.exec("ALTER TABLE photos DROP COLUMN modified_at");
+      raw.exec("ALTER TABLE photos DROP COLUMN preview_at");
       raw.exec("PRAGMA user_version = 1");
       raw.close();
 
       const migrated = new Catalog(path);
-      expect(migrated.getPhoto("p")).toMatchObject({ importedAt: 4242, modifiedAt: 4242 });
+      expect(migrated.getPhoto("p")).toMatchObject({ importedAt: 4242, modifiedAt: 4242, previewAt: null });
+      migrated.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("adds the edited-preview version to a v2 library", () => {
+    const dir = mkdtempSync(join(tmpdir(), "llr-catalog-"));
+    const path = join(dir, "catalog.db");
+    try {
+      const v3 = new Catalog(path);
+      v3.insertPhoto({ id: "p", folderId: ROOT_FOLDER_ID, name: "p.arw", ext: ".arw", size: 1 }, 4242);
+      v3.close();
+
+      const raw = new DatabaseSync(path);
+      raw.exec("ALTER TABLE photos DROP COLUMN preview_at");
+      raw.exec("PRAGMA user_version = 2");
+      raw.close();
+
+      const migrated = new Catalog(path);
+      expect(migrated.getPhoto("p")).toMatchObject({ previewAt: null });
+      expect(migrated.setPreviewAt("p", 99)).toMatchObject({ previewAt: 99 });
       migrated.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
