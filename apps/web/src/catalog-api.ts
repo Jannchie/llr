@@ -104,6 +104,13 @@ export async function putEdit<S>(id: string, edit: PersistedEdit<S>, opts: { kee
   await request(`/photos/${id}/edit`, json("PUT", edit, { keepalive: opts.keepalive === true }));
 }
 
+// The client's rendering of the photo's edit; answers with the record, whose
+// previewUrl now names the new version.
+export async function putPreview(id: string, jpeg: Blob): Promise<Photo> {
+  const init: RequestInit = { method: "PUT", headers: { "content-type": "image/jpeg" }, body: jpeg };
+  return (await request<{ photo: Photo }>(`/photos/${id}/preview`, init)).photo;
+}
+
 // ── Migration ──
 
 export type LegacyPhoto = { id: string; name: string; size: number; edit?: PersistedEdit<unknown> };

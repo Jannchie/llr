@@ -185,10 +185,45 @@ export function useCropEditor(opts: {
          + `M${r.x},${r.y}V${r.y + r.h}H${r.x + r.w}V${r.y}Z`;
   });
 
-  function cropHandlePos(h: { fx: number; fy: number }): { x: number; y: number } {
-    const r = cropBoxRect.value;
-    return { x: r.x + h.fx * r.w, y: r.y + h.fy * r.h };
-  }
+  // Far beyond the bbox on every side (±50×): the viewport clips, so anything
+  // drawn to it reads as unbounded at any zoom/pan. The rotate catcher fills
+  // it; the edge lines run across it.
+  const cropOverscan = computed<Rect>(() => {
+    const B = cropBBox;
+    return { x: B.x - 50 * B.w, y: B.y - 50 * B.h, w: 101 * B.w, h: 101 * B.h };
+  });
+
+  // The grip being dragged, so the overlay can light up the edges it moves.
+  const activeCropHandle = ref<CropHandle | "move" | null>(null);
+  const hotEdges = computed<ReadonlySet<string>>(() => {
+    const a = activeCropHandle.value;
+    // A corner's key spells its two edges ("tl" = t + l).
+    return new Set(a === "move" ? ["t", "b", "l", "r"] : a ? [...a] : []);
+  });
+
+  // Overlay grips in output-frame units. The crop's edges are lines running
+  // across the overscan rather than a closed frame; each line is its edge's
+  // grip and carries a short bar at its midpoint. The corners are where the
+  // lines cross: a small square with a larger invisible hit target.
+  const cropGrips = computed(() => {
+    const r = cropBoxRect.value, O = cropOverscan.value, u = ofPerScreen.value;
+    const hot = hotEdges.value;
+    const edges = [], corners = [];
+    for (const h of CROP_HANDLES) {
+      const x = r.x + h.fx * r.w, y = r.y + h.fy * r.h;
+      const cursor = lineTool.value ? "crosshair" : h.cursor;
+      const isHot = [...h.key].every(k => hot.has(k));
+      const box = (half: number) => ({ x: x - half * u, y: y - half * u, w: 2 * half * u, h: 2 * half * u });
+      if (h.key.length === 2) { corners.push({ key: h.key, cursor, hot: isHot, mark: box(3.5), hit: box(10) }); continue; }
+      const horiz = h.fx === 0.5;
+      edges.push({
+        key: h.key, cursor, hot: isHot,
+        line: horiz ? { x1: O.x, y1: y, x2: O.x + O.w, y2: y } : { x1: x, y1: O.y, x2: x, y2: O.y + O.h },
+        bar: horiz ? { x: x - 9 * u, y: y - 1.25 * u, w: 18 * u, h: 2.5 * u } : { x: x - 1.25 * u, y: y - 9 * u, w: 2.5 * u, h: 18 * u },
+      });
+    }
+    return { edges, corners };
+  });
 
   // ── Drag state machine ──
 
@@ -229,6 +264,7 @@ export function useCropEditor(opts: {
     e.stopPropagation();
     const r = cropBoxRect.value;
     cropDrag = { mode: "resize", handle, l: r.x, t: r.y, r: r.x + r.w, b: r.y + r.h, startRatio: r.w / r.h };
+    activeCropHandle.value = handle;
     attachCropDrag();
   }
 
@@ -244,6 +280,7 @@ export function useCropEditor(opts: {
       isRotating.value = true;
     } else if (inside) {
       cropDrag = { mode: "move", startX: p.x, startY: p.y, cx: crop.cx, cy: crop.cy };
+      activeCropHandle.value = "move";
     } else {
       // Drag in the margin to straighten (rotate the image), Lightroom-style.
       const [iw, ih] = currentImageDims();
@@ -318,6 +355,7 @@ export function useCropEditor(opts: {
     }
     isRotating.value = false;
     cropDrag = null;
+    activeCropHandle.value = null;
     window.removeEventListener("mousemove", onCropDragMove);
     window.removeEventListener("mouseup", onCropDragUp);
     opts.onDragEnd();
@@ -396,7 +434,7 @@ export function useCropEditor(opts: {
     cropGuide, setCropGuide, cycleCropGuide, cycleCropGuideVariant, cropGuideShapes: cropGuideShapesView,
     isRotating, rotateGridLines, lineTool, setLineTool, straightenLine, readoutAngle,
     setTransform, resetTransform, removeLastGuide, guideLinesView,
-    cropBoxRect, CROP_HANDLES, ofPerScreen, cropViewBox, cropDimPath, cropHandlePos,
+    cropBoxRect, ofPerScreen, cropViewBox, cropDimPath, cropOverscan, cropGrips, activeCropHandle,
     onCropHandleDown, onCropOverlayDown, onGuideHandleDown,
   };
 }

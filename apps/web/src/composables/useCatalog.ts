@@ -125,7 +125,8 @@ export function useCatalog<S, V>(opts: {
 
   function photoById(id: string): Photo | undefined { return photosById.get(id); }
   function resolveUrl(u: string): string { return isAbsoluteUrl(u) ? u : `${opts.api}${u}`; }
-  function thumbSrc(p: Photo): string { return resolveUrl(p.thumbUrl); }
+  // The rendering of the edit when there is one, else the camera's thumbnail.
+  function thumbSrc(p: Photo): string { return resolveUrl(p.previewUrl ?? p.thumbUrl); }
 
   function markInvalid(id: string): void {
     invalidIds.add(id);
@@ -378,24 +379,37 @@ export function useCatalog<S, V>(opts: {
 
   // ── Photo operations ──
 
+  // One way in for a record: the session's map, the open folder's listing and
+  // the active photo are three copies of the same row.
+  function apply(p: Photo): void {
+    photosById.set(p.id, p);
+    const i = folderPhotos.value.findIndex(f => f.id === p.id);
+    if (i >= 0) {
+      const next = folderPhotos.value.slice();
+      next[i] = p;
+      folderPhotos.value = next;
+    }
+    if (activePhoto.value?.id === p.id) activePhoto.value = p;
+  }
+
+  // Store a rendering of the photo's edit as its preview; the filmstrip, the
+  // grid and the next visit's placeholder pick the new version up.
+  async function savePreview(id: string, jpeg: Blob): Promise<void> {
+    try {
+      const photo = await api.putPreview(id, jpeg);
+      if (photosById.has(id)) apply(photo);
+    } catch (error) {
+      // A missed preview only leaves the previous one up; not worth a toast.
+      console.warn(`failed to save the preview of ${id}:`, error);
+    }
+  }
+
   // Rename the display label (the copy behind it is named after its id). The
   // grid shows the new name at once; a refusal — a sibling already has it —
   // puts the old one back and says why.
   async function renamePhoto(id: string, name: string): Promise<void> {
     const photo = photosById.get(id);
     if (!photo || photo.name === name) return;
-    // One way in for a record: the session's map, the open folder's listing and
-    // the active photo are three copies of the same row.
-    const apply = (p: Photo) => {
-      photosById.set(id, p);
-      const i = folderPhotos.value.findIndex(f => f.id === id);
-      if (i >= 0) {
-        const next = folderPhotos.value.slice();
-        next[i] = p;
-        folderPhotos.value = next;
-      }
-      if (activePhoto.value?.id === id) activePhoto.value = p;
-    };
     apply({ ...photo, name });
     try {
       const renamed = await api.renamePhoto(id, name);
@@ -689,6 +703,6 @@ export function useCatalog<S, V>(opts: {
     activateSource, selectSource, openPhoto, setView,
     selectFolder, toggleExpanded, createFolder, renameFolder, moveFolder, deleteFolder,
     removePhotos, renamePhoto, movePhotos, importFiles, importDropped, importPickedDirectory,
-    boot,
+    savePreview, boot,
   };
 }

@@ -24,7 +24,7 @@ import {
   packMasks, presetGroup, defaultComponent, defaultAdjust, MASK_PRESETS, MASK_GROUPS, MASK_COMPS,
   type MaskGroup, type MaskType, type MaskAdjust, type MaskPresetName, type MaskComponent,
 } from "./rendering/masks";
-import { trackFill, formatBytes, clamp, IMPORT_ACCEPT, IMPORT_FORMAT_HINT } from "./ui";
+import { formatBytes, clamp, IMPORT_ACCEPT, IMPORT_FORMAT_HINT } from "./ui";
 import { buildSections, GROUP_KEYS, SORT_KEYS, type GroupKey, type SortKey } from "./librarySort";
 import { pathOf, type FolderNode } from "./catalogTree";
 import { t, locale, setLocale, LOCALES, type MessageKey } from "./i18n";
@@ -557,9 +557,11 @@ const MASK_ADJUST_SLIDERS: { key: MaskSliderKey; min: number; max: number; step:
 // The cast's hue slider shows the wheel it picks from; the strength slider the
 // colour it lands on.
 const HUE_TRACK = "linear-gradient(to right, #f0f, #00f, #0ff, #0f0, #ff0, #f00, #f0f)";
+// A saturation track: grey up to the full colour of the hue it saturates.
+const satTrack = (hue: number) => `linear-gradient(to right, #888, hsl(${gradingHueDeg(hue)}, 100%, 50%))`;
 function maskTintTrack(key: MaskSliderKey, adjust: MaskAdjust): string | undefined {
   if (key === "tintHue") return HUE_TRACK;
-  if (key === "tintSat") return `linear-gradient(to right, #888, hsl(${gradingHueDeg(adjust.tintHue)}, 100%, 50%))`;
+  if (key === "tintSat") return satTrack(adjust.tintHue);
   return WB_TRACK[key as RecipeKey];
 }
 // The Add menu: presets first (the common cases), then a bare component of
@@ -618,7 +620,7 @@ const {
   cropGuide, setCropGuide, cycleCropGuide, cycleCropGuideVariant, cropGuideShapes,
   isRotating, rotateGridLines, lineTool, setLineTool, straightenLine, readoutAngle,
   setTransform, resetTransform, removeLastGuide, guideLinesView,
-  cropBoxRect, CROP_HANDLES, ofPerScreen, cropViewBox, cropDimPath, cropHandlePos,
+  cropBoxRect, ofPerScreen, cropViewBox, cropDimPath, cropOverscan, cropGrips, activeCropHandle,
   onCropHandleDown, onCropOverlayDown, onGuideHandleDown,
 } = useCropEditor({
   crop, srcW, srcH, fitScale, zoom,
@@ -644,6 +646,12 @@ const cropReadout = computed(() => {
   if (isRotating.value) return `${readoutAngle.value.toFixed(2)}°`;
   if (lineTool.value === "straighten") return t("crop.straightenHint");
   return "";
+});
+
+// Output size tag pinned inside the crop box's bottom-right corner.
+const cropSizeLabel = computed(() => {
+  const [w, h] = cropOutputSize(crop, srcW.value, srcH.value);
+  return `${w} × ${h}`;
 });
 
 // The transform sliders, in panel order; each is one SliderRow.
@@ -826,7 +834,7 @@ const {
   capture: () => captureSnapshot(),
   apply: (s) => applySnapshot(s),
   suspended: () => isRestoring,
-  onCommitted: () => schedulePersist(),
+  onCommitted: () => { schedulePersist(); schedulePreview(); },
 });
 
 function captureSnapshot(): Snapshot {
@@ -955,6 +963,7 @@ type ImageEdit = PersistedEdit<Snapshot>;
 // Push a stored edit (null = defaults) into the live reactive state.
 // Does not decode/draw — the library pairs this with loadSource().
 function applyStoredEdit(e: ImageEdit | null): void {
+  previewDirty = e != null && !activeSource.value?.previewUrl;
   isRestoring = true;
   suppressDcpReload = true;
   if (e) {
@@ -979,7 +988,7 @@ const {
   selectSource, openPhoto, setView,
   selectFolder, toggleExpanded, createFolder, renameFolder, moveFolder, deleteFolder,
   removePhotos, renamePhoto, movePhotos, importFiles, importDropped, importPickedDirectory,
-  boot,
+  savePreview, boot,
 } = useCatalog<Snapshot, typeof viewSettings>({
   api: API,
   status, errorMessage, cropMode,
@@ -988,8 +997,14 @@ const {
   loadPixels: (id, o) => loadSource(id, o),
   flushPendingHistory: () => flushPendingHistory(),
   // A pending denoise reload belongs to the outgoing image; firing it after the
-  // switch would re-decode the new image a second time.
-  beforeActivate: () => { if (denoiseReloadTimer) { clearTimeout(denoiseReloadTimer); denoiseReloadTimer = 0; } },
+  // switch would re-decode the new image a second time. A pending preview is
+  // the outgoing image's too, and this is the last moment its pixels and its
+  // edit are both still live: take it now rather than drop it.
+  beforeActivate: () => {
+    if (denoiseReloadTimer) { clearTimeout(denoiseReloadTimer); denoiseReloadTimer = 0; }
+    flushPreview();
+    previewDirty = false;
+  },
   onEmptied: () => {
     currentSourceId = "";
     hasLinearData = false;
@@ -1352,6 +1367,7 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     clearInvalid(id);
     status.value = "idle";
     timing.value = Math.round(performance.now() - t0);
+    if (previewDirty) armPreviewTimer();
     return true;
   } catch (err) {
     if (stale()) return false; // a newer load owns status/errorMessage now
@@ -2005,6 +2021,7 @@ watch([recipe, hslHue, hslSat, hslLum, grading, masks, () => [...bypass]], () =>
   if (!isRestoring) scheduleWebGLDraw();
   scheduleHistoryCommit();
   schedulePersist();
+  schedulePreview();
 }, { deep: true });
 // The switches that reach something other than a draw parameter: the curve
 // LUT bake (the tone group's Basic terms rebake on their own, drawWebGL
@@ -2043,13 +2060,14 @@ watch(crop, () => {
   if (!isRestoring) scheduleCropRender();
   scheduleHistoryCommit();
   schedulePersist();
+  schedulePreview();
 }, { deep: true });
 
 // History/persist for the edit state not covered above (redraws handled by
 // their own paths: curve LUT bake, dcp/denoise re-decode; aspect is snapshot
 // state but changes no pixels by itself).
 watch([toneCurve, dcpCode, profileId, denoise, cropAspect, look, lookStyle, droStrength, droLevel, sonyAdvancedColour, sonyCameraMatch],
-  () => { scheduleHistoryCommit(); schedulePersist(); }, { deep: true });
+  () => { scheduleHistoryCommit(); schedulePersist(); schedulePreview(); }, { deep: true });
 
 // Sony's advanced colour reproduction. The same trade the camera-match toggle
 // makes: the table is static and lives in a uniform's texture, so the switch
@@ -2296,6 +2314,48 @@ function renderFrame(s: Snapshot | null, maxEdge: number, matte?: string): Pipel
 
 async function captureFrame(s: Snapshot | null, maxEdge: number, matte?: string): Promise<Blob> {
   return renderFrame(s, maxEdge, matte).toBlob("image/jpeg", 0.85);
+}
+
+// ── Edited preview ──
+// Once an edit settles, a ~1024px rendering of it is stored as the photo's
+// preview: the filmstrip and the grid show it instead of the camera's
+// thumbnail, and opening the photo shows it while the RAW decodes.
+const PREVIEW_EDGE = 1024;
+const PREVIEW_SETTLE_MS = 1000;
+let previewDirty = false;
+let previewTimer = 0;
+
+function armPreviewTimer(): void {
+  clearTimeout(previewTimer);
+  previewTimer = window.setTimeout(flushPreview, PREVIEW_SETTLE_MS);
+}
+
+function schedulePreview(): void {
+  if (isRestoring) return;
+  previewDirty = true;
+  armPreviewTimer();
+}
+
+// Renders and reads the pixels synchronously (only the JPEG encode and the
+// upload are async), so beforeActivate can call it while the renderer still
+// holds the outgoing photo.
+function flushPreview(): void {
+  clearTimeout(previewTimer);
+  previewTimer = 0;
+  const id = activeSource.value?.id;
+  if (!previewDirty || !id || !webglRenderer || !hasLinearData) return;
+  // The pixels must be this photo's and the frame its final crop, not the
+  // crop editor's straighten box; otherwise wait for things to settle.
+  if (renderedId.value !== id || status.value !== "idle" || cropMode.value) {
+    armPreviewTimer();
+    return;
+  }
+  const [ow, oh] = cropOutputSize(effectiveCrop(crop), srcW.value, srcH.value);
+  if (imageW.value !== ow || imageH.value !== oh) renderNormal(); // a crop render still queued
+  previewDirty = false;
+  captureFrame(null, PREVIEW_EDGE).then(
+    jpeg => savePreview(id, jpeg),
+    err => console.warn("failed to render the preview:", err));
 }
 
 async function blobToBase64(blob: Blob): Promise<string> {
@@ -3063,7 +3123,7 @@ const vWheelAdjust = {
         <!-- The camera JPEG stands in while a *different* source decodes: the
              fit view is a plain contain, so it lands where the frame will. -->
         <img v-if="activeSource && !activeSource.invalid && status === 'rendering' && renderedId !== activeSource.id"
-          class="preview-placeholder" :src="activeSource.embeddedUrl ? resolveUrl(activeSource.embeddedUrl) : thumbSrc(activeSource)" :alt="t('aria.preview')" />
+          class="preview-placeholder" :src="activeSource.previewUrl || !activeSource.embeddedUrl ? thumbSrc(activeSource) : resolveUrl(activeSource.embeddedUrl)" :alt="t('aria.preview')" />
         <!-- Camera-JPEG compare: opaque overlay in the canvas's exact box, with
              the full-frame JPEG placed inside it through the edit's own crop /
              straighten / flip so both sides show the same framing. The src stays
@@ -3089,8 +3149,8 @@ const vWheelAdjust = {
           <!-- transparent catchers: anywhere outside the box rotates (the rect
                far exceeds the bbox so it covers the viewport at any zoom/pan;
                overflow is visible and the viewport clips), inside moves. -->
-          <rect class="crop-catch crop-catch-rotate" :x="cropBBox.x - 50 * cropBBox.w" :y="cropBBox.y - 50 * cropBBox.h"
-            :width="101 * cropBBox.w" :height="101 * cropBBox.h" />
+          <rect class="crop-catch crop-catch-rotate" :x="cropOverscan.x" :y="cropOverscan.y"
+            :width="cropOverscan.w" :height="cropOverscan.h" />
           <rect class="crop-catch" :x="cropBoxRect.x" :y="cropBoxRect.y" :width="cropBoxRect.w" :height="cropBoxRect.h" />
           <!-- dim outside the crop -->
           <path class="crop-dim" :d="cropDimPath" fill-rule="evenodd" />
@@ -3115,14 +3175,27 @@ const vWheelAdjust = {
           <line v-if="straightenLine.active" class="crop-straighten-line"
             :x1="straightenLine.x1" :y1="straightenLine.y1" :x2="straightenLine.x2" :y2="straightenLine.y2"
             :stroke-width="1.5 * ofPerScreen" />
-          <!-- crop box border -->
-          <rect class="crop-frame" :x="cropBoxRect.x" :y="cropBoxRect.y" :width="cropBoxRect.w" :height="cropBoxRect.h" :stroke-width="1.5 * ofPerScreen" />
-          <!-- handles -->
-          <rect v-for="h in CROP_HANDLES" :key="h.key" class="crop-handle"
-            :x="cropHandlePos(h).x - 5.5 * ofPerScreen" :y="cropHandlePos(h).y - 5.5 * ofPerScreen"
-            :width="11 * ofPerScreen" :height="11 * ofPerScreen"
-            :style="{ cursor: h.cursor }"
-            @mousedown="onCropHandleDown($event, h.key)" />
+          <!-- crop edges: two horizontals and two verticals running out past
+               the viewport rather than a closed frame; each line is its edge's
+               grip, the crossings are the corner grips. -->
+          <g :class="{ 'is-dragging': activeCropHandle != null }">
+            <template v-for="e in cropGrips.edges" :key="e.key">
+              <line class="crop-edge" :class="{ 'is-hot': e.hot }"
+                :x1="e.line.x1" :y1="e.line.y1" :x2="e.line.x2" :y2="e.line.y2" :stroke-width="1 * ofPerScreen" />
+              <rect class="crop-grip" :class="{ 'is-hot': e.hot }" :x="e.bar.x" :y="e.bar.y" :width="e.bar.w" :height="e.bar.h" />
+              <line class="crop-edge-hit" :x1="e.line.x1" :y1="e.line.y1" :x2="e.line.x2" :y2="e.line.y2"
+                :stroke-width="12 * ofPerScreen" :style="{ cursor: e.cursor }" @mousedown="onCropHandleDown($event, e.key)" />
+            </template>
+            <template v-for="c in cropGrips.corners" :key="c.key">
+              <rect class="crop-grip crop-grip-corner" :class="{ 'is-hot': c.hot }"
+                :x="c.mark.x" :y="c.mark.y" :width="c.mark.w" :height="c.mark.h" :stroke-width="1 * ofPerScreen" />
+              <rect class="crop-grip-hit" :x="c.hit.x" :y="c.hit.y" :width="c.hit.w" :height="c.hit.h"
+                :style="{ cursor: c.cursor }" @mousedown="onCropHandleDown($event, c.key)" />
+            </template>
+          </g>
+          <text class="crop-size" :x="cropBoxRect.x + cropBoxRect.w - 8 * ofPerScreen"
+            :y="cropBoxRect.y + cropBoxRect.h - 8 * ofPerScreen"
+            :font-size="11 * ofPerScreen" :stroke-width="3 * ofPerScreen">{{ cropSizeLabel }}</text>
         </svg>
         <div v-if="cropMode && cropReadout" class="crop-readout">{{ cropReadout }}</div>
         <!-- Mask gradient handles (useMaskEditor): same box as the crop
@@ -3632,7 +3705,7 @@ const vWheelAdjust = {
         </div>
         <SliderRow v-for="(range, i) in HSL_RANGES" :key="range.key"
           :model-value="hslValue(i)" @update:model-value="v => setHsl(i, v)"
-          :label="t(`hsl.${range.key}`)" :dot-color="range.color" row-class="hsl-row" number-class="hsl-number"
+          :label="t(`hsl.${range.key}`)" :dot-color="range.color" row-class="hsl-row"
           :min="-100" :max="100" show-modified />
       </section>
 
@@ -3651,8 +3724,10 @@ const vWheelAdjust = {
             <span class="grading-dot" :style="{ background: gradingColor(g.band) }" />
             <span>{{ t(`grading.${g.band}`) }}</span>
           </div>
-          <SliderRow v-model="grading[g.hueKey]" :label="t('grading.h')" row-class="grading-row" :min="-180" :max="180" />
-          <SliderRow v-model="grading[g.satKey]" :label="t('grading.s')" row-class="grading-row" :min="0" :max="100" />
+          <SliderRow v-model="grading[g.hueKey]" :label="t('grading.h')" row-class="grading-row" :min="-180" :max="180"
+            :track="HUE_TRACK" />
+          <SliderRow v-model="grading[g.satKey]" :label="t('grading.s')" row-class="grading-row" :min="0" :max="100"
+            :track="satTrack(grading[g.hueKey])" />
         </div>
         <SliderRow v-model="grading.blend" :label="t('grading.blend')" :min="0" :max="100" :reset-value="50" />
         <SliderRow v-model="grading.balance" :label="t('grading.balance')" :min="-100" :max="100" />
@@ -3683,20 +3758,24 @@ const vWheelAdjust = {
           <SliderRow v-for="r in PARAM_REGIONS" :key="r"
             :model-value="paramValue(r)" @update:model-value="v => setParam(r, v)"
             :label="t(`curveRegion.${r}`)" :min="-100" :max="100" />
+          <!-- The three region boundaries as three thumbs on one rail. The
+               inputs are stacked; only their thumbs take the pointer. -->
           <div class="curve-splits">
             <span class="curve-splits-label">{{ t('curve.splits') }}</span>
-            <input type="range" min="4" max="96" step="1" :title="t('slider.hint')"
-              :value="paramValue('shadowSplit')"
-              :style="{ '--track': trackFill(paramValue('shadowSplit'), 0, 100) }"
-              @input="setParam('shadowSplit', Math.min(($event.target as HTMLInputElement).valueAsNumber, paramValue('midtoneSplit') - 4))" />
-            <input type="range" min="4" max="96" step="1" :title="t('slider.hint')"
-              :value="paramValue('midtoneSplit')"
-              :style="{ '--track': trackFill(paramValue('midtoneSplit'), 0, 100) }"
-              @input="setParam('midtoneSplit', Math.min(Math.max(($event.target as HTMLInputElement).valueAsNumber, paramValue('shadowSplit') + 4), paramValue('highlightSplit') - 4))" />
-            <input type="range" min="4" max="96" step="1" :title="t('slider.hint')"
-              :value="paramValue('highlightSplit')"
-              :style="{ '--track': trackFill(paramValue('highlightSplit'), 0, 100) }"
-              @input="setParam('highlightSplit', Math.max(($event.target as HTMLInputElement).valueAsNumber, paramValue('midtoneSplit') + 4))" />
+            <div class="split-rail" :style="{
+              '--s1': (paramValue('shadowSplit') - 4) / 92,
+              '--s2': (paramValue('midtoneSplit') - 4) / 92,
+              '--s3': (paramValue('highlightSplit') - 4) / 92 }">
+              <input type="range" min="4" max="96" step="1" :title="t('slider.hint')"
+                :value="paramValue('shadowSplit')"
+                @input="setParam('shadowSplit', Math.min(($event.target as HTMLInputElement).valueAsNumber, paramValue('midtoneSplit') - 4))" />
+              <input type="range" min="4" max="96" step="1" :title="t('slider.hint')"
+                :value="paramValue('midtoneSplit')"
+                @input="setParam('midtoneSplit', Math.min(Math.max(($event.target as HTMLInputElement).valueAsNumber, paramValue('shadowSplit') + 4), paramValue('highlightSplit') - 4))" />
+              <input type="range" min="4" max="96" step="1" :title="t('slider.hint')"
+                :value="paramValue('highlightSplit')"
+                @input="setParam('highlightSplit', Math.max(($event.target as HTMLInputElement).valueAsNumber, paramValue('midtoneSplit') + 4))" />
+            </div>
           </div>
         </div>
 

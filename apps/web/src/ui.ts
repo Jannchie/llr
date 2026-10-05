@@ -24,10 +24,15 @@ export type Photo = {
   fnumber: number | null;
   focal: number | null;
   thumbState: "pending" | "ready" | "failed";
+  /** When the edited preview was last written; null if it never was. */
+  previewAt: number | null;
   /** Camera preview JPEG, API-relative. */
   embeddedUrl: string;
   /** 384px thumbnail, API-relative. */
   thumbUrl: string;
+  /** The app's own rendering of the edit (~1024px, versioned), API-relative;
+   *  null until the photo has been shown with an edit. */
+  previewUrl: string | null;
 };
 
 // The active photo as the editor sees it. `invalid` is frontend-only (set
@@ -37,16 +42,6 @@ export type Source = Photo & { invalid?: boolean };
 
 export function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
-}
-
-// Build a filled-track gradient for a range input. Bipolar sliders (min<0<max)
-// fill from the center toward the thumb; unipolar fill from the left.
-export function trackFill(value: number, min: number, max: number): string {
-  const p = clamp((value - min) / (max - min), 0, 1) * 100;
-  const z = min < 0 && max > 0 ? (-min) / (max - min) * 100 : 0;
-  const a = Math.min(p, z);
-  const b = Math.max(p, z);
-  return `linear-gradient(to right, var(--track-bg) ${a}%, var(--accent) ${a}%, var(--accent) ${b}%, var(--track-bg) ${b}%)`;
 }
 
 export function formatBytes(n: number): string {

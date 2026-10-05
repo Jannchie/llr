@@ -48,6 +48,13 @@ export type PhotoRow = {
   fnumber: number | null;
   focal: number | null;
   thumbState: ThumbState;
+  /**
+   * When the client last uploaded a rendering of the photo's edit (the small
+   * `edited.jpg` beside the camera's thumbnail), or null if it never has. It
+   * doubles as the preview's version: its URL carries it, so the image can be
+   * cached for good and still change.
+   */
+  previewAt: number | null;
 };
 
 export type PhotoMeta = Partial<Pick<PhotoRow,
@@ -74,7 +81,7 @@ export class CatalogError extends Error {
   }
 }
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 const SCHEMA = `
 CREATE TABLE folders (
@@ -102,7 +109,8 @@ CREATE TABLE photos (
   exposure REAL,
   fnumber REAL,
   focal REAL,
-  thumb_state TEXT NOT NULL DEFAULT 'pending'
+  thumb_state TEXT NOT NULL DEFAULT 'pending',
+  preview_at INTEGER
 );
 CREATE INDEX photos_folder ON photos(folder_id);
 CREATE TABLE edits (
@@ -119,7 +127,7 @@ CREATE TABLE meta (
 `;
 
 const PHOTO_COLUMNS = `id, folder_id, name, ext, size, imported_at, modified_at, width, height, orientation,
-  captured_at, make, model, lens, iso, exposure, fnumber, focal, thumb_state`;
+  captured_at, make, model, lens, iso, exposure, fnumber, focal, thumb_state, preview_at`;
 
 // Chronological where the shot has a capture time, import order for the rest
 // (a screenshot, a file with no EXIF) — those sort last rather than by an
@@ -157,6 +165,7 @@ function toPhoto(r: Row): PhotoRow {
     fnumber: num(r.fnumber),
     focal: num(r.focal),
     thumbState: (str(r.thumb_state) as ThumbState | null) ?? "pending",
+    previewAt: num(r.preview_at),
   };
 }
 
@@ -205,6 +214,11 @@ export class Catalog {
       if (version === 1) {
         this.db.exec("ALTER TABLE photos ADD COLUMN modified_at INTEGER");
         this.db.exec("UPDATE photos SET modified_at = imported_at");
+      }
+      // v3: the edited preview's version (see PhotoRow). Nothing to backfill:
+      // a photo has no rendering of its edit until the client next shows it.
+      if (version >= 1 && version < 3) {
+        this.db.exec("ALTER TABLE photos ADD COLUMN preview_at INTEGER");
       }
       this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
       this.db.exec("COMMIT");
@@ -361,6 +375,12 @@ export class Catalog {
       this.db.prepare("UPDATE photos SET name = ? WHERE id = ?").run(name, id);
       return this.getPhoto(id)!;
     });
+  }
+
+  /** Record that the photo's edited preview was (re)written at `at`. */
+  setPreviewAt(id: string, at: number): PhotoRow | null {
+    this.db.prepare("UPDATE photos SET preview_at = ? WHERE id = ?").run(at, id);
+    return this.getPhoto(id);
   }
 
   /** Fill in what the preview extraction learned; absent keys are left alone. */
