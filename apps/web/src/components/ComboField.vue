@@ -2,6 +2,8 @@
 import { computed, nextTick, onBeforeUnmount, ref, useId, watch } from "vue";
 import { t } from "../i18n";
 import { useFixedPlacement } from "../composables/useFixedPlacement";
+import { IconCheck, IconChevronDown } from "@jannchie/icons";
+import { JIcon } from "@jannchie/icons-vue";
 
 // A text field that suggests: type freely, or pick from the list that floats
 // under it. It is the model dialog's field — the API's registry supplies the
@@ -210,19 +212,13 @@ onBeforeUnmount(() => closeList());
       :aria-activedescendant="open && activeIndex >= 0 ? optionId(activeIndex) : undefined"
       @input="onInput(($event.target as HTMLInputElement).value)"
       @pointerdown="onPointerDown" @focus="openList('')" @blur="closeList(); commit()" @keydown="onKeydown" />
-    <svg class="combo-caret" viewBox="0 0 10 6" aria-hidden="true">
-      <path d="M1 1l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
-        stroke-linejoin="round" />
-    </svg>
+    <JIcon class="combo-caret" :icon="IconChevronDown" weight="bold" />
     <div v-if="open" :id="listId" ref="listEl" class="select-pop" :class="{ 'is-placed': placed }" :style="style"
       role="listbox" :aria-label="ariaLabel" @pointerdown="onListPointerDown">
       <div v-for="row in shown" :id="optionId(row.i)" :key="row.o.value" class="select-option"
         :class="{ 'is-active': row.i === activeIndex, 'is-selected': row.o.value === modelValue }" role="option"
         :aria-selected="row.o.value === modelValue" @pointerenter="activeIndex = row.i" @click="pick(row.i)">
-        <svg class="select-check" viewBox="0 0 14 14" aria-hidden="true">
-          <path d="M2 7.5l3.2 3.2L12 3.8" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"
-            stroke-linejoin="round" />
-        </svg>
+        <JIcon class="select-check" :icon="IconCheck" weight="bold" />
         <span class="select-option-label">{{ row.o.label }}</span>
         <span class="select-option-hint" v-if="row.o.hint">{{ row.o.hint }}</span>
       </div>

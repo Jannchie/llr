@@ -31,6 +31,8 @@ const props = defineProps<{
   isInvalid: (id: string) => boolean;
   /** Where "move to…" can send the selection: every folder but the open one. */
   moveTargets: { id: number; label: string }[];
+  /** Whether a copied set of settings is waiting to be pasted. */
+  canPaste: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -40,6 +42,8 @@ const emit = defineEmits<{
   (e: "move", ids: string[], folderId: number): void;
   (e: "newFolder"): void;
   (e: "importFiles"): void;
+  (e: "copySettings", id: string): void;
+  (e: "pasteSettings", ids: string[]): void;
 }>();
 
 const container = ref<HTMLElement | null>(null);
@@ -434,6 +438,9 @@ function cellMenu(photo: Photo): MenuItem[] {
     { id: `open:${photo.id}`, label: t("grid.open") },
     { id: "rename", label: t("grid.rename"), disabled: ids.length !== 1 },
     { id: "-" },
+    { id: `copySettings:${photo.id}`, label: t("grid.copySettings") },
+    { id: "pasteSettings", label: t("grid.pasteSettings", { n: ids.length }), disabled: none || !props.canPaste },
+    { id: "-" },
     {
       id: "move", label: t("grid.moveTo"), disabled: none || !props.moveTargets.length,
       children: props.moveTargets.map(f => ({ id: `move:${f.id}`, label: f.label })),
@@ -470,6 +477,8 @@ function onContextMenu(e: MouseEvent): void {
 function onMenuSelect(id: string): void {
   if (id.startsWith("open:")) return emit("open", id.slice(5));
   if (id.startsWith("move:")) return emit("move", selection(), Number(id.slice(5)));
+  if (id.startsWith("copySettings:")) return emit("copySettings", id.slice(13));
+  if (id === "pasteSettings") return emit("pasteSettings", selection());
   switch (id) {
     case "rename": {
       const only = selection();

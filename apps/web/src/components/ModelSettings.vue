@@ -3,6 +3,8 @@ import { computed, ref, watch } from "vue";
 import { t } from "../i18n";
 import { modelKey, type ModelSpec, type ProviderCatalog } from "../composables/useAssistant";
 import ComboField, { type ComboOption } from "./ComboField.vue";
+import { IconAlertTriangle, IconPlus, IconX } from "@jannchie/icons";
+import { JIcon } from "@jannchie/icons-vue";
 
 // The assistant's model menu, edited in place. A native <dialog>: showModal()
 // gives the backdrop, focus trap and Escape for free. Both fields are pickers
@@ -89,8 +91,8 @@ function add(): void {
           @update:model-value="v => setProvider(i, v)" />
         <ComboField class="model-id" :model-value="m.id" :options="idOptions(m.provider)" :placeholder="t('models.id')"
           :aria-label="t('models.id')" @update:model-value="v => update(i, { id: v })" />
-        <span class="model-key" :title="t('models.noKey', { provider: m.provider })" v-if="!hasKey(m.provider)">⚠</span>
-        <button class="ghost model-remove" type="button" :aria-label="t('common.remove')" @click="remove(i)">×</button>
+        <JIcon class="model-key" :icon="IconAlertTriangle" :title="t('models.noKey', { provider: m.provider })" v-if="!hasKey(m.provider)" />
+        <button class="ghost model-remove" type="button" :aria-label="t('common.remove')" @click="remove(i)"><JIcon :icon="IconX" /></button>
       </div>
       <form class="model-row model-add" @submit.prevent="add">
         <ComboField class="model-provider" :model-value="draft.provider" :options="providerOptions"
@@ -98,7 +100,7 @@ function add(): void {
           @update:model-value="setDraftProvider" />
         <ComboField class="model-id" :model-value="draft.id" :options="idOptions(draft.provider)"
           :placeholder="t('models.id')" :aria-label="t('models.id')" @update:model-value="v => draft.id = v" />
-        <button class="ghost" type="submit" :disabled="!draft.id.trim() || !draft.provider.trim()">{{ t('common.add') }}</button>
+        <button class="ghost ghost-icon" type="submit" :disabled="!draft.id.trim() || !draft.provider.trim()" :title="t('common.add')" :aria-label="t('common.add')"><JIcon :icon="IconPlus" /></button>
       </form>
     </div>
   </dialog>

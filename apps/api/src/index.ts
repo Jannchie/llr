@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
-import { access, mkdir, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
@@ -26,6 +26,7 @@ import {
   FOLDER_ID,
   SOURCE_ID,
   buildLinearFrameHeader,
+  frameHeader,
   clampDroLevel,
   clampDroStrength,
   clampLookStyle,
@@ -167,6 +168,24 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
     return;
   }
 
+  const model = /^\/(erase|relight|ai)-(status|download)$/.exec(pathname);
+  if (model && method === (model[2] === "status" ? "GET" : "POST")) {
+    // Whether the worker can run a model — generative erase, the relight
+    // geometry, the AI masks (worker model_fetch.status) — and why not;
+    // POST …-download also starts fetching it in the background.
+    const st = await daemon.send({ command: pathname.slice(1) });
+    sendJson(response, {
+      available: st.available === true, reason: st.reason, modelDir: st.modelDir, provider: st.provider,
+      detail: st.detail, received: st.received, total: st.total,
+    });
+    return;
+  }
+
+  if (method === "POST" && (pathname === "/relight-geometry" || pathname === "/ai-masks")) {
+    await handleFrameAnalysis(request, response, pathname.slice(1));
+    return;
+  }
+
   if (method === "POST" && pathname === "/look-profile") {
     await handleLookProfile(request, response);
     return;
@@ -189,7 +208,7 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
 // an SSE stream that lasts for the whole agent run.
 async function routeAgent(action: string, method: string, request: IncomingMessage, response: ServerResponse): Promise<void> {
   if (method === "GET" && action === "models") {
-    sendJson(response, { providers: agentCatalog() });
+    sendJson(response, { providers: await agentCatalog() });
     return;
   }
   if (method !== "POST") throw new HttpError(404, "Not found");
@@ -578,22 +597,7 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
   const outputPath = resolve(sessionDir, `linear-${randomUUID()}.bin`);
   let meta;
   try {
-    meta = await daemon.send({
-      command: "render-linear",
-      input: sourcePath,
-      output: outputPath,
-      profile: params.profile,
-      halfSize: params.halfSize,
-      maxSize: params.maxSize,
-      recipe: { autoTone: false },
-      dcpCode: params.dcpCode,
-      denoise: params.denoise,
-      look: params.look,
-      style: params.style,
-      dro: params.dro,
-      droLevel: params.droLevel,
-      purpose: params.purpose,
-    });
+    meta = await daemon.send({ command: "render-linear", ...decodeArgs(params, sourcePath, outputPath), purpose: params.purpose });
   } catch (error) {
     await rm(outputPath, { force: true });
     throw error;
@@ -601,16 +605,47 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
 
   // The pixel payload (tens of MB) is streamed from disk instead of being
   // buffered whole in memory; see buildLinearFrameHeader for the framing.
-  const frameHeader = buildLinearFrameHeader(meta);
+  const header = buildLinearFrameHeader(meta);
   const pixelBytes = Number(meta.bytesWritten);
   const headers: Record<string, string> = { "content-type": "application/octet-stream", "cache-control": "no-store" };
   if (Number.isFinite(pixelBytes) && pixelBytes >= 0) {
-    headers["content-length"] = String(frameHeader.length + pixelBytes);
+    headers["content-length"] = String(header.length + pixelBytes);
   }
   try {
     response.writeHead(200, headers);
-    response.write(frameHeader);
+    response.write(header);
     await pipeline(createReadStream(outputPath), response);
+  } finally {
+    await rm(outputPath, { force: true });
+  }
+}
+
+// The worker's decode arguments for a clamped render body: render-linear and
+// the analyses made on its frame must ask for the very same decode.
+function decodeArgs(params: ReturnType<typeof clampRenderParams>, input: string, output: string) {
+  return {
+    input, output,
+    profile: params.profile, halfSize: params.halfSize, maxSize: params.maxSize, recipe: { autoTone: false },
+    dcpCode: params.dcpCode, denoise: params.denoise, look: params.look, style: params.style,
+    dro: params.dro, droLevel: params.droLevel, erase: params.erase,
+  };
+}
+
+// A per-decode analysis of the frame render-linear would serve for the same
+// body: the relight geometry (worker relight.py, RGBA float16 normals + depth)
+// or the AI mattes (worker ai_masks.py, RGBA8). Framed like render-linear:
+// [u32 header length][JSON header][pixels], header = width, height, …
+async function handleFrameAnalysis(request: IncomingMessage, response: ServerResponse, command: string): Promise<void> {
+  const body = await readJson<RenderLinearBody>(request);
+  const { sessionDir, sourcePath } = await resolveSource(body.sourceId);
+  const params = clampRenderParams(body);
+  const outputPath = resolve(sessionDir, `${command}-${randomUUID()}.bin`);
+  try {
+    const meta = await daemon.send({ command, ...decodeArgs(params, sourcePath, outputPath) });
+    const { output: _output, bytesWritten: _bytes, id: _id, ok: _ok, ...header } = meta;
+    const pixels = await readFile(outputPath);
+    response.writeHead(200, { "content-type": "application/octet-stream", "cache-control": "no-store" });
+    response.end(Buffer.concat([frameHeader(header), pixels]));
   } finally {
     await rm(outputPath, { force: true });
   }

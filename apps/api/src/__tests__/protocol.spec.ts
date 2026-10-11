@@ -4,7 +4,9 @@ import {
   DRO_MAX_STRENGTH,
   buildLinearFrameHeader,
   clampDroStrength,
+  clampErase,
   clampRenderParams,
+  ERASE_MAX_STROKES,
   PHOTO_NAME_MAX,
   isAllowedHost,
   isJsonContentType,
@@ -53,6 +55,28 @@ describe("isValidSourceId", () => {
   });
 });
 
+describe("clampErase", () => {
+  it("keeps well-formed strokes and drops the rest whole", () => {
+    const good = { points: [[0.1, 0.2], [0.3, 0.4]], radius: 0.02 };
+    expect(clampErase([good])).toEqual([good]);
+    // A bad point is dropped from its stroke; a stroke with no good point, a
+    // radius out of range or no points at all is dropped entirely.
+    expect(clampErase([{ points: [[0.1, 0.2], [Number.NaN, 0], [5, 0], "x"], radius: 0.02 }]))
+      .toEqual([{ points: [[0.1, 0.2]], radius: 0.02 }]);
+    for (const bad of [{ points: [], radius: 0.1 }, { points: [[0, 0]], radius: 0 }, { points: [[0, 0]], radius: 0.6 },
+      { points: [[0, 0]] }, { radius: 0.1 }, null, "stroke", 3]) {
+      expect(clampErase([bad]), JSON.stringify(bad)).toEqual([]);
+    }
+    expect(clampErase(undefined)).toEqual([]);
+    expect(clampErase({ points: [[0, 0]], radius: 0.1 })).toEqual([]);
+  });
+
+  it("caps the stroke count", () => {
+    const many = Array.from({ length: ERASE_MAX_STROKES + 5 }, () => ({ points: [[0.5, 0.5]], radius: 0.01 }));
+    expect(clampErase(many)).toHaveLength(ERASE_MAX_STROKES);
+  });
+});
+
 describe("clampRenderParams", () => {
   it("fills defaults for an empty body", () => {
     // toEqual, not toMatchObject: this pins the *whole* shape, so a field added
@@ -69,6 +93,7 @@ describe("clampRenderParams", () => {
       dro: undefined,
       droLevel: undefined,
       purpose: "preview",
+      erase: [],
     });
   });
 
@@ -168,6 +193,7 @@ describe("buildLinearFrameHeader", () => {
       colorProfile: { kind: "dcp" },
       dtype: "float16",
       denoiseUsesChroma: true,
+      erase: null,
     });
   });
 

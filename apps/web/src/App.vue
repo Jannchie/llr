@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from "vue";
 import { PipelineRenderer, parseDcpTables, type EditParams, type ProfileCurve, type ViewWindow } from "./rendering/pipeline-renderer";
 import { sonyChromaNrSlider } from "./rendering/sony-denoise";
 import { parseCameraMatch } from "./rendering/camera-match";
@@ -16,12 +16,16 @@ import {
   ASPECT_PRESETS, defaultTransform,
   type AspectPreset, type CropState,
 } from "./rendering/crop";
-import { API, fetchLinear, fetchLookProfile, type ColorProfileMeta, type DenoisePayload, type LookTweaks, type LookTweakKey } from "./api";
+import { API, fetchAiMasks, fetchModelStatus, fetchLinear, fetchRelightGeometry, fetchLookProfile, type ColorProfileMeta, type DenoisePayload, type ModelStatus, type LookTweaks, type LookTweakKey } from "./api";
 import { type PersistedEdit } from "./edits";
 import { gradingTint, gradingHueDeg } from "./rendering/grading";
 import { parseLensCorr, mixLensTable, LENS_IDENTITY, type LensCorr } from "./rendering/lens";
+import { cloneErase, eraseWire, lensWarp, strokeToView, viewToStroke, ERASE_MAX_POINTS, ERASE_MAX_STROKES, type EraseStroke } from "./rendering/erase";
+import { rasterBrushes, sameBrushes, type BrushStroke } from "./rendering/brush";
+import { AUX_LAYER } from "./rendering/pipeline-renderer";
+import { cloneRelight, defaultRelight, packRelight, relightActive, RELIGHT_MAX_LIGHTS, LIGHT_KINDS, type RelightGeometry, type RelightState } from "./rendering/relight";
 import {
-  packMasks, presetGroup, defaultComponent, defaultAdjust, MASK_PRESETS, MASK_GROUPS, MASK_COMPS,
+  packMasks, presetGroup, defaultComponent, defaultAdjust, MASK_PRESETS, MASK_GROUPS, MASK_COMPS, AI_KINDS,
   type MaskGroup, type MaskType, type MaskAdjust, type MaskPresetName, type MaskComponent,
 } from "./rendering/masks";
 import { formatBytes, clamp, IMPORT_ACCEPT, IMPORT_FORMAT_HINT } from "./ui";
@@ -38,19 +42,36 @@ import { useHistory } from "./composables/useHistory";
 import { useToneCurve } from "./composables/useToneCurve";
 import { useCropEditor, DEFAULT_ASPECT } from "./composables/useCropEditor";
 import { useMaskEditor } from "./composables/useMaskEditor";
+import { useEraseEditor } from "./composables/useEraseEditor";
+import { useRelightEditor, useFocusPicker } from "./composables/useRelightEditor";
+import { useWorkerAnalysis } from "./composables/useWorkerAnalysis";
 import { ROOT_FOLDER_ID, useCatalog } from "./composables/useCatalog";
 import { useHistogram } from "./composables/useHistogram";
-import { useExport, type ExportPlan } from "./composables/useExport";
+import { renderPlan, useExport, type ExportPlan } from "./composables/useExport";
 import { useAssistant, modelKey, THINKING_LEVELS, type AssistantTool, type ToolContent, type TurnUsage } from "./composables/useAssistant";
 import { binImageThrough, measureHint, measureHistogram, measurePixels } from "./rendering/histogram";
 import ModelSettings from "./components/ModelSettings.vue";
 import AssistantMessage from "./components/AssistantMessage.vue";
 import ChatIcon, { type ChatIconName } from "./components/ChatIcon.vue";
-import { extractRecipe, applyRecipe, serializeRecipe, parseRecipe, loadSavedRecipes, storeSavedRecipes, type SavedRecipe, type RecipeData } from "./rendering/recipes";
+import { JIcon } from "@jannchie/icons-vue";
+import {
+  IconArrowUp, IconArrowsLeftRight, IconAsterisk, IconAperture, IconBookmark, IconCamera, IconChevronRight,
+  IconCompare, IconContrast, IconCrop, IconDashedCircle, IconDownload, IconEraserSparkle, IconFlip, IconFlipVertical, IconGrid3x3, IconHistory,
+  IconImage, IconLightbulb, IconCameraLens, IconCursorCrosshair, IconBrush, IconBandage, IconPalette, IconRedo, IconReset, IconRotate, IconRotateCcw, IconRuler, IconSettings, IconSliders, IconSparkle,
+  IconStop, IconSun, IconUndo, IconX, IconBroom, IconCheck, IconClipboardPaste, IconCopy, IconFitToScreen, IconMinus, IconPlus,
+  IconSortAscending, IconSortDescending, type Icon,
+} from "@jannchie/icons";
+import {
+  extractRecipe, applyRecipe, serializeRecipe, parseRecipe, loadSavedRecipes, storeSavedRecipes, loadCopySections, storeCopySections,
+  RECIPE_SECTIONS, DEFAULT_SECTIONS, type SavedRecipe, type RecipeData, type RecipeSection,
+} from "./rendering/recipes";
 
 // ── types ──
 
-type RecipeKey = "exposure"|"contrast"|"highlights"|"shadows"|"whites"|"blacks"|"vibrance"|"saturation"|"temperature"|"tint"|"clarity"|"dehaze"|"lensDistortion"|"lensVignetting"|"nrLuminance"|"nrDetail";
+type RecipeKey = "exposure"|"contrast"|"highlights"|"shadows"|"whites"|"blacks"|"vibrance"|"saturation"|"temperature"|"tint"|"clarity"|"dehaze"|"lensDistortion"|"lensVignetting"|"nrLuminance"|"nrDetail"
+  |"sharpAmount"|"sharpRadius"|"sharpDetail"|"sharpMasking"|"defringePurple"|"defringeGreen"
+  |"blurAmount"|"blurRange"|"blurFocusX"|"blurFocusY"|"fogAmount"|"fogStart"
+  |"vigAmount"|"vigMidpoint"|"vigFeather"|"vigRoundness"|"grainAmount"|"grainSize"|"grainRoughness";
 type Recipe = Record<RecipeKey, number>;
 // Labels are not stored: a slider's caption is always `slider.<key>` and a
 // group's is `panel.<title>`, so the catalog can't drift from the controls.
@@ -58,12 +79,13 @@ type SliderSpec = { key: RecipeKey; min: number; max: number; step: number };
 // needsLensCorr: the group's controls do nothing but blend the shot's own
 // correction tables toward identity, so they only mean something when the file
 // carried a pair (see lensCorrAvailable).
-type SliderGroup = { title: "tone" | "presence" | "color" | "lens" | "noise"; tab: EditTab; items: SliderSpec[]; needsLensCorr?: boolean };
+type GroupTitle = "tone" | "presence" | "color" | "lens" | "noise" | "sharpen" | "defringe" | "lensBlur" | "fog" | "vignette" | "grain";
+type SliderGroup = { title: GroupTitle; tab: EditTab; items: SliderSpec[]; needsLensCorr?: boolean };
 
 // The rail shows one group at a time, picked from the icon strip along its
 // outer edge. Nine always-open panels stacked to 2400px — reaching the curve
 // meant scrolling two and a half screens past controls nobody was using.
-type EditTab = "light" | "color" | "masks" | "recipes" | "detail" | "look" | "crop" | "assistant" | "history" | "settings";
+type EditTab = "light" | "color" | "masks" | "erase" | "relight" | "effects" | "recipes" | "detail" | "look" | "crop" | "assistant" | "history" | "settings";
 
 // Distortion correction defaults to fully applied (mirrorless glass is designed
 // around it — uncorrected geometry reads as broken). Vignetting stays off by
@@ -75,6 +97,14 @@ const defaultRecipe = (): Recipe => ({
   temperature: 6500, tint: 0, clarity: 0, dehaze: 0,
   lensDistortion: 100, lensVignetting: 0,
   nrLuminance: 0, nrDetail: 50,
+  sharpAmount: 0, sharpRadius: 1, sharpDetail: 25, sharpMasking: 0,
+  defringePurple: 0, defringeGreen: 0,
+  // The lens blur's focus point is source-norm (y down), -1 = the frame's centre;
+  // set by clicking the image, not by a slider.
+  blurAmount: 0, blurRange: 20, blurFocusX: -1, blurFocusY: -1,
+  fogAmount: 0, fogStart: 30,
+  vigAmount: 0, vigMidpoint: 50, vigFeather: 50, vigRoundness: 0,
+  grainAmount: 0, grainSize: 25, grainRoughness: 50,
 });
 
 const groups: SliderGroup[] = [
@@ -107,6 +137,38 @@ const groups: SliderGroup[] = [
   { title: "noise", tab: "detail", items: [
     { key: "nrLuminance", min: 0, max: 100, step: 1 },
     { key: "nrDetail", min: 0, max: 100, step: 1 },
+  ]},
+  // Output sharpening and defringe (passes.ts FINISH_SHADER / chromaClean):
+  // Lightroom's Detail and Lens Corrections controls, on their scales.
+  { title: "sharpen", tab: "detail", items: [
+    { key: "sharpAmount", min: 0, max: 150, step: 1 },
+    { key: "sharpRadius", min: 0.5, max: 3, step: 0.1 },
+    { key: "sharpDetail", min: 0, max: 100, step: 1 },
+    { key: "sharpMasking", min: 0, max: 100, step: 1 },
+  ]},
+  { title: "defringe", tab: "detail", items: [
+    { key: "defringePurple", min: 0, max: 100, step: 1 },
+    { key: "defringeGreen", min: 0, max: 100, step: 1 },
+  ]},
+  // Depth effects on the relight geometry, then the framing effects.
+  { title: "lensBlur", tab: "effects", items: [
+    { key: "blurAmount", min: 0, max: 100, step: 1 },
+    { key: "blurRange", min: 0, max: 100, step: 1 },
+  ]},
+  { title: "fog", tab: "effects", items: [
+    { key: "fogAmount", min: -100, max: 100, step: 1 },
+    { key: "fogStart", min: 0, max: 100, step: 1 },
+  ]},
+  { title: "vignette", tab: "effects", items: [
+    { key: "vigAmount", min: -100, max: 100, step: 1 },
+    { key: "vigMidpoint", min: 0, max: 100, step: 1 },
+    { key: "vigFeather", min: 0, max: 100, step: 1 },
+    { key: "vigRoundness", min: -100, max: 100, step: 1 },
+  ]},
+  { title: "grain", tab: "effects", items: [
+    { key: "grainAmount", min: 0, max: 100, step: 1 },
+    { key: "grainSize", min: 0, max: 100, step: 1 },
+    { key: "grainRoughness", min: 0, max: 100, step: 1 },
   ]},
 ];
 
@@ -168,7 +230,7 @@ const SLIDER_DEFAULTS: Record<string, number> = { ...defaultRecipe() };
 // would from Lightroom. The keys are the panels that have a Reset, minus the
 // crop box (which has no switch in Lightroom either: an off crop is a
 // different image, not a comparison).
-type BypassKey = "tone" | "presence" | "color" | "lens" | "noise" | "hsl" | "grading" | "curve" | "transform" | "look" | "masks";
+type BypassKey = GroupTitle | "hsl" | "grading" | "curve" | "transform" | "look" | "masks";
 const bypass = reactive(new Set<BypassKey>());
 function isBypassed(key: BypassKey): boolean { return bypass.has(key); }
 function toggleBypass(key: BypassKey): void { if (bypass.has(key)) bypass.delete(key); else bypass.add(key); }
@@ -543,7 +605,7 @@ const selectedMask = ref<string | null>(null);
 const cloneMasks = (m: readonly MaskGroup[]): MaskGroup[] => JSON.parse(JSON.stringify(m));
 const selectedGroup = computed(() => masks.find(g => g.id === selectedMask.value) ?? null);
 
-const MASK_TYPES: MaskType[] = ["luminance", "color", "linear", "radial"];
+const MASK_TYPES: MaskType[] = ["luminance", "color", "linear", "radial", "depth", "brush", "ai"];
 const MASK_OPS = ["add", "subtract", "intersect"] as const;
 // The local sliders: exposure in EV, the rest on the global sliders' ±100.
 type MaskSliderKey = Exclude<keyof MaskAdjust, "contrast" | "blacks">; // the two reserved keys have no slider yet
@@ -553,6 +615,7 @@ const MASK_ADJUST_SLIDERS: { key: MaskSliderKey; min: number; max: number; step:
     .map(key => ({ key, min: -100, max: 100, step: 1 })),
   { key: "tintHue", min: -180, max: 180, step: 1 },
   { key: "tintSat", min: 0, max: 100, step: 1 },
+  { key: "moire", min: 0, max: 100, step: 1 },
 ];
 // The cast's hue slider shows the wheel it picks from; the strength slider the
 // colour it lands on.
@@ -596,6 +659,73 @@ function addComponent(type: string): void {
   if (g && g.components.length < MASK_COMPS) g.components.push(defaultComponent(type as MaskType));
 }
 function resetMasks(): void { masks.splice(0); selectedMask.value = null; }
+
+// ── Erase (generative fill) ──
+//
+// Brushed regions the worker refills with Moebius before the frame reaches the
+// GPU (worker erase.py), so the fill takes every later edit like the pixels
+// around it. Strokes are per-image edit state in the decode's own frame
+// (rendering/erase.ts); a change re-requests the decode, like denoise. The
+// brush size and the stroke overlay are view state.
+const erase = reactive<EraseStroke[]>([]);
+const eraseBrush = ref(Number(localStorage.getItem("llr.eraseBrush")) || 24);
+watch(eraseBrush, v => localStorage.setItem("llr.eraseBrush", String(v)));
+const eraseShowStrokes = ref(false);
+const eraseHover = ref<string | null>(null);
+const eraseBusy = ref(false);
+// Why the last decode's fills did not run (no model, no runtime), from the worker.
+const eraseError = ref<string | null>(null);
+const eraseStatus = ref<ModelStatus | null>(null);
+// Which brush paints: the generative fill, or the healing brush (a nearby patch
+// matched and blended in by the worker — no model, near-instant). View state.
+const eraseMode = ref<"fill" | "heal">((localStorage.getItem("llr.eraseMode") as "fill" | "heal" | null) ?? "fill");
+watch(eraseMode, v => localStorage.setItem("llr.eraseMode", v));
+function addEraseStroke(points: [number, number][], radius: number): void {
+  if (erase.length >= ERASE_MAX_STROKES || !points.length) return;
+  erase.push({ id: newMaskId(), points: points.slice(0, ERASE_MAX_POINTS), radius: Math.min(radius, 0.5),
+    ...(eraseMode.value === "heal" ? { mode: "heal" as const } : {}) });
+}
+function removeErase(id: string): void {
+  const i = erase.findIndex(s => s.id === id);
+  if (i >= 0) erase.splice(i, 1);
+}
+function resetErase(): void { erase.splice(0); }
+
+// ── Relight (added lights) ──
+//
+// Point lights the shader adds to the scene-linear frame, shaded on normals and
+// depth the worker estimates once per decode (rendering/relight.ts, worker
+// relight.py). The rig is per-image edit state and a pure redraw; only the
+// geometry is fetched, and only when there is a rig to light it with or the
+// tab is open.
+const relight = reactive<RelightState>(defaultRelight());
+const selectedLight = ref<string | null>(null);
+// The geometry the preview renderer holds, and which decode it was made for.
+let relightGeometry: RelightGeometry | null = null;
+let relightGeometryKey = "";
+const relightHasGeometry = ref(false);
+// View state, like the mask matte: which geometry map replaces the photo while the tab is open.
+const relightView = ref<0 | 1 | 2>(0);
+watch(relightView, () => scheduleWebGLDraw());
+const LIGHT_COLORS = ["#ffd9a8", "#a8c8ff", "#ffffff", "#ff9a7a"];
+function addLight(u: number, v: number): void {
+  if (relight.lights.length >= RELIGHT_MAX_LIGHTS) return;
+  const id = newMaskId();
+  relight.lights.push({ id, u, v, lift: 0.4, ev: 1, color: LIGHT_COLORS[relight.lights.length % LIGHT_COLORS.length]! });
+  selectedLight.value = id;
+}
+function removeLight(id: string): void {
+  const i = relight.lights.findIndex(l => l.id === id);
+  if (i >= 0) relight.lights.splice(i, 1);
+  if (selectedLight.value === id) selectedLight.value = relight.lights[0]?.id ?? null;
+}
+function resetRelight(): void {
+  // In place: the editor holds the lights array itself.
+  const d = defaultRelight();
+  relight.lights.splice(0);
+  relight.ambient = d.ambient; relight.wrap = d.wrap; relight.falloff = d.falloff; relight.shadows = d.shadows;
+  selectedLight.value = null;
+}
 const deg = (rad: number) => Math.round((rad * 180) / Math.PI);
 const rad = (d: number) => (d * Math.PI) / 180;
 
@@ -636,6 +766,86 @@ const {
   onLinearEndDown, onLinearLineDown, onRadialCentreDown, onRadialAxisDown, onRadialRotateDown,
 } = useMaskEditor({
   crop, srcW, srcH, group: selectedGroup, ofPerScreen,
+  onDragEnd: () => flushPendingHistory(),
+});
+
+// The erase brush: same overlay placement, strokes taken back through the
+// lens correction the preview is drawn with (rendering/erase.ts).
+// The lens correction the preview is drawn with, for mapping overlay points
+// to source pixels and back.
+function viewLens() {
+  const r = effectiveRecipe(recipe, bypass);
+  return lensWarp(lensCorr ? mixLensTable(lensCorr.distortion, (r.lensDistortion ?? 100) / 100) : undefined,
+    lensCorr?.caR, lensCorr?.caB, srcW.value, srcH.value);
+}
+const {
+  overlayRef: eraseOverlayRef, viewBox: eraseViewBox, paths: erasePaths, livePath: eraseLivePath,
+  cursor: eraseCursor, cursorR: eraseCursorR,
+  onPointerDown: onErasePointerDown, onPointerMove: onErasePointerMove, onPointerUp: onErasePointerUp,
+  onPointerLeave: onErasePointerLeave,
+} = useEraseEditor({
+  crop, srcW, srcH, strokes: erase, brush: eraseBrush, ofPerScreen,
+  lens: viewLens,
+  onStroke: addEraseStroke,
+});
+
+// ── Brush masks ──
+//
+// Painting goes into one brush component at a time (activeBrush), through the
+// same stroke editor as erase; size, softness, flow and the eraser are view
+// state, stamped onto each stroke as it lands.
+const activeBrush = ref<{ gid: string; idx: number } | null>(null);
+const activeBrushComp = computed(() => {
+  const a = activeBrush.value;
+  const c = a ? masks.find(g => g.id === a.gid)?.components[a.idx] : undefined;
+  return c && c.type === "brush" ? c : null;
+});
+const brushSize = ref(Number(localStorage.getItem("llr.brushSize")) || 40);
+watch(brushSize, v => localStorage.setItem("llr.brushSize", String(v)));
+const brushFeather = ref(60);
+const brushFlow = ref(100);
+const brushErase = ref(false);
+watch(selectedMask, () => { activeBrush.value = null; });
+function toggleBrush(gid: string, idx: number): void {
+  const a = activeBrush.value;
+  activeBrush.value = a && a.gid === gid && a.idx === idx ? null : { gid, idx };
+}
+const {
+  overlayRef: brushOverlayRef, viewBox: brushViewBox, livePath: brushLivePath,
+  cursor: brushCursor, cursorR: brushCursorR,
+  onPointerDown: onBrushPointerDown, onPointerMove: onBrushPointerMove, onPointerUp: onBrushPointerUp,
+  onPointerLeave: onBrushPointerLeave,
+} = useEraseEditor({
+  crop, srcW, srcH, strokes: () => [], brush: brushSize, ofPerScreen,
+  lens: viewLens,
+  onStroke: (points, radius) => {
+    activeBrushComp.value?.strokes.push({
+      points: points.slice(0, ERASE_MAX_POINTS), radius: Math.min(radius, 0.5),
+      feather: brushFeather.value / 100, flow: brushFlow.value / 100, ...(brushErase.value ? { erase: true } : {}),
+    });
+  },
+});
+
+// The lens blur's focus point: picked on the image, kept in source-norm like a
+// light's aim point (useFocusPicker), so it stays on its subject through a crop.
+const pickingFocus = ref(false);
+const {
+  overlayRef: focusOverlayRef, viewBox: focusViewBox, marker: focusMarker, onPointerDown: onFocusPointerDown,
+} = useFocusPicker({
+  crop, srcW, srcH, picking: pickingFocus,
+  focus: () => recipe.blurFocusX >= 0 ? [recipe.blurFocusX, recipe.blurFocusY] : [0.5, 0.5],
+  lens: viewLens,
+  onPick: (u, v) => { recipe.blurFocusX = u; recipe.blurFocusY = v; pickingFocus.value = false; },
+});
+
+const {
+  overlayRef: relightOverlayRef, viewBox: relightViewBox, handles: relightHandles,
+  onHandleDown: onLightHandleDown, onPointerDown: onRelightPointerDown,
+  onPointerMove: onRelightPointerMove, onPointerUp: onRelightPointerUp,
+} = useRelightEditor({
+  crop, srcW, srcH, lights: relight.lights, selected: selectedLight, ofPerScreen,
+  lens: viewLens,
+  onAdd: addLight,
   onDragEnd: () => flushPendingHistory(),
 });
 
@@ -785,6 +995,10 @@ type Snapshot = {
   sonyCameraMatch?: boolean;
   // Local adjustments; absent in sessions that predate them, which is empty.
   masks?: MaskGroup[];
+  // Generative erase strokes (rendering/erase.ts); absent before erase existed.
+  erase?: EraseStroke[];
+  // Added lights (rendering/relight.ts); absent before relight existed.
+  relight?: RelightState;
   // Panels switched off (see BypassKey); absent in older sessions, i.e. none.
   bypass?: BypassKey[];
 };
@@ -822,6 +1036,8 @@ function defaultSnapshot(name?: string): Snapshot {
     sonyAdvancedColour: false,
     sonyCameraMatch: true,
     masks: [],
+    erase: [],
+    relight: defaultRelight(),
     bypass: [],
   };
 }
@@ -856,6 +1072,8 @@ function captureSnapshot(): Snapshot {
     sonyAdvancedColour: sonyAdvancedColour.value,
     sonyCameraMatch: sonyCameraMatch.value,
     masks: cloneMasks(masks),
+    erase: cloneErase(erase),
+    relight: cloneRelight(relight),
     bypass: [...bypass],
   };
 }
@@ -892,8 +1110,16 @@ function setEditState(s: Snapshot): void {
   sonyAdvancedColour.value = s.sonyAdvancedColour ?? false;
   // Same rule: a snapshot from before the stage existed was rendered without it.
   sonyCameraMatch.value = s.sonyCameraMatch ?? false;
-  masks.splice(0, masks.length, ...cloneMasks(s.masks ?? []));
+  masks.splice(0, masks.length, ...cloneMasks(s.masks ?? []).map(g => ({ ...g, adjust: { ...defaultAdjust(), ...g.adjust } })));
   if (selectedMask.value && !masks.some(g => g.id === selectedMask.value)) selectedMask.value = null;
+  erase.splice(0, erase.length, ...cloneErase(s.erase ?? []));
+  {
+    // In place: the editor holds the lights array itself.
+    const r = cloneRelight(s.relight);
+    relight.lights.splice(0, relight.lights.length, ...r.lights);
+    relight.ambient = r.ambient; relight.wrap = r.wrap; relight.falloff = r.falloff; relight.shadows = r.shadows;
+    if (selectedLight.value && !relight.lights.some(l => l.id === selectedLight.value)) selectedLight.value = null;
+  }
   dcpCode.value = s.dcp;
   profileId.value = s.profile ?? "standard";
   // Rebake with the snapshot's Basic values (bakeCurveLUT also syncs bakedBasic).
@@ -936,6 +1162,8 @@ function describeStep(prev: Snapshot, next: Snapshot): string {
     || prev.sonyAdvancedColour !== next.sonyAdvancedColour
     || prev.sonyCameraMatch !== next.sonyCameraMatch) parts.push(t("panel.creativeLook"));
   if (!same(prev.masks ?? [], next.masks ?? [])) parts.push(t("panel.masks"));
+  if (!same(prev.erase ?? [], next.erase ?? [])) parts.push(t("panel.erase"));
+  if (!same(prev.relight ?? defaultRelight(), next.relight ?? defaultRelight())) parts.push(t("panel.relight"));
   if (!parts.length) return t("history.edit");
   return parts.length > 3 ? `${parts.slice(0, 3).join(", ")} +${parts.length - 3}` : parts.join(", ");
 }
@@ -988,7 +1216,7 @@ const {
   selectSource, openPhoto, setView,
   selectFolder, toggleExpanded, createFolder, renameFolder, moveFolder, deleteFolder,
   removePhotos, renamePhoto, movePhotos, importFiles, importDropped, importPickedDirectory,
-  savePreview, boot,
+  savePreview, boot, updateEdits, snapshotOf,
 } = useCatalog<Snapshot, typeof viewSettings>({
   api: API,
   status, errorMessage, cropMode,
@@ -1128,17 +1356,20 @@ const visibleGroups = computed(() =>
 // crop is a tab like the rest, but it drives the viewport's crop editor rather
 // than a set of sliders, so cropMode stays the source of truth and the tab
 // follows it (the R shortcut and the editor's Done button move both).
-const EDIT_TABS: { key: EditTab; icon: string[] }[] = [
-  { key: "look", icon: ["M21 19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h3l1.5-2.5h5L16 7h3a2 2 0 0 1 2 2z", "M12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8z"] },
-  { key: "light", icon: ["M12 3a9 9 0 0 0 0 18z", "M12 3a9 9 0 0 1 0 18"] },
-  { key: "color", icon: ["M12 3a9 9 0 1 0 0 18c1.1 0 1.6-.9 1.6-1.7 0-1.6-1.4-1.9-1.4-3 0-.9.7-1.6 1.7-1.6H16a5 5 0 0 0 5-5c0-3.7-4-6.7-9-6.7z", "M7.5 12.5h.01", "M9.5 8.5h.01", "M14.5 8h.01"] },
-  { key: "masks", icon: ["M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z", "M12 3v18", "M12 7.5h5.5", "M12 12h8.5", "M12 16.5h5.5"] },
-  { key: "detail", icon: ["M12 4v16", "M4 12h16", "M6.3 6.3l11.4 11.4", "M17.7 6.3L6.3 17.7"] },
-  { key: "crop", icon: ["M6 2v14a2 2 0 0 0 2 2h14", "M2 6h14a2 2 0 0 1 2 2v14"] },
-  { key: "assistant", icon: ["M12 3l1.8 4.7L18.5 9.5l-4.7 1.8L12 16l-1.8-4.7L5.5 9.5l4.7-1.8z", "M19 16l.8 2.2 2.2.8-2.2.8L19 22l-.8-2.2-2.2-.8 2.2-.8z"] },
-  { key: "recipes", icon: ["M6 3h12a1 1 0 0 1 1 1v17l-7-4-7 4V4a1 1 0 0 1 1-1z"] },
-  { key: "history", icon: ["M12 8v4l3 2", "M3.5 12a8.5 8.5 0 1 0 2.5-6", "M3 3v4h4"] },
-  { key: "settings", icon: ["M4 7h16", "M4 17h16", "M9 7a2 2 0 1 0 4 0 2 2 0 0 0-4 0z", "M13 17a2 2 0 1 0 4 0 2 2 0 0 0-4 0z"] },
+const EDIT_TABS: { key: EditTab; icon: Icon }[] = [
+  { key: "look", icon: IconAperture },
+  { key: "light", icon: IconSun },
+  { key: "color", icon: IconPalette },
+  { key: "masks", icon: IconDashedCircle },
+  { key: "erase", icon: IconEraserSparkle },
+  { key: "relight", icon: IconLightbulb },
+  { key: "effects", icon: IconCameraLens },
+  { key: "detail", icon: IconAsterisk },
+  { key: "crop", icon: IconCrop },
+  { key: "assistant", icon: IconSparkle },
+  { key: "recipes", icon: IconBookmark },
+  { key: "history", icon: IconHistory },
+  { key: "settings", icon: IconSliders },
 ];
 
 const editTab = ref<EditTab>((localStorage.getItem("llr.tab") as EditTab | null) ?? "light");
@@ -1175,6 +1406,9 @@ const tabEdited = computed<Record<EditTab, boolean>>(() => ({
   light: groups.some(g => g.tab === "light" && groupEdited(g)) || curveEdited.value,
   color: groups.some(g => g.tab === "color" && groupEdited(g)) || hslEdited.value || gradingEdited.value,
   masks: masks.length > 0,
+  erase: erase.length > 0,
+  relight: relightActive(relight),
+  effects: groups.some(g => g.tab === "effects" && groupEdited(g)),
   recipes: false,
   detail: groups.some(g => g.tab === "detail" && groupEdited(g)) || denoiseEdited.value,
   look: lookEdited.value,
@@ -1288,7 +1522,7 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     // buffer by on-screen device pixels, so a fit view shades the same number of
     // fragments it always did. What it does cost is transfer and VRAM (~140 MB
     // for 24 MP, ~360 MB for 61 MP, as float16).
-    const lin = await fetchLinear({ sourceId: id, halfSize: false, maxSize: 0, profileId: profileId.value, dcpCode: dcpCode.value, denoise: denoisePayload(), look: bypass.has("look") ? undefined : look.value ?? undefined, style: bypass.has("look") ? undefined : lookStyle.value ?? undefined, dro: renderDro.value.strength ?? undefined, droLevel: renderDro.value.level });
+    const lin = await fetchLinear(decodeBody(id));
     if (stale()) return false;
     if (!lin) { markInvalid(id); return false; }
     const { meta: linMeta, pixels: linearFloat } = lin;
@@ -1303,6 +1537,7 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     // not — it is read by the render path, not by the template.
     lensCorrAvailable.value = lensCorr !== null;
     denoiseUsesChroma.value = linMeta.denoiseUsesChroma;
+    eraseError.value = linMeta.erase?.error ?? null;
     isRawSource.value = linMeta.colorProfile?.kind !== "rendered-image";
     // What the worker *actually* rendered with, which is not always what was
     // asked for: "sony" falls back to the DCP path on a RAW without Sony's
@@ -1356,6 +1591,16 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     }
     webglRenderer.uploadImage(linearFloat, linMeta.width, linMeta.height);
     renderedId.value = id;
+    // The geometry belongs to this decode's frame (erase fills included): keep
+    // it only if it was made for the same one, and fetch it if it is wanted.
+    if (relightGeometryKey !== frameKey()) { relightGeometry = null; relightGeometryKey = ""; relightHasGeometry.value = false; }
+    webglRenderer.uploadRelightGeometry(relightGeometry);
+    void ensureRelightGeometry();
+    // uploadImage emptied the mask layers: hand over what belongs to this frame.
+    brushDrawn = null;
+    if (aiMasks && aiMasks.key !== frameKey()) { aiMasks = null; aiReady.value = false; }
+    if (aiMasks) webglRenderer.uploadMaskLayer(AUX_LAYER.ai, aiMasks);
+    void ensureAiMasks();
     bakeCurveLUT();
     webglRenderer.uploadProfileCurveLUT(profileCurveLUT);
     webglRenderer.uploadDcpTables(parseDcpTables(linMeta.colorProfile));
@@ -1464,7 +1709,13 @@ async function reloadLookProfile(): Promise<void> {
 // photo: undefined follows the Masks panel's live overlay (view-only, so a
 // snapshot never carries it), null draws none (the assistant's captures), a
 // group id draws that one (view_mask).
-function buildPipelineParams(s?: Snapshot, opts: { matte?: string | null } = {}): Partial<EditParams> {
+// `ctx` stands in for the open photo's own facts — its lens tables and size —
+// when the snapshot is another photo's (a background preview render).
+function buildPipelineParams(
+  s?: Snapshot, opts: { matte?: string | null; ctx?: { lensCorr: LensCorr | null; srcW: number; srcH: number } } = {},
+): Partial<EditParams> {
+  const lensCorr = opts.ctx ? opts.ctx.lensCorr : lensCorrLiveGet();
+  const sw = opts.ctx ? opts.ctx.srcW : srcW.value, sh = opts.ctx ? opts.ctx.srcH : srcH.value;
   // Switched-off panels render at their defaults; a snapshot carries its own
   // switches, the live state its live ones.
   const b: ReadonlySet<BypassKey> = s ? new Set(s.bypass ?? []) : bypass;
@@ -1506,7 +1757,20 @@ function buildPipelineParams(s?: Snapshot, opts: { matte?: string | null } = {})
     cameraMatch: cameraMatch.value ? 1 : 0,
     nrLuminance: r.nrLuminance ?? 0,
     nrDetail: r.nrDetail ?? 50,
-    ...packMasks(b.has("masks") ? [] : (s?.masks ?? masks), effectiveCrop(s?.crop ?? crop, b), srcW.value, srcH.value,
+    sharpAmount: (r.sharpAmount ?? 0) / 100, sharpRadius: r.sharpRadius ?? 1,
+    sharpDetail: (r.sharpDetail ?? 25) / 100, sharpMasking: (r.sharpMasking ?? 0) / 100,
+    defringePurple: (r.defringePurple ?? 0) / 100, defringeGreen: (r.defringeGreen ?? 0) / 100,
+    lensBlurAmount: (r.blurAmount ?? 0) / 100, lensBlurRange: (r.blurRange ?? 20) / 100,
+    // Texcoord, y up, like every source-frame sampler.
+    lensBlurFocus: (r.blurFocusX ?? -1) >= 0 ? [r.blurFocusX, 1 - r.blurFocusY] : [-1, -1],
+    fogAmount: (r.fogAmount ?? 0) / 100, fogStart: (r.fogStart ?? 30) / 100,
+    vigAmount: (r.vigAmount ?? 0) / 100, vigMid: (r.vigMidpoint ?? 50) / 100,
+    vigFeather: (r.vigFeather ?? 50) / 100, vigRound: (r.vigRoundness ?? 0) / 100,
+    grainAmount: (r.grainAmount ?? 0) / 100, grainSize: 0.75 + ((r.grainSize ?? 25) / 100) * 3,
+    grainRough: (r.grainRoughness ?? 50) / 100,
+    ...packRelight(s ? (s.relight ?? null) : relight),
+    relightView: !s && editTab.value === "relight" ? relightView.value : 0,
+    ...packMasks(b.has("masks") ? [] : (s?.masks ?? masks), effectiveCrop(s?.crop ?? crop, b), sw, sh,
       { temperature: r.temperature, tint: r.tint },
       opts.matte !== undefined ? opts.matte : (!s && maskPreview.value ? selectedMask.value : null)),
   };
@@ -1519,6 +1783,8 @@ let profileCurveLUT: ProfileCurve = null;
 // Per-image lens correction tables (canonical 16-knot grid), parsed from the
 // decode response in loadSource. null = the RAW carries no correction data.
 let lensCorr: LensCorr | null = null;
+// buildPipelineParams' alias for it (its own `lensCorr` may be another photo's).
+const lensCorrLiveGet = () => lensCorr;
 
 function buildProfileLUT(cp: ColorProfileMeta | null | undefined): ProfileCurve {
   const pts = cp?.profileToneCurve;
@@ -1797,7 +2063,10 @@ function drawWebGL(): void {
   updateRenderWindow();
   webglRenderer.setViewWindow(renderWindow.value);
   webglRenderer.setPreviewScale(computePreviewScale());
-  webglRenderer.draw(showOriginal.value ? baselineParams() : buildPipelineParams());
+  if (showOriginal.value) { webglRenderer.draw(baselineParams()); return; }
+  const params = buildPipelineParams();
+  syncBrushLayer(params);
+  webglRenderer.draw(params);
 }
 
 function startCompare(): void { if (activeSource.value && !cropMode.value) showOriginal.value = true; }
@@ -1929,8 +2198,20 @@ function onKeyDown(e: KeyboardEvent): void {
     if (k === "z") { e.preventDefault(); if (e.shiftKey) redo(); else undo(); return; }
     if (k === "y") { e.preventDefault(); redo(); return; }
     // Lightroom's copy / paste settings.
-    if (e.shiftKey && k === "c") { e.preventDefault(); copyRecipe(); return; }
-    if (e.shiftKey && k === "v") { e.preventDefault(); void pasteRecipe(); return; }
+    // In the library they act on the grid: copy from the one selected photo,
+    // paste onto every selected one. Alt+Shift+C asks what to copy.
+    if (e.shiftKey && k === "c") {
+      e.preventDefault();
+      const from = libraryView.value === "library" && selectedIds.size === 1 ? [...selectedIds][0]! : null;
+      if (e.altKey) openCopyDialog(from); else void copyRecipe(from);
+      return;
+    }
+    if (e.shiftKey && k === "v") {
+      e.preventDefault();
+      if (libraryView.value === "library" && selectedIds.size) void pasteToPhotos([...selectedIds]);
+      else void pasteRecipe();
+      return;
+    }
   }
 
   // Space held turns drags into pans wherever a tool owns the pointer. A focused
@@ -2017,7 +2298,7 @@ watch(showOriginal, () => {
 // second deep watcher over the same objects would re-traverse them on every
 // slider input for no benefit (history/persist scheduling self-guards on
 // isRestoring and is debounced).
-watch([recipe, hslHue, hslSat, hslLum, grading, masks, () => [...bypass]], () => {
+watch([recipe, hslHue, hslSat, hslLum, grading, masks, relight, () => [...bypass]], () => {
   if (!isRestoring) scheduleWebGLDraw();
   scheduleHistoryCommit();
   schedulePersist();
@@ -2137,6 +2418,149 @@ watch(denoise, () => {
   if (!suppressDcpReload && currentSourceId && lookCurrent) installLookProfile(lookCurrent);
 }, { deep: true });
 
+// Erase is baked into the decode too (the worker fills before the frame leaves),
+// so a stroke added, removed or undone re-requests it. Not debounced: a stroke
+// arrives whole on pointer-up. Fills the worker already made are cached, so
+// only the new one costs inference.
+watch(() => JSON.stringify(erase), () => {
+  scheduleHistoryCommit();
+  schedulePersist();
+  schedulePreview();
+  if (suppressDcpReload || !currentSourceId) return;
+  eraseBusy.value = true;
+  void loadSource(currentSourceId, { resetView: false }).finally(() => { eraseBusy.value = false; });
+});
+
+// Whether this machine can erase at all, asked when the tab opens (the worker
+// may have gained its model since) — and why not, which is what the panel says.
+// A missing model is fetched right away (once per failure: a failed download
+// waits for the retry button), and polled until it lands; strokes that were
+// waiting on it are then filled by reloading the decode.
+let erasePoll: number | undefined;
+function setEraseStatus(st: ModelStatus): void {
+  const was = eraseStatus.value;
+  eraseStatus.value = st;
+  window.clearTimeout(erasePoll);
+  if (st.reason === "downloading") erasePoll = window.setTimeout(() => void refreshEraseStatus(), 1000);
+  if (st.available && was && !was.available && erase.length && currentSourceId) {
+    eraseBusy.value = true;
+    void loadSource(currentSourceId, { resetView: false }).finally(() => { eraseBusy.value = false; });
+  }
+}
+async function refreshEraseStatus(download = false): Promise<void> {
+  try {
+    let st = await fetchModelStatus("erase", download);
+    if (st.reason === "models-missing" && !st.detail && !download) st = await fetchModelStatus("erase", true);
+    setEraseStatus(st);
+  } catch { /* the panel keeps its last word; the next tab visit asks again */ }
+}
+watch(editTab, v => { if (v === "erase") void refreshEraseStatus(); }, { immediate: true });
+onBeforeUnmount(() => window.clearTimeout(erasePoll));
+const fmtMB = (n: number) => `${Math.round(n / 1e6)} MB`;
+// ── Relight geometry ──
+//
+// One fetch per decode (the worker caches it beside the source too), asked for
+// only when it would be used: the tab is open or the edit has a rig. The body
+// is loadSource's, so the worker estimates on the very frame on screen.
+//
+// The full-resolution decode the preview shows (see loadSource): the relight
+// geometry and the AI mattes are estimated on exactly this frame.
+function decodeBody(id: string): Record<string, unknown> {
+  return {
+    sourceId: id, halfSize: false, maxSize: 0, profileId: profileId.value, dcpCode: dcpCode.value,
+    denoise: denoisePayload(), look: bypass.has("look") ? undefined : look.value ?? undefined,
+    style: bypass.has("look") ? undefined : lookStyle.value ?? undefined,
+    dro: renderDro.value.strength ?? undefined, droLevel: renderDro.value.level, erase: eraseWire(erase),
+  };
+}
+// The decode an analysis belongs to: the source and its erase fills.
+function frameKey(): string | null {
+  return currentSourceId && webglRenderer ? `${currentSourceId}|${JSON.stringify(eraseWire(erase))}` : null;
+}
+watch(editTab, v => {
+  void ensureRelightGeometry();
+  if (relightView.value) scheduleWebGLDraw();
+  if (v !== "effects") pickingFocus.value = false;
+});
+// Everything that reads the scene's geometry: the rig, depth masks, lens blur
+// and fog — plus the two tabs where it is about to be wanted.
+function snapshotNeedsGeometry(s: { relight?: RelightState; recipe: Recipe; masks?: MaskGroup[] }): boolean {
+  return (!!s.relight && relightActive(s.relight)) || (s.recipe.blurAmount ?? 0) > 0 || (s.recipe.fogAmount ?? 0) !== 0
+    || (s.masks ?? []).some(g => g.enabled && g.components.some(c => c.type === "depth"));
+}
+function geometryWanted(): boolean {
+  return editTab.value === "relight" || editTab.value === "effects"
+    || snapshotNeedsGeometry({ relight, recipe: effectiveRecipe(recipe), masks: bypass.has("masks") ? [] : masks });
+}
+const {
+  busy: relightBusy, error: relightError, status: relightStatus, notice: relightNotice, ensure: ensureRelightGeometry,
+} = useWorkerAnalysis<RelightGeometry>({
+  model: "relight", key: frameKey, wanted: geometryWanted,
+  has: key => relightGeometryKey === key && !!relightGeometry,
+  fetch: () => fetchRelightGeometry(decodeBody(currentSourceId!)),
+  apply: (key, geo) => {
+    relightGeometry = geo;
+    relightGeometryKey = key;
+    relightHasGeometry.value = true;
+    webglRenderer?.uploadRelightGeometry(geo);
+    scheduleWebGLDraw();
+  },
+});
+const selectedLightObj = computed(() => relight.lights.find(l => l.id === selectedLight.value) ?? null);
+
+// ── AI mask mattes ──
+//
+// Fetched like the geometry, once per decode and only when a mask reads them
+// (worker ai_masks.py); handed to the renderer's aux array as a layer.
+type AiMattes = { data: Uint8Array; w: number; h: number };
+let aiMasks: (AiMattes & { key: string }) | null = null;
+const aiReady = ref(false);
+function aiWanted(): boolean {
+  return !bypass.has("masks") && masks.some(g => g.enabled && g.components.some(c => c.type === "ai"));
+}
+const { notice: aiAnalysisNotice, ensure: ensureAiMasks } = useWorkerAnalysis<AiMattes>({
+  model: "ai", key: frameKey, wanted: aiWanted,
+  has: key => aiMasks?.key === key,
+  fetch: () => fetchAiMasks(decodeBody(currentSourceId!)),
+  apply: (key, res) => {
+    aiMasks = { key, ...res };
+    aiReady.value = true;
+    webglRenderer?.uploadMaskLayer(AUX_LAYER.ai, res);
+    scheduleWebGLDraw();
+  },
+});
+const aiNotice = computed(() => aiAnalysisNotice.value ?? (aiReady.value ? null : t("ai.analyzing")));
+
+// The brush layer: rasterised from the packed brush components whenever they
+// (or the image) change, at the aux array's size.
+let brushDrawn: { w: number; h: number; brushes: BrushStroke[][] } | null = null;
+function syncBrushLayer(p: Partial<EditParams> & { maskBrushes?: BrushStroke[][] }): void {
+  if (!webglRenderer) return;
+  const dims = webglRenderer.auxDims();
+  const brushes = p.maskBrushes ?? [];
+  if (!dims) return;
+  const d = brushDrawn;
+  if (d && d.w === dims[0] && d.h === dims[1] && sameBrushes(d.brushes, brushes)) return;
+  brushDrawn = { w: dims[0], h: dims[1], brushes: brushes.map(s => s.slice()) };
+  webglRenderer.uploadMaskLayer(AUX_LAYER.brush, brushes.length
+    ? { data: rasterBrushes(brushes, dims[0], dims[1]), w: dims[0], h: dims[1] } : null);
+}
+
+const eraseDownloading = computed(() => eraseStatus.value?.reason === "downloading");
+const eraseNotice = computed(() => {
+  const st = eraseStatus.value;
+  if (st?.reason === "downloading") {
+    const total = st.total ?? 0, got = st.received ?? 0;
+    return t("erase.downloading", { pct: total ? Math.floor((100 * got) / total) : 0, got: fmtMB(got), total: fmtMB(total) });
+  }
+  if (st?.reason === "models-missing" && st.detail) return t("erase.downloadFailed", { detail: st.detail });
+  if (eraseError.value) return t("erase.failed", { detail: eraseError.value });
+  if (!st || st.available) return null;
+  if (st.reason === "models-missing") return t("erase.missingModels", { dir: st.modelDir ?? "" });
+  if (st.reason === "runtime-missing") return t("erase.missingRuntime");
+  return t("erase.loadFailed", { detail: st.detail ?? "" });
+});
+
 // Flush the latest edit on tab close. Only a keepalive request survives the
 // unload, so also flush whenever the tab goes hidden — that fires earlier and
 // more reliably than beforeunload (mobile tab switches, window close).
@@ -2191,12 +2615,28 @@ async function onFolderChange(e: Event): Promise<void> {
   t.value = "";
 }
 
-// A drag only means "import" when it actually carries files. Dragging a
-// filmstrip thumbnail — or any text/link — fires dragover on the shell too, and
-// without this gate the full-screen import overlay flashes on every such drag.
+// A drag that starts inside the page is never an import, even when it carries
+// "Files": the browser packs a dragged <img> (the stand-in JPEG while a photo
+// decodes, say) as a file, and dropping it would upload the picture back into
+// the library. dragstart only fires for drags born in this document, so it
+// marks them; dragend (fired even after a drop elsewhere) clears the mark.
+let internalDrag = false;
+function onDocDragStart(): void { internalDrag = true; }
+function onDocDragEnd(): void { internalDrag = false; }
+document.addEventListener("dragstart", onDocDragStart);
+document.addEventListener("dragend", onDocDragEnd);
+onBeforeUnmount(() => {
+  document.removeEventListener("dragstart", onDocDragStart);
+  document.removeEventListener("dragend", onDocDragEnd);
+});
+
+// A drag only means "import" when it actually carries files from outside the
+// page. Dragging a filmstrip thumbnail — or any text/link — fires dragover on
+// the shell too, and without this gate the full-screen import overlay flashes
+// on every such drag.
 function onDragOver(e: DragEvent): void {
   e.preventDefault();
-  if (e.dataTransfer?.types.includes("Files")) isDragging.value = true;
+  if (!internalDrag && e.dataTransfer?.types.includes("Files")) isDragging.value = true;
 }
 
 // dragleave bubbles from every child the pointer crosses on its way across the
@@ -2212,7 +2652,7 @@ async function onDrop(e: DragEvent): Promise<void> {
   e.preventDefault();
   isDragging.value = false;
   const dt = e.dataTransfer;
-  if (!dt || dt.types.includes("application/x-llr-photos") || dt.types.includes("application/x-llr-folder")) return;
+  if (!dt || internalDrag || dt.types.includes("application/x-llr-photos") || dt.types.includes("application/x-llr-folder")) return;
   if (!dt.types.includes("Files")) return;
   await importDropped(dt, selectedFolderId.value);
 }
@@ -2221,6 +2661,7 @@ async function onDrop(e: DragEvent): Promise<void> {
 // handler never clears the overlay).
 function onTreeDrop(dt: DataTransfer, folderId: number): void {
   isDragging.value = false;
+  if (internalDrag) return;
   void importDropped(dt, folderId);
 }
 
@@ -2236,6 +2677,8 @@ function resetRecipe(): void {
   resetHslGrading();
   resetCurve();
   masks.splice(0);
+  erase.splice(0);
+  resetRelight();
 }
 
 // ── Assistant ──
@@ -2258,6 +2701,10 @@ function describeEdit(): unknown {
     image: { width: srcFullW.value, height: srcFullH.value, orientedWidth: iw, orientedHeight: ih, name: activeSource.value?.name },
     sliders: Object.fromEntries(visibleGroups.value.flatMap(g => g.items).map(sp =>
       [sp.key, { value: recipe[sp.key], min: sp.min, max: sp.max, default: SLIDER_DEFAULTS[sp.key] }])),
+    lensBlurFocus: recipe.blurFocusX >= 0 ? (() => {
+      const [x, y] = strokeToView(recipe.blurFocusX, recipe.blurFocusY, crop, viewLens());
+      return { x: +x.toFixed(3), y: +y.toFixed(3) };
+    })() : "centre",
     hsl: Object.fromEntries(HSL_RANGES.map((r, i) => [r.key, { hue: hslHue[i], sat: hslSat[i], lum: hslLum[i] }])),
     grading: {
       ...Object.fromEntries(Object.entries(GRADING_NAMES).map(([name, p]) => [name, { hue: grading[`${p}H`], sat: grading[`${p}S`] }])),
@@ -2452,8 +2899,12 @@ const SET_EDIT_SCHEMA = {
   properties: {
     reset: { type: "boolean", description: "Reset every adjustment and the crop to defaults before applying the rest" },
     sliders: {
-      type: "object", description: "Basic sliders, absolute values (Lightroom semantics). Omitted keys keep their value.",
+      type: "object", description: "Every slider, absolute values (Lightroom semantics). Omitted keys keep their value.",
       properties: Object.fromEntries(SLIDER_SPECS.map(sp => [sp.key, num(sp.min, sp.max)])),
+    },
+    lensBlurFocus: {
+      type: "object", description: "Where lens blur focuses, in fractions of the oriented, uncropped image (x right, y down); null-like values are ignored.",
+      properties: { x: num(0, 1), y: num(0, 1) },
     },
     hsl: { type: "object", description: "Per-colour HSL, each band {hue,sat,lum} in -100..100", properties: Object.fromEntries(HSL_RANGES.map(r => [r.key, HSL_BAND_SCHEMA])) },
     grading: { type: "object", description: "Colour grading (split toning): a tint per tonal band. blend 0..100 = how far the shadow and highlight tints overlap into the midtones; balance -100..100 shifts the crossover towards shadows (negative) or highlights (positive).", properties: { shadows: GRADING_BAND_SCHEMA, midtones: GRADING_BAND_SCHEMA, highlights: GRADING_BAND_SCHEMA, blend: num(0, 100), balance: num(-100, 100) } },
@@ -2477,12 +2928,13 @@ const SET_EDIT_SCHEMA = {
     masks: {
       type: "array", description: "Local adjustments. Replaces the whole mask list (send [] to clear). Start each mask from a preset, or give components; adjust values are deltas added to the global sliders where the mask applies.",
       items: { type: "object", properties: {
-        preset: { type: "string", enum: Object.keys(MASK_PRESETS) },
+        preset: { type: "string", enum: Object.keys(MASK_PRESETS).filter(k => k !== "brush") },
         name: { type: "string" }, invert: { type: "boolean" },
         components: {
-          type: "array", description: "Combined in order: luminance/color select by tone or hue, linear/radial by position in fractions of the oriented image.",
+          type: "array", description: "Combined in order: luminance/color select by tone or hue, depth by distance (lo/hi on 0 = nearest .. 100 = farthest), ai by what the region is (kind), linear/radial by position in fractions of the oriented image.",
           items: { type: "object", properties: {
-            type: { type: "string", enum: MASK_TYPES }, op: { type: "string", enum: MASK_OPS }, invert: { type: "boolean" },
+            type: { type: "string", enum: MASK_TYPES.filter(k => k !== "brush") }, op: { type: "string", enum: MASK_OPS }, invert: { type: "boolean" },
+            kind: { type: "string", enum: AI_KINDS, description: "ai components: what to select" },
             lo: num(0, 100), hi: num(0, 100), feather: num(0, 100),
             hue: num(-180, 180, "degrees"), hueWidth: num(5, 120, "degrees"),
             x0: num(0, 1), y0: num(0, 1), x1: num(0, 1), y1: num(0, 1),
@@ -2529,6 +2981,11 @@ async function applyAssistantEdit(args: any): Promise<void> {
   requireImage();
   if (args.reset) { resetRecipe(); resetCrop(); resetLook(); }
   for (const sp of SLIDER_SPECS) recipe[sp.key] = numOr(args.sliders?.[sp.key], recipe[sp.key], sp.min, sp.max);
+  if (typeof args.lensBlurFocus?.x === "number" && typeof args.lensBlurFocus?.y === "number") {
+    // Oriented image-norm -> the source-norm point the picker would store.
+    const [u, v] = viewToStroke(clamp(args.lensBlurFocus.x, 0, 1), clamp(args.lensBlurFocus.y, 0, 1), crop, viewLens());
+    recipe.blurFocusX = clamp(u, 0, 1); recipe.blurFocusY = clamp(v, 0, 1);
+  }
   HSL_RANGES.forEach((r, i) => {
     const band = args.hsl?.[r.key];
     if (!band) return;
@@ -2586,18 +3043,21 @@ async function applyAssistantEdit(args: any): Promise<void> {
       if (Array.isArray(m?.components)) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         g.components = m.components.slice(0, MASK_COMPS).flatMap((c: any): MaskComponent[] => {
-          if (!MASK_TYPES.includes(c?.type)) return [];
+          // A brush needs strokes the assistant cannot paint.
+          if (!MASK_TYPES.includes(c?.type) || c.type === "brush") return [];
           const d = defaultComponent(c.type as MaskType);
           d.op = MASK_OPS.includes(c.op) ? c.op : d.op;
           d.invert = typeof c.invert === "boolean" ? c.invert : d.invert;
-          if (d.type === "luminance") {
+          if (d.type === "luminance" || d.type === "depth") {
             d.lo = numOr(c.lo, d.lo, 0, 100); d.hi = numOr(c.hi, d.hi, 0, 100);
             d.featherLo = d.featherHi = numOr(c.feather, d.featherLo, 0, 100);
           } else if (d.type === "color") {
             d.hue = rad(numOr(c.hue, deg(d.hue), -180, 180)); d.hueWidth = rad(numOr(c.hueWidth, deg(d.hueWidth), 5, 120));
           } else if (d.type === "linear") {
             d.x0 = numOr(c.x0, d.x0, 0, 1); d.y0 = numOr(c.y0, d.y0, 0, 1); d.x1 = numOr(c.x1, d.x1, 0, 1); d.y1 = numOr(c.y1, d.y1, 0, 1);
-          } else {
+          } else if (d.type === "ai") {
+            d.kind = AI_KINDS.includes(c.kind) ? c.kind : d.kind;
+          } else if (d.type === "radial") {
             d.cx = numOr(c.cx, d.cx, 0, 1); d.cy = numOr(c.cy, d.cy, 0, 1); d.rx = numOr(c.rx, d.rx, 0.02, 1); d.ry = numOr(c.ry, d.ry, 0.02, 1);
             d.angle = numOr(c.angle, d.angle, -180, 180); d.feather = numOr(c.feather, d.feather * 100, 0, 100) / 100;
           }
@@ -2705,18 +3165,23 @@ const assistantTools: Record<string, AssistantTool> = {
 
 function assistantSystemPrompt(): string {
   return [
-    "You are the editing assistant inside LLR, a RAW photo editor with Lightroom-style controls. The user has a photo open; you edit it by calling tools, and every change shows up live and can be undone.",
-    "Workflow, in this order, every time you change the photo:",
-    "1. Look first: get_edit for the current values and view_image for the picture.",
-    "2. Apply with set_edit (absolute values, not deltas). Change 2–4 controls per round, not everything at once.",
-    "3. Judge with compare (before/after side by side) and measure (numbers). Ask: is it too much, too little, did anything clip?",
-    "4. Refine with another set_edit, then compare again. Expect 2–4 rounds; stop when compare shows the intent without over-correction. Never finish a turn with a set_edit you have not looked at.",
-    "Strength calibration (Lightroom semantics): exposure ±0.3 EV is one visible step, ±1 EV is dramatic. On -100..100 sliders, ±10 is subtle (visible only in compare), ±30 clearly visible, ±60 strong, beyond that is a special effect. Temperature: ±300 K subtle, ±1000 K obviously warm/cool. Start at the subtle-to-visible end and increase only if compare shows too little.",
-    "Slider semantics: exposure in stops; contrast, highlights, shadows, whites, blacks, clarity, dehaze, vibrance, saturation in -100..100; temperature in Kelvin (higher = warmer rendering), tint negative = green, positive = magenta. For crops, think about composition (subject placement, horizon, distractions at the edges) and use angle to straighten. Keep the original aspect ratio (aspect 'orig') unless the user asks for a specific ratio or free crop: the frame may be headed for a print.",
-    "Styles are built in the colour and curve tools, not in Basic: a 'cinematic', 'film', 'moody' or 'vintage' ask means grading (shadows/highlights split tones: teal −160..180 in the shadows with orange 25..35 in the highlights is the classic cinematic pair, warm shadows + cool highlights reads as film), the tone curve (lift the black point for a faded look, an S for punch), HSL for taming or shifting single colours, and vibrance/saturation for the overall chroma. Grading sat 10–15 is subtle, 25–35 a clear look, above 50 a colour cast. Basic sliders then only set the overall brightness and contrast the style sits on.",
-    "Local before global: when the problem is in one part of the picture — a dull sky over a fine foreground, a backlit face, a bright distraction at the edge, shadows that need lifting without flattening the highlights — reach for masks instead of pushing a global slider that then has to be undone elsewhere. Start from a preset when one fits — the luminance ones pick the lit or the shaded side, sky wants a blue sky (a grey sky is a highlights or top-down linear job). Compose components for anything else: luminance range ∩ colour hue ∩ linear/radial position, e.g. a warm-lit face = skin ∩ highlights, the foreground = an inverted top-down linear. Adjust values are local deltas added to the global sliders. Always view_mask a new selection before trusting it, then compare its effect.",
-    "look (Sony shots only): the camera's own rendering — pick a style for a wholesale character change (VV vivid, PT portrait skin, FL film), and prefer its tweaks over the Basic sliders when the user asks for 'the camera's look' or an in-camera style. DRO already lifts shadows on many frames: check it before adding shadows/exposure, and turn it off when the user wants the flat decode.",
-    `Answer briefly, in the user's language (UI locale: ${locale.value}). Say what you changed and why; do not list every value.`,
+    "You are the editing assistant inside LLR, a RAW photo editor with Lightroom-style controls. The user has a photo open; you edit it by calling tools. Every change shows up live and can be undone, so act rather than ask when the request is clear enough to try.",
+    "",
+    "How to work: see the photo before you change it (view_image, and get_edit for the current values), and see the result before you finish (compare; measure when clipping or levels matter). An edit you have not looked at is not done. Group related controls into one set_edit and judge them together; take another round only when compare shows the intent missed — too little, too much, or a side effect. A small, precise ask (\"a bit warmer\") usually needs one round; a whole look may need a few.",
+    "",
+    "Strength (Lightroom semantics): exposure ±0.3 EV is a visible step, ±1 EV dramatic. On -100..100 sliders ±10 is subtle, ±30 clear, ±60 strong, beyond that an effect. Temperature ±300 K subtle, ±1000 K obviously warm or cool; tint negative = green, positive = magenta. Start subtle-to-visible and go further only when compare shows too little.",
+    "",
+    "Looks and styles live in colour grading, the tone curve and HSL, not in Basic. Cinematic: teal (hue −160..180) shadows with orange (25..35) highlights; film: warm shadows and cool highlights; faded: lift the curve's black point; punch: an S curve. Grading saturation 10–15 is subtle, 25–35 a clear look, above 50 a colour cast. Basic then sets the brightness and contrast the look sits on. Vignette (vig*) and grain (grain*) are finishing touches: vignette −15..−35 and grain 15–35 read as natural, more reads as an effect.",
+    "",
+    "Global first, masks last: get the whole picture right before touching a region — exposure, white balance, tone, then the look. Most photos need no mask at all. Reach for one only when a specific region still reads wrong after the global balance and fixing it globally would visibly harm the rest (a sky still blown out, a face still in shadow, a distracting bright edge). Keep it to one or two masks per photo, with modest adjustments (exposure ±0.3–0.7 EV, other sliders within ±30) so the region still belongs to the frame. Pick the selection by what the region is: the AI presets for the main subject, the sky (grey skies included) and people; the depth presets (foreground, background) or a depth range for near versus far; luminance or colour ranges for tones and hues; linear and radial gradients for position. Components combine (e.g. people ∩ highlights = lit faces). Adjust values are deltas on top of the global sliders. view_mask a new selection before trusting it — AI and depth mattes need a moment to compute the first time and are empty until then.",
+    "",
+    "Depth effects use the photo's estimated geometry: blurAmount is lens blur (the focus point defaults to the frame centre — set lensBlurFocus on the subject, and blurRange for how deep the sharp zone is); fogAmount adds haze with distance, negative clears distant haze. Detail: sharpAmount 40–70 is normal output sharpening (sharpMasking 50+ keeps skin and sky smooth); defringe only when purple or green edges are actually visible.",
+    "",
+    "Crops: think about composition (subject placement, horizon, edge distractions) and straighten with angle. Keep the original aspect ratio ('orig') unless the user asks otherwise.",
+    "",
+    "look (Sony shots only): the camera's own rendering. Pick a style for a wholesale change of character (VV vivid, PT portrait skin, FL film) and prefer its tweaks over Basic when the user asks for the camera's look. DRO already lifts shadows on many frames; check it before adding shadows or exposure.",
+    "",
+    `Answer briefly in the user's language (UI locale: ${locale.value}): what you changed and why, not every value.`,
   ].join("\n");
 }
 
@@ -2825,20 +3290,132 @@ function toolDetail(entry: { name: string; result?: ToolContent[] }): { image?: 
 
 const savedRecipes = ref<SavedRecipe[]>(loadSavedRecipes());
 const recipeName = ref("");
-let recipeClipboard: RecipeData | null = null;
+const recipeClipboard = shallowRef<RecipeData | null>(null);
+// Which sections a copy takes: the dialog's ticks, remembered per browser,
+// and what the quick copy (Ctrl+Shift+C) uses without asking.
+const copySections = ref<RecipeSection[]>(loadCopySections());
+// The Copy Settings dialog: open, and which photo it copies from (null = the open one).
+const copyDialog = ref<{ from: string | null } | null>(null);
+const copyNotice = ref<string | null>(null);
+let copyNoticeTimer = 0;
+function flashCopyNotice(msg: string): void {
+  copyNotice.value = msg;
+  window.clearTimeout(copyNoticeTimer);
+  copyNoticeTimer = window.setTimeout(() => { copyNotice.value = null; }, 2600);
+}
 
-function copyRecipe(): void {
-  if (!activeSource.value) return;
-  recipeClipboard = extractRecipe(captureSnapshot());
-  void navigator.clipboard?.writeText(serializeRecipe(recipeClipboard)).catch(() => {});
+async function snapshotFor(id: string | null): Promise<Snapshot | null> {
+  if (!id || id === activeSource.value?.id) return activeSource.value ? captureSnapshot() : null;
+  const photo = photoById(id);
+  return (await snapshotOf(id)) ?? (photo ? defaultSnapshot(photo.name) : null);
+}
+
+async function copyRecipe(from: string | null = null, sections: readonly RecipeSection[] = copySections.value): Promise<void> {
+  const s = await snapshotFor(from);
+  if (!s) return;
+  recipeClipboard.value = extractRecipe(s, sections);
+  void navigator.clipboard?.writeText(serializeRecipe(recipeClipboard.value)).catch(() => {});
+  flashCopyNotice(t("recipe.copied", { n: sections.length }));
+}
+
+function openCopyDialog(from: string | null = null): void {
+  copyDialog.value = { from };
+}
+async function confirmCopy(): Promise<void> {
+  const from = copyDialog.value?.from ?? null;
+  storeCopySections(copySections.value);
+  copyDialog.value = null;
+  await copyRecipe(from);
+}
+function toggleCopySection(s: RecipeSection): void {
+  const on = new Set(copySections.value);
+  if (on.has(s)) on.delete(s); else on.add(s);
+  copySections.value = RECIPE_SECTIONS.filter(x => on.has(x));
+}
+
+// The newer of the in-app copy and the system clipboard: a recipe copied in
+// another tab arrives through the latter.
+async function clipboardRecipe(): Promise<RecipeData | null> {
+  const text = await navigator.clipboard?.readText().catch(() => "") ?? "";
+  return parseRecipe(text) ?? recipeClipboard.value;
 }
 
 async function pasteRecipe(): Promise<void> {
   if (!activeSource.value) return;
-  // The system clipboard wins when it holds a recipe: it is the newer copy.
-  const text = await navigator.clipboard?.readText().catch(() => "") ?? "";
-  const r = parseRecipe(text) ?? recipeClipboard;
+  const r = await clipboardRecipe();
   if (r) await applyRecipeStep(r, t("recipe.pasted"));
+}
+
+/**
+ * Paste onto photos chosen in the grid. The open photo takes it as a live
+ * history step; the rest have their stored edits rewritten, then get their
+ * edited previews re-rendered in the background, one by one.
+ */
+async function pasteToPhotos(ids: readonly string[]): Promise<void> {
+  const r = await clipboardRecipe();
+  if (!r || !ids.length) return;
+  if (activeSource.value && ids.includes(activeSource.value.id)) await applyRecipeStep(r, t("recipe.pasted"));
+  const changed = await updateEdits(ids, p => defaultSnapshot(p.name), cur => applyRecipe(cur, r));
+  flashCopyNotice(t("recipe.pastedTo", { n: changed.length + (activeSource.value && ids.includes(activeSource.value.id) ? 1 : 0) }));
+  queuePreviewRefresh(changed);
+}
+
+// ── Background preview refresh ──
+//
+// A photo whose edit changed without being opened still shows its old edited
+// preview; this re-renders it the way an export would, at preview size and
+// from a half-size decode (kept out of the worker's caches), one at a time.
+const previewQueue: string[] = [];
+const previewProgress = ref<{ done: number; total: number } | null>(null);
+let previewRunning = false;
+function queuePreviewRefresh(ids: readonly string[]): void {
+  for (const id of ids) if (!previewQueue.includes(id)) previewQueue.push(id);
+  previewProgress.value = { done: previewProgress.value?.done ?? 0, total: (previewProgress.value?.done ?? 0) + previewQueue.length };
+  if (!previewRunning) void runPreviewQueue();
+}
+async function runPreviewQueue(): Promise<void> {
+  previewRunning = true;
+  try {
+    while (previewQueue.length) {
+      const id = previewQueue.shift()!;
+      try {
+        const s = await snapshotFor(id);
+        if (s) await savePreview(id, await renderSnapshot(id, s, PREVIEW_EDGE));
+      } catch (err) {
+        console.warn(`[preview] ${id} failed:`, err);
+      }
+      if (previewProgress.value) previewProgress.value = { ...previewProgress.value, done: previewProgress.value.done + 1 };
+    }
+  } finally {
+    previewRunning = false;
+    previewProgress.value = null;
+  }
+}
+
+/** Render a photo's snapshot off-screen at `maxEdge` (another photo than the open one). */
+async function renderSnapshot(id: string, settings: Snapshot, maxEdge: number): Promise<Blob> {
+  const off = new Set(settings.bypass ?? []);
+  const body = {
+    sourceId: id, halfSize: true, maxSize: 2048, purpose: "export",
+    profileId: settings.profile ?? "standard", dcpCode: settings.dcp, denoise: denoisePayload(settings.denoise),
+    look: off.has("look") ? undefined : settings.look ?? undefined,
+    style: off.has("look") ? undefined : settings.lookStyle ?? undefined,
+    dro: off.has("look") ? undefined : settings.dro ?? undefined, erase: eraseWire(settings.erase ?? []),
+  };
+  const masksOn = off.has("masks") ? [] : settings.masks ?? [];
+  const [geo, ai] = await Promise.all([
+    snapshotNeedsGeometry({ ...settings, recipe: effectiveRecipe(settings.recipe, off), masks: masksOn })
+      ? fetchRelightGeometry(body).catch(() => null) : null,
+    masksOn.some(g => g.enabled && g.components.some(c => c.type === "ai"))
+      ? fetchAiMasks(body).catch(() => null) : null,
+  ]);
+  const plan = buildPlan(id, settings, {
+    params: (meta) => buildPipelineParams(settings, {
+      matte: null, ctx: { lensCorr: parseLensCorr(meta.colorProfile?.lensCorr), srcW: meta.width, srcH: meta.height },
+    }),
+    relightGeometry: geo, ai,
+  });
+  return renderPlan({ ...plan, decode: { halfSize: true, maxSize: 2048 } }, { maxEdge, quality: 0.85 });
 }
 
 // One history step, like the assistant's edits.
@@ -2877,16 +3454,38 @@ function exportFilename(): string {
 function buildExportPlan(): ExportPlan | null {
   if (!currentSourceId || !activeSource.value) return null;
   const settings = captureSnapshot();
+  return buildPlan(currentSourceId, settings, {
+    params: buildPipelineParams(settings),
+    relightGeometry: relightGeometry, ai: aiMasks,
+  });
+}
+
+// The plan for `settings` on photo `id`: the export's, and the background
+// preview's (which brings its own params builder and per-photo analyses).
+function buildPlan(
+  id: string, settings: Snapshot,
+  extra: { params: ExportPlan["params"]; relightGeometry: RelightGeometry | null; ai: { data: Uint8Array; w: number; h: number } | null },
+): ExportPlan {
   const off = new Set(settings.bypass ?? []);
   const cropSnap = effectiveCrop(settings.crop, off);
   return {
-    sourceId: currentSourceId,
-    filename: exportFilename(),
+    sourceId: id,
+    filename: id === currentSourceId ? exportFilename() : `${(photoById(id)?.name ?? "export").replace(/\.[^.]+$/, "")}.jpg`,
     settings,
     stripPrivate: viewSettings.exportStripPrivate === 1,
     dcpCode: settings.dcp,
     profileId: settings.profile ?? "standard",
     denoise: denoisePayload(settings.denoise),
+    erase: eraseWire(settings.erase ?? []),
+    prepare: (r, params) => {
+      const p = params as Partial<EditParams> & { maskBrushes?: BrushStroke[][]; maskUsesAi?: boolean };
+      const dims = r.auxDims();
+      if (dims && p.maskBrushes?.length) {
+        r.uploadMaskLayer(AUX_LAYER.brush, { data: rasterBrushes(p.maskBrushes, dims[0], dims[1]), w: dims[0], h: dims[1] });
+      }
+      if (p.maskUsesAi && extra.ai) r.uploadMaskLayer(AUX_LAYER.ai, extra.ai);
+    },
+    relightGeometry: snapshotNeedsGeometry({ ...settings, recipe: effectiveRecipe(settings.recipe, off), masks: off.has("masks") ? [] : settings.masks }) ? extra.relightGeometry : null,
     // Absent means as shot, same as everywhere else — the full-res decode then
     // rebuilds the profile the preview was showing (plan.profileLUT).
     look: off.has("look") ? undefined : settings.look ?? undefined,
@@ -2894,7 +3493,7 @@ function buildExportPlan(): ExportPlan | null {
     dro: off.has("look") ? undefined : settings.dro ?? undefined,
     sonyAdvancedColour: settings.sonyAdvancedColour ?? false,
     sonyCameraMatch: settings.sonyCameraMatch ?? false,
-    params: buildPipelineParams(settings),
+    params: extra.params,
     curveLUT: buildToneCurveLUT(off.has("curve") ? defaultToneCurve() : settings.curve,
       currentBasic(effectiveRecipe(settings.recipe, off))),
     profileLUT: (meta) => buildProfileLUT(meta.colorProfile),
@@ -3002,41 +3601,26 @@ const vWheelAdjust = {
       </div>
       <div class="topbar-actions">
         <button class="icon-btn" :disabled="!canUndo" @click="undo" :title="t('action.undo')" :aria-label="t('aria.undo')">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M3 9h11a5 5 0 0 1 0 10H8" />
-            <path d="M7 5L3 9l4 4" />
-          </svg>
+          <JIcon :icon="IconUndo" />
         </button>
         <button class="icon-btn" :disabled="!canRedo" @click="redo" :title="t('action.redo')" :aria-label="t('aria.redo')">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M21 9H10a5 5 0 0 0 0 10h6" />
-            <path d="M17 5l4 4-4 4" />
-          </svg>
+          <JIcon :icon="IconRedo" />
         </button>
         <button class="icon-btn" :class="{ 'is-on': showOriginal }" :disabled="!activeSource || cropMode"
           @mousedown="startCompare" @mouseup="endCompare" @mouseleave="endCompare"
           @touchstart.prevent="startCompare" @touchend.prevent="endCompare" @touchcancel="endCompare"
           :title="t('action.compareOriginal')" :aria-label="t('aria.compareOriginal')">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="3" y="5" width="18" height="14" rx="2" />
-            <path d="M12 5v14" />
-          </svg>
+          <JIcon :icon="IconCompare" />
         </button>
         <button class="icon-btn" :disabled="!anyEdited" @click="resetRecipe"
           :title="t('action.resetAll')" :aria-label="t('action.resetAll')">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M3 4v6h6" />
-            <path d="M3.5 10a9 9 0 1 1 1.6 6" />
-          </svg>
+          <JIcon :icon="IconReset" />
         </button>
         <button class="icon-btn" :class="{ 'is-on': showEmbedded }" :disabled="!activeSource || cropMode || !embeddedSrc"
           @mousedown="startCompareEmbedded" @mouseup="endCompareEmbedded" @mouseleave="endCompareEmbedded"
           @touchstart.prevent="startCompareEmbedded" @touchend.prevent="endCompareEmbedded" @touchcancel="endCompareEmbedded"
           :title="t('action.compareJpeg')" :aria-label="t('aria.compareJpeg')">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M20 19H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h3l2-2.5h6L17 7h3a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2z" />
-            <circle cx="12" cy="13" r="3.5" />
-          </svg>
+          <JIcon :icon="IconCamera" />
         </button>
       </div>
       <div class="meta-summary">
@@ -3047,11 +3631,7 @@ const vWheelAdjust = {
         <span v-else class="meta-empty">{{ t('meta.noImage') }}</span>
       </div>
       <button class="export-btn" type="button" :disabled="!activeSource || exporting" @click="exportImage">
-        <svg v-if="!exporting" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M12 3v12" />
-          <path d="M8 11l4 4 4-4" />
-          <path d="M5 21h14" />
-        </svg>
+        <JIcon v-if="!exporting" :icon="IconDownload" />
         <span class="export-spinner" v-else aria-hidden="true" />
         <span>{{ exporting ? t('action.exporting') : t('action.export') }}</span>
       </button>
@@ -3078,10 +3658,7 @@ const vWheelAdjust = {
             :title="sortControlLabel" :aria-label="sortControlLabel" @update:model-value="setSort" />
           <button class="icon-btn library-dir" type="button" :title="sortDir === 'asc' ? t('library.asc') : t('library.desc')"
             :aria-label="sortDir === 'asc' ? t('library.asc') : t('library.desc')" @click="toggleSortDir">
-            <svg viewBox="0 0 12 12" aria-hidden="true" :class="{ 'is-desc': sortDir === 'desc' }">
-              <path d="M6 2v8M2.5 6.5L6 10l3.5-3.5" fill="none" stroke="currentColor" stroke-width="1.5"
-                stroke-linecap="round" stroke-linejoin="round" />
-            </svg>
+            <JIcon :icon="sortDir === 'asc' ? IconSortAscending : IconSortDescending" />
           </button>
           <SelectMenu icon="group" :model-value="groupKey" :options="groupOptions"
             :title="groupControlLabel" :aria-label="groupControlLabel" @update:model-value="setGroup" />
@@ -3089,7 +3666,8 @@ const vWheelAdjust = {
       </div>
       <PhotoGrid v-show="libraryView === 'library'" :sections="library.sections" :grouped="library.grouped" :active-id="activeId"
         :selected-ids="selectedIds" :loading="folderLoading" :thumb-src="thumbSrc" :is-invalid="(id) => activeSource?.id === id && !!activeSource.invalid"
-        :move-targets="moveTargets"
+        :move-targets="moveTargets" :can-paste="!!recipeClipboard"
+        @copy-settings="openCopyDialog" @paste-settings="pasteToPhotos"
         @open="openPhoto" @remove="removePhotosConfirmed" @rename="onGridRename" @move="onGridMove"
         @new-folder="onGridNewFolder" @import-files="pickFiles" />
       <div class="viewport" ref="viewportRef" v-show="libraryView === 'develop'"
@@ -3102,11 +3680,7 @@ const vWheelAdjust = {
         :class="{ 'is-grabbing': isPanning, 'is-grab': spaceHeld && !isPanning }">
         <div class="dropzone" v-show="!activeSource && status !== 'uploading'" @click="pickFiles">
           <div class="dropzone-inner">
-            <svg class="dropzone-icon" viewBox="0 0 48 48" fill="none" aria-hidden="true">
-              <rect x="6" y="10" width="36" height="28" rx="4" stroke="currentColor" stroke-width="2" />
-              <circle cx="17" cy="20" r="3.5" stroke="currentColor" stroke-width="2" />
-              <path d="M9 33l9-9 6 6 8-8 7 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-            </svg>
+            <JIcon class="dropzone-icon" :icon="IconImage" weight="light" />
             <p class="dropzone-title">{{ t('dropzone.title') }}</p>
             <p class="dropzone-sub">{{ t('dropzone.sub') }}</p>
             <p class="dropzone-hint">{{ IMPORT_FORMAT_HINT }}</p>
@@ -3123,7 +3697,7 @@ const vWheelAdjust = {
         <!-- The camera JPEG stands in while a *different* source decodes: the
              fit view is a plain contain, so it lands where the frame will. -->
         <img v-if="activeSource && !activeSource.invalid && status === 'rendering' && renderedId !== activeSource.id"
-          class="preview-placeholder" :src="activeSource.previewUrl || !activeSource.embeddedUrl ? thumbSrc(activeSource) : resolveUrl(activeSource.embeddedUrl)" :alt="t('aria.preview')" />
+          class="preview-placeholder" draggable="false" :src="activeSource.previewUrl || !activeSource.embeddedUrl ? thumbSrc(activeSource) : resolveUrl(activeSource.embeddedUrl)" :alt="t('aria.preview')" />
         <!-- Camera-JPEG compare: opaque overlay in the canvas's exact box, with
              the full-frame JPEG placed inside it through the edit's own crop /
              straighten / flip so both sides show the same framing. The src stays
@@ -3132,7 +3706,7 @@ const vWheelAdjust = {
         <div v-show="showEmbedded && webglRenderer != null && activeSource && !activeSource.invalid"
           class="preview compare-embedded"
           :style="{ transform: displayTransform, width: imageW + 'px', height: imageH + 'px' }">
-          <img ref="embeddedImgRef" :style="{ transform: embeddedTransform, width: srcW + 'px', height: srcH + 'px' }"
+          <img ref="embeddedImgRef" draggable="false" :style="{ transform: embeddedTransform, width: srcW + 'px', height: srcH + 'px' }"
             :src="embeddedSrc || undefined" :alt="t('aria.cameraJpeg')" />
         </div>
         <div v-show="activeSource && (status === 'rendering' || status === 'uploading')"
@@ -3226,9 +3800,66 @@ const vWheelAdjust = {
             </g>
           </template>
         </svg>
-        <img v-show="activeSource && !activeSource.invalid && !webglRenderer && status !== 'rendering'" class="preview" :style="{ transform: displayTransform }" :src="activeSource ? resolveUrl(activeSource.embeddedUrl) : ''" :alt="t('aria.preview')" />
+        <!-- Erase brush (useEraseEditor): same box as the crop overlay. The
+             whole image takes the pointer while the tab is open; Space hands it
+             back to the viewport for panning. Stored strokes are drawn only on
+             request (or the one hovered in the list) — over a fill they would
+             hide exactly what the user wants to look at. -->
+        <svg v-show="editTab === 'erase' && !cropMode && webglRenderer != null" ref="eraseOverlayRef"
+          class="crop-overlay erase-overlay" :class="{ 'is-passthrough': spaceHeld }"
+          :style="{ transform: displayTransform, width: imageW + 'px', height: imageH + 'px' }"
+          :viewBox="eraseViewBox" preserveAspectRatio="none"
+          @pointerdown="onErasePointerDown" @pointermove="onErasePointerMove" @pointerup="onErasePointerUp"
+          @pointerleave="onErasePointerLeave">
+          <template v-for="p in erasePaths" :key="p.id">
+            <path v-if="eraseShowStrokes || eraseHover === p.id" class="erase-stroke" :class="{ 'is-hover': eraseHover === p.id }"
+              :d="p.d" :stroke-width="p.width" />
+          </template>
+          <path v-if="eraseLivePath" class="erase-stroke is-live" :d="eraseLivePath" :stroke-width="2 * eraseCursorR" />
+          <circle v-if="eraseCursor" class="erase-cursor" :cx="eraseCursor.x" :cy="eraseCursor.y" :r="eraseCursorR" />
+        </svg>
+        <!-- Brush mask painter: the erase brush's editor, painting into the
+             active brush component (activeBrush) instead. -->
+        <svg v-show="editTab === 'masks' && activeBrushComp && !cropMode && webglRenderer != null" ref="brushOverlayRef"
+          class="crop-overlay erase-overlay" :class="{ 'is-passthrough': spaceHeld }"
+          :style="{ transform: displayTransform, width: imageW + 'px', height: imageH + 'px' }"
+          :viewBox="brushViewBox" preserveAspectRatio="none"
+          @pointerdown="onBrushPointerDown" @pointermove="onBrushPointerMove" @pointerup="onBrushPointerUp"
+          @pointerleave="onBrushPointerLeave">
+          <path v-if="brushLivePath" class="erase-stroke brush-live" :class="{ 'is-erasing': brushErase }" :d="brushLivePath" :stroke-width="2 * brushCursorR" />
+          <circle v-if="brushCursor" class="erase-cursor" :cx="brushCursor.x" :cy="brushCursor.y" :r="brushCursorR" />
+        </svg>
+        <!-- Relight rig (useRelightEditor): a click on the image adds a light
+             aimed there, a handle drags it. Same box as the crop overlay. -->
+        <svg v-show="editTab === 'relight' && !cropMode && webglRenderer != null" ref="relightOverlayRef"
+          class="crop-overlay relight-overlay" :class="{ 'is-passthrough': spaceHeld }"
+          :style="{ transform: displayTransform, width: imageW + 'px', height: imageH + 'px' }"
+          :viewBox="relightViewBox" preserveAspectRatio="none"
+          @pointerdown="onRelightPointerDown" @pointermove="onRelightPointerMove" @pointerup="onRelightPointerUp">
+          <g v-for="(h, i) in relightHandles" :key="h.id">
+            <circle class="relight-handle" :class="{ 'is-selected': selectedLight === h.id, 'is-behind': h.behind }"
+              :cx="h.x" :cy="h.y" :r="9 * ofPerScreen" :style="{ fill: h.color }"
+              @pointerdown="onLightHandleDown($event, h.id)" />
+            <text class="relight-label" :x="h.x" :y="h.y + 3.5 * ofPerScreen" :font-size="10 * ofPerScreen">{{ i + 1 }}</text>
+          </g>
+        </svg>
+        <!-- Lens blur focus (useFocusPicker): the point shown while the
+             Effects tab is open; while picking, a click on the image sets it. -->
+        <svg v-show="editTab === 'effects' && !cropMode && webglRenderer != null && (pickingFocus || recipe.blurAmount > 0)" ref="focusOverlayRef"
+          class="crop-overlay focus-overlay" :class="{ 'is-picking': pickingFocus, 'is-passthrough': spaceHeld }"
+          :style="{ transform: displayTransform, width: imageW + 'px', height: imageH + 'px' }"
+          :viewBox="focusViewBox" preserveAspectRatio="none" @pointerdown="onFocusPointerDown">
+          <g v-if="focusMarker" class="focus-marker">
+            <circle :cx="focusMarker.x" :cy="focusMarker.y" :r="14 * ofPerScreen" />
+            <line :x1="focusMarker.x - 22 * ofPerScreen" :y1="focusMarker.y" :x2="focusMarker.x - 8 * ofPerScreen" :y2="focusMarker.y" />
+            <line :x1="focusMarker.x + 8 * ofPerScreen" :y1="focusMarker.y" :x2="focusMarker.x + 22 * ofPerScreen" :y2="focusMarker.y" />
+            <line :x1="focusMarker.x" :y1="focusMarker.y - 22 * ofPerScreen" :x2="focusMarker.x" :y2="focusMarker.y - 8 * ofPerScreen" />
+            <line :x1="focusMarker.x" :y1="focusMarker.y + 8 * ofPerScreen" :x2="focusMarker.x" :y2="focusMarker.y + 22 * ofPerScreen" />
+          </g>
+        </svg>
+        <img v-show="activeSource && !activeSource.invalid && !webglRenderer && status !== 'rendering'" class="preview" draggable="false" :style="{ transform: displayTransform }" :src="activeSource ? resolveUrl(activeSource.embeddedUrl) : ''" :alt="t('aria.preview')" />
         <div v-if="activeSource?.invalid" class="invalid-state">
-          <img v-if="activeSource && thumbSrc(activeSource)" :src="thumbSrc(activeSource)" :alt="activeSource.name" />
+          <img v-if="activeSource && thumbSrc(activeSource)" draggable="false" :src="thumbSrc(activeSource)" :alt="activeSource.name" />
           <p class="invalid-title">{{ t('invalid.missingTitle') }}</p>
           <p class="invalid-sub">{{ t('invalid.missingSub') }}</p>
         </div>
@@ -3254,10 +3885,10 @@ const vWheelAdjust = {
         </div>
         <div class="status-right">
           <div class="status-cell zoom-cell" v-if="activeSource && libraryView === 'develop'">
-            <button class="zoom-btn" @click="zoomOut" :disabled="zoom <= 0.1">−</button>
+            <button class="zoom-btn" @click="zoomOut" :disabled="zoom <= 0.1" :title="t('zoom.out')" :aria-label="t('zoom.out')"><JIcon :icon="IconMinus" /></button>
             <span class="zoom-percent">{{ zoomPercent }}%</span>
-            <button class="zoom-btn" @click="zoomIn" :disabled="zoom >= 50">+</button>
-            <button class="zoom-btn" @click="fitView">{{ t('zoom.fit') }}</button>
+            <button class="zoom-btn" @click="zoomIn" :disabled="zoom >= 50" :title="t('zoom.in')" :aria-label="t('zoom.in')"><JIcon :icon="IconPlus" /></button>
+            <button class="zoom-btn" @click="fitView" :title="t('zoom.fit')" :aria-label="t('zoom.fit')"><JIcon :icon="IconFitToScreen" /></button>
           </div>
         </div>
       </footer>
@@ -3272,12 +3903,9 @@ const vWheelAdjust = {
         <header class="panel-head chat-head">
           <span>{{ t('panel.assistant') }}</span>
           <button class="icon-btn chat-gear" type="button" :title="t('models.title')" :aria-label="t('models.title')" @click="modelSettingsOpen = true">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z" />
-              <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" />
-            </svg>
+            <JIcon :icon="IconSettings" />
           </button>
-          <button class="ghost" type="button" :disabled="!chatEntries.length || chatBusy" @click="resetChat">{{ t('chat.clear') }}</button>
+          <button class="icon-btn chat-gear" type="button" :disabled="!chatEntries.length || chatBusy" :title="t('chat.clear')" :aria-label="t('chat.clear')" @click="resetChat"><JIcon :icon="IconBroom" /></button>
         </header>
         <ModelSettings :open="modelSettingsOpen" :models="chatModels" :catalog="chatCatalog"
           @update:models="v => chatModels = v" @close="modelSettingsOpen = false" />
@@ -3349,10 +3977,10 @@ const vWheelAdjust = {
               :aria-label="t('models.title')" :placeholder="t('models.none')" />
             <SelectMenu v-model="chatThinking" :options="chatThinkingOptions" :disabled="chatBusy" :aria-label="t('chat.thinking')" />
             <button v-if="chatBusy" type="button" class="chat-send is-stop" :title="t('chat.stop')" :aria-label="t('chat.stop')" @click="abortChat">
-              <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2" /></svg>
+              <JIcon :icon="IconStop" />
             </button>
             <button v-else type="submit" class="chat-send" :disabled="!chatDraft.trim()" :title="t('chat.send')" :aria-label="t('chat.send')">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5" /><path d="M6 11l6-6 6 6" /></svg>
+              <JIcon :icon="IconArrowUp" weight="bold" />
             </button>
           </div>
         </form>
@@ -3364,7 +3992,7 @@ const vWheelAdjust = {
       <section class="panel crop-panel" v-if="activeSource && cropMode">
         <header class="panel-head">
           <span>{{ t('panel.crop') }}</span>
-          <button class="ghost" type="button" @click="resetCrop">{{ t('common.reset') }}</button>
+          <button class="ghost ghost-icon" type="button" :title="t('common.reset')" :aria-label="t('common.reset')" @click="resetCrop"><JIcon :icon="IconReset" /></button>
         </header>
         <div class="control-row">
           <label class="control-label">{{ t('crop.aspect') }}</label>
@@ -3372,10 +4000,7 @@ const vWheelAdjust = {
             <SelectMenu :model-value="customAspect ? 'custom' : cropAspect" :options="aspectOptions"
               :aria-label="t('crop.aspect')" @update:model-value="selectAspect" />
             <button class="icon-mini" type="button" :title="t('crop.swap')" @click="swapAspect" :aria-label="t('aria.swapAspect')">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M16 3l4 4-4 4" /><path d="M20 7H8a4 4 0 0 0-4 4" />
-                <path d="M8 21l-4-4 4-4" /><path d="M4 17h12a4 4 0 0 0 4-4" />
-              </svg>
+              <JIcon :icon="IconArrowsLeftRight" />
             </button>
           </div>
         </div>
@@ -3399,29 +4024,19 @@ const vWheelAdjust = {
         <div class="crop-buttons">
           <button type="button" class="crop-tool" :class="{ 'is-on': lineTool === 'straighten' }" :title="t('crop.straighten')"
             :aria-pressed="lineTool === 'straighten'" @click="setLineTool('straighten')">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M3 17L21 7" /><path d="M6.5 15.2l1.2 2.2" /><path d="M10.5 13l1.2 2.2" /><path d="M14.5 10.8l1.2 2.2" /><path d="M18.5 8.6l1.2 2.2" />
-            </svg>
+            <JIcon :icon="IconRuler" />
           </button>
           <button type="button" class="crop-tool" :title="t('crop.rotateLeft')" @click="rotateCrop(-1)">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5" />
-            </svg>
+            <JIcon :icon="IconRotateCcw" />
           </button>
           <button type="button" class="crop-tool" :title="t('crop.rotateRight')" @click="rotateCrop(1)">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21 12a9 9 0 1 1-3-6.7L21 8" /><path d="M21 3v5h-5" />
-            </svg>
+            <JIcon :icon="IconRotate" />
           </button>
           <button type="button" class="crop-tool" :class="{ 'is-on': crop.flipH }" :title="t('crop.flipH')" @click="flipCropH">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 3v18" /><path d="M8 7l-4 5 4 5" /><path d="M16 7l4 5-4 5" />
-            </svg>
+            <JIcon :icon="IconFlip" />
           </button>
           <button type="button" class="crop-tool" :class="{ 'is-on': crop.flipV }" :title="t('crop.flipV')" @click="flipCropV">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M3 12h18" /><path d="M7 8l5-4 5 4" /><path d="M7 16l5 4 5-4" />
-            </svg>
+            <JIcon :icon="IconFlipVertical" />
           </button>
         </div>
         <header class="panel-head crop-sub" :class="{ 'is-off': isBypassed('transform') }">
@@ -3430,36 +4045,34 @@ const vWheelAdjust = {
               :aria-pressed="!isBypassed('transform')" :title="t('panel.switch')" @click="toggleBypass('transform')" />
             {{ t('xf.title') }}
           </span>
-          <button class="ghost" type="button" @click="resetTransform">{{ t('common.reset') }}</button>
+          <button class="ghost ghost-icon" type="button" :title="t('common.reset')" :aria-label="t('common.reset')" @click="resetTransform"><JIcon :icon="IconReset" /></button>
         </header>
         <div class="xf-guided">
           <button type="button" class="crop-tool xf-guided-btn" :class="{ 'is-on': lineTool === 'guided' }"
             :title="t('xf.guidedTitle')" :aria-pressed="lineTool === 'guided'" @click="setLineTool('guided')">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M7 3v18" /><path d="M17 3v18" /><path d="M3 8h18" /><path d="M3 16h18" />
-            </svg>
+            <JIcon :icon="IconGrid3x3" />
             <span>{{ t('xf.guided') }}</span>
           </button>
           <button type="button" class="crop-tool xf-guided-count" :disabled="!crop.xf.guides.length"
-            :title="t('xf.removeGuide')" @click="removeLastGuide">{{ crop.xf.guides.length }} / 4 ×</button>
+            :title="t('xf.removeGuide')" @click="removeLastGuide">{{ crop.xf.guides.length }} / 4 <JIcon :icon="IconX" /></button>
         </div>
         <SliderRow v-for="s in XF_SLIDERS" :key="s.key" :model-value="crop.xf[s.key]"
           @update:model-value="v => setTransform({ [s.key]: v })"
           :label="t(`xf.${s.key}`)" :min="s.min" :max="s.max" :step="1" :reset-value="s.reset" show-modified />
-        <button type="button" class="crop-done" @click="exitCropMode">{{ t('crop.done') }}</button>
+        <button type="button" class="crop-done" @click="exitCropMode"><JIcon :icon="IconCheck" />{{ t('crop.done') }}</button>
       </section>
 
       <section class="panel" v-if="editTab === 'recipes' && activeSource">
         <header class="panel-head">
           <span>{{ t('panel.recipes') }}</span>
           <span class="recipe-actions">
-            <button class="ghost" type="button" :title="t('recipe.copyHint')" @click="copyRecipe">{{ t('recipe.copy') }}</button>
-            <button class="ghost" type="button" :title="t('recipe.pasteHint')" @click="pasteRecipe">{{ t('recipe.paste') }}</button>
+            <button class="ghost ghost-icon" type="button" :title="t('recipe.copyHint')" :aria-label="t('recipe.copy')" @click="openCopyDialog(null)"><JIcon :icon="IconCopy" /></button>
+            <button class="ghost ghost-icon" type="button" :title="t('recipe.pasteHint')" :aria-label="t('recipe.paste')" @click="pasteRecipe"><JIcon :icon="IconClipboardPaste" /></button>
           </span>
         </header>
         <form class="recipe-save" @submit.prevent="saveRecipe">
           <input class="model-field" v-model="recipeName" :placeholder="t('recipe.namePlaceholder')" spellcheck="false" @keydown.stop />
-          <button class="ghost" type="submit">{{ t('recipe.save') }}</button>
+          <button class="ghost ghost-icon" type="submit" :title="t('recipe.save')" :aria-label="t('recipe.save')"><JIcon :icon="IconPlus" /></button>
         </form>
         <ol class="history-list recipe-list" v-if="savedRecipes.length">
           <li v-for="(r, i) in savedRecipes" :key="r.name" class="recipe-row">
@@ -3467,7 +4080,7 @@ const vWheelAdjust = {
               <span class="history-label">{{ r.name }}</span>
             </button>
             <button class="icon-mini" type="button" :aria-label="t('common.remove')" @click="deleteRecipe(i)">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
+              <JIcon :icon="IconX" />
             </button>
           </li>
         </ol>
@@ -3540,9 +4153,7 @@ const vWheelAdjust = {
             {{ t('panel.creativeLook') }}
             <span v-if="lookEdited" class="panel-dot" aria-hidden="true" />
           </span>
-          <button class="ghost" type="button" :disabled="!lookEdited" @click="resetLook">
-            {{ t('common.reset') }}
-          </button>
+          <button class="ghost ghost-icon" type="button" :disabled="!lookEdited" :title="t('common.reset')" :aria-label="t('common.reset')" @click="resetLook"><JIcon :icon="IconReset" /></button>
         </header>
         <!-- Every ARW carries all of the body's looks, so this switches between
              calibrations already in the file. No re-decode: they share the one
@@ -3635,14 +4246,23 @@ const vWheelAdjust = {
             {{ t(`panel.${group.title}`) }}
             <span v-if="groupEdited(group)" class="panel-dot" aria-hidden="true" />
           </span>
-          <button class="ghost" type="button" :disabled="!groupEdited(group)" @click="resetGroup(group)">
-            {{ t('common.reset') }}
-          </button>
+          <button class="ghost ghost-icon" type="button" :disabled="!groupEdited(group)" :title="t('common.reset')" :aria-label="t('common.reset')" @click="resetGroup(group)"><JIcon :icon="IconReset" /></button>
         </header>
         <SliderRow v-for="spec in group.items" :key="spec.key"
           v-model="recipe[spec.key]" :label="t(`slider.${spec.key}`)" :input-id="`s-${spec.key}`"
           :min="spec.min" :max="spec.max" :step="spec.step"
           :reset-value="SLIDER_DEFAULTS[spec.key]" :track="WB_TRACK[spec.key]" show-modified />
+        <template v-if="group.title === 'lensBlur' || group.title === 'fog'">
+          <p v-if="!relightHasGeometry" class="control-note">{{ relightNotice ?? t('relight.analyzing') }}</p>
+          <div v-if="group.title === 'lensBlur'" class="lb-actions">
+            <button class="ghost" type="button" :class="{ 'is-on': pickingFocus }" :disabled="!relightHasGeometry"
+              @click="pickingFocus = !pickingFocus">
+              <JIcon :icon="IconCursorCrosshair" /> {{ pickingFocus ? t('lensBlur.picking') : t('lensBlur.pickFocus') }}
+            </button>
+            <button class="ghost" type="button" :disabled="recipe.blurFocusX < 0"
+              @click="recipe.blurFocusX = -1; recipe.blurFocusY = -1">{{ t('lensBlur.centre') }}</button>
+          </div>
+        </template>
       </section>
 
       <section class="panel" v-if="editTab === 'detail' && activeSource && isRawSource">
@@ -3696,7 +4316,7 @@ const vWheelAdjust = {
             {{ t('panel.hsl') }}
             <span v-if="hslEdited" class="panel-dot" aria-hidden="true" />
           </span>
-          <button class="ghost" type="button" :disabled="!hslEdited" @click="resetHsl">{{ t('common.reset') }}</button>
+          <button class="ghost ghost-icon" type="button" :disabled="!hslEdited" :title="t('common.reset')" :aria-label="t('common.reset')" @click="resetHsl"><JIcon :icon="IconReset" /></button>
         </header>
         <div class="hsl-tabs">
           <button :class="{ active: hslTab === 'hue' }" @click="hslTab = 'hue'">H</button>
@@ -3717,7 +4337,7 @@ const vWheelAdjust = {
             {{ t('panel.grading') }}
             <span v-if="gradingEdited" class="panel-dot" aria-hidden="true" />
           </span>
-          <button class="ghost" type="button" :disabled="!gradingEdited" @click="resetGrading">{{ t('common.reset') }}</button>
+          <button class="ghost ghost-icon" type="button" :disabled="!gradingEdited" :title="t('common.reset')" :aria-label="t('common.reset')" @click="resetGrading"><JIcon :icon="IconReset" /></button>
         </header>
         <div v-for="g in GRADING_BANDS" :key="g.band" class="grading-group">
           <div class="grading-header">
@@ -3740,7 +4360,7 @@ const vWheelAdjust = {
               :aria-pressed="!isBypassed('curve')" :title="t('panel.switch')" @click="toggleBypass('curve')" />
             {{ t('panel.curve') }}
           </span>
-          <button class="ghost" type="button" @click="resetCurve">{{ t('common.reset') }}</button>
+          <button class="ghost ghost-icon" type="button" :title="t('common.reset')" :aria-label="t('common.reset')" @click="resetCurve"><JIcon :icon="IconReset" /></button>
         </header>
         <div class="curve-tabs">
           <button v-for="tab in CURVE_TABS" :key="tab" type="button"
@@ -3786,6 +4406,96 @@ const vWheelAdjust = {
         </div>
       </section>
 
+      <!-- Erase: brush size, the stroke list (hover shows a stroke on the
+           canvas), and why erase cannot run here when it cannot. -->
+      <section class="panel" v-if="editTab === 'erase' && activeSource">
+        <header class="panel-head">
+          <span class="panel-title">
+            {{ t('panel.erase') }}
+            <span v-if="erase.length" class="panel-dot" aria-hidden="true" />
+          </span>
+          <span v-if="eraseBusy" class="panel-hint">{{ t('erase.working') }}</span>
+          <button class="ghost ghost-icon" type="button" :disabled="!erase.length" :title="t('common.reset')" :aria-label="t('common.reset')" @click="resetErase"><JIcon :icon="IconReset" /></button>
+        </header>
+        <div class="curve-tabs" :aria-label="t('erase.mode')">
+          <button type="button" :class="['curve-tab', { active: eraseMode === 'fill' }]" @click="eraseMode = 'fill'">{{ t('erase.modeFill') }}</button>
+          <button type="button" :class="['curve-tab', { active: eraseMode === 'heal' }]" @click="eraseMode = 'heal'">{{ t('erase.modeHeal') }}</button>
+        </div>
+        <p class="control-note" :class="{ 'is-warn': eraseNotice && !eraseDownloading && eraseMode === 'fill' }">
+          {{ eraseMode === 'heal' ? t('erase.healHint') : eraseNotice ?? t('erase.hint') }}</p>
+        <progress v-if="eraseDownloading" class="erase-progress" :value="eraseStatus?.received ?? 0" :max="eraseStatus?.total || 1" />
+        <button v-if="eraseStatus?.reason === 'models-missing' && eraseStatus.detail" class="ghost" type="button" @click="refreshEraseStatus(true)">{{ t('erase.retryDownload') }}</button>
+        <SliderRow v-model="eraseBrush" :label="t('erase.brush')" :min="4" :max="200" :reset-value="24" />
+        <div class="control-row">
+          <label class="control-label" for="erase-strokes">{{ t('erase.showStrokes') }}</label>
+          <label class="switch">
+            <input id="erase-strokes" type="checkbox" v-model="eraseShowStrokes" />
+            <span class="switch-track"><span class="switch-thumb" /></span>
+          </label>
+        </div>
+        <ol class="mask-list" v-if="erase.length">
+          <li v-for="(s, i) in erase" :key="s.id" class="mask-row" @mouseenter="eraseHover = s.id" @mouseleave="eraseHover = null">
+            <div class="mask-head erase-head">
+              <span class="mask-name">
+                <JIcon v-if="s.mode === 'heal'" :icon="IconBandage" />
+                {{ t(s.mode === 'heal' ? 'erase.itemHeal' : 'erase.item', { n: i + 1 }) }}</span>
+              <button class="icon-mini" type="button" :title="t('erase.remove')" :aria-label="t('erase.remove')" @click="removeErase(s.id)">
+                <JIcon :icon="IconX" />
+              </button>
+            </div>
+          </li>
+        </ol>
+      </section>
+
+      <!-- Relight: global light controls, then the rig (click the image to add). -->
+      <section class="panel" v-if="editTab === 'relight' && activeSource">
+        <header class="panel-head">
+          <span class="panel-title">
+            {{ t('panel.relight') }}
+            <span v-if="relightActive(relight)" class="panel-dot" aria-hidden="true" />
+          </span>
+          <span v-if="relightBusy" class="panel-hint">{{ t('relight.analyzing') }}</span>
+          <button class="ghost ghost-icon" type="button" :disabled="!relightActive(relight)" :title="t('common.reset')" :aria-label="t('common.reset')" @click="resetRelight"><JIcon :icon="IconReset" /></button>
+        </header>
+        <p class="control-note" :class="{ 'is-warn': !!relightError || (relightStatus && !relightStatus.available && relightStatus.reason !== 'downloading') }">
+          {{ relightNotice ?? (relightHasGeometry ? t('relight.hint') : t('relight.analyzing')) }}
+        </p>
+        <div class="curve-tabs" :aria-label="t('relight.view')">
+          <button v-for="(k, v) in (['relight.viewPhoto', 'relight.viewDepth', 'relight.viewNormals'] as const)" :key="k" type="button"
+            :class="['curve-tab', { active: relightView === v }]" :disabled="v > 0 && !relightHasGeometry"
+            @click="relightView = v as 0 | 1 | 2">{{ t(k) }}</button>
+        </div>
+        <SliderRow v-model="relight.ambient" :label="t('relight.ambient')" :min="-5" :max="1" :step="0.05" :reset-value="0" />
+        <SliderRow :model-value="Math.round(relight.wrap * 100)" @update:model-value="v => relight.wrap = v / 100" :label="t('relight.wrap')" :min="0" :max="100" :reset-value="30" />
+        <SliderRow :model-value="Math.round(relight.falloff * 100)" @update:model-value="v => relight.falloff = v / 100" :label="t('relight.falloff')" :min="0" :max="100" :reset-value="100" />
+        <SliderRow :model-value="Math.round(relight.shadows * 100)" @update:model-value="v => relight.shadows = v / 100" :label="t('relight.shadows')" :min="0" :max="100" :reset-value="80" />
+        <ol class="mask-list" v-if="relight.lights.length">
+          <li v-for="(l, i) in relight.lights" :key="l.id" class="mask-row" :class="{ 'is-selected': selectedLight === l.id }"
+            @click="selectedLight = l.id">
+            <div class="mask-head erase-head">
+              <input class="relight-color" type="color" :value="l.color" :title="t('relight.color')"
+                @input="l.color = ($event.target as HTMLInputElement).value" @click.stop />
+              <span class="mask-name">{{ t('relight.item', { n: i + 1 }) }}</span>
+              <button class="icon-mini" type="button" :title="t('relight.remove')" :aria-label="t('relight.remove')" @click.stop="removeLight(l.id)">
+                <JIcon :icon="IconX" />
+              </button>
+            </div>
+          </li>
+        </ol>
+        <template v-if="selectedLightObj">
+          <div class="curve-tabs">
+            <button v-for="k in LIGHT_KINDS" :key="k" type="button" :class="['curve-tab', { active: (selectedLightObj.kind ?? 'point') === k }]"
+              @click="selectedLightObj!.kind = k">{{ t(`relight.kind.${k}`) }}</button>
+          </div>
+          <SliderRow v-if="selectedLightObj.kind === 'spot'" :model-value="selectedLightObj.cone ?? 25"
+            @update:model-value="v => selectedLightObj!.cone = v" :label="t('relight.cone')" :min="5" :max="80" :reset-value="25" />
+          <SliderRow v-model="selectedLightObj.ev" :label="t('relight.intensity')" :min="-4" :max="6" :step="0.05" :reset-value="1" />
+          <SliderRow :model-value="Math.round(selectedLightObj.lift * 100)" @update:model-value="v => selectedLightObj!.lift = v / 100"
+            :label="t('relight.distance')" :min="-100" :max="95" :reset-value="40" />
+        </template>
+        <p v-else-if="!relight.lights.length" class="control-note">{{ t('relight.empty') }}</p>
+      </section>
+
       <!-- Masks: the group list, then the selected group's components, the
            matte-preview switch and its local sliders (rendering/masks.ts). -->
       <section class="panel" v-if="editTab === 'masks' && activeSource" :class="{ 'is-off': isBypassed('masks') }">
@@ -3796,7 +4506,7 @@ const vWheelAdjust = {
             {{ t('panel.masks') }}
             <span v-if="masks.length" class="panel-dot" aria-hidden="true" />
           </span>
-          <button class="ghost" type="button" :disabled="!masks.length" @click="resetMasks">{{ t('common.reset') }}</button>
+          <button class="ghost ghost-icon" type="button" :disabled="!masks.length" :title="t('common.reset')" :aria-label="t('common.reset')" @click="resetMasks"><JIcon :icon="IconReset" /></button>
         </header>
         <!-- An accordion: the selected group opens under its own row, so the
              rows read as things to click. Names edit in place. -->
@@ -3804,7 +4514,7 @@ const vWheelAdjust = {
           <li v-for="g in masks" :key="g.id" class="mask-row"
             :class="{ 'is-selected': selectedMask === g.id, 'is-off': !g.enabled }">
             <div class="mask-head" role="button" :aria-expanded="selectedMask === g.id" @click="selectedMask = g.id">
-              <svg class="mask-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6" /></svg>
+              <JIcon class="mask-chevron" :icon="IconChevronRight" weight="bold" />
               <input class="mask-name" type="text" :value="maskLabel(g)" :aria-label="t('mask.rename')" spellcheck="false"
                 @change="g.name = ($event.target as HTMLInputElement).value.trim() || undefined"
                 @keydown.enter="($event.target as HTMLInputElement).blur()" @keydown.stop />
@@ -3814,12 +4524,10 @@ const vWheelAdjust = {
               </label>
               <button class="icon-mini" :class="{ 'is-on': g.invert }" type="button" :title="t('mask.invert')"
                 :aria-pressed="g.invert" @click.stop="g.invert = !g.invert">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z" /><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none" />
-                </svg>
+                <JIcon :icon="IconContrast" />
               </button>
               <button class="icon-mini" type="button" :title="t('mask.remove')" @click.stop="removeMask(g.id)">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
+                <JIcon :icon="IconX" />
               </button>
             </div>
             <div class="mask-body" v-if="selectedMask === g.id">
@@ -3838,15 +4546,36 @@ const vWheelAdjust = {
                 </div>
                 <button class="icon-mini" :class="{ 'is-on': c.invert }" type="button" :title="t('mask.invert')"
                   :aria-pressed="c.invert" @click="c.invert = !c.invert">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z" /><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none" />
-                  </svg>
+                  <JIcon :icon="IconContrast" />
                 </button>
                 <button class="icon-mini" type="button" :title="t('mask.remove')" @click="g.components.splice(i, 1)">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
+                  <JIcon :icon="IconX" />
                 </button>
               </div>
-              <template v-if="c.type === 'luminance'">
+              <template v-if="c.type === 'ai'">
+                <div class="curve-tabs">
+                  <button v-for="k in AI_KINDS" :key="k" type="button" :class="['curve-tab', { active: c.kind === k }]"
+                    @click="c.kind = k">{{ t(`ai.kind.${k}`) }}</button>
+                </div>
+                <p v-if="aiNotice" class="control-note">{{ aiNotice }}</p>
+              </template>
+              <template v-else-if="c.type === 'brush'">
+                <div class="lb-actions">
+                  <button class="ghost" type="button" :class="{ 'is-on': activeBrush?.gid === g.id && activeBrush?.idx === i }"
+                    @click="toggleBrush(g.id, i)"><JIcon :icon="IconBrush" />
+                    {{ activeBrush?.gid === g.id && activeBrush?.idx === i ? t('brush.painting') : t('brush.paint') }}</button>
+                  <button class="ghost" type="button" :class="{ 'is-on': brushErase }" @click="brushErase = !brushErase">{{ t('brush.eraser') }}</button>
+                  <button class="ghost" type="button" :disabled="!c.strokes.length" @click="c.strokes.splice(0)">{{ t('brush.clear') }}</button>
+                </div>
+                <p class="control-note">{{ t('brush.count', { n: c.strokes.length }) }}</p>
+                <template v-if="activeBrush?.gid === g.id && activeBrush?.idx === i">
+                  <SliderRow v-model="brushSize" :label="t('brush.size')" :min="2" :max="400" :reset-value="40" />
+                  <SliderRow v-model="brushFeather" :label="t('brush.feather')" :min="0" :max="100" :reset-value="60" />
+                  <SliderRow v-model="brushFlow" :label="t('brush.flow')" :min="5" :max="100" :reset-value="100" />
+                </template>
+              </template>
+              <template v-else-if="c.type === 'luminance' || c.type === 'depth'">
+                <p v-if="c.type === 'depth' && !relightHasGeometry" class="control-note">{{ t('relight.analyzing') }}</p>
                 <SliderRow v-model="c.lo" :label="t('mask.range.lo')" :min="0" :max="100" />
                 <SliderRow v-model="c.hi" :label="t('mask.range.hi')" :min="0" :max="100" :reset-value="100" />
                 <SliderRow v-model="c.featherLo" :label="t('mask.range.featherLo')" :min="0" :max="100" />
@@ -3887,9 +4616,7 @@ const vWheelAdjust = {
           class="rail-tab" :class="{ 'is-on': editTab === tb.key }" :aria-pressed="editTab === tb.key"
           :disabled="tb.disabled"
           :title="t(`tab.${tb.key}`)" :aria-label="t(`tab.${tb.key}`)" @click="selectTab(tb.key)">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-            <path v-for="(d, i) in tb.icon" :key="i" :d="d" />
-          </svg>
+          <JIcon :icon="tb.icon" />
           <span v-if="tabEdited[tb.key]" class="rail-tab-dot" aria-hidden="true" />
         </button>
       </nav>
@@ -3902,6 +4629,33 @@ const vWheelAdjust = {
     <input ref="fileInput" type="file" :accept="IMPORT_ACCEPT" hidden multiple @change="onFileChange" />
     <input ref="folderInput" type="file" hidden multiple webkitdirectory @change="onFolderChange" />
     <transition name="fade"><div v-if="isDragging" class="drag-overlay">{{ t('drag.overlay') }}</div></transition>
+    <!-- Copy Settings: which sections a copy takes (rendering/recipes.ts). -->
+    <div v-if="copyDialog" class="copy-dialog-backdrop" @click.self="copyDialog = null" @keydown.esc="copyDialog = null">
+      <div class="copy-dialog" role="dialog" aria-modal="true" :aria-label="t('recipe.copyTitle')">
+        <header class="copy-dialog-head">
+          <span>{{ t('recipe.copyTitle') }}</span>
+          <button class="icon-mini" type="button" :aria-label="t('common.done')" @click="copyDialog = null"><JIcon :icon="IconX" /></button>
+        </header>
+        <div class="copy-dialog-grid">
+          <label v-for="sec in RECIPE_SECTIONS" :key="sec" class="copy-check">
+            <input type="checkbox" :checked="copySections.includes(sec)" @change="toggleCopySection(sec)" />
+            <span>{{ t(`recipe.section.${sec}`) }}</span>
+          </label>
+        </div>
+        <p class="control-note">{{ t('recipe.positionalNote') }}</p>
+        <footer class="copy-dialog-foot">
+          <button class="ghost" type="button" @click="copySections = [...RECIPE_SECTIONS]">{{ t('recipe.all') }}</button>
+          <button class="ghost" type="button" @click="copySections = [...DEFAULT_SECTIONS]">{{ t('recipe.defaults') }}</button>
+          <button class="ghost" type="button" @click="copySections = []">{{ t('recipe.none') }}</button>
+          <button class="primary" type="button" :disabled="!copySections.length" @click="confirmCopy">{{ t('recipe.copy') }}</button>
+        </footer>
+      </div>
+    </div>
+    <transition name="fade">
+      <div v-if="copyNotice || previewProgress" class="copy-pill">
+        {{ previewProgress ? t('recipe.refreshing', { done: previewProgress.done, total: previewProgress.total }) : copyNotice }}
+      </div>
+    </transition>
     <transition name="fade">
       <div v-if="errorMessage && !activeSource?.invalid" class="error-toast" @click="errorMessage = null" :title="t('toast.dismiss')">
         {{ errorMessage }}

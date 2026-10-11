@@ -3,6 +3,8 @@ import { computed, ref, toRef, watch } from "vue";
 import { formatBytes, type Photo } from "../ui";
 import { t } from "../i18n";
 import { useVirtualStrip } from "../composables/useVirtualStrip";
+import { IconPlus, IconX } from "@jannchie/icons";
+import { JIcon } from "@jannchie/icons-vue";
 
 // The library strip along the bottom: the open folder's photos, one row,
 // windowed — a folder of thousands mounts a screen's worth of cells. A
@@ -63,9 +65,7 @@ function onDragStart(e: DragEvent, id: string): void {
 <template>
   <footer class="filmstrip">
     <button class="filmstrip-import" type="button" @click="emit('import')">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
-        <path d="M12 5v14M5 12h14" />
-      </svg>
+      <JIcon :icon="IconPlus" />
       {{ t('film.import') }}
     </button>
     <div class="filmstrip-track" ref="track" @wheel="onWheel">
@@ -90,9 +90,7 @@ function onDragStart(e: DragEvent, id: string): void {
           </button>
           <button type="button" class="film-remove" :title="t('film.remove')"
             :aria-label="t('aria.removeFromLibrary')" @click="emit('remove', photo.id)">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
-              <path d="M6 6l12 12M18 6L6 18" />
-            </svg>
+            <JIcon :icon="IconX" weight="bold" />
           </button>
         </div>
       </div>

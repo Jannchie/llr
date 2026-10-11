@@ -9,6 +9,7 @@ import {
   SPICA_GAIN_SCALE,
   SONY_POST_PROGRAMS, type SonyPostProgramName,
   MASK_BLUR_SHADER, MASK_DOWNSAMPLE_SHADER, MASK_VERTEX_SHADER, PASSES, VERTEX_SHADER,
+  RELIGHT_BLUR_SHADER, RELIGHT_SHADOW_SHADER, FINISH_SHADER, AUX_COPY_SHADER, LENS_BLUR_DOWN_SHADER, LENS_BLUR_GATHER_SHADER,
 } from "./passes";
 import { type MarbleUniforms, type ProfileMarble, marbleUniforms } from "./sony-marble";
 import { type LumaNrParams, type ProfileLumaNr, lumaNrParams } from "./sony-lumanr";
@@ -21,11 +22,12 @@ import {
   SPICA_CODE_COUNT, SPICA_LUT, SPICA_TABLE_COUNT, SPICA_TAP_COUNT, SPICA_WEIGHTS,
 } from "./spica-tables";
 import { LENS_IDENTITY, LENS_KNOTS, lensCaFillScale, lensFillScale } from "./lens";
-import { computeWbMatrix } from "./color-spaces";
+import { computeWbMatrix, halfToFloat, ppLuma } from "./color-spaces";
 import { LUT_SIZE, buildToneCurveLUT, defaultToneCurve } from "./curve";
 import { LOG2_MID } from "./tonal-model";
 import { GROUP_STRIDE, MASK_UBO_BYTES, MASK_USE, imgFromTex } from "./masks";
 import { defaultCrop } from "./crop";
+import { RELIGHT_MAX_LIGHTS, geometryStats, type RelightGeometry } from "./relight";
 import { binRgba, type HistogramBins } from "./histogram";
 
 // Contrast and Blacks are not here: they are display-referred and baked into
@@ -70,6 +72,29 @@ export interface EditParams {
   // default path is untouched.
   masks: Float32Array; maskGroups: number; maskUse: number; maskPreview: number;
   imgFromTex: Float32Array; imgAspect: number;
+  // Relight (relight.ts packRelight): lights in texcoord space and their
+  // ProPhoto radiance, four floats each. Absent or inactive = the stage is off;
+  // it also stays off until uploadRelightGeometry has given it a scene.
+  relightActive?: number; relightCount?: number;
+  relightPos?: Float32Array; relightCol?: Float32Array;
+  relightAmbient?: number; relightWrap?: number; relightFalloff?: number; relightShadows?: number;
+  // Show the geometry instead of the photo: 0 off, 1 depth, 2 normals. View-only.
+  relightView?: number;
+  // Depth effects on the relight geometry (inactive without it): fog amount
+  // -1..1 (negative removes haze) and where it starts on the 0..1 depth axis;
+  // lens blur amount 0..1, the in-focus range 0..1 and the focus point as a
+  // source texcoord (negative = the frame's centre).
+  fogAmount?: number; fogStart?: number;
+  lensBlurAmount?: number; lensBlurRange?: number; lensBlurFocus?: [number, number];
+  // Defringe: purple and green amounts 0..1.
+  defringePurple?: number; defringeGreen?: number;
+  // The finish pass (passes.ts FINISH_SHADER): output sharpening (amount 0..1,
+  // radius in output px, detail and masking 0..1), the post-crop vignette
+  // (amount -1..1, midpoint, feather 0..1, roundness -1..1) and grain (amount
+  // 0..1, size in output px, roughness 0..1).
+  sharpAmount?: number; sharpRadius?: number; sharpDetail?: number; sharpMasking?: number;
+  vigAmount?: number; vigMid?: number; vigFeather?: number; vigRound?: number;
+  grainAmount?: number; grainSize?: number; grainRough?: number;
 }
 
 const HSL_ZERO = [0, 0, 0, 0, 0, 0, 0, 0];
@@ -395,6 +420,18 @@ const SONY_LUT3D_UNIT = 11;
  * guarantees per stage.
  */
 const SONY_LUMA_LUT_ADV_UNIT = 12;
+const RELIGHT_GEO_UNIT = 13;
+// The aux array (passes.ts u_aux): every per-image layer the main pass reads
+// beside the source, in source texcoords, at one fixed size — fixed, not the
+// render's, so a preview and its export read the same layers.
+const AUX_UNIT = 14;
+const AUX_LONG = 1600;
+export const AUX_LAYER = { lensBlur: 0, shadow: 1, ai: 2, brush: 3 } as const;
+const AUX_LAYERS = 4;
+// The widest circle of confusion the lens blur draws at full amount, as a
+// fraction of the aux long edge.
+const LENS_BLUR_MAX_FRAC = 0.03;
+
 // 33 per axis, which is well inside WebGL2's guaranteed MAX_3D_TEXTURE_SIZE of
 // 256 — checked anyway, because a device that cannot hold it must leave the
 // switch inert rather than render something wrong.
@@ -477,6 +514,23 @@ void main() { outColor = texture(u_input, v_uv); }`;
 // fraction of the frame and preview/export masks match by construction.
 const MASK_LONG = 256;
 
+/** The 90th-percentile luminance (ProPhoto Y) of a frame, from a sparse sample: the fog's airlight. */
+function sceneLevel(pixels: LinearPixels, count: number): number {
+  const step = Math.max(1, Math.floor(count / 20000));
+  const half = pixels instanceof Uint16Array;
+  const ys: number[] = [];
+  for (let i = 0; i < count; i += step) {
+    const r = half ? halfToFloat(pixels[3 * i]!) : pixels[3 * i]!;
+    const g = half ? halfToFloat(pixels[3 * i + 1]!) : pixels[3 * i + 1]!;
+    const b = half ? halfToFloat(pixels[3 * i + 2]!) : pixels[3 * i + 2]!;
+    const y = ppLuma([r, g, b]);
+    if (Number.isFinite(y)) ys.push(Math.max(y, 0));
+  }
+  if (!ys.length) return 0.5;
+  ys.sort((a, b) => a - b);
+  return Math.max(ys[Math.floor(0.9 * (ys.length - 1))]!, 1e-4);
+}
+
 export const DEFAULT_PARAMS: EditParams = {
   exposure: 0, saturation: 1,
   temperature: 6500, tint: 0,
@@ -554,6 +608,40 @@ export class PipelineRenderer {
   private dcpTableDims: Record<DcpSlot, [number, number, number, number]> = {
     hsm: [0, 0, 0, 0], look: [0, 0, 0, 0], match: [0, 0, 0, 0],
   };
+  // Relight geometry (relight.ts): normals + depth as RGBA16F, and the ray
+  // slopes that turn a texcoord and a depth into a camera-space point.
+  private relightGeoTex: WebGLTexture | null = null;
+  private relightK: [number, number] = [1, 1];
+  private relightDepthRef = 1;
+  // Per-light shadow visibility (RGBA8, one light per channel), the two
+  // targets its blur ping-pongs between, the programs, and what it was last
+  // computed for — rebuilt only when the geometry or a light's position moves.
+  // The aux array, a framebuffer per layer, and two 2D scratch targets of the
+  // same size the passes that end in a layer go through. Null until a pass
+  // needs it; a 1x1 stand-in stays bound meanwhile (an unbound array sampler
+  // is undefined behaviour even when the read is branched around).
+  private aux: { tex: WebGLTexture; fbos: WebGLFramebuffer[]; a: RenderTarget; b: RenderTarget; w: number; h: number } | null = null;
+  private auxDummy: WebGLTexture | null = null;
+  private auxCopyProg: WebGLProgram | null = null;
+  private shadowReady = false;
+  // Mask layers handed over from outside (AI mattes, rasterised brushes), kept
+  // so a remade aux array (another size) can be refilled without asking again.
+  private auxLayerData = new Map<number, { data: Uint8Array; w: number; h: number }>();
+  private relightShadowProg: WebGLProgram | null = null;
+  private relightBlurProg: WebGLProgram | null = null;
+  private relightShadowKey = "";
+  private relightGeoSerial = 0;
+  // The geometry's depth span: (log near, 1 / log span) for the masks' axis.
+  private relightDepthLog: [number, number] = [0, 1];
+  // A bright level of the scene (90th percentile luminance, pre-WB), the fog's airlight.
+  private sceneLevel = 0.5;
+  private sourceSerial = 0;
+  private lensBlurProgs: { down: WebGLProgram; gather: WebGLProgram } | null = null;
+  private lensBlurKey = "";
+  private lensBlurReady = false;
+  // The finish pass: its program and the frame it reads.
+  private finishProg: WebGLProgram | null = null;
+  private finishTargets = new Map<string, RenderTarget>();
   private texWidth = 0;
   private texHeight = 0;
   // Output (canvas / render) dimensions — equal to the texture dims for an
@@ -739,6 +827,190 @@ export class PipelineRenderer {
     if (info) console.log("[pipeline] GPU:", gl.getParameter(info.UNMASKED_RENDERER_WEBGL));
   }
 
+  /** The relight stage's scene (worker relight.py); null drops it, which turns the stage off. */
+  uploadRelightGeometry(geo: RelightGeometry | null): void {
+    const gl = this.gl;
+    if (this.relightGeoTex) gl.deleteTexture(this.relightGeoTex);
+    this.relightGeoTex = null;
+    this.relightGeoSerial++;
+    if (!geo) return;
+    const tex = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    // Rows arrive top-down like the source's, and are flipped the same way, so
+    // the shader reads both at the same texcoord.
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, geo.width, geo.height, 0, gl.RGBA, gl.HALF_FLOAT, geo.data);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    this.relightGeoTex = tex;
+    this.relightK = [geo.k[0], geo.k[1]];
+    const st = geometryStats(geo);
+    this.relightDepthRef = st.median;
+    this.relightDepthLog = [Math.log(st.near), 1 / Math.max(Math.log(st.far) - Math.log(st.near), 1e-3)];
+  }
+
+  /**
+   * Recompute the relight shadow texture if the lights or the geometry moved
+   * since it was last made. Runs before the main pass binds its own target.
+   */
+  private updateRelightShadows(p: EditParams): void {
+    const gl = this.gl;
+    const count = p.relightCount ?? 0;
+    if ((p.relightActive ?? 0) !== 1 || !this.relightGeoTex || count === 0 || !(p.relightShadows! > 0)) return;
+    const aux = this.ensureAux();
+    if (!aux) return;
+    const key = `${this.relightGeoSerial}|${aux.w}x${aux.h}|${count}|${Array.from(p.relightPos!.subarray(0, 4 * count)).join(",")}`;
+    if (key === this.relightShadowKey) return;
+    this.shadowReady = false;
+    if (!this.relightShadowProg) {
+      try {
+        this.relightShadowProg = this.compileProgramVS(MASK_VERTEX_SHADER, RELIGHT_SHADOW_SHADER);
+        this.relightBlurProg = this.compileProgramVS(MASK_VERTEX_SHADER, RELIGHT_BLUR_SHADER);
+      } catch (err) {
+        console.warn("[pipeline] relight shadow programs unavailable:", err);
+        return;
+      }
+    }
+    const { a, b, w, h } = aux;
+    gl.viewport(0, 0, w, h);
+    gl.bindVertexArray(this.unitQuadVao());
+    const sp = this.relightShadowProg!;
+    this.blitQuad(sp, this.relightGeoTex, a.fbo, () => {
+      gl.uniform1i(gl.getUniformLocation(sp, "u_rlGeo"), 0);
+      gl.uniform1i(gl.getUniformLocation(sp, "u_rlCount"), count);
+      gl.uniform2f(gl.getUniformLocation(sp, "u_rlK"), this.relightK[0], this.relightK[1]);
+      gl.uniform4fv(gl.getUniformLocation(sp, "u_rlPos"), p.relightPos!);
+    });
+    const bp = this.relightBlurProg!;
+    const blur = (src: WebGLTexture, dst: WebGLFramebuffer, dx: number, dy: number) =>
+      this.blitQuad(bp, src, dst, () => {
+        gl.uniform1i(gl.getUniformLocation(bp, "u_input"), 0);
+        gl.uniform2f(gl.getUniformLocation(bp, "u_dir"), dx, dy);
+      });
+    blur(a.tex, b.fbo, 1 / w, 0);
+    blur(b.tex, aux.fbos[AUX_LAYER.shadow]!, 0, 1 / h);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    this.relightShadowKey = key;
+    this.shadowReady = true;
+  }
+
+  /** The aux array at the current source's aspect, made (or remade) on demand. */
+  private ensureAux(): NonNullable<typeof this.aux> | null {
+    const gl = this.gl;
+    const dims = this.maskSupported ? this.auxDims() : null;
+    if (!dims) return null;
+    const [w, h] = dims;
+    if (this.aux && this.aux.w === w && this.aux.h === h) return this.aux;
+    this.releaseAux();
+    const tex = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
+    gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.RGBA16F, w, h, AUX_LAYERS);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const fbos: WebGLFramebuffer[] = [];
+    for (let l = 0; l < AUX_LAYERS; l++) {
+      const fbo = gl.createFramebuffer()!;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+      gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, tex, 0, l);
+      fbos.push(fbo);
+    }
+    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    const a = ok ? this.makeRenderTarget(w, h, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT) : null;
+    const b = ok ? this.makeRenderTarget(w, h, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT) : null;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (!a || !b) {
+      for (const f of fbos) gl.deleteFramebuffer(f);
+      gl.deleteTexture(tex);
+      return null;
+    }
+    // Layers start empty (zero): no blur, full shadow, no mask — each pass
+    // that fills one says so through its own ready flag.
+    this.aux = { tex, fbos, a, b, w, h };
+    for (const layer of this.auxLayerData.keys()) this.writeLayerData(layer);
+    return this.aux;
+  }
+
+  /** The aux array's size for the current source, whether or not it exists yet. */
+  auxDims(): [number, number] | null {
+    if (!this.texWidth) return null;
+    const scale = Math.min(1, AUX_LONG / Math.max(this.texWidth, this.texHeight, 1));
+    return [Math.max(1, Math.round(this.texWidth * scale)), Math.max(1, Math.round(this.texHeight * scale))];
+  }
+
+  /**
+   * Fill an aux layer from RGBA8 rows (top-down, the decode's orientation) of
+   * any size; null empties it. Kept, and rewritten whenever the array is remade.
+   */
+  uploadMaskLayer(layer: number, image: { data: Uint8Array; w: number; h: number } | null): void {
+    if (image) this.auxLayerData.set(layer, image);
+    else this.auxLayerData.set(layer, { data: new Uint8Array(4), w: 1, h: 1 });
+    if (this.ensureAux()) this.writeLayerData(layer);
+  }
+
+  private writeLayerData(layer: number): void {
+    const gl = this.gl;
+    const img = this.auxLayerData.get(layer);
+    if (!img) return;
+    const tex = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, img.w, img.h, 0, gl.RGBA, gl.UNSIGNED_BYTE, img.data);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    this.writeAuxLayer(layer, tex);
+    gl.deleteTexture(tex);
+  }
+
+  private releaseAux(): void {
+    const gl = this.gl;
+    if (this.aux) {
+      for (const f of this.aux.fbos) gl.deleteFramebuffer(f);
+      for (const t of [this.aux.a, this.aux.b]) { gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fbo); }
+      gl.deleteTexture(this.aux.tex);
+    }
+    this.aux = null;
+    this.relightShadowKey = "";
+    this.lensBlurKey = "";
+    this.shadowReady = this.lensBlurReady = false;
+  }
+
+  /** Copy a 2D texture into an aux layer (resampled to the layer's size). */
+  writeAuxLayer(layer: number, src: WebGLTexture): boolean {
+    const gl = this.gl;
+    const aux = this.ensureAux();
+    if (!aux) return false;
+    if (!this.auxCopyProg) {
+      try { this.auxCopyProg = this.compileProgramVS(MASK_VERTEX_SHADER, AUX_COPY_SHADER); } catch { return false; }
+    }
+    const prog = this.auxCopyProg;
+    gl.viewport(0, 0, aux.w, aux.h);
+    gl.bindVertexArray(this.unitQuadVao());
+    this.blitQuad(prog, src, aux.fbos[layer]!, () => gl.uniform1i(gl.getUniformLocation(prog, "u_input"), 0));
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return true;
+  }
+
+  /** The 1x1 all-zero array bound while there is no aux. */
+  private auxStandIn(): WebGLTexture {
+    const gl = this.gl;
+    if (!this.auxDummy) {
+      this.auxDummy = gl.createTexture()!;
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, this.auxDummy);
+      gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.RGBA16F, 1, 1, AUX_LAYERS);
+    }
+    return this.auxDummy;
+  }
+
   uploadImage(pixels: LinearPixels, width: number, height: number): void {
     const gl = this.gl;
     // texImage2D past MAX_TEXTURE_SIZE only raises GL_INVALID_VALUE: the draw
@@ -753,6 +1025,11 @@ export class PipelineRenderer {
         + "Enable hardware acceleration to raise it.");
     }
     this.texWidth = width; this.texHeight = height;
+    this.sourceSerial++;
+    // Another image: its mask layers are the caller's to hand over again.
+    this.auxLayerData.clear();
+    this.releaseAux();
+    this.sceneLevel = sceneLevel(pixels, width * height);
     if (this.sourceTex) gl.deleteTexture(this.sourceTex);
     const tex = gl.createTexture()!;
     gl.bindTexture(gl.TEXTURE_2D, tex);
@@ -1343,7 +1620,7 @@ export class PipelineRenderer {
     const ch = Math.max(1, Math.round((win ? win.h : this.outHeight) * this.previewScale));
     if (this.canvas.width !== cw) this.canvas.width = cw;
     if (this.canvas.height !== ch) this.canvas.height = ch;
-    this.renderPass(null, cw, ch, p, win ? this.windowXform(win) : undefined);
+    this.renderPass(null, cw, ch, p, win ? this.windowXform(win) : undefined, win);
     this.scheduleRefine(p, win, cw, ch);
   }
 
@@ -1404,7 +1681,7 @@ export class PipelineRenderer {
     }
     const target = this.refineTarget;
     // The export's render, into the target instead of the canvas.
-    this.renderPass(target.fbo, w, h, p, win ? this.windowXform(win) : undefined);
+    this.renderPass(target.fbo, w, h, p, win ? this.windowXform(win) : undefined, win);
     // Then the downscale: a full mip chain and trilinear sampling, so every
     // canvas pixel is an area average of the frame rather than one sample of it.
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -1435,9 +1712,17 @@ export class PipelineRenderer {
    * land here — which is why Sony's post stages hang off it: they follow the
    * render wherever it goes, with no second place to keep in step.
    */
-  private renderPass(fbo: WebGLFramebuffer | null, w: number, h: number, p: EditParams, texXform?: Float32Array): void {
+  private renderPass(
+    finalFbo: WebGLFramebuffer | null, w: number, h: number, p: EditParams, texXform?: Float32Array,
+    win?: ViewWindow | null,
+  ): void {
     const gl = this.gl;
     if (!this.sourceTex) return;
+    this.updateLensBlur(p);
+    // The finish pass, when on, takes everything below into a frame of its own
+    // and draws the last step into `finalFbo` itself.
+    const finishTarget = this.finishActive(p) ? this.prepareFinish(w, h) : null;
+    const fbo = finishTarget ? finishTarget.fbo : finalFbo;
     // With either post stage on, the main pass renders into a scene target and
     // the chain below composes from it into `fbo` instead.
     const xform = texXform ?? this.texXform;
@@ -1446,6 +1731,7 @@ export class PipelineRenderer {
     const noise: NoiseStage | null = p.nrLuminance > 0
       ? { amount: Math.min(1, p.nrLuminance / 100), sigma: NOISE_SIGMA_BASE * Math.pow(2, (50 - p.nrDetail) / 25) }
       : null;
+    this.updateRelightShadows(p);
     const post = this.prepareSonyPost(w, h, xform, noise);
     gl.bindFramebuffer(gl.FRAMEBUFFER, post ? post.scene.fbo : fbo);
     gl.viewport(0, 0, w, h);
@@ -1512,12 +1798,112 @@ export class PipelineRenderer {
       gl.uniform1i(this.uniforms[DCP_SAMPLER[slot]], unit);
       gl.uniform4fv(this.uniforms[DCP_DIMS_UNIFORM[slot]], this.dcpTableDims[slot]);
     }
+    if (this.relightGeoTex) {
+      gl.activeTexture(gl.TEXTURE0 + RELIGHT_GEO_UNIT);
+      gl.bindTexture(gl.TEXTURE_2D, this.relightGeoTex);
+      gl.uniform1i(this.uniforms["u_rlGeo"], RELIGHT_GEO_UNIT);
+    }
+    gl.activeTexture(gl.TEXTURE0 + AUX_UNIT);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, this.aux ? this.aux.tex : this.auxStandIn());
+    gl.uniform1i(this.uniforms["u_aux"], AUX_UNIT);
     gl.activeTexture(gl.TEXTURE0);
     this.setUniforms(p);
     gl.bindVertexArray(this.vao);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
     if (post) this.runSonyPost(post, fbo, w, h);
+    if (finishTarget) this.runFinish(finishTarget, finalFbo, w, h, p, win ?? null);
   }
+
+  private finishActive(p: EditParams): boolean {
+    return (p.sharpAmount ?? 0) > 0 || (p.vigAmount ?? 0) !== 0 || (p.grainAmount ?? 0) > 0;
+  }
+
+  private prepareFinish(w: number, h: number): RenderTarget | null {
+    if (!this.finishProg) {
+      try {
+        this.finishProg = this.compileProgramVS(MASK_VERTEX_SHADER, FINISH_SHADER);
+      } catch (err) {
+        console.warn("[pipeline] finish program unavailable:", err);
+        return null;
+      }
+    }
+    return this.cachedFrame(this.finishTargets, w, h, false);
+  }
+
+  private runFinish(src: RenderTarget, dst: WebGLFramebuffer | null, w: number, h: number, p: EditParams, win: ViewWindow | null): void {
+    const gl = this.gl;
+    const prog = this.finishProg!;
+    const ow = this.outWidth, oh = this.outHeight;
+    const rect = win ? [win.x / ow, win.y / oh, win.w / ow, win.h / oh] : [0, 0, 1, 1];
+    const scale = w / Math.max(1, ow * rect[2]!);
+    const u = (n: string) => gl.getUniformLocation(prog, n);
+    gl.viewport(0, 0, w, h);
+    gl.bindVertexArray(this.unitQuadVao());
+    this.blitQuad(prog, src.tex, dst, () => {
+      gl.uniform1i(u("u_scene"), 0);
+      gl.uniform2f(u("u_sceneTexel"), 1 / w, 1 / h);
+      gl.uniform4f(u("u_outRect"), rect[0]!, rect[1]!, rect[2]!, rect[3]!);
+      gl.uniform2f(u("u_outSize"), ow, oh);
+      gl.uniform1f(u("u_scale"), scale);
+      gl.uniform4f(u("u_sharpen"), p.sharpAmount ?? 0, p.sharpRadius ?? 1, p.sharpDetail ?? 0.25, p.sharpMasking ?? 0);
+      gl.uniform4f(u("u_vignette"), p.vigAmount ?? 0, p.vigMid ?? 0.5, p.vigFeather ?? 0.5, p.vigRound ?? 0);
+      gl.uniform3f(u("u_grain"), p.grainAmount ?? 0, Math.max(0.5, p.grainSize ?? 1.5), p.grainRough ?? 0.5);
+    });
+  }
+
+  /**
+   * Re-run the lens blur pre-pass if its inputs moved: the source, the
+   * geometry, or the blur's own settings. Exposure and everything after the
+   * source read never reach it, so slider drags elsewhere cost nothing here.
+   */
+  private updateLensBlur(p: EditParams): void {
+    const gl = this.gl;
+    const amount = p.lensBlurAmount ?? 0;
+    this.lensBlurReady = false;
+    if (amount <= 0 || !this.relightGeoTex || !this.sourceTex || !this.maskSupported) return;
+    const focus = p.lensBlurFocus && p.lensBlurFocus[0] >= 0 ? p.lensBlurFocus : [0.5, 0.5];
+    const aux = this.ensureAux();
+    if (!aux) return;
+    const { w, h } = aux;
+    const key = `${this.sourceSerial}|${this.relightGeoSerial}|${w}x${h}|${amount}|${p.lensBlurRange ?? 0}|${focus[0]},${focus[1]}`;
+    if (key === this.lensBlurKey) {
+      this.lensBlurReady = true;
+      return;
+    }
+    if (!this.lensBlurProgs) {
+      try {
+        this.lensBlurProgs = {
+          down: this.compileProgramVS(MASK_VERTEX_SHADER, LENS_BLUR_DOWN_SHADER),
+          gather: this.compileProgramVS(MASK_VERTEX_SHADER, LENS_BLUR_GATHER_SHADER),
+        };
+      } catch (err) {
+        console.warn("[pipeline] lens blur programs unavailable:", err);
+        return;
+      }
+    }
+    const params: [number, number, number] = [amount * LENS_BLUR_MAX_FRAC * Math.max(w, h), (p.lensBlurRange ?? 0) * 0.5, this.relightDepthRef];
+    gl.viewport(0, 0, w, h);
+    gl.bindVertexArray(this.unitQuadVao());
+    const run = (prog: WebGLProgram, src: WebGLTexture, dst: WebGLFramebuffer) =>
+      this.blitQuad(prog, src, dst, () => {
+        const u = (n: string) => gl.getUniformLocation(prog, n);
+        gl.uniform1i(u("u_input"), 0);
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, this.relightGeoTex);
+        gl.uniform1i(u("u_rlGeo"), 1);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.uniform2f(u("u_texel"), 1 / w, 1 / h);
+        gl.uniform2f(u("u_lbFocus"), focus[0]!, focus[1]!);
+        gl.uniform3f(u("u_lbParams"), ...params);
+      });
+    run(this.lensBlurProgs.down, this.sourceTex, aux.a.fbo);
+    run(this.lensBlurProgs.gather, aux.a.tex, aux.fbos[AUX_LAYER.lensBlur]!);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    this.lensBlurKey = key;
+    this.lensBlurReady = true;
+  }
+
+
 
   /**
    * Render targets for Sony's post chain, plus the base grid Clarity was sized
@@ -2507,6 +2893,22 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     this.releaseRefine();
     if (this.refineProg) { gl.deleteProgram(this.refineProg); this.refineProg = null; }
     if (this.sourceTex) gl.deleteTexture(this.sourceTex);
+    if (this.relightGeoTex) gl.deleteTexture(this.relightGeoTex);
+    this.relightGeoTex = null;
+    this.releaseAux();
+    if (this.auxDummy) gl.deleteTexture(this.auxDummy);
+    this.auxDummy = null;
+    if (this.auxCopyProg) gl.deleteProgram(this.auxCopyProg);
+    this.auxCopyProg = null;
+    if (this.lensBlurProgs) { gl.deleteProgram(this.lensBlurProgs.down); gl.deleteProgram(this.lensBlurProgs.gather); }
+    this.lensBlurProgs = null;
+    if (this.finishProg) gl.deleteProgram(this.finishProg);
+    this.finishProg = null;
+    for (const t of this.finishTargets.values()) { gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fbo); }
+    this.finishTargets.clear();
+    if (this.relightShadowProg) gl.deleteProgram(this.relightShadowProg);
+    if (this.relightBlurProg) gl.deleteProgram(this.relightBlurProg);
+    this.relightShadowProg = this.relightBlurProg = null;
     if (this.curveLutTex) gl.deleteTexture(this.curveLutTex);
     if (this.profileLutTex) gl.deleteTexture(this.profileLutTex);
     if (this.sepiaLutTex) gl.deleteTexture(this.sepiaLutTex);
@@ -2669,6 +3071,33 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
     // shift of its own.
     i("u_hasMask", this.maskTex ? 1 : 0);
     s("u_maskShift", p.exposure - LOG2_MID);
+    // Relight: needs both a light rig and a scene to put it in.
+    const rlActive = (p.relightActive ?? 0) === 1 && this.relightGeoTex !== null;
+    i("u_rlActive", rlActive ? 1 : 0);
+    i("u_rlView", this.relightGeoTex ? (p.relightView ?? 0) : 0);
+    i("u_rlHasGeo", this.relightGeoTex ? 1 : 0);
+    v2("u_rlDepthLog", this.relightDepthLog[0], this.relightDepthLog[1]);
+    {
+      const l = this.uniforms["u_fog"];
+      if (l) gl.uniform3f(l, p.fogAmount ?? 0, p.fogStart ?? 0, this.sceneLevel);
+    }
+    i("u_lbActive", this.lensBlurReady && (p.lensBlurAmount ?? 0) > 0 ? 1 : 0);
+    v2("u_srcTexel", 1 / Math.max(1, this.texWidth), 1 / Math.max(1, this.texHeight));
+    v2("u_defringe", p.defringePurple ?? 0, p.defringeGreen ?? 0);
+    s("u_rlDepthRef", this.relightDepthRef);
+    if (rlActive) {
+      i("u_rlCount", p.relightCount ?? 0);
+      v2("u_rlK", this.relightK[0], this.relightK[1]);
+      s("u_rlAmbient", p.relightAmbient ?? 1);
+      s("u_rlWrap", p.relightWrap ?? 0);
+      s("u_rlFalloff", p.relightFalloff ?? 1);
+      s("u_rlShadows", this.shadowReady ? p.relightShadows ?? 0 : 0);
+      for (let k = 0; k < RELIGHT_MAX_LIGHTS; k++) {
+        const pl = this.uniforms[`u_rlPos[${k}]`], cl = this.uniforms[`u_rlCol[${k}]`];
+        if (pl && p.relightPos) gl.uniform4fv(pl, p.relightPos.subarray(4 * k, 4 * k + 4));
+        if (cl && p.relightCol) gl.uniform4fv(cl, p.relightCol.subarray(4 * k, 4 * k + 4));
+      }
+    }
     // HSL
     for (let band = 0; band < 8; band++) {
       s(`u_hsl_h[${band}]`, p.hslH?.[band] ?? 0);

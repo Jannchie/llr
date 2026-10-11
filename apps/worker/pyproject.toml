@@ -9,6 +9,12 @@ dependencies = [
   "rawpy>=0.25.0",
   "pywavelets>=1.6.0",
   "numba>=0.67.0",
+  # Generative erase (erase.py). DirectML runs it on any DX12 GPU without a CUDA
+  # install and is as fast as the CUDA provider for this model; elsewhere the
+  # plain runtime is the fallback (CPU, about four minutes a fill — install
+  # onnxruntime-gpu in its place for a GPU).
+  "onnxruntime-directml>=1.20; sys_platform == 'win32'",
+  "onnxruntime>=1.20; sys_platform != 'win32'",
 ]
 
 [dependency-groups]

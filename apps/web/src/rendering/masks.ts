@@ -16,6 +16,7 @@ import { computeWbMatrix, smoothstep, type Mat3 } from "./color-spaces";
 import { gradingTint } from "./grading";
 import { HSL_CENTERS, HSL_SEL_L_FLOOR, SKIN_HUE, SKIN_HUE_HALF, hueWindow } from "./hsl-bands";
 import { imageDims, sourceNormToImageNorm, type CropState } from "./crop";
+import { BRUSH_SLOTS, type BrushStroke } from "./brush";
 
 export type MaskOp = "add" | "subtract" | "intersect";
 type CompBase = { op: MaskOp; invert: boolean };
@@ -28,7 +29,17 @@ export type MaskComponent =
   | (CompBase & { type: "linear"; x0: number; y0: number; x1: number; y1: number })
   // Centre / semi-axes in image-norm (rx=ry=0.5 inscribes the frame), angle in
   // degrees, feather as a fraction of the radius.
-  | (CompBase & { type: "radial"; cx: number; cy: number; rx: number; ry: number; angle: number; feather: number });
+  | (CompBase & { type: "radial"; cx: number; cy: number; rx: number; ry: number; angle: number; feather: number })
+  // Depth range on the relight geometry's 0..100 axis: 0 the near end of the
+  // scene (its 2nd percentile), 100 the far end (98th), log-spaced between —
+  // so "the background" is a range, whatever the scene's absolute scale.
+  | (CompBase & { type: "depth"; lo: number; hi: number; featherLo: number; featherHi: number })
+  // Painted strokes (brush.ts), in source-norm; rasterised into the aux brush layer.
+  | (CompBase & { type: "brush"; strokes: BrushStroke[] })
+  // A matte from the AI mask models (worker ai_masks.py).
+  | (CompBase & { type: "ai"; kind: AiKind });
+export type AiKind = "subject" | "sky" | "person";
+export const AI_KINDS: AiKind[] = ["subject", "sky", "person"];
 export type MaskType = MaskComponent["type"];
 
 /** exposure in EV, the rest -100..100. contrast/blacks are reserved (§3.3), not applied. */
@@ -38,6 +49,9 @@ export type MaskAdjust = {
   // A colour cast for the selection (Lightroom's local "Color"): wheel hue in
   // degrees and strength 0..100, built into a tint by grading.ts gradingTint.
   tintHue: number; tintSat: number;
+  // Moiré removal 0..100: the selection's chroma smoothed over a few pixels,
+  // its luminance left alone (Lightroom's local Moiré). Absent before it existed.
+  moire: number;
   contrast?: number; blacks?: number;
 };
 export type MaskGroup = {
@@ -52,12 +66,12 @@ export const GROUP_STRIDE = 6 + MASK_COMPS * 3;
 const ROWS = MASK_GROUPS * GROUP_STRIDE;
 export const MASK_UBO_BYTES = ROWS * 16;
 
-const TYPE_CODE: Record<MaskType, number> = { luminance: 0, color: 1, linear: 2, radial: 3 };
+const TYPE_CODE: Record<MaskType, number> = { luminance: 0, color: 1, linear: 2, radial: 3, depth: 4, brush: 5, ai: 6 };
 const OP_CODE: Record<MaskOp, number> = { add: 0, subtract: 1, intersect: 2 };
 
 // Which shader blocks any packed group touches — OR'd into the existing skip
 // gates so an untouched frame still skips them (bit layout shared with GLSL).
-export const MASK_USE = { exposure: 1, tonal: 2, clarity: 4, dehaze: 8, color: 16 } as const;
+export const MASK_USE = { exposure: 1, tonal: 2, clarity: 4, dehaze: 8, color: 16, moire: 32 } as const;
 
 // Slider units. Temperature: ±100 ↦ ±4000 K, linear in Kelvin like the global
 // slider. Hue: ±100 ↦ ±0.5 rad, the HSL mixer's scale.
@@ -77,7 +91,7 @@ export const MASK_SKIN_C1 = 0.10;
 const EPS = 1e-3;
 
 export function defaultAdjust(): MaskAdjust {
-  return { exposure: 0, temperature: 0, tint: 0, saturation: 0, vibrance: 0, highlights: 0, shadows: 0, clarity: 0, dehaze: 0, hue: 0, tintHue: 0, tintSat: 0 };
+  return { exposure: 0, temperature: 0, tint: 0, saturation: 0, vibrance: 0, highlights: 0, shadows: 0, clarity: 0, dehaze: 0, hue: 0, tintHue: 0, tintSat: 0, moire: 0 };
 }
 
 export const ADJUST_KEYS = Object.keys(defaultAdjust()) as (keyof MaskAdjust)[];
@@ -95,6 +109,9 @@ export function defaultComponent<T extends MaskType>(type: T): Extract<MaskCompo
     color: { ...base, type: "color", hue: HSL_CENTERS[5], hueWidth: 0.6, chromaLo: MASK_COLOR_C0, chromaHi: MASK_COLOR_C1 },
     linear: { ...base, type: "linear", x0: 0.5, y0: 0.15, x1: 0.5, y1: 0.55 },
     radial: { ...base, type: "radial", cx: 0.5, cy: 0.5, rx: 0.35, ry: 0.35, angle: 0, feather: 0.5 },
+    depth: { ...base, type: "depth", lo: 50, hi: 100, featherLo: 20, featherHi: 0 },
+    brush: { ...base, type: "brush", strokes: [] },
+    ai: { ...base, type: "ai", kind: "subject" },
   };
   return all[type];
 }
@@ -116,6 +133,12 @@ export const MASK_PRESETS = {
   skin:       { components: [{ type: "color", hue: SKIN_HUE, hueWidth: SKIN_HUE_HALF, chromaLo: MASK_SKIN_C0, chromaHi: MASK_SKIN_C1 }] },
   vignette:   { components: [{ type: "radial", cx: 0.5, cy: 0.5, rx: 0.55, ry: 0.55, angle: 0, feather: 0.6, invert: true }],
                 adjust: { exposure: -0.7 } },
+  background: { components: [{ type: "depth", lo: 55, hi: 100, featherLo: 20, featherHi: 0 }] },
+  foreground: { components: [{ type: "depth", lo: 0, hi: 40, featherLo: 0, featherHi: 20 }] },
+  subject:    { components: [{ type: "ai", kind: "subject" }] },
+  aiSky:      { components: [{ type: "ai", kind: "sky" }] },
+  people:     { components: [{ type: "ai", kind: "person" }] },
+  brush:      { components: [{ type: "brush", strokes: [] }] },
 } satisfies Record<string, MaskPreset>;
 export type MaskPresetName = keyof typeof MASK_PRESETS;
 
@@ -130,11 +153,12 @@ export function presetGroup(name: MaskPresetName, id: string): MaskGroup {
 
 // ── Packing ──
 
-/** The 3 vec4 rows of one component: h=(type, op, invert, ·), a, b. */
-function componentRows(c: MaskComponent): number[] {
+/** The 3 vec4 rows of one component: h=(type, op, invert, ·), a, b. `slot` is a brush's aux channel. */
+function componentRows(c: MaskComponent, slot = -1): number[] {
   const h = [TYPE_CODE[c.type], OP_CODE[c.op], c.invert ? 1 : 0, 0];
   switch (c.type) {
     case "luminance":
+    case "depth":
       return [...h, c.lo / 100, c.hi / 100, Math.max(c.featherLo / 100, EPS), Math.max(c.featherHi / 100, EPS), 0, 0, 0, 0];
     case "color":
       return [...h, c.hue, Math.max(c.hueWidth, EPS), c.chromaLo, Math.max(c.chromaHi, c.chromaLo + EPS), 0, 0, 0, 0];
@@ -146,6 +170,10 @@ function componentRows(c: MaskComponent): number[] {
     case "radial":
       return [...h, c.cx, c.cy, Math.max(c.rx, EPS), Math.max(c.ry, EPS),
         Math.max(Math.min(c.feather, 1), EPS), (c.angle * Math.PI) / 180, 0, 0];
+    case "brush":
+      return [...h, slot, 0, 0, 0, 0, 0, 0, 0];
+    case "ai":
+      return [...h, AI_KINDS.indexOf(c.kind), 0, 0, 0, 0, 0, 0, 0];
   }
 }
 
@@ -161,6 +189,9 @@ export function imgFromTex(c: CropState): Float32Array {
 export type PackedMasks = {
   masks: Float32Array; maskGroups: number; maskUse: number; maskPreview: number;
   imgFromTex: Float32Array; imgAspect: number;
+  // The packed brush components' strokes, in aux channel order (brush.ts
+  // rasterBrushes), and whether any packed group reads the AI mattes.
+  maskBrushes: BrushStroke[][]; maskUsesAi: boolean;
 };
 
 /**
@@ -176,7 +207,8 @@ export function packMasks(
 ): PackedMasks {
   const [iw, ih] = imageDims(srcW, srcH, crop.orientation);
   const masks = new Float32Array(ROWS * 4);
-  let n = 0, use = 0, preview = -1;
+  let n = 0, use = 0, preview = -1, usesAi = false;
+  const brushes: BrushStroke[][] = [];
   const m0 = wb.temperature === 6500 && wb.tint === 0 ? null : computeWbMatrix(wb.temperature, wb.tint);
   for (const g of groups) {
     if (n >= MASK_GROUPS) break;
@@ -186,7 +218,7 @@ export function packMasks(
     const a = g.adjust;
     const base = n * GROUP_STRIDE * 4;
     const comps = g.components.slice(0, MASK_COMPS);
-    masks.set([comps.length, g.invert ? 1 : 0, 0, 0], base);
+    masks.set([comps.length, g.invert ? 1 : 0, (a.moire ?? 0) / 100, 0], base);
     masks.set([a.exposure, a.highlights / 100, a.shadows / 100, a.clarity / 100], base + 4);
     masks.set([a.dehaze / 100, a.saturation / 100, a.vibrance / 100, (a.hue / 100) * MASK_HUE_RAD], base + 8);
     if (a.temperature || a.tint || a.tintSat) {
@@ -201,16 +233,23 @@ export function packMasks(
       // Column-major: the shader rebuilds mat3(col0, col1, col2).
       for (let col = 0; col < 3; col++) masks.set([d[0][col], d[1][col], d[2][col], tint[col] - 1], base + 12 + col * 4);
     }
-    comps.forEach((c, k) => masks.set(componentRows(c), base + 24 + k * 12));
+    comps.forEach((c, k) => {
+      let slot = -1;
+      if (c.type === "brush" && brushes.length < BRUSH_SLOTS) { slot = brushes.length; brushes.push(c.strokes); }
+      if (c.type === "ai") usesAi = true;
+      masks.set(componentRows(c, slot), base + 24 + k * 12);
+    });
     if (a.exposure) use |= MASK_USE.exposure;
     if (a.highlights || a.shadows) use |= MASK_USE.tonal;
     if (a.clarity) use |= MASK_USE.clarity;
     if (a.dehaze) use |= MASK_USE.dehaze;
     if (a.saturation || a.vibrance || a.hue) use |= MASK_USE.color;
+    if (a.moire) use |= MASK_USE.moire;
     if (isPreview) preview = n;
     n++;
   }
-  return { masks, maskGroups: n, maskUse: use, maskPreview: preview, imgFromTex: imgFromTex(crop), imgAspect: ih / iw };
+  return { masks, maskGroups: n, maskUse: use, maskPreview: preview, imgFromTex: imgFromTex(crop), imgAspect: ih / iw,
+    maskBrushes: brushes, maskUsesAi: usesAi };
 }
 
 function deltaWb(mg: Mat3, m0: Mat3 | null): Mat3 {
@@ -224,17 +263,22 @@ function deltaWb(mg: Mat3, m0: Mat3 | null): Mat3 {
 /**
  * One component's weight from its packed rows (mirrors maskComponent in
  * MASK_GLSL). pImg is oriented image-norm, pLum the 0..1 perceptual luminance,
- * lab the selection colour in Oklab, aspect = ih/iw.
+ * lab the selection colour in Oklab, aspect = ih/iw, pDepth the 0..1 depth
+ * axis (negative = no geometry, which selects nothing).
  */
 export function componentWeight(
   rows: ArrayLike<number>, pImg: readonly [number, number], pLum: number,
-  lab: readonly [number, number, number], aspect: number,
+  lab: readonly [number, number, number], aspect: number, pDepth = -1,
 ): number {
   const type = rows[0], inv = rows[2] > 0.5;
   const a = [rows[4], rows[5], rows[6], rows[7]], b = [rows[8], rows[9]];
   let w: number;
-  if (type === 0) {
-    w = smoothstep(a[0] - a[2], a[0], pLum) * (1 - smoothstep(a[1], a[1] + a[3], pLum));
+  if (type === 5 || type === 6) {
+    w = 0;   // texture-backed (brush strokes, AI mattes): evaluated in the shader only
+  } else if (type === 0 || type === 4) {
+    const x = type === 0 ? pLum : pDepth;
+    w = type === 4 && pDepth < 0 ? 0
+      : smoothstep(a[0] - a[2], a[0], x) * (1 - smoothstep(a[1], a[1] + a[3], x));
   } else if (type === 1) {
     const ratio = Math.hypot(lab[1], lab[2]) / Math.max(lab[0], HSL_SEL_L_FLOOR);
     w = smoothstep(0, 1, hueWindow(Math.atan2(lab[2], lab[1]), a[0], a[1])) * smoothstep(a[2], a[3], ratio);
@@ -255,11 +299,11 @@ export function componentWeight(
 /** A group's weight: components combined in order, then the group invert (§2.4). */
 export function groupWeight(
   g: MaskGroup, pImg: readonly [number, number], pLum: number,
-  lab: readonly [number, number, number], aspect: number,
+  lab: readonly [number, number, number], aspect: number, pDepth = -1,
 ): number {
   let w = 0;
   g.components.slice(0, MASK_COMPS).forEach((c, k) => {
-    const wc = componentWeight(componentRows(c), pImg, pLum, lab, aspect);
+    const wc = componentWeight(componentRows(c), pImg, pLum, lab, aspect, pDepth);
     w = k === 0 ? wc : c.op === "add" ? 1 - (1 - w) * (1 - wc) : c.op === "subtract" ? w * (1 - wc) : w * wc;
   });
   return g.invert ? 1 - w : w;
@@ -278,17 +322,25 @@ const int MASK_USE_TONAL = ${MASK_USE.tonal};
 const int MASK_USE_CLARITY = ${MASK_USE.clarity};
 const int MASK_USE_DEHAZE = ${MASK_USE.dehaze};
 const int MASK_USE_COLOR = ${MASK_USE.color};
+const int MASK_USE_MOIRE = ${MASK_USE.moire};
 // Packed by masks.ts packMasks: MASK_STRIDE vec4 rows per group — hdr
-// (count, invert), adjA (expo, hi, sh, clar), adjB (haze, sat, vib, hue),
+// (count, invert, moire), adjA (expo, hi, sh, clar), adjB (haze, sat, vib, hue),
 // three ΔWB columns, then 3 rows per component.
 layout(std140) uniform Masks { vec4 m[${ROWS}]; };
 
 // One component's weight (mirrors componentWeight in masks.ts). base is its
 // first row: h = (type, op, invert, ·), then a and b.
-float maskComponent(int base, vec2 pImg, float pLum, vec3 labSel) {
+float maskComponent(int base, vec2 pImg, float pLum, vec3 labSel, float pDepth, vec2 srcUV) {
   vec4 h = m[base], a = m[base + 1], b = m[base + 2];
   int type = int(h.x); float w;
   if (type == 0) w = smoothstep(a.x - a.z, a.x, pLum) * (1.0 - smoothstep(a.y, a.y + a.w, pLum));
+  else if (type == 4) w = pDepth < 0.0 ? 0.0
+                        : smoothstep(a.x - a.z, a.x, pDepth) * (1.0 - smoothstep(a.y, a.y + a.w, pDepth));
+  // Texture-backed: the aux array's brush (3) and AI (2) layers, a channel
+  // each. textureLod: this runs in per-pixel control flow, where implicit
+  // derivatives are undefined (and the D3D backend would unroll the loop).
+  else if (type == 5) w = a.x < 0.0 ? 0.0 : textureLod(u_aux, vec3(srcUV, 3.0), 0.0)[int(a.x)];
+  else if (type == 6) w = textureLod(u_aux, vec3(srcUV, 2.0), 0.0)[int(a.x)];
   else if (type == 1) w = smoothstep(0.0, 1.0, hueWindow(atan(labSel.z, labSel.y), a.x, a.y))
                         * smoothstep(a.z, a.w, hslChromaRatio(length(labSel.yz), labSel.x));
   else {

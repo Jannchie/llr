@@ -63,6 +63,23 @@ session skips the decode after a worker restart too. Sources and that cache
 live under `$LLR_CACHE_DIR` (default `~/.cache/llr`), outside the checkout, and
 stay until the photo is removed from the library.
 
+Generative erase rides on the same response (`erase.py`): render-linear may
+carry brushed strokes, in the decode's own source-normalised frame, and each is
+refilled by Moebius — a 0.22B latent inpainting model, run as ONNX — before the
+pixels leave. The region goes to the model through an invertible tone map and
+comes back to scene-linear, so the fill is just more source pixels and every
+browser-side edit reaches it. The caches above keep the frame as decoded; the
+fills are layered on per response and cached by the decode (minus its size) and
+the strokes up to each one, so a preview and an export share them.
+
+GPU models never run in the worker process itself. DirectML returns device
+memory only when a process exits, so a model run in the long-lived worker would
+pin its peak VRAM (BiRefNet: 11-21 GB) for good and starve the browser's WebGL.
+`gpu_host.py` runs MoGe (relight geometry, ~1.8 GB) and Moebius (erase,
+~6.6 GB) in a child started on demand and stopped after it idles (60 s, or 10 s
+once Moebius is loaded), which hands all of it back; the AI mask models run on
+the CPU (`ai_masks.py`). `LLR_GPU=0` keeps everything on the CPU.
+
 ## Catalog: api (`apps/api/src/catalog.ts`)
 
 What is in the library lives in one SQLite file, `$LLR_CACHE_DIR/catalog.db`
@@ -147,7 +164,7 @@ Extended-XMP chunks when a heavy edit overflows the 64 KB APP1 limit.
 ## Assistant
 
 The Assistant tab is a chat that edits the open photo. The agent loop
-(`@mariozechner/pi-agent-core`) runs in the API (`apps/api/src/agent.ts`),
+(`@earendil-works/pi-agent-core`) runs in the API (`apps/api/src/agent.ts`),
 which holds the LLM key and streams events to the browser over SSE; every tool
 the model calls — look at the render, read the edit, apply an edit — executes in
 the browser against the same reactive state the sliders drive, so its changes

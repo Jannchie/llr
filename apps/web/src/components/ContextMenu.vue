@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { clamp } from "../ui";
+import { IconChevronRight } from "@jannchie/icons";
+import { JIcon } from "@jannchie/icons-vue";
 
 // A right-click menu, at the pointer: the file-manager half of the grid. The
 // caller owns what is in it (`menu.items`, already labelled and localized) and
@@ -250,10 +252,7 @@ onBeforeUnmount(() => removeWindow?.());
           role="menuitem" :aria-disabled="item.disabled || undefined" :aria-haspopup="item.children?.length ? 'menu' : undefined"
           @pointerenter="hover(i, $event.currentTarget)" @click="item.children?.length ? openSub(i) : pick(item)">
           <span class="ctx-label">{{ item.label }}</span>
-          <svg v-if="item.children?.length" class="ctx-arrow" viewBox="0 0 6 10" aria-hidden="true">
-            <path d="M1 1l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
-              stroke-linejoin="round" />
-          </svg>
+          <JIcon v-if="item.children?.length" class="ctx-arrow" :icon="IconChevronRight" weight="bold" />
         </div>
       </template>
     </div>

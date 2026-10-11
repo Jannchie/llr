@@ -41,19 +41,48 @@ const DEFAULT_MODELS: ModelSpec[] = [
   { provider: "openai", id: "gpt-5.6-luna" },
   { provider: "openai", id: "gpt-5.6-terra" },
   { provider: "openai", id: "gpt-6-astra" },
-  { provider: "anthropic", id: "claude-opus-5" },
+  { provider: "anthropic", id: "claude-opus-5-5" },
+  { provider: "anthropic", id: "claude-sonnet-5-5" },
   { provider: "anthropic", id: "claude-fable-5-1" },
   { provider: "deepseek", id: "deepseek-flash" },
 ];
 const MODELS_KEY = "llr.agent.models";
 const SELECTED_KEY = "llr.agent.model";
+// Bumped when the defaults move on; a list saved under an older version gets
+// that move applied once (upgradeModels), after which it is the person's again.
+const MODELS_VERSION_KEY = "llr.agent.models.v";
+const MODELS_VERSION = 2;
+
+// v2: Claude Opus 5 -> Opus 5.5 (keeping its thinking level), and Sonnet 5.5
+// beside it — the defaults a list saved before them was missing.
+function upgradeModels(list: ModelSpec[], from: number): ModelSpec[] {
+  if (from >= 2) return list;
+  const out = list.map(m => (m.provider === "anthropic" && m.id === "claude-opus-5" ? { ...m, id: "claude-opus-5-5" } : m));
+  const has = (id: string) => out.some(m => m.provider === "anthropic" && m.id === id);
+  if (!has("claude-sonnet-5-5")) {
+    const at = out.findIndex(m => m.provider === "anthropic" && m.id === "claude-opus-5-5");
+    out.splice(at >= 0 ? at + 1 : out.length, 0, { provider: "anthropic", id: "claude-sonnet-5-5" });
+  }
+  return out;
+}
 
 function loadModels(): ModelSpec[] {
   try {
     const raw = JSON.parse(localStorage.getItem(MODELS_KEY) ?? "");
     if (Array.isArray(raw) && raw.every(m => typeof m?.provider === "string" && typeof m?.id === "string"
-      && (m.thinking === undefined || THINKING_LEVELS.includes(m.thinking)))) return raw;
+      && (m.thinking === undefined || THINKING_LEVELS.includes(m.thinking)))) {
+      const from = Number(localStorage.getItem(MODELS_VERSION_KEY) ?? 1);
+      const list = upgradeModels(raw, from);
+      if (from < MODELS_VERSION) {
+        localStorage.setItem(MODELS_KEY, JSON.stringify(list));
+        localStorage.setItem(MODELS_VERSION_KEY, String(MODELS_VERSION));
+        // The selection followed the renamed entry.
+        if (localStorage.getItem(SELECTED_KEY) === "anthropic/claude-opus-5") localStorage.setItem(SELECTED_KEY, "anthropic/claude-opus-5-5");
+      }
+      return list;
+    }
   } catch { /* fall through to defaults */ }
+  localStorage.setItem(MODELS_VERSION_KEY, String(MODELS_VERSION));
   return DEFAULT_MODELS.map(m => ({ ...m }));
 }
 

@@ -14,6 +14,8 @@
   },
   "dependencies": {
     "@fadedown/vue": "0.7.0",
+    "@jannchie/icons": "0.9.0",
+    "@jannchie/icons-vue": "0.9.0",
     "vue": "^3.5.13"
   },
   "devDependencies": {

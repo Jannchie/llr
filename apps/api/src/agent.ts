@@ -7,8 +7,15 @@
 // and settles the promise the loop is waiting on.
 import type { ServerResponse } from "node:http";
 
-import { Agent, type AgentEvent, type AgentMessage, type AgentTool, type AgentToolResult } from "@mariozechner/pi-agent-core";
-import { clampThinkingLevel, getEnvApiKey, getModel, getModels, getProviders, type Api, type ImageContent, type KnownProvider, type Model, type ModelThinkingLevel, type TextContent, type TSchema } from "@mariozechner/pi-ai";
+import { Agent, type AgentEvent, type AgentMessage, type AgentTool, type AgentToolResult } from "@earendil-works/pi-agent-core";
+import { clampThinkingLevel, type Api, type ImageContent, type Model, type ModelThinkingLevel, type TextContent, type TSchema } from "@earendil-works/pi-ai";
+import { builtinModels } from "@earendil-works/pi-ai/providers/all";
+
+// Every built-in provider, its model catalog and its auth (the provider's
+// usual env var: ANTHROPIC_API_KEY, OPENAI_API_KEY, …). The catalog knows each
+// model's request surface — Claude's adaptive-only thinking, effort levels,
+// which parameters a model rejects — so requests need no patching here.
+const models = builtinModels();
 
 // `role` is all the API knows about a tool: whether it changes the photo or
 // looks at it, so the nudge below can tell "edited and never looked" without
@@ -33,7 +40,9 @@ export type ToolResultBody = {
 };
 
 type Pending = { resolve: (r: AgentToolResult<undefined>) => void; reject: (e: Error) => void };
-type Session = { agent: Agent; pending: Map<string, Pending>; lastUsed: number };
+// `prompt` is the system prompt the transcript holds: the transcript owns it, so
+// a different one later is appended as a system message, never swapped in place.
+type Session = { agent: Agent; pending: Map<string, Pending>; lastUsed: number; prompt: string };
 
 const SESSION_IDLE_MS = 60 * 60 * 1000;
 const sessions = new Map<string, Session>();
@@ -42,42 +51,48 @@ setInterval(() => {
   for (const [id, s] of sessions) if (s.lastUsed < cutoff && !s.agent.state.isStreaming) sessions.delete(id);
 }, 10 * 60 * 1000).unref();
 
-// The browser names the model; the key is whatever the provider's usual env var
-// holds. Ids the bundled registry has not heard of yet (a model released after
-// pi-ai's last update) are served through a sibling of the same provider — same
-// endpoint and API flavour, only the id differs. Vision is assumed: every current
-// frontier model takes images, and a text-only sibling (deepseek-v4-flash in the
-// registry) would otherwise silently swap view_image's frames for placeholders.
+// The browser names the model. Ids the catalog has not heard of yet (a model
+// released after this pi-ai) are served through a sibling of the same provider
+// — same endpoint and API flavour, only the id differs. Vision is assumed: every
+// current frontier model takes images, and a text-only sibling would otherwise
+// silently swap view_image's frames for placeholders.
 export function resolveModel(spec: ModelSpec): Model<Api> {
-  const provider = spec.provider as KnownProvider;
-  if (!getProviders().includes(provider)) throw new Error(`Unknown provider "${spec.provider}"`);
-  const known = getModel(provider, spec.id as never) as Model<Api> | undefined;
+  if (!models.getProvider(spec.provider)) throw new Error(`Unknown provider "${spec.provider}"`);
+  const known = models.getModel(spec.provider, spec.id);
   if (known) return known;
-  const sibling = getModels(provider)[0];
+  const sibling = models.getModels(spec.provider)[0];
   if (!sibling) throw new Error(`No template model for provider "${spec.provider}"`);
   return { ...sibling, id: spec.id, name: spec.id, input: ["text", "image"] };
 }
 
 /**
- * What the model dialog offers: every provider the registry knows, the ids it
+ * What the model dialog offers: every provider the catalog knows, the ids it
  * ships for it, and whether this server holds that provider's key. An id newer
- * than the registry can still be typed — the browser only needs the list to
+ * than the catalog can still be typed — the browser only needs the list to
  * show what is usual.
  */
 export type ProviderCatalogEntry = { id: string; hasKey: boolean; models: { id: string; name: string }[] };
 
-export function agentCatalog(): ProviderCatalogEntry[] {
-  return getProviders().map(p => ({
-    id: p,
-    hasKey: !!getEnvApiKey(p),
-    models: getModels(p).map(m => ({ id: m.id, name: m.name })),
-  }));
+export async function agentCatalog(): Promise<ProviderCatalogEntry[]> {
+  return Promise.all(models.getProviders().map(async p => ({
+    id: p.id,
+    // A broken credential (expired OAuth) reads as "no key" rather than failing the list.
+    hasKey: !!(await models.getAuth(p.id).catch(() => undefined)),
+    models: models.getModels(p.id).map(m => ({ id: m.id, name: m.name })),
+  })));
 }
 
-function getSession(id: string): Session {
+function getSession(id: string, init: { model: Model<Api>; systemPrompt: string }): Session {
   let s = sessions.get(id);
   if (!s) {
-    s = { agent: new Agent({ getApiKey: getEnvApiKey }), pending: new Map(), lastUsed: Date.now() };
+    s = {
+      agent: new Agent({
+        initialState: { model: init.model, systemPrompt: init.systemPrompt },
+        streamFn: models.streamSimple.bind(models),
+        sessionId: id,
+      }),
+      pending: new Map(), lastUsed: Date.now(), prompt: init.systemPrompt,
+    };
     sessions.set(id, s);
   }
   s.lastUsed = Date.now();
@@ -128,11 +143,19 @@ export function isSessionBusy(session: string): boolean {
 }
 
 export async function handleAgentPrompt(body: PromptBody, response: ServerResponse): Promise<void> {
-  const s = getSession(body.session);
-  s.agent.state.model = resolveModel(body.model);
-  s.agent.state.thinkingLevel = clampThinkingLevel(s.agent.state.model, body.thinking ?? "off");
-  s.agent.state.systemPrompt = body.systemPrompt;
+  const model = resolveModel(body.model);
+  const s = getSession(body.session, { model, systemPrompt: body.systemPrompt });
+  s.agent.state.model = model;
+  s.agent.state.thinkingLevel = clampThinkingLevel(model, body.thinking ?? "off");
   s.agent.state.tools = browserTools(s, body.tools);
+  // The prompt changed since the transcript began (the UI language, a newer
+  // build): append it as instructions that supersede, keeping the history and
+  // its cache — the transcript is append-only.
+  const promptPatch: AgentMessage[] = [];
+  if (body.systemPrompt !== s.prompt) {
+    promptPatch.push({ role: "system", content: `Updated instructions (they replace the earlier ones):\n${body.systemPrompt}`, timestamp: Date.now() } as AgentMessage);
+    s.prompt = body.systemPrompt;
+  }
   response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store", connection: "keep-alive" });
 
   // The prompt tells the model to look at every edit before answering; this
@@ -166,7 +189,11 @@ export async function handleAgentPrompt(body: PromptBody, response: ServerRespon
   };
   response.on("close", onClose);
   try {
-    await s.agent.prompt(body.text, body.images);
+    if (promptPatch.length) {
+      await s.agent.prompt([...promptPatch, { role: "user", content: [{ type: "text", text: body.text }, ...(body.images ?? [])], timestamp: Date.now() } as AgentMessage]);
+    } else {
+      await s.agent.prompt(body.text, body.images);
+    }
   } finally {
     unsubscribe();
     response.off("close", onClose);
