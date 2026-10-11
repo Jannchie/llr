@@ -87,6 +87,14 @@ export const XYZ_D50_TO_PROPHOTO: Mat3 = [
 ];
 
 /** TS mirror of the GLSL builtin — shared by every module with a shader twin. */
+/** IEEE half float -> number. */
+export function halfToFloat(h: number): number {
+  const s = h & 0x8000 ? -1 : 1, e = (h >> 10) & 0x1f, f = h & 0x3ff;
+  if (e === 0) return s * f * 2 ** -24;
+  if (e === 31) return f ? Number.NaN : s * Infinity;
+  return s * (1 + f / 1024) * 2 ** (e - 15);
+}
+
 export function smoothstep(e0: number, e1: number, x: number): number {
   const t = Math.min(1, Math.max(0, (x - e0) / (e1 - e0)));
   return t * t * (3 - 2 * t);

@@ -6,6 +6,7 @@
 import type { LinearPixels, ProfileClarity, ProfileSharpen, ProfileSpica } from "./rendering/pipeline-renderer";
 import type { ProfileLumaNr } from "./rendering/sony-lumanr";
 import type { ProfileMarble } from "./rendering/sony-marble";
+import type { RelightGeometry } from "./rendering/relight";
 
 export const API = (import.meta.env.VITE_API_URL as string | undefined) ?? "/api";
 
@@ -199,15 +200,39 @@ export type LinearMeta = {
   // where the control works. Always present: the API fills it in (true for a
   // worker that does not report it), so the "older worker" rule lives there.
   denoiseUsesChroma: boolean;
+  // How the request's erase strokes went: null without any; `error` says why
+  // the fills did not run (no model, no runtime) — the frame is then as decoded.
+  erase?: { strokes: number; error?: string } | null;
 };
 
-// Decode linear data via /render-linear. The response carries the pixels
-// directly: [u32 header length][JSON header, padded so the pixels stay 4-byte
-// aligned][linear RGB in header.dtype]. float16 payloads (half the bytes of
-// float32) stay as Uint16Array and upload straight into an RGB16F texture.
-// Returns null on 404 (source evicted server-side).
-export async function fetchLinear(body: Record<string, unknown>): Promise<{ meta: LinearMeta; pixels: LinearPixels } | null> {
-  const res = await fetch(`${API}/render-linear`, {
+// Whether a worker model (erase, relight geometry, AI masks) can run on this
+// machine (worker model_fetch.status): its files and the ONNX runtime present,
+// or why not.
+export type ModelStatus = {
+  available: boolean;
+  reason?: "models-missing" | "downloading" | "runtime-missing" | "load-failed";
+  modelDir?: string;
+  provider?: string;
+  detail?: string;
+  received?: number;   // model bytes fetched so far, while downloading
+  total?: number;      // model bytes to fetch
+};
+export type WorkerModel = "erase" | "relight" | "ai";
+
+// The model's status; with `download`, first start fetching whatever it is
+// missing (a no-op when it is there or on its way), so the answer is then
+// "downloading".
+export async function fetchModelStatus(model: WorkerModel, download = false): Promise<ModelStatus> {
+  const res = await fetch(`${API}/${model}-${download ? "download" : "status"}`, { method: download ? "POST" : "GET" });
+  if (!res.ok) throw new Error(await res.text());
+  return (await res.json()) as ModelStatus;
+}
+
+// POST a decode body to an endpoint that answers framed like render-linear:
+// [u32 header length][JSON header, padded to 4 bytes][payload]. Null on 404
+// (the source evicted server-side).
+async function postFramed<M>(path: string, body: Record<string, unknown>): Promise<{ meta: M; buf: ArrayBuffer; offset: number } | null> {
+  const res = await fetch(`${API}/${path}`, {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
@@ -215,10 +240,34 @@ export async function fetchLinear(body: Record<string, unknown>): Promise<{ meta
   if (!res.ok) throw new Error(await res.text());
   const buf = await res.arrayBuffer();
   const headerLen = new DataView(buf).getUint32(0);
-  const meta = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 4, headerLen))) as LinearMeta;
-  const pixels = meta.dtype === "float16"
-    ? new Uint16Array(buf, 4 + headerLen)
-    : new Float32Array(buf, 4 + headerLen);
+  const meta = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 4, headerLen))) as M;
+  return { meta, buf, offset: 4 + headerLen };
+}
+
+// Normals + depth for the relight shader, estimated on the frame render-linear
+// serves for the same body (worker relight.py).
+export async function fetchRelightGeometry(body: Record<string, unknown>): Promise<RelightGeometry | null> {
+  const r = await postFramed<{ width: number; height: number; k: [number, number] }>("relight-geometry", body);
+  return r && { width: r.meta.width, height: r.meta.height, k: r.meta.k, data: new Uint16Array(r.buf, r.offset) };
+}
+
+// Subject / sky / person mattes as RGBA8 rows (top-down, the decode's frame),
+// estimated on the frame render-linear serves for the same body.
+export async function fetchAiMasks(body: Record<string, unknown>): Promise<{ data: Uint8Array; w: number; h: number } | null> {
+  const r = await postFramed<{ width: number; height: number }>("ai-masks", body);
+  return r && { w: r.meta.width, h: r.meta.height, data: new Uint8Array(r.buf, r.offset) };
+}
+
+// Decode linear data via /render-linear. The response carries the pixels
+// directly: [u32 header length][JSON header, padded so the pixels stay 4-byte
+// aligned][linear RGB in header.dtype]. float16 payloads (half the bytes of
+// float32) stay as Uint16Array and upload straight into an RGB16F texture.
+// Returns null on 404 (source evicted server-side).
+export async function fetchLinear(body: Record<string, unknown>): Promise<{ meta: LinearMeta; pixels: LinearPixels } | null> {
+  const r = await postFramed<LinearMeta>("render-linear", body);
+  if (!r) return null;
+  const { meta, buf, offset } = r;
+  const pixels = meta.dtype === "float16" ? new Uint16Array(buf, offset) : new Float32Array(buf, offset);
   return { meta, pixels };
 }
 

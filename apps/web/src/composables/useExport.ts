@@ -2,6 +2,7 @@ import { ref, type Ref } from "vue";
 import { PipelineRenderer, parseDcpTables, type EditParams, type ProfileCurve } from "../rendering/pipeline-renderer";
 import { API, fetchLinear, type DenoisePayload, type LinearMeta, type LookTweaks } from "../api";
 import { t } from "../i18n";
+import type { RelightGeometry } from "../rendering/relight";
 
 /**
  * Everything the export mechanics need, frozen at click time. The full-res
@@ -22,6 +23,16 @@ export interface ExportPlan {
   /** Exactly what `denoisePayload` returns — see DenoisePayload for why the
    * shape is declared once rather than repeated here. */
   denoise: DenoisePayload;
+  /** Generative erase strokes, as render-linear takes them (rendering/erase.ts
+   * eraseWire). The worker fills them into the decode, so the export has to ask
+   * for the same ones the preview showed. */
+  erase: { points: [number, number][]; radius: number }[];
+  /** Relight geometry for the rig in `params` (resolution-free, so the
+   * preview's serves the export); null when the edit adds no light. */
+  relightGeometry: RelightGeometry | null;
+  /** Anything else the renderer needs per image before it draws (mask layers:
+   * AI mattes, rasterised brushes) — called once the full-res frame is up. */
+  prepare?: (renderer: PipelineRenderer, params: Partial<EditParams>) => void;
   /** Creative Look tweaks; undefined renders the shot's own (Sony path only). */
   look: LookTweaks | undefined;
   /** Which Creative Look; undefined renders the body's own (Sony path only). */
@@ -36,12 +47,60 @@ export interface ExportPlan {
   /** Camera match, the post chain's last stage. Render-time and per-image like
    * the switch above, and handed over for the same reason. */
   sonyCameraMatch: boolean;
-  params: Partial<EditParams>;
+  /** The render params, or how to make them from the decode (a photo that is
+   * not open: its lens tables and size are only known once it is decoded). */
+  params: Partial<EditParams> | ((meta: LinearMeta) => Partial<EditParams>);
+  /** Decode size; absent = full resolution (an export). */
+  decode?: { halfSize: boolean; maxSize: number };
   curveLUT: Float32Array;
   profileLUT: (meta: LinearMeta) => ProfileCurve;
   /** Crop-aware output dims + source transform for the full-res frame. */
   output: (meta: LinearMeta) => { width: number; height: number; texXform: Float32Array };
   background: [number, number, number];
+}
+
+/**
+ * Decode `plan`'s photo and render its frozen edit off-screen: the whole of an
+ * export but the download, and — with `maxEdge` — a small rendering of a photo
+ * that is not open (the edited previews a paste onto a selection refreshes).
+ */
+export async function renderPlan(plan: ExportPlan, opts: { maxEdge?: number; quality?: number } = {}): Promise<Blob> {
+  let renderer: PipelineRenderer | null = null;
+  try {
+    // Full resolution for an export (no half-size, no cap); purpose keeps
+    // this one-off decode out of the worker's caches.
+    const lin = await fetchLinear({
+      sourceId: plan.sourceId, halfSize: plan.decode?.halfSize ?? false, maxSize: plan.decode?.maxSize ?? 0, purpose: "export",
+      profileId: plan.profileId, dcpCode: plan.dcpCode, denoise: plan.denoise,
+      look: plan.look, style: plan.lookStyle, dro: plan.dro, erase: plan.erase,
+    });
+    if (!lin) throw new Error(t("error.exportSourceGone"));
+    const { meta, pixels } = lin;
+    const params = typeof plan.params === "function" ? plan.params(meta) : plan.params;
+
+    renderer = new PipelineRenderer(document.createElement("canvas"));
+    renderer.uploadImage(pixels, meta.width, meta.height);
+    renderer.uploadCurveLUT(plan.curveLUT);
+    renderer.uploadProfileCurveLUT(plan.profileLUT(meta));
+    // The DCP HueSatMaps are the shader's job now, so this off-screen renderer
+    // needs them as much as the preview does — without them the export would
+    // come out unprofiled while the preview looked right.
+    renderer.uploadDcpTables(parseDcpTables(meta.colorProfile));
+    // Awaited, unlike the preview's fire-and-redraw: this renderer draws once
+    // and is thrown away, so the table has to be resident before it does.
+    await renderer.setSonyAdvancedColour(plan.sonyAdvancedColour);
+    renderer.setSonyCameraMatch(plan.sonyCameraMatch);
+    renderer.uploadRelightGeometry(plan.relightGeometry);
+    plan.prepare?.(renderer, params);
+    const out = plan.output(meta);
+    const f = opts.maxEdge ? Math.min(1, opts.maxEdge / Math.max(out.width, out.height)) : 1;
+    renderer.setOutput(Math.max(1, Math.round(out.width * f)), Math.max(1, Math.round(out.height * f)), out.texXform, plan.background);
+    renderer.draw(params);
+    // quality 1.0 also disables the browser encoder's 4:2:0 chroma subsampling
+    return await renderer.toBlob("image/jpeg", opts.quality ?? 1.0);
+  } finally {
+    renderer?.destroy();
+  }
 }
 
 /**
@@ -65,46 +124,17 @@ export function useExport(opts: {
     exporting.value = true;
     opts.errorMessage.value = null;
     opts.status.value = "rendering";
-    let renderer: PipelineRenderer | null = null;
     try {
-      // 1. Decode full-resolution linear data (no half-size / no max-size cap).
-      // Same dimensions the preview asks for; purpose is what keeps this one-off
-      // decode out of the worker's caches.
-      const lin = await fetchLinear({
-        sourceId: plan.sourceId, halfSize: false, maxSize: 0, purpose: "export",
-        profileId: plan.profileId, dcpCode: plan.dcpCode, denoise: plan.denoise,
-        look: plan.look, style: plan.lookStyle, dro: plan.dro,
-      });
-      if (!lin) throw new Error(t("error.exportSourceGone"));
-      const { meta, pixels } = lin;
+      const blob = await renderPlan(plan);
 
-      // 2. Render full-res off-screen with the frozen edit, read back as JPEG
-      renderer = new PipelineRenderer(document.createElement("canvas"));
-      renderer.uploadImage(pixels, meta.width, meta.height);
-      renderer.uploadCurveLUT(plan.curveLUT);
-      renderer.uploadProfileCurveLUT(plan.profileLUT(meta));
-      // The DCP HueSatMaps are the shader's job now, so this off-screen renderer
-      // needs them as much as the preview does — without them the export would
-      // come out unprofiled while the preview looked right.
-      renderer.uploadDcpTables(parseDcpTables(meta.colorProfile));
-      // Awaited, unlike the preview's fire-and-redraw: this renderer draws once
-      // and is thrown away, so the table has to be resident before it does.
-      await renderer.setSonyAdvancedColour(plan.sonyAdvancedColour);
-      renderer.setSonyCameraMatch(plan.sonyCameraMatch);
-      const out = plan.output(meta);
-      renderer.setOutput(out.width, out.height, out.texXform, plan.background);
-      renderer.draw(plan.params);
-      // quality 1.0 also disables the browser encoder's 4:2:0 chroma subsampling
-      const blob = await renderer.toBlob("image/jpeg", 1.0);
-
-      // 3. Embed edit settings (llr:* XMP + lossless LLR JSON) into the JPEG server-side
+      // Embed edit settings (llr:* XMP + lossless LLR JSON) into the JPEG server-side
       const fd = new FormData();
       fd.append("file", blob, "export.jpg");
       fd.append("meta", JSON.stringify({ sourceId: plan.sourceId, settings: plan.settings, stripPrivate: plan.stripPrivate }));
       const exRes = await fetch(`${API}/export`, { method: "POST", body: fd });
       if (!exRes.ok) throw new Error(await exRes.text());
 
-      // 4. Download the finished file
+      // Download the finished file
       downloadBlob(await exRes.blob(), plan.filename);
       // Don't stomp the status of a decode the user started mid-export.
       if (opts.status.value === "rendering") opts.status.value = "idle";
@@ -115,7 +145,6 @@ export function useExport(opts: {
       opts.errorMessage.value = err instanceof Error ? err.message : String(err);
       console.error("[export] failed:", err);
     } finally {
-      renderer?.destroy();
       exporting.value = false;
     }
   }

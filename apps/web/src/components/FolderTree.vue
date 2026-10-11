@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import InlineEdit from "./InlineEdit.vue";
+import { IconChevronRight, IconEdit, IconFolder, IconFolderArrowUp, IconFolderPlus, IconTrash, IconUpload } from "@jannchie/icons";
+import { JIcon } from "@jannchie/icons-vue";
 import { descendantIds, visibleRows, type FolderNode, type FolderRow } from "../catalogTree";
 import { t } from "../i18n";
 
@@ -178,24 +180,15 @@ defineExpose({ startCreate });
       <div class="tree-actions">
         <button type="button" class="tree-btn" :title="t('tree.newFolder')" :aria-label="t('tree.newFolder')"
           :disabled="busy" @click="startCreate(selectedId)">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
-            <path d="M12 11v6M9 14h6" />
-          </svg>
+          <JIcon :icon="IconFolderPlus" />
         </button>
         <button type="button" class="tree-btn" :title="t('tree.importFiles')" :aria-label="t('tree.importFiles')"
           :disabled="busy" @click="emit('importFiles', selectedId)">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M12 16V4M7 9l5-5 5 5" />
-            <path d="M4 20h16" />
-          </svg>
+          <JIcon :icon="IconUpload" />
         </button>
         <button type="button" class="tree-btn" :title="t('tree.importFolder')" :aria-label="t('tree.importFolder')"
           :disabled="busy" @click="emit('importFolder', selectedId)">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
-            <path d="M12 17v-6M9 14l3-3 3 3" />
-          </svg>
+          <JIcon :icon="IconFolderArrowUp" />
         </button>
       </div>
     </header>
@@ -219,13 +212,9 @@ defineExpose({ startCreate });
           @drop="onDrop($event, node.id)">
           <button type="button" class="tree-twisty" tabindex="-1" :class="{ 'is-open': expanded.has(node.id), 'is-leaf': !node.children.length }"
             :aria-hidden="!node.children.length" @click.stop="node.children.length && emit('toggle', node.id)">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M9 6l6 6-6 6" />
-            </svg>
+            <JIcon :icon="IconChevronRight" weight="bold" />
           </button>
-          <svg class="tree-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true">
-            <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
-          </svg>
+          <JIcon class="tree-icon" :icon="IconFolder" />
           <InlineEdit v-if="editing?.kind === 'rename' && editing.id === node.id" class="tree-edit"
             :value="node.name" @commit="commitEdit" @cancel="cancelEdit" @click.stop />
           <span v-else class="tree-name">{{ label(node) }}</span>
@@ -235,23 +224,17 @@ defineExpose({ startCreate });
           <span class="tree-row-actions" v-if="node.id !== 1">
             <button type="button" class="tree-btn tree-btn-sm" tabindex="-1" :title="t('tree.rename')" :aria-label="t('tree.rename')"
               @click.stop="startRename(node)">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M4 20h4l10-10-4-4L4 16z" />
-              </svg>
+              <JIcon :icon="IconEdit" />
             </button>
             <button type="button" class="tree-btn tree-btn-sm" tabindex="-1" :title="t('tree.delete')" :aria-label="t('tree.delete')"
               @click.stop="confirmDelete(node)">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
-                <path d="M6 6l12 12M18 6L6 18" />
-              </svg>
+              <JIcon :icon="IconTrash" />
             </button>
           </span>
         </div>
         <div v-if="editing?.kind === 'create' && i === createAfterIndex" class="tree-row is-editing" :style="{ '--depth': editing.depth }">
           <span class="tree-twisty is-leaf" aria-hidden="true" />
-          <svg class="tree-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true">
-            <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
-          </svg>
+          <JIcon class="tree-icon" :icon="IconFolder" />
           <InlineEdit class="tree-edit" :value="t('tree.newFolderName')" @commit="commitEdit" @cancel="cancelEdit" />
         </div>
       </template>

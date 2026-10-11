@@ -14,13 +14,21 @@ uv run --project apps/worker pytest -q apps/worker/tests          # tests
 
 The daemon protocol is one JSON object per line on stdin (`command`,
 `id`, command-specific fields) answered by one JSON line on stdout.
-Commands: `ping`, `extract-preview`, `render-linear`, `export`.
+Commands: `ping`, `extract-preview`, `render-linear`, `look-profile`,
+`erase-status`, `erase-download`, `export`.
 
 ## Modules
 
 - `cli.py` — daemon loop, decode/cache orchestration, XMP building and JPEG
   APP1 embedding, camera-crop math. Exports copy the RAW's full EXIF; the
   `stripPrivate` export flag excludes GPS/serials/owner/maker notes instead.
+- `erase.py` — generative erase: brushed strokes refilled by Moebius (ONNX,
+  run with onnxruntime — DirectML on Windows) as patches on the decoded
+  scene-linear frame, cached per stroke beside the source. The three graphs
+  live in `$LLR_ERASE_MODEL_DIR` (default `$LLR_CACHE_DIR/models/moebius`) and
+  are fetched on first use of the Erase tab from the pinned Hugging Face
+  export (`Jannchie/moebius-inpaint-onnx`, size- and SHA-256-checked, resumable),
+  which `scripts/export_moebius_onnx.py` produced.
 - `dcp.py` — Adobe DCP (classic-TIFF) parsing and application: color matrix,
   ProfileHueSatMap, ProfileLookTable, profile tone curve, in linear ProPhoto.
 - `denoise.py` — Bayer-mosaic denoise before demosaic (2×2 CFAs only, X-Trans is

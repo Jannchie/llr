@@ -1,6 +1,8 @@
 <script setup lang="ts" generic="T extends string | number">
 import { computed, nextTick, onBeforeUnmount, ref, useId, watch } from "vue";
 import { useFixedPlacement } from "../composables/useFixedPlacement";
+import { IconArrowsUpDown, IconCheck, IconChevronDown, IconLayoutGrid } from "@jannchie/icons";
+import { JIcon } from "@jannchie/icons-vue";
 
 // A listbox picker that replaces the native <select>. The native control draws
 // its popup at the OS level: it ignores the app's dark palette, cannot show a
@@ -209,23 +211,13 @@ onBeforeUnmount(() => close(false));
     :aria-activedescendant="open && activeIndex >= 0 ? optionId(activeIndex) : undefined" @click="onTriggerClick"
     @keydown="onKeydown">
     <template v-if="icon === 'sort'">
-      <svg class="control-select-icon" viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M5 7h14M5 12h10M5 17h6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
-      </svg>
+      <JIcon class="control-select-icon" :icon="IconArrowsUpDown" />
     </template>
     <template v-else-if="icon === 'group'">
-      <svg class="control-select-icon" viewBox="0 0 24 24" aria-hidden="true">
-        <rect x="4" y="5" width="6" height="6" rx="1" fill="none" stroke="currentColor" stroke-width="1.8" />
-        <rect x="14" y="5" width="6" height="6" rx="1" fill="none" stroke="currentColor" stroke-width="1.8" />
-        <rect x="4" y="14" width="6" height="6" rx="1" fill="none" stroke="currentColor" stroke-width="1.8" />
-        <rect x="14" y="14" width="6" height="6" rx="1" fill="none" stroke="currentColor" stroke-width="1.8" />
-      </svg>
+      <JIcon class="control-select-icon" :icon="IconLayoutGrid" />
     </template>
     <span v-else class="control-select-value">{{ selectedLabel }}</span>
-    <svg class="control-select-caret" viewBox="0 0 10 6" aria-hidden="true">
-      <path d="M1 1l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
-        stroke-linejoin="round" />
-    </svg>
+    <JIcon class="control-select-caret" :icon="IconChevronDown" weight="bold" />
   </button>
   <!-- Body-level so the rail's overflow and the cards' stacking contexts can't
        clip it; fixed coordinates are recomputed on scroll. -->
@@ -236,10 +228,7 @@ onBeforeUnmount(() => close(false));
         :class="{ 'is-active': i === activeIndex, 'is-selected': o.value === modelValue, 'is-disabled': o.disabled }"
         role="option" :aria-selected="o.value === modelValue" :aria-disabled="o.disabled || undefined"
         @pointerenter="o.disabled || (activeIndex = i)" @click="choose(i)">
-        <svg class="select-check" viewBox="0 0 14 14" aria-hidden="true">
-          <path d="M2 7.5l3.2 3.2L12 3.8" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"
-            stroke-linejoin="round" />
-        </svg>
+        <JIcon class="select-check" :icon="IconCheck" weight="bold" />
         <span class="select-option-label">{{ o.label }}</span>
       </div>
     </div>

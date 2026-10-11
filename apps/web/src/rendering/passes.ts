@@ -8,6 +8,7 @@
  */
 
 import { COLOR_GLSL, PROPHOTO_Y, REC709_Y, glslFloat } from "./color-spaces";
+import { RELIGHT_MAX_LIGHTS } from "./relight";
 
 /**
  * The luma Sony's engine filters: RGB2YCC's Y, (2432, 4864, 896) / 8192 of the
@@ -65,6 +66,229 @@ void main() {
   v_texCoordH = u_texXform * vec3(p, 1.0);
   gl_Position = vec4(a_position, 0.0, 1.0);
 }`;
+
+// Shared by the main pass and the shadow pre-pass (RELIGHT_SHADOW_SHADER).
+const RELIGHT_COMMON_GLSL = `
+uniform int u_rlCount;
+uniform vec4 u_rlPos[${RELIGHT_MAX_LIGHTS}];
+uniform vec2 u_rlK;             // ray slope across the frame (x, y)
+uniform sampler2D u_rlGeo;
+
+vec3 rlPoint(vec2 uv, float z) { return vec3((uv.x - 0.5) * u_rlK.x, (0.5 - uv.y) * u_rlK.y, 1.0) * z; }
+
+// Light i: the surface it is aimed at, and where it stands.
+vec3 rlTarget(int i) { vec2 uv = u_rlPos[i].xy; return rlPoint(uv, textureLod(u_rlGeo, uv, 0.0).a); }
+vec3 rlLight(int i) { return rlTarget(i) * (1.0 - u_rlPos[i].z); }
+// 0 a point lamp, 1 a spot (cone toward the aim point), 2 the sun: parallel
+// light along the lamp -> aim direction, no falloff.
+int rlKind(int i) { return int(u_rlPos[i].w + 0.5); }
+// Where light i reaches P from: the lamp itself, or for the sun a point far
+// out along its direction from P (so shadows march the right way).
+vec3 rlLightFor(int i, vec3 P) {
+  vec3 L = rlLight(i), T = rlTarget(i);
+  if (rlKind(i) == 2) return P + normalize(L - T) * max(length(L - T), 1e-3) * 4.0;
+  return L;
+}
+`;
+
+// Shadows, one channel per light, in the geometry's own UV at a fraction of
+// its resolution; the main pass reads them back filtered (u_aux layer 1). Marching
+// per screen pixel instead printed every small bump of the depth estimate as a
+// ray-shaped streak fanning out from the light, and the fixed step spacing beat
+// against the pixel grid into a moiré; here the march is jittered and the
+// result blurred (RELIGHT_BLUR_SHADER), which leaves a soft, clean shadow.
+export const RELIGHT_SHADOW_SHADER = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 outColor;
+${RELIGHT_COMMON_GLSL}
+
+// March the segment P -> L through the depth map. A sample point that lands
+// just behind the surface the map has there is in that surface's shadow; one
+// far behind it has passed behind a thin object and is not.
+float rlVisibility(vec3 P, vec3 L) {
+  const int N = 48;
+  float vis = 1.0;
+  float j = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+  for (int s = 1; s < N; s++) {
+    float f = (float(s) + j) / float(N);
+    vec3 Q = mix(P, L, f);
+    if (Q.z <= 1e-3) break;
+    vec2 uv = vec2(Q.x / (Q.z * u_rlK.x) + 0.5, 0.5 - Q.y / (Q.z * u_rlK.y));
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) break;
+    float dz = Q.z - texture(u_rlGeo, uv).a;
+    // The estimate is smooth, not exact: anything nearer than a few percent
+    // of the depth is the surface itself, not something in front of it.
+    float bias = 0.03 * Q.z, thick = 0.15 * Q.z;
+    if (dz > bias && dz < thick) vis = min(vis, 1.0 - smoothstep(bias, 2.0 * bias, dz) * smoothstep(thick, 0.6 * thick, dz));
+  }
+  return vis;
+}
+
+void main() {
+  vec4 g = texture(u_rlGeo, v_uv);
+  vec3 N = normalize(g.xyz);
+  vec3 P = rlPoint(v_uv, g.a);
+  P += N * 0.01 * P.z;
+  vec4 v = vec4(1.0);
+  for (int i = 0; i < ${RELIGHT_MAX_LIGHTS}; i++) {
+    if (i >= u_rlCount) break;
+    v[i] = rlVisibility(P, rlLightFor(i, P));
+  }
+  outColor = v;
+}`;
+
+// Separable Gaussian over the four shadow channels, one axis per pass.
+export const RELIGHT_BLUR_SHADER = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 outColor;
+uniform sampler2D u_input;
+uniform vec2 u_dir;
+const float SIGMA = 2.5;
+const int RADIUS = 6;
+void main() {
+  vec4 sum = vec4(0.0);
+  float wsum = 0.0;
+  for (int i = -RADIUS; i <= RADIUS; i++) {
+    float w = exp(-float(i * i) / (2.0 * SIGMA * SIGMA));
+    sum += w * texture(u_input, v_uv + u_dir * float(i));
+    wsum += w;
+  }
+  outColor = sum / wsum;
+}`;
+
+// Relight (rendering/relight.ts, worker relight.py). u_rlGeo holds the camera-
+// space unit normal (OpenCV axes: x right, y down, z forward) in rgb and the
+// depth in a, in the decode's frame, so it is read at lensUV like the source.
+// A light is aimed at a pixel (u_rlPos.xy, texcoord) and stands lift (.z) of
+// that surface's depth back toward the camera; u_rlCol is its colour (unit
+// luminance) times 2^EV, in units of the light already falling on the aim
+// point — so 0 EV doubles what is there, whatever the exposure of the shot.
+const RELIGHT_GLSL = `
+${RELIGHT_COMMON_GLSL}
+uniform int u_rlActive;
+uniform vec4 u_rlCol[${RELIGHT_MAX_LIGHTS}];
+uniform float u_rlAmbient;      // gain on the existing light
+uniform float u_rlWrap;         // light wrapping past the terminator, 0..1
+uniform float u_rlFalloff;      // 0 = none, 1 = inverse square
+uniform float u_rlShadows;      // shadow strength; 0 = the shadow layer is not read
+// The aux array (pipeline-renderer AUX_*), all in source texcoords: layer 0
+// lens blur (rgb + CoC), 1 per-light shadow visibility, 2 AI masks (subject,
+// sky, person), 3 brush masks (one per channel). One sampler for all four:
+// WebGL's D3D backend allows sixteen per shader and the main pass is at the
+// edge of that — a sixteenth bound sampler took the GPU process down.
+precision highp sampler2DArray;
+uniform sampler2DArray u_aux;
+uniform int u_rlHasGeo;         // 1 when u_rlGeo holds a scene (depth masks, fog, lens blur)
+uniform vec2 u_rlDepthLog;      // (log near, 1 / (log far - log near)): the depth axis masks select on
+uniform vec3 u_fog;             // amount -1..1, start 0..1 on the depth axis, airlight level
+uniform int u_lbActive;         // lens blur: 1 mixes aux layer 0 in by its CoC
+uniform vec2 u_srcTexel;        // one source texel, for the defringe / moiré taps
+uniform vec2 u_defringe;        // purple, green amounts 0..1
+uniform int u_rlView;           // geometry preview: 0 off, 1 depth, 2 normals
+uniform float u_rlDepthRef;     // the scene's median depth, which the depth view puts on mid-grey
+
+// Position on the scene's 0..1 depth axis (log-spaced, near..far percentiles).
+float depthAxis(vec2 uv) {
+  return u_rlHasGeo == 1 ? (log(max(textureLod(u_rlGeo, uv, 0.0).a, 1e-4)) - u_rlDepthLog.x) * u_rlDepthLog.y : -1.0;
+}
+
+// Atmospheric perspective on the depth axis: past the start, transmission
+// falls off exponentially and the airlight fills in. A negative amount takes
+// haze out in proportion to distance — not by subtracting a global airlight,
+// which on a dark scene crushes the far half to black, but by stretching each
+// pixel away from its own neighbourhood mean (the blurred log-luma mask) by
+// 1/transmission: distant contrast comes back, levels stay where they were.
+vec3 applyFog(vec3 c, vec2 uv) {
+  float t = clamp(depthAxis(uv), 0.0, 1.5);
+  float d = max(t - u_fog.y, 0.0) / max(1.0 - u_fog.y, 0.05);
+  float tr = exp(-3.0 * abs(u_fog.x) * d);
+  vec3 A = vec3(u_fog.z);
+  if (u_fog.x > 0.0) return c * tr + A * (1.0 - tr);
+  if (u_hasMask == 0) return c;
+  float m = exp2(textureLod(u_mask_lum, uv, 0.0).r);
+  float y = max(ppLuma(c), 1e-6);
+  float yo = max(m + (y - m) / max(tr, 0.4), 0.15 * y);
+  return c * (yo / y);
+}
+
+// Defringe and local moiré removal share one neighbourhood: eight WB'd taps
+// in Oklab, a few source pixels out. Defringe pulls the chroma of purple or
+// green pixels that sit on a strong luminance edge (lateral fringing) toward
+// neutral; moiré replaces the pixel's chroma, per unit lightness, with the
+// neighbourhood's, leaving its lightness alone.
+vec3 chromaClean(vec3 c, vec2 uv, float moire, vec2 fw) {
+  return c; // BISECT
+  vec2 s = max(3.0 * u_srcTexel, 1.5 * fw);
+  vec3 lab = proPhotoToOklab(c);
+  vec2 ratio = vec2(0.0); float lmin = 1e9, lmax = -1e9;
+  for (int i = 0; i < 8; i++) {
+    float a = float(i) * 0.785398;
+    // textureLod: no derivatives, so the D3D backend can keep this a loop in
+    // the per-pixel branch it sits in instead of unrolling it (which hung the
+    // GPU process at the first draw).
+    vec3 t = max(u_wbMatrix * textureLod(u_input, uv + vec2(cos(a), sin(a)) * s, 0.0).rgb, 0.0);
+    vec3 tl = proPhotoToOklab(t);
+    ratio += tl.yz / max(tl.x, 0.02);
+    float ly = log2(max(ppLuma(t), 1e-6));
+    lmin = min(lmin, ly); lmax = max(lmax, ly);
+  }
+  if (moire > 0.0) lab.yz = mix(lab.yz, ratio / 8.0 * max(lab.x, 0.02), moire);
+  if (u_defringe != vec2(0.0)) {
+    float edge = smoothstep(0.5, 1.5, lmax - lmin);
+    float h = atan(lab.z, lab.y);
+    float wp = u_defringe.x * smoothstep(0.0, 1.0, hueWindow(h, -1.05, 0.7));
+    float wg = u_defringe.y * smoothstep(0.0, 1.0, hueWindow(h, 2.35, 0.6));
+    lab.yz *= 1.0 - clamp(edge * max(wp, wg), 0.0, 1.0);
+  }
+  return max(oklabToProPhoto(lab), 0.0);
+}
+
+// The estimate itself, shown in place of the photo (view-only, like the mask
+// matte). Depth as inverse depth — near is bright — with the median at mid-
+// grey; normals as the usual RGB encoding, x right / y up / toward the camera.
+vec3 rlViewColor(vec2 uv) {
+  vec4 g = texture(u_rlGeo, uv);
+  if (u_rlView == 1) return vec3(srgbDecode(clamp(0.5 * u_rlDepthRef / max(g.a, 1e-4), 0.0, 1.0)));
+  return srgbDecode(clamp(normalize(g.xyz) * vec3(0.5, -0.5, -0.5) + 0.5, 0.0, 1.0));
+}
+
+vec3 relight(vec3 c, vec2 uv) {
+  vec4 g = texture(u_rlGeo, uv);
+  vec3 N = normalize(g.xyz);
+  vec3 P = rlPoint(uv, g.a);
+  // Albedo proxy: the pixel over its blurred neighbourhood (Retinex), so a mid
+  // surface reads ~1 whatever light it sits in now. The mask is the WB-free
+  // log luma; WB is luminance-normalised, so that is the same luminance.
+  float S = u_hasMask == 1 ? exp2(texture(u_mask_lum, uv).r) : max(ppLuma(c), 1e-6);
+  vec3 A = min(c / max(S, 1e-5), vec3(8.0));
+  vec3 E = vec3(0.0);
+  vec4 shadow = u_rlShadows > 0.0 ? mix(vec4(1.0), texture(u_aux, vec3(uv, 1.0)), u_rlShadows) : vec4(1.0);
+  for (int i = 0; i < ${RELIGHT_MAX_LIGHTS}; i++) {
+    if (i >= u_rlCount) break;
+    vec3 T = rlTarget(i);
+    float level = u_hasMask == 1 ? exp2(textureLod(u_mask_lum, u_rlPos[i].xy, 0.0).r) : 0.18;
+    int kind = rlKind(i);
+    vec3 L = rlLightFor(i, P);
+    vec3 d = L - P;
+    float d2 = max(dot(d, d), 1e-10);
+    vec3 l = d * inversesqrt(d2);
+    float ndl = (dot(N, l) + u_rlWrap) / (1.0 + u_rlWrap);
+    if (ndl <= 0.0) continue;
+    // Normalised to 1 at the aim point; capped so a surface right by the
+    // light glows instead of blowing up.
+    vec3 lamp = rlLight(i);
+    float ref2 = dot(lamp - T, lamp - T);
+    float atten = kind == 2 ? 1.0 : mix(1.0, min(ref2 / d2, 16.0), u_rlFalloff);
+    // A spot's cone: full inside 65% of its half-angle's cosine span, none past it.
+    if (kind == 1) atten *= smoothstep(u_rlCol[i].w, mix(u_rlCol[i].w, 1.0, 0.35), dot(-l, normalize(T - lamp)));
+    float vis = shadow[i];
+    E += u_rlCol[i].rgb * (level * ndl * atten * vis);
+  }
+  return c * u_rlAmbient + A * E;
+}
+`;
 
 export const PROCESS_SHADER = `#version 300 es
 precision highp float;
@@ -250,6 +474,7 @@ ${COLOR_GLSL}
 ${TONAL_GLSL}
 ${HSL_GLSL}
 ${LUT_GLSL}
+${RELIGHT_GLSL}
 ${MASK_GLSL}
 
 // ===== View transforms: scene-linear ProPhoto -> display-linear ProPhoto [0,1] =====
@@ -670,8 +895,18 @@ void main() {
     c = texture(u_input, lensUV).rgb;
   }
 
+  // --- Lens blur (LENS_BLUR_*): the defocused copy wherever the circle of
+  // confusion is wider than about a pixel of it; in focus stays full-res. ---
+  if (u_lbActive == 1) {
+    vec4 lb = texture(u_aux, vec3(lensUV, 0.0));
+    c = mix(c, lb.rgb, smoothstep(0.35, 1.5, lb.a));
+  }
+
   // Input is scene-linear ProPhoto (D50). Edit here in wide-gamut scene-linear.
   c = max(c, 0.0) * lensGain;
+  // Derivatives are only defined in uniform control flow, so the footprint
+  // the per-pixel-gated chroma taps below scale by is taken here.
+  vec2 lensFw = fwidth(lensUV);
 
   // --- DCP HueSatMaps --- Adobe's order, and the position the worker applied
   // them in: straight after the colour matrix, before anything tonal. Each is
@@ -723,13 +958,15 @@ void main() {
     labSel = proPhotoToOklab(cSel);
   }
   float dExpo = 0.0, dHi = 0.0, dSh = 0.0, dClar = 0.0, dHaze = 0.0, dSat = 0.0, dVib = 0.0, dHue = 0.0, wPrev = 0.0;
+  float dMoire = 0.0;
   if (u_maskGroups > 0) {
     vec2 pImg = (u_imgFromTex * vec3(v_texCoord, 1.0)).xy;
+    float pDepth = depthAxis(lensUV);
     mat3 dWb = mat3(0.0); vec3 dTint = vec3(0.0);
     for (int g = 0; g < u_maskGroups; g++) {
       int base = g * MASK_STRIDE; vec4 hdr = m[base]; float w = 0.0;
       for (int k = 0; k < int(hdr.x); k++) {
-        int cb = base + 6 + k * 3; float wc = maskComponent(cb, pImg, pLum, labSel); float op = m[cb].y;
+        int cb = base + 6 + k * 3; float wc = maskComponent(cb, pImg, pLum, labSel, pDepth, lensUV); float op = m[cb].y;
         w = k == 0 ? wc : op == 0.0 ? 1.0 - (1.0 - w) * (1.0 - wc) : op == 1.0 ? w * (1.0 - wc) : w * wc;
       }
       if (hdr.y > 0.5) w = 1.0 - w;
@@ -737,6 +974,7 @@ void main() {
       vec4 A = m[base + 1], B = m[base + 2];
       dExpo += w * A.x; dHi += w * A.y; dSh += w * A.z; dClar += w * A.w;
       dHaze += w * B.x; dSat += w * B.y; dVib += w * B.z; dHue += w * B.w;
+      dMoire += w * hdr.z;
       dWb += w * mat3(m[base + 3].xyz, m[base + 4].xyz, m[base + 5].xyz);   // packed column-major
       dTint += w * vec3(m[base + 3].w, m[base + 4].w, m[base + 5].w);
     }
@@ -755,6 +993,18 @@ void main() {
     // --- White Balance (Bradford adaptation, identity at temp=6500 / tint=0) ---
     c = max(u_wbMatrix * c, 0.0);
   }
+
+  // --- Relight (rendering/relight.ts): added lights on the estimated
+  // geometry, after WB so a light's colour is the colour it was picked as,
+  // and before exposure so every tonal control takes it like the scene. ---
+  if (u_rlActive == 1) c = relight(c, lensUV);
+
+  // --- Defringe (global) and moiré (local): chroma only, before anything tonal. ---
+  if (u_defringe != vec2(0.0) || ((u_maskUse & MASK_USE_MOIRE) != 0 && dMoire > 0.0))
+    c = chromaClean(c, lensUV, clamp(dMoire, 0.0, 1.0), lensFw);
+
+  // --- Fog / depth haze removal, on the scene before exposure. ---
+  if (u_fog.x != 0.0 && u_rlHasGeo == 1) c = applyFog(c, lensUV);
 
   // === Exposure (highlight-shouldered) + tonal region gains + Clarity ===
   // One log-luminance block, applied to RGB as a single hue-preserving ratio.
@@ -966,6 +1216,7 @@ void main() {
   // white where the adjustment applies in full. View-only: u_maskPreview is
   // -1 for export and for the assistant's view_image.
   if (u_maskPreview >= 0) disp = vec3(wPrev);
+  if (u_rlView > 0) disp = rlViewColor(lensUV);
   outColor = vec4(srgbEncode(disp), 1.0); // sRGB transfer (Display-P3 shares it)
 }`;
 
@@ -975,6 +1226,184 @@ void main() {
 // texture UV space with no u_texXform — the main pass samples the mask at
 // v_texCoord, which *is* source UV after its transform, so crop / straighten /
 // flip stay aligned by construction.
+
+// ===== Finish: the last pass over the finished, display-encoded frame =====
+//
+// Output sharpening, the post-crop vignette and film grain — everything that
+// belongs to the picture as framed, after every other stage (noise reduction
+// included: grain put in before it would be taken out again). The pass only
+// exists when one of them is on (pipeline-renderer renderPass), so a frame
+// without them is drawn exactly as before.
+export const FINISH_SHADER = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 outColor;
+uniform sampler2D u_scene;
+uniform vec2 u_sceneTexel;
+uniform vec4 u_outRect;      // this render's part of the output frame, in its uv (x, y, w, h), y down
+uniform vec2 u_outSize;      // the whole output frame, px
+uniform float u_scale;       // render px per output px
+uniform vec4 u_sharpen;      // amount, radius (output px), detail, masking — all 0..1 but radius
+uniform vec4 u_vignette;     // amount -1..1, midpoint, feather, roundness -1..1
+uniform vec3 u_grain;        // amount, size (output px), roughness
+${COLOR_GLSL}
+const vec3 LUMA = REC709_Y;
+
+// PCG2D (Jarzynski & Olano): an integer hash with no visible lattice structure.
+float hash(vec2 p) {
+  uvec2 v = uvec2(ivec2(p) + 32768);
+  v = v * 1664525u + 1013904223u;
+  v.x += v.y * 1664525u; v.y += v.x * 1664525u;
+  v ^= v >> 16u;
+  v.x += v.y * 1664525u; v.y += v.x * 1664525u;
+  v ^= v >> 16u;
+  return float(v.x) * (1.0 / 4294967295.0);
+}
+// Value noise, smoothly interpolated, in [-1, 1].
+float vnoise1(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  float a = hash(i), b = hash(i + vec2(1, 0)), c = hash(i + vec2(0, 1)), d = hash(i + vec2(1, 1));
+  return 2.0 * mix(mix(a, b, u.x), mix(c, d, u.x), u.y) - 1.0;
+}
+// Three lattices at unrelated angles, averaged: one alone shows its grid as a
+// faint screen-door; the sum is isotropic and nearer Gaussian, like grain.
+float vnoise(vec2 p) {
+  const mat2 R1 = mat2(0.7986, 0.6018, -0.6018, 0.7986), R2 = mat2(0.3256, -0.9455, 0.9455, 0.3256);
+  return (vnoise1(p) + vnoise1(R1 * p + 31.7) + vnoise1(R2 * p - 57.3)) * 0.8;
+}
+
+void main() {
+  vec3 rgb = texture(u_scene, v_uv).rgb;
+  // Where this pixel sits in the output frame (y down), whatever window renders it.
+  vec2 p = u_outRect.xy + vec2(v_uv.x, 1.0 - v_uv.y) * u_outRect.zw;
+
+  // --- Sharpening: unsharp mask on luma. A 3x3 binomial blur with its taps a
+  // radius apart (in output px, so the kernel spans the same image detail at
+  // every render scale); Detail lowers the threshold below which a difference
+  // counts as noise, Masking keeps it to edges. ---
+  if (u_sharpen.x > 0.0) {
+    vec2 s = u_sceneTexel * max(u_sharpen.y * u_scale, 0.5);
+    float y = dot(rgb, LUMA);
+    float n = dot(texture(u_scene, v_uv + vec2(0, s.y)).rgb, LUMA), so = dot(texture(u_scene, v_uv - vec2(0, s.y)).rgb, LUMA);
+    float e = dot(texture(u_scene, v_uv + vec2(s.x, 0)).rgb, LUMA), w = dot(texture(u_scene, v_uv - vec2(s.x, 0)).rgb, LUMA);
+    float ne = dot(texture(u_scene, v_uv + s).rgb, LUMA), sw = dot(texture(u_scene, v_uv - s).rgb, LUMA);
+    float nw = dot(texture(u_scene, v_uv + vec2(-s.x, s.y)).rgb, LUMA), se = dot(texture(u_scene, v_uv + vec2(s.x, -s.y)).rgb, LUMA);
+    float blur = (4.0 * y + 2.0 * (n + so + e + w) + ne + sw + nw + se) / 16.0;
+    float hi = y - blur;
+    float thr = (1.0 - u_sharpen.z) * 0.015;
+    hi = sign(hi) * max(abs(hi) - thr, 0.0);
+    float edge = max(abs(n - so), abs(e - w));
+    float mask = u_sharpen.w > 0.0 ? smoothstep(0.5 * u_sharpen.w * 0.12, u_sharpen.w * 0.12, edge) : 1.0;
+    // A preview rendered below output scale would otherwise sharpen detail the
+    // export never shows that strongly; ease it with the scale.
+    float amt = u_sharpen.x * 1.5 * min(1.0, pow(u_scale, 0.5));
+    rgb = clamp(rgb + vec3(amt * hi * mask), 0.0, 1.0);
+  }
+
+  // --- Post-crop vignette, in linear light: the frame's own ellipse at
+  // roundness 0, a circle at +1, a rounded rectangle toward -1. ---
+  if (u_vignette.x != 0.0) {
+    vec2 q = (p - 0.5) * 2.0;
+    float aspect = u_outSize.x / max(u_outSize.y, 1.0);
+    if (u_vignette.w > 0.0) q.x *= mix(1.0, aspect, u_vignette.w);
+    float ex = 2.0 + max(-u_vignette.w, 0.0) * 6.0;
+    float d = pow(pow(abs(q.x), ex) + pow(abs(q.y), ex), 1.0 / ex);
+    float mid = mix(0.25, 1.25, u_vignette.y);
+    float v = smoothstep(mid, mid + mix(0.05, 1.0, u_vignette.z), d);
+    vec3 lin = srgbDecode(rgb);
+    lin = u_vignette.x < 0.0 ? lin * (1.0 + u_vignette.x * v) : mix(lin, vec3(1.0), u_vignette.x * v);
+    rgb = srgbEncode(lin);
+  }
+
+  // --- Grain: value noise fixed to the output frame's pixels, so the export
+  // and a 1:1 preview show the same grain; a preview that averages several
+  // grains into one pixel shows them that much fainter. Strongest in the
+  // midtones, as film's is. ---
+  if (u_grain.x > 0.0) {
+    vec2 g = p * u_outSize / u_grain.y;
+    float n = vnoise(g) * (1.0 - 0.5 * u_grain.z) + vnoise(g * 2.7 + 17.0) * 0.5 * u_grain.z;
+    float y = dot(rgb, LUMA);
+    float amp = u_grain.x * 0.11 * min(1.0, u_scale * u_grain.y) * (0.35 + 2.6 * y * (1.0 - y));
+    rgb = clamp(rgb + vec3(amp * n), 0.0, 1.0);
+  }
+  outColor = vec4(rgb, 1.0);
+}`;
+
+// ===== Lens blur: a defocus pre-pass on the scene-linear source =====
+//
+// Runs at a fixed resolution in the source's own UV (LENS_BLUR_LONG), so a
+// preview and its export blur alike; the main pass mixes it in by the
+// circle of confusion stored in alpha, keeping in-focus pixels at full
+// resolution. The circle grows with the distance in inverse depth from the
+// focal plane (a thin lens), past a range that stays sharp.
+const LENS_COC_GLSL = `
+uniform sampler2D u_rlGeo;      // relight geometry: depth in .a
+uniform vec2 u_lbFocus;         // focus point, texcoord
+uniform vec3 u_lbParams;        // max radius (px of this pass), in-focus range, depth reference (median, m)
+float lbCoc(vec2 uv) {
+  float zf = max(texture(u_rlGeo, u_lbFocus).a, 1e-4);
+  float z = max(texture(u_rlGeo, uv).a, 1e-4);
+  float d = abs(u_lbParams.z / z - u_lbParams.z / zf);
+  return u_lbParams.x * clamp((d - u_lbParams.y) / 0.8, 0.0, 1.0);
+}
+`;
+
+// Downsample (a 2x2 box of bilinear taps) and stamp each pixel's CoC.
+export const LENS_BLUR_DOWN_SHADER = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 outColor;
+uniform sampler2D u_input;      // scene-linear source
+uniform vec2 u_texel;           // one texel of this pass
+${LENS_COC_GLSL}
+void main() {
+  vec2 o = 0.25 * u_texel;
+  vec3 c = texture(u_input, v_uv + vec2(-o.x, -o.y)).rgb + texture(u_input, v_uv + vec2(o.x, -o.y)).rgb
+         + texture(u_input, v_uv + vec2(-o.x, o.y)).rgb + texture(u_input, v_uv + vec2(o.x, o.y)).rgb;
+  outColor = vec4(max(c * 0.25, 0.0), lbCoc(v_uv));
+}`;
+
+// Gather with scatter semantics: a tap lands here only if its own circle
+// reaches this far, and a tap from behind this pixel only within this pixel's
+// circle — so a sharp subject neither blurs nor is overrun by the background.
+// Golden-angle spiral taps; scene-linear, so a bright point opens into a disc.
+export const LENS_BLUR_GATHER_SHADER = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 outColor;
+uniform sampler2D u_input;      // LENS_BLUR_DOWN output: rgb + CoC
+uniform vec2 u_texel;
+${LENS_COC_GLSL}
+const int N = 112;
+void main() {
+  vec4 c0 = texture(u_input, v_uv);
+  float r0 = c0.a;
+  float z0 = texture(u_rlGeo, v_uv).a;
+  float rMax = u_lbParams.x;
+  vec3 sum = c0.rgb; float wsum = 1.0;
+  if (rMax >= 0.5) {
+    for (int i = 1; i < N; i++) {
+      float fi = float(i);
+      float dist = rMax * sqrt(fi / float(N));
+      float ang = fi * 2.39996323;
+      vec2 uv = v_uv + vec2(cos(ang), sin(ang)) * dist * u_texel;
+      vec4 t = texture(u_input, uv);
+      float w = smoothstep(dist - 1.0, dist + 0.5, t.a);
+      if (texture(u_rlGeo, uv).a > z0) w *= smoothstep(dist - 1.0, dist + 0.5, r0);
+      sum += t.rgb * w; wsum += w;
+    }
+  }
+  outColor = vec4(sum / wsum, r0);
+}`;
+
+// A plain copy, for writing a 2D texture into an aux layer.
+export const AUX_COPY_SHADER = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 outColor;
+uniform sampler2D u_input;
+void main() { outColor = texture(u_input, v_uv); }`;
 
 export const MASK_VERTEX_SHADER = `#version 300 es
 precision highp float;
@@ -2056,6 +2485,10 @@ export const PASSES: PassDef[] = [
     "u_vibrance", "u_saturation", "u_clarity", "u_dehaze",
     "u_tonalActive", "u_hslActive", "u_maskShift", "u_hasMask",
     "u_maskGroups", "u_maskUse", "u_maskPreview", "u_imgFromTex", "u_imgAspect",
+    "u_rlActive", "u_rlCount", "u_rlView", "u_rlDepthRef", "u_aux",
+    "u_rlHasGeo", "u_rlDepthLog", "u_fog", "u_lbActive", "u_srcTexel", "u_defringe", "u_rlK", "u_rlAmbient", "u_rlWrap", "u_rlFalloff", "u_rlShadows", "u_rlGeo",
+    ...Array.from({ length: RELIGHT_MAX_LIGHTS }, (_, k) => `u_rlPos[${k}]`),
+    ...Array.from({ length: RELIGHT_MAX_LIGHTS }, (_, k) => `u_rlCol[${k}]`),
     "u_hsl_h[0]","u_hsl_h[1]","u_hsl_h[2]","u_hsl_h[3]","u_hsl_h[4]","u_hsl_h[5]","u_hsl_h[6]","u_hsl_h[7]",
     "u_hsl_s[0]","u_hsl_s[1]","u_hsl_s[2]","u_hsl_s[3]","u_hsl_s[4]","u_hsl_s[5]","u_hsl_s[6]","u_hsl_s[7]",
     "u_hsl_l[0]","u_hsl_l[1]","u_hsl_l[2]","u_hsl_l[3]","u_hsl_l[4]","u_hsl_l[5]","u_hsl_l[6]","u_hsl_l[7]",

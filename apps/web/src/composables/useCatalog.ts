@@ -211,6 +211,44 @@ export function useCatalog<S, V>(opts: {
     saveUiState();
   }
 
+  /**
+   * Rewrite the stored edits of photos other than the open one (a paste onto
+   * a selection): each gets `update(current)` as a new history step on top of
+   * its own history — or of `base` for a photo never edited — and is persisted
+   * at once. Returns the ids that changed. The open photo is the caller's: its
+   * edit is the live state, not the map.
+   */
+  async function updateEdits(ids: readonly string[], base: (photo: Photo) => S, update: (current: S, photo: Photo) => S | null): Promise<string[]> {
+    const done: string[] = [];
+    for (const id of ids) {
+      if (id === activeId.value) continue;
+      const photo = photosById.get(id) ?? await api.getPhoto(id);
+      if (!photo) continue;
+      let e = edits.get(id);
+      if (e === undefined) e = await api.getEdit<S>(id);
+      const current = e?.snapshot ?? base(photo);
+      const next = update(current, photo);
+      if (!next) continue;
+      const history = [...(e ? e.history.slice(0, e.historyIndex + 1) : [current]), next];
+      edits.set(id, trimEdit({ snapshot: next, history, historyIndex: history.length - 1 }));
+      dirtyEditIds.add(id);
+      done.push(id);
+    }
+    persistNow();
+    return done;
+  }
+
+  /** A photo's current edit snapshot (the live one for the open photo); null at defaults. */
+  async function snapshotOf(id: string): Promise<S | null> {
+    if (id === activeId.value) return opts.captureEdit().snapshot;
+    let e = edits.get(id);
+    if (e === undefined) {
+      e = await api.getEdit<S>(id);
+      edits.set(id, e);
+    }
+    return e?.snapshot ?? null;
+  }
+
   function schedulePersist(): void {
     if (opts.isRestoring()) return;
     if (persistTimer) clearTimeout(persistTimer);
@@ -703,6 +741,6 @@ export function useCatalog<S, V>(opts: {
     activateSource, selectSource, openPhoto, setView,
     selectFolder, toggleExpanded, createFolder, renameFolder, moveFolder, deleteFolder,
     removePhotos, renamePhoto, movePhotos, importFiles, importDropped, importPickedDirectory,
-    savePreview, boot,
+    savePreview, boot, updateEdits, snapshotOf,
   };
 }

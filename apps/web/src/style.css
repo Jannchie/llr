@@ -688,6 +688,18 @@ button {
   transition: background 120ms;
 }
 
+/* Icon-only ghost: the label moves to title / aria-label. */
+.ghost-icon {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px;
+}
+
+.ghost-icon svg {
+  width: 14px;
+  height: 14px;
+}
+
 .ghost:hover {
   background: var(--accent-soft);
 }
@@ -1135,8 +1147,8 @@ input[type="range"]:focus::-moz-range-thumb {
 
 .control-select-caret {
   flex: none;
-  width: 11px;
-  height: 7px;
+  width: 12px;
+  height: 12px;
   color: var(--accent);
   transition: transform 140ms ease;
 }
@@ -1300,9 +1312,9 @@ input[type="range"]:focus::-moz-range-thumb {
   position: absolute;
   right: 7px;
   top: 50%;
-  width: 9px;
-  height: 6px;
-  margin-top: -3px;
+  width: 12px;
+  height: 12px;
+  margin-top: -6px;
   color: var(--accent);
   pointer-events: none;
   transition: transform 140ms ease;
@@ -1599,12 +1611,17 @@ input[type="range"]:focus::-moz-range-thumb {
   justify-content: center;
   min-width: 24px;
   height: 24px;
-  padding: 0 7px;
+  padding: 0 5px;
   color: var(--text-dim);
   background: transparent;
   font-size: 12px;
   border-radius: var(--radius-sm);
   transition: color 120ms, background 120ms, transform 80ms;
+}
+
+.zoom-btn svg {
+  width: 14px;
+  height: 14px;
 }
 
 .zoom-btn:hover:not(:disabled) {
@@ -1900,13 +1917,8 @@ input[type="range"]:focus::-moz-range-thumb {
 }
 
 .library-dir svg {
-  width: 12px;
-  height: 12px;
-  transition: transform 120ms ease;
-}
-
-.library-dir svg.is-desc {
-  transform: rotate(180deg);
+  width: 16px;
+  height: 16px;
 }
 
 .photo-grid {
@@ -2139,8 +2151,8 @@ input[type="range"]:focus::-moz-range-thumb {
 
 .ctx-arrow {
   flex: none;
-  width: 6px;
-  height: 10px;
+  width: 12px;
+  height: 12px;
 }
 
 .ctx-sep {
@@ -2531,7 +2543,8 @@ input[type="range"]:focus::-moz-range-thumb {
 }
 
 .xf-guided-btn { gap: 7px; font-size: 13px; padding: 0 10px; }
-.xf-guided-count { padding: 0 10px; font-size: 13px; font-variant-numeric: tabular-nums; }
+.xf-guided-count { gap: 4px; padding: 0 10px; font-size: 13px; font-variant-numeric: tabular-nums; }
+.crop-tool.xf-guided-count svg { width: 13px; height: 13px; }
 .xf-guided-count:disabled { opacity: 0.4; cursor: default; }
 
 .crop-straighten-line {
@@ -2697,6 +2710,10 @@ input[type="range"]:focus::-moz-range-thumb {
 .crop-tool.is-on { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
 
 .crop-done {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   width: 100%;
   margin-top: 8px;
   height: 32px;
@@ -2710,6 +2727,7 @@ input[type="range"]:focus::-moz-range-thumb {
   transition: background 130ms;
 }
 
+.crop-done svg { width: 14px; height: 14px; }
 .crop-done:hover { background: var(--accent-fill-hover); }
 
 /* ---------- Assistant ----------
@@ -3307,14 +3325,19 @@ input[type="range"]:focus::-moz-range-thumb {
 }
 
 .model-key {
+  width: 14px;
+  height: 14px;
   color: var(--error);
-  font-size: 13px;
 }
 
 .model-remove {
-  font-size: 16px;
-  line-height: 1;
+  display: inline-flex;
   color: var(--text-dim);
+}
+
+.model-remove svg {
+  width: 14px;
+  height: 14px;
 }
 
 /* ---------- Masks panel ----------
@@ -3475,4 +3498,91 @@ input[type="range"]:focus::-moz-range-thumb {
 /* The 0% end is a ring, so the two ends read apart at a glance. */
 .mask-handle-end { fill: rgba(0, 0, 0, 0.35); stroke: #fff; stroke-width: 2; }
 .mask-handle-sq { cursor: crosshair; }
+
+/* ---------- Erase brush ----------
+   The overlay itself takes the pointer (the brush paints anywhere on the
+   image); its own ring is the cursor. Space passes it through for panning. */
+
+.erase-overlay { z-index: 6; pointer-events: all; cursor: none; touch-action: none; }
+.erase-overlay.is-passthrough { pointer-events: none; }
+
+.erase-stroke {
+  fill: none;
+  stroke: rgba(255, 64, 48, 0.45);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+.erase-stroke.is-hover { stroke: rgba(255, 64, 48, 0.6); }
+.erase-stroke.brush-live { stroke: rgba(80, 160, 255, 0.45); }
+.erase-stroke.brush-live.is-erasing { stroke: rgba(255, 255, 255, 0.35); }
+
+.erase-cursor {
+  fill: none;
+  stroke: #fff;
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+  filter: drop-shadow(0 0 1px rgba(0, 0, 0, 0.8));
+  pointer-events: none;
+}
+
+.erase-head { cursor: default; }
+
+/* ---------- Relight rig ---------- */
+.relight-overlay { z-index: 6; pointer-events: all; cursor: crosshair; touch-action: none; }
+.relight-overlay.is-passthrough { pointer-events: none; }
+.relight-handle {
+  stroke: rgba(0, 0, 0, 0.55);
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+  cursor: grab;
+  filter: drop-shadow(0 0 2px rgba(0, 0, 0, 0.7));
+}
+.relight-handle.is-selected { stroke: #fff; stroke-width: 3; }
+.relight-handle.is-behind { stroke-dasharray: 3 2; }
+.relight-label { text-anchor: middle; fill: #111; font-weight: 700; pointer-events: none; user-select: none; }
+.relight-color { width: 22px; height: 18px; padding: 0; border: 1px solid var(--line); border-radius: 4px; background: none; cursor: pointer; }
+.mask-row.is-selected { outline: 1px solid var(--accent); outline-offset: -1px; }
+
+/* ---------- Copy Settings ---------- */
+.copy-dialog-backdrop {
+  position: fixed; inset: 0; z-index: 50; display: grid; place-items: center;
+  background: rgba(0, 0, 0, 0.45);
+}
+.copy-dialog {
+  width: min(440px, calc(100vw - 32px)); padding: 14px 16px; border-radius: 10px;
+  background: var(--panel, #1b1b1e); border: 1px solid var(--line); box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  display: flex; flex-direction: column; gap: 10px;
+}
+.copy-dialog-head { display: flex; justify-content: space-between; align-items: center; font-weight: 600; }
+.copy-dialog-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 14px; }
+.copy-check { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.copy-dialog-foot { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
+.copy-dialog-foot .primary {
+  padding: 4px 14px; border-radius: 6px; border: 0; cursor: pointer;
+  background: var(--accent); color: #fff;
+}
+.copy-dialog-foot .primary:disabled { opacity: 0.5; cursor: default; }
+.copy-pill {
+  position: fixed; left: 50%; bottom: 120px; transform: translateX(-50%); z-index: 40;
+  padding: 6px 14px; border-radius: 999px; background: rgba(20, 20, 24, 0.92); border: 1px solid var(--line);
+  font-size: 12px; pointer-events: none;
+}
+
+/* ---------- Lens blur focus ---------- */
+.focus-overlay { z-index: 6; pointer-events: none; }
+.focus-overlay.is-picking { pointer-events: all; cursor: crosshair; }
+.focus-overlay.is-passthrough { pointer-events: none; }
+.focus-marker circle, .focus-marker line {
+  fill: none; stroke: #fff; stroke-width: 1.5; vector-effect: non-scaling-stroke;
+  filter: drop-shadow(0 0 1px rgba(0, 0, 0, 0.8));
+}
+button.ghost.is-on { color: var(--accent); border-color: var(--accent); }
+.lb-actions { display: flex; gap: 8px; margin-top: 6px; }
+.lb-actions button { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.control-note.is-warn { color: var(--error); }
+.erase-progress { width: 100%; height: 4px; appearance: none; border: 0; border-radius: 2px; background: var(--line); overflow: hidden; }
+.erase-progress::-webkit-progress-bar { background: var(--line); }
+.erase-progress::-webkit-progress-value { background: var(--accent); }
+.erase-progress::-moz-progress-bar { background: var(--accent); }
 .mask-handle-rotate { fill: var(--accent); stroke: #fff; }

@@ -76,6 +76,7 @@ export interface RenderLinearBody {
   dro?: number;
   droLevel?: number;
   purpose?: string;
+  erase?: unknown;
 }
 
 export interface RenderParams {
@@ -107,6 +108,37 @@ export interface RenderParams {
   style: string | undefined;
   dro: number | undefined;
   droLevel: number | undefined;
+  // Generative erase strokes, in the decode's own source-normalised frame (see
+  // clampErase). Empty means none — the worker serves the cached decode as is.
+  erase: EraseStroke[];
+}
+
+// One brushed region to refill: a polyline in source-normalised coordinates
+// (y down, the decode's orientation; may stray a little past the frame where
+// the brush did) with a radius in units of the frame's long edge. The worker
+// fills each in order (worker erase.py); its limits match these.
+export type EraseStroke = { points: [number, number][]; radius: number; mode?: "heal" };
+export const ERASE_MAX_STROKES = 64;
+export const ERASE_MAX_POINTS = 4096;
+
+// Keep only well-formed strokes. A malformed one is dropped rather than
+// repaired: a guessed stroke would fill pixels the user never brushed.
+export function clampErase(erase: unknown): EraseStroke[] {
+  if (!Array.isArray(erase)) return [];
+  const out: EraseStroke[] = [];
+  for (const item of erase.slice(0, ERASE_MAX_STROKES)) {
+    if (!item || typeof item !== "object") continue;
+    const { points, radius } = item as { points?: unknown; radius?: unknown };
+    if (typeof radius !== "number" || !(radius > 0 && radius <= 0.5) || !Array.isArray(points)) continue;
+    const pts: [number, number][] = [];
+    for (const p of points.slice(0, ERASE_MAX_POINTS)) {
+      if (Array.isArray(p) && p.length === 2 && p.every((v) => typeof v === "number" && Number.isFinite(v) && v > -1 && v < 2)) {
+        pts.push([p[0] as number, p[1] as number]);
+      }
+    }
+    if (pts.length) out.push((item as { mode?: unknown }).mode === "heal" ? { points: pts, radius, mode: "heal" } : { points: pts, radius });
+  }
+  return out;
 }
 
 // DRO strength, where 1 is what the camera itself applied. Absent means "as
@@ -192,6 +224,7 @@ export function clampRenderParams(body: RenderLinearBody): RenderParams {
     style: clampLookStyle(body.style),
     dro: clampDroStrength(body.dro),
     droLevel: clampDroLevel(body.droLevel),
+    erase: clampErase(body.erase),
     // Defaults to the cacheable path: a client that never states its intent is
     // treated as a preview, so at worst it costs memory rather than making
     // every subsequent edit re-decode.
@@ -202,7 +235,7 @@ export function clampRenderParams(body: RenderLinearBody): RenderParams {
 // [u32 header length][JSON header, space-padded so the pixels stay 4-byte
 // aligned for a zero-copy typed-array view][linear RGB in header.dtype].
 export function buildLinearFrameHeader(meta: Record<string, unknown>): Buffer {
-  let header = Buffer.from(JSON.stringify({
+  return frameHeader({
     width: meta.width,
     height: meta.height,
     fullWidth: meta.fullWidth ?? null,
@@ -217,11 +250,20 @@ export function buildLinearFrameHeader(meta: Record<string, unknown>): Buffer {
     // Defaults to true so a worker that does not send it keeps showing the
     // control — the old behaviour — rather than hiding a working one.
     denoiseUsesChroma: meta.denoiseUsesChroma !== false,
-  }), "utf8");
-  if (header.length % 4) header = Buffer.concat([header, Buffer.alloc(4 - (header.length % 4), 0x20)]);
+    // How the erase strokes went: null when the request had none, otherwise
+    // the count and, when the fills could not run (no model, no runtime), why —
+    // the frame then arrives as decoded rather than not at all.
+    erase: meta.erase && typeof meta.erase === "object" ? meta.erase : null,
+  });
+}
+
+/** [u32 BE length][JSON, space-padded to 4 bytes so the payload after it stays aligned]. */
+export function frameHeader(header: unknown): Buffer {
+  let json = Buffer.from(JSON.stringify(header), "utf8");
+  if (json.length % 4) json = Buffer.concat([json, Buffer.alloc(4 - (json.length % 4), 0x20)]);
   const prefix = Buffer.alloc(4);
-  prefix.writeUInt32BE(header.length, 0);
-  return Buffer.concat([prefix, header]);
+  prefix.writeUInt32BE(json.length, 0);
+  return Buffer.concat([prefix, json]);
 }
 
 // Private address space, i.e. what a LAN client of the dev server can be:

@@ -24,7 +24,10 @@ import numpy as np
 import rawpy
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+from . import ai_masks as ai_module
 from . import denoise as denoise_module
+from . import erase as erase_module
+from . import relight as relight_module
 from .catalog_meta import catalog_meta_from_exif
 from .creative_style import normalize_style
 from .dcp import DcpProfile, apply_dcp_profile, load_dcp_profile
@@ -392,6 +395,10 @@ def emit_response(payload: dict[str, Any]) -> None:
         sys.stdout.flush()
 
 
+# The worker's downloadable models, by the name their status/download commands carry.
+_MODELS = {"erase": erase_module, "relight": relight_module, "ai": ai_module}
+
+
 def handle_daemon_request(request: dict[str, Any], root: Path) -> dict[str, Any]:
     command = request.get("command")
     if command == "render-linear":
@@ -402,6 +409,14 @@ def handle_daemon_request(request: dict[str, Any], root: Path) -> dict[str, Any]
         return daemon_extract_preview(request, root)
     if command == "export":
         return daemon_export(request, root)
+    model, _, action = str(command).partition("-")
+    if model in _MODELS and action in ("status", "download"):
+        module = _MODELS[model]
+        return module.status() if action == "status" else module.start_download()
+    if command == "relight-geometry":
+        return daemon_relight_geometry(request, root)
+    if command == "ai-masks":
+        return daemon_ai_masks(request, root)
     if command == "ping":
         return {"pong": True, "cacheSize": len(_LINEAR_CACHE)}
     raise ValueError(f"unknown command: {command}")
@@ -604,6 +619,38 @@ def _link_or_copy(src: Path, dst: Path) -> None:
         shutil.copyfile(src, dst)
 
 
+def _read_disk_pixels(disk: Path) -> tuple[np.ndarray, dict[str, Any]] | None:
+    """A cached decode's pixels (as float32) and sidecar, without linking anything."""
+    try:
+        meta = json.loads(disk.with_suffix(".json").read_text())
+        os.utime(disk)
+        pixels = np.fromfile(disk, dtype=np.float16).reshape(int(meta["height"]), int(meta["width"]), 3)
+        return pixels.astype(np.float32), meta
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def _write_erased(linear_arr: np.ndarray, strokes: list[erase_module.Stroke], base_key: tuple[Any, ...],
+                  output_path: Path, owned: bool = False) -> tuple[int, dict[str, Any]]:
+    """Write the frame with its erase strokes filled, as this response's own file.
+
+    The response path may already be a hardlink to a cache entry, and writing
+    through it would put the fills into the cache — which holds the frame they
+    are made *on*. So the name is unlinked first and the pixels get an inode of
+    their own. A fill that cannot run (no model, no runtime) leaves the frame as
+    decoded and says why, rather than failing the render the user is looking at.
+    `owned`: the caller's own copy of the frame, filled in place.
+    """
+    info: dict[str, Any] = {"strokes": len(strokes)}
+    try:
+        linear_arr = erase_module.apply_erase(linear_arr, strokes, base_key, output_path.parent, inplace=owned)
+    except Exception as error:
+        sys.stderr.write(f"erase failed: {error}\n")
+        info["error"] = str(error)
+    output_path.unlink(missing_ok=True)
+    return _write_linear_f16(linear_arr, output_path), info
+
+
 def _read_disk_cache(disk: Path, output_path: Path) -> dict[str, Any] | None:
     """The sidecar of a cached decode, with its pixels linked into output_path."""
     try:
@@ -664,6 +711,44 @@ def _stamp_look_choices(profile: dict[str, Any], input_path: Path) -> dict[str, 
                        camera_match_table(profile["cameraBody"], profile.get("creativeLook"),
                                           LookTweaks.from_json(profile.get("lookTweaks")).fade))
     return profile
+
+
+def daemon_relight_geometry(request: dict[str, Any], root: Path) -> dict[str, Any]:
+    """Normals and depth for the relight shader (relight.py), written to `output` as RGBA float16.
+
+    Estimated on the very frame render-linear serves for the same request — so
+    the geometry lines up with the pixels, erase fills included — and cached by
+    the source and its strokes alone: neither the colour engine nor the denoise
+    moves a surface.
+    """
+    return _frame_analysis(request, root, relight_module.cached_estimate, "float16")
+
+
+def daemon_ai_masks(request: dict[str, Any], root: Path) -> dict[str, Any]:
+    """Subject / sky / person mattes (ai_masks.py), RGBA8, on the same frame and terms as the geometry."""
+    return _frame_analysis(request, root, ai_module.cached_estimate, "uint8")
+
+
+def _frame_analysis(request: dict[str, Any], root: Path, estimate: Any, dtype: str) -> dict[str, Any]:
+    """Run a per-decode analysis on the frame render-linear serves for `request`, cached by source + strokes."""
+    input_path = resolve_path(root, request["input"])
+    output_path = resolve_path(root, request["output"])
+    strokes = erase_module.parse_strokes(request.get("erase"))
+    key = f"{input_path}|{input_path.stat().st_mtime_ns}|{[s.key() for s in strokes]}"
+
+    def frame() -> np.ndarray:
+        tmp = output_path.with_name(output_path.name + ".frame")
+        try:
+            meta = daemon_linear({**request, "output": str(tmp), "purpose": "preview"}, root)
+            pixels = np.fromfile(tmp, dtype=np.float16).reshape(int(meta["height"]), int(meta["width"]), 3)
+            return pixels.astype(np.float32)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    data, meta = estimate(key, frame, input_path.parent)
+    with open(output_path, "wb") as f:
+        data.tofile(f)
+    return {**meta, "dtype": dtype, "channels": 4, "bytesWritten": data.nbytes, "output": str(output_path)}
 
 
 def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
@@ -778,6 +863,14 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
 
     cache_key = _linear_cache_key(input_path, profile_id, half_size, max_size, dcp_code, dn_model, dn_amount, (dn_edge, dn_chroma), dn_strength, dn_amount_ui)
 
+    # Generative erase rides on top of the decode the same way the look overrides
+    # do: the caches below hold the frame as decoded, and the fills are layered
+    # onto this response only. They are keyed on the decode minus its size, so a
+    # preview and an export of one edit share them (erase.apply_erase).
+    erase_strokes = erase_module.parse_strokes(request.get("erase"))
+    erase_key = _linear_cache_key(input_path, profile_id, False, 0, dcp_code, dn_model, dn_amount,
+                                  (dn_edge, dn_chroma), dn_strength, dn_amount_ui)
+
     # What is cached is always the camera's own rendering; this request's
     # overrides are layered on the way out, so they never outlive it. Stamped
     # first so lookAsShotStyle captures the look the body chose.
@@ -789,11 +882,21 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     # tier's float32. Read regardless of purpose (an export wants the same pixels
     # a preview cached), written only below where store_cache says so.
     disk = _disk_cache_path(cache_key, output_path)
-    cached_meta = _read_disk_cache(disk, output_path)
-    if cached_meta is not None:
-        cached_meta["colorProfile"] = finish(cached_meta["colorProfile"])
-        cached_meta["output"] = str(output_path)
-        return cached_meta
+    if erase_strokes:
+        hit = _read_disk_pixels(disk)
+        if hit is not None:
+            pixels, cached_meta = hit
+            cached_meta["bytesWritten"], cached_meta["erase"] = _write_erased(pixels, erase_strokes, erase_key,
+                                                                              output_path, owned=True)
+            cached_meta["colorProfile"] = finish(cached_meta["colorProfile"])
+            cached_meta["output"] = str(output_path)
+            return cached_meta
+    else:
+        cached_meta = _read_disk_cache(disk, output_path)
+        if cached_meta is not None:
+            cached_meta["colorProfile"] = finish(cached_meta["colorProfile"])
+            cached_meta["output"] = str(output_path)
+            return cached_meta
 
     with _CACHE_LOCK:
         cached_linear = _LINEAR_CACHE.get(cache_key)
@@ -802,8 +905,13 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     if cached_linear is not None:
         linear_arr, color_profile = cached_linear
         color_profile = finish(color_profile)
-        bytes_written = _write_linear_f16(linear_arr, output_path)
+        erase_info = None
+        if erase_strokes:
+            bytes_written, erase_info = _write_erased(linear_arr, erase_strokes, erase_key, output_path)
+        else:
+            bytes_written = _write_linear_f16(linear_arr, output_path)
         return {
+            "erase": erase_info,
             "width": linear_arr.shape[1],
             "height": linear_arr.shape[0],
             "fullWidth": color_profile.get("fullWidth"),
@@ -916,8 +1024,16 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
         "dtype": "float16",
         "denoiseUsesChroma": dn_uses_chroma,
     }
-    bytes_written = (_write_disk_cache(linear_arr, meta, disk, output_path) if store_cache
-                     else _write_linear_f16(linear_arr, output_path))
+    # The cache always takes the frame as decoded; the fills go to this response only.
+    erase_info = None
+    if erase_strokes:
+        if store_cache:
+            _write_disk_cache(linear_arr, meta, disk, output_path)
+        bytes_written, erase_info = _write_erased(linear_arr, erase_strokes, erase_key, output_path)
+    elif store_cache:
+        bytes_written = _write_disk_cache(linear_arr, meta, disk, output_path)
+    else:
+        bytes_written = _write_linear_f16(linear_arr, output_path)
     # The browser answers an auto-matched decode by asking for that code by name,
     # which is the same DCP file under a different key: link the entry there too
     # rather than decode the same pixels twice.
@@ -935,6 +1051,7 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
         "output": str(output_path),
         "colorProfile": finish(prepared.color_profile),
         "bytesWritten": bytes_written,
+        "erase": erase_info,
     }
 
 
