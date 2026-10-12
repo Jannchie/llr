@@ -355,7 +355,33 @@ def _warm_kernels() -> None:
             sys.stderr.flush()
 
 
+def _opt_out_of_power_throttling() -> None:
+    """Ask Windows not to run this process as background work (EcoQoS).
+
+    The daemon is spawned by the API with no window, so Windows 11 classes it
+    as background and, a few seconds into a sustained load, throttles it onto
+    efficiency settings: on a 12900K a demosaic that takes 1.1 s fresh settles
+    at 2.5 s within three frames, at an unchanged clock. Every decode is
+    something the user is waiting on, so the daemon opts out once at start.
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    class _ThrottlingState(ctypes.Structure):
+        _fields_ = [("Version", wintypes.ULONG), ("ControlMask", wintypes.ULONG), ("StateMask", wintypes.ULONG)]
+
+    # ProcessPowerThrottling = 4; control EXECUTION_SPEED (1), state 0 = never throttle it
+    state = _ThrottlingState(1, 1, 0)
+    kernel32 = ctypes.windll.kernel32
+    kernel32.SetProcessInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    if not kernel32.SetProcessInformation(kernel32.GetCurrentProcess(), 4, ctypes.byref(state), ctypes.sizeof(state)):
+        sys.stderr.write("could not opt out of power throttling; decodes may slow under sustained load\n")
+
+
 def run_daemon(root: Path) -> None:
+    _opt_out_of_power_throttling()
     sys.stderr.write("llr-worker daemon ready\n")
     sys.stderr.flush()
     threading.Thread(target=_warm_kernels, name="kernel-warmup", daemon=True).start()
