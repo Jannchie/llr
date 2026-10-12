@@ -41,6 +41,7 @@ from .denoise import (
 )
 from .fit_profile import camera_match_path, libraw_wb_kwargs, postprocess_camera_native
 from .imported import decode_image_linear
+from .model_fetch import cache_root
 from .sony import (
     NO_TWEAKS,
     LookTweaks,
@@ -2411,7 +2412,27 @@ def read_exiftool_metadata(input_path: Path) -> dict[str, Any]:
 
 @functools.lru_cache(maxsize=64)
 def _read_exiftool_metadata_cached(path: str, size: int, mtime_ns: int) -> dict[str, Any]:
-    input_path = Path(path)
+    # Kept on disk too: exiftool is a Perl start-up per file, a fifth of a
+    # second ahead of every first decode after the daemon restarts. Keyed by
+    # the file's identity and by this code (the tag list lives here), so a
+    # changed file or a changed list asks exiftool again.
+    digest = hashlib.sha1(repr((_CODE_STAMP, path, size, mtime_ns)).encode()).hexdigest()[:24]
+    disk = cache_root() / "exif" / f"{digest}.json"
+    try:
+        return json.loads(disk.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    out = _run_exiftool(Path(path))
+    if out:
+        with suppress(OSError):
+            disk.parent.mkdir(parents=True, exist_ok=True)
+            tmp = disk.with_suffix(f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(out), encoding="utf-8")
+            os.replace(tmp, disk)
+    return out
+
+
+def _run_exiftool(input_path: Path) -> dict[str, Any]:
     command = detect_exiftool()
     if command is None:
         return {}
