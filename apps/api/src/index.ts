@@ -614,7 +614,9 @@ async function handleRenderLinear(request: IncomingMessage, response: ServerResp
   try {
     response.writeHead(200, headers);
     response.write(header);
-    await pipeline(createReadStream(outputPath), response);
+    // 1 MiB reads instead of the 64 KiB default: a 33 MP frame is ~200 MB, and
+    // per-chunk overhead held it to ~430 MB/s on localhost against ~1.2 GB/s.
+    await pipeline(createReadStream(outputPath, { highWaterMark: 1 << 20 }), response);
   } finally {
     await rm(outputPath, { force: true });
   }
