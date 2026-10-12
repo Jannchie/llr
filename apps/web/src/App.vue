@@ -35,6 +35,7 @@ import { t, locale, setLocale, LOCALES, type MessageKey } from "./i18n";
 import SliderRow from "./components/SliderRow.vue";
 import SelectMenu from "./components/SelectMenu.vue";
 import Filmstrip from "./components/Filmstrip.vue";
+import GroupNav from "./components/GroupNav.vue";
 import FolderTree from "./components/FolderTree.vue";
 import PhotoGrid from "./components/PhotoGrid.vue";
 import { useViewport } from "./composables/useViewport";
@@ -1304,6 +1305,11 @@ const moveTargets = computed(() => {
 // The tree owns the inline new-folder editor, so the grid's menu asks it to
 // start one under the folder that is open rather than inventing a name here.
 const folderTree = ref<InstanceType<typeof FolderTree> | null>(null);
+
+// The grid's group navigator (in the sidebar, under the tree): which section is
+// at the top of the grid, and the grid itself to scroll when a group is picked.
+const photoGrid = ref<InstanceType<typeof PhotoGrid> | null>(null);
+const librarySection = ref(-1);
 
 function toggleSortDir(): void { setSort(sortKey.value, sortDir.value === "asc" ? "desc" : "asc"); }
 function onGridRename(id: string, name: string): void { void renamePhoto(id, name); }
@@ -3642,7 +3648,11 @@ const vWheelAdjust = {
       @select="selectFolder" @toggle="toggleExpanded"
       @create="(parentId, name) => createFolder(parentId, name)" @rename="renameFolder" @delete="deleteFolder"
       @move-photos="movePhotos" @move-folder="moveFolder"
-      @drop-files="onTreeDrop" @import-files="pickFiles" @import-folder="pickFolder" />
+      @drop-files="onTreeDrop" @import-files="pickFiles" @import-folder="pickFolder">
+      <GroupNav v-if="libraryView === 'library' && library.grouped && folderPhotos.length"
+        :title="groupOptions.find(o => o.value === groupKey)?.label ?? t('library.group')"
+        :sections="library.sections" :current="librarySection" @jump="(i) => photoGrid?.scrollToSection(i)" />
+    </FolderTree>
 
     <main class="center">
       <!-- The grid and the stage swap by v-show, not v-if: the canvas and its
@@ -3664,12 +3674,12 @@ const vWheelAdjust = {
             :title="groupControlLabel" :aria-label="groupControlLabel" @update:model-value="setGroup" />
         </div>
       </div>
-      <PhotoGrid v-show="libraryView === 'library'" :sections="library.sections" :grouped="library.grouped" :active-id="activeId"
+      <PhotoGrid ref="photoGrid" v-show="libraryView === 'library'" :sections="library.sections" :grouped="library.grouped" :active-id="activeId"
         :selected-ids="selectedIds" :loading="folderLoading" :thumb-src="thumbSrc" :is-invalid="(id) => activeSource?.id === id && !!activeSource.invalid"
         :move-targets="moveTargets" :can-paste="!!recipeClipboard"
         @copy-settings="openCopyDialog" @paste-settings="pasteToPhotos"
         @open="openPhoto" @remove="removePhotosConfirmed" @rename="onGridRename" @move="onGridMove"
-        @new-folder="onGridNewFolder" @import-files="pickFiles" />
+        @new-folder="onGridNewFolder" @import-files="pickFiles" @section="(i) => librarySection = i" />
       <div class="viewport" ref="viewportRef" v-show="libraryView === 'develop'"
         @wheel="onWheel"
         @mousedown="startPan"
@@ -4622,7 +4632,7 @@ const vWheelAdjust = {
       </nav>
     </aside>
 
-    <Filmstrip v-if="folderPhotos.length && libraryView === 'develop'" :photos="folderPhotos" :active-id="activeId"
+    <Filmstrip v-if="folderPhotos.length && libraryView === 'develop'" :sections="library.sections" :grouped="library.grouped" :active-id="activeId"
       :rendering="status === 'rendering'" :thumb-src="thumbSrc" :is-invalid="(id) => activeSource?.id === id && !!activeSource.invalid"
       @select="selectSource" @remove="(id) => removePhotosConfirmed([id])" @import="pickFiles" />
 
