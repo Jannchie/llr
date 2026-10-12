@@ -44,6 +44,8 @@ const emit = defineEmits<{
   (e: "importFiles"): void;
   (e: "copySettings", id: string): void;
   (e: "pasteSettings", ids: string[]): void;
+  /** The section at the top of the viewport changed (-1 when not grouped). */
+  (e: "section", index: number): void;
 }>();
 
 const container = ref<HTMLElement | null>(null);
@@ -58,9 +60,53 @@ const ordered = computed(() => props.sections.flatMap(s => s.photos));
 const lanes = ref(1);
 const layout = computed(() => buildRows(props.sections, lanes.value, props.grouped));
 const heights = computed(() => layout.value.rows.map(r => r.height));
-const { visible, tops, totalSize, viewport, scrollToRow } = useVirtualRows({
+const { visible, tops, totalSize, viewport, scrollPos, scrollToRow } = useVirtualRows({
   container, heights, lanes, cellWidth: GRID_CELL.w, gap: GRID_CELL.gap,
 });
+
+// ── Sections (the sidebar's group navigator) ──
+
+// Row index of each section's header, in section order. Only laid out when
+// grouped, so the list is empty otherwise.
+const headerRows = computed(() => {
+  const out: number[] = [];
+  layout.value.rows.forEach((r, i) => { if (r.kind === "header") out.push(i); });
+  return out;
+});
+
+// The section picked in the navigator, until its header leaves the viewport:
+// near the end of the folder the grid cannot scroll a late group to the top,
+// and the highlight should still name the group that was asked for.
+const jumped = ref<number | null>(null);
+
+// The section whose rows are at the top of the viewport: the last header at or
+// above it. The navigator highlights it as the grid scrolls.
+const currentSection = computed(() => {
+  const hs = headerRows.value;
+  if (!hs.length) return -1;
+  const j = jumped.value;
+  if (j !== null && j < hs.length) {
+    const y = tops.value[hs[j]] ?? 0;
+    if (y >= scrollPos.value - 1 && y < scrollPos.value + viewport.value) return j;
+  }
+  const top = rowAt(tops.value, heights.value, scrollPos.value + 1);
+  let si = 0;
+  while (si + 1 < hs.length && hs[si + 1] <= top) si++;
+  return si;
+});
+watch(currentSection, si => emit("section", si), { immediate: true });
+watch(() => props.sections, () => { jumped.value = null; });
+
+/** Scroll so section `si` starts at the top of the grid. */
+function scrollToSection(si: number): void {
+  const row = headerRows.value[si];
+  const el = container.value;
+  if (!el || row === undefined) return;
+  jumped.value = si;
+  el.scrollTop = tops.value[row] ?? 0;
+}
+
+defineExpose({ scrollToSection });
 
 const visibleRows = computed(() => {
   const all = layout.value.rows;

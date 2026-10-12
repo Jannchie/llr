@@ -20,7 +20,7 @@ import { API, fetchAiMasks, fetchModelStatus, fetchLinear, fetchRelightGeometry,
 import { type PersistedEdit } from "./edits";
 import { gradingTint, gradingHueDeg } from "./rendering/grading";
 import { parseLensCorr, mixLensTable, LENS_IDENTITY, type LensCorr } from "./rendering/lens";
-import { cloneErase, eraseWire, lensWarp, strokeToView, viewToStroke, ERASE_MAX_POINTS, ERASE_MAX_STROKES, type EraseStroke } from "./rendering/erase";
+import { cloneErase, eraseWire, lensWarp, strokeToView, viewToStroke, ERASE_MAX_LINES, ERASE_MAX_POINTS, ERASE_MAX_STROKES, type EraseStroke } from "./rendering/erase";
 import { rasterBrushes, sameBrushes, type BrushStroke } from "./rendering/brush";
 import { AUX_LAYER } from "./rendering/pipeline-renderer";
 import { cloneRelight, defaultRelight, packRelight, relightActive, RELIGHT_MAX_LIGHTS, LIGHT_KINDS, type RelightGeometry, type RelightState } from "./rendering/relight";
@@ -35,6 +35,7 @@ import { t, locale, setLocale, LOCALES, type MessageKey } from "./i18n";
 import SliderRow from "./components/SliderRow.vue";
 import SelectMenu from "./components/SelectMenu.vue";
 import Filmstrip from "./components/Filmstrip.vue";
+import GroupNav from "./components/GroupNav.vue";
 import FolderTree from "./components/FolderTree.vue";
 import PhotoGrid from "./components/PhotoGrid.vue";
 import { useViewport } from "./composables/useViewport";
@@ -680,11 +681,36 @@ const eraseStatus = ref<ModelStatus | null>(null);
 // matched and blended in by the worker — no model, near-instant). View state.
 const eraseMode = ref<"fill" | "heal">((localStorage.getItem("llr.eraseMode") as "fill" | "heal" | null) ?? "fill");
 watch(eraseMode, v => localStorage.setItem("llr.eraseMode", v));
+// A generative fill is brushed in as many strokes as it takes and run on
+// demand: strokes collect in a draft (view state — not in the edit, history or
+// the decode) until "Fill" turns the draft into one region, filled as one. The
+// healing brush is near-instant and patches each stroke on its own, so its
+// strokes land straight away.
+const eraseDraft = shallowRef<EraseStroke | null>(null);
+const eraseDraftLines = computed(() => eraseDraft.value ? 1 + (eraseDraft.value.more?.length ?? 0) : 0);
 function addEraseStroke(points: [number, number][], radius: number): void {
   if (erase.length >= ERASE_MAX_STROKES || !points.length) return;
-  erase.push({ id: newMaskId(), points: points.slice(0, ERASE_MAX_POINTS), radius: Math.min(radius, 0.5),
-    ...(eraseMode.value === "heal" ? { mode: "heal" as const } : {}) });
+  const line = { points: points.slice(0, ERASE_MAX_POINTS), radius: Math.min(radius, 0.5) };
+  if (eraseMode.value === "heal") {
+    erase.push({ id: newMaskId(), ...line, mode: "heal" });
+    return;
+  }
+  const d = eraseDraft.value;
+  if (!d) eraseDraft.value = { id: newMaskId(), ...line };
+  else if (eraseDraftLines.value < ERASE_MAX_LINES) eraseDraft.value = { ...d, more: [...(d.more ?? []), line] };
 }
+function commitEraseDraft(): void {
+  const d = eraseDraft.value;
+  if (!d || erase.length >= ERASE_MAX_STROKES) return;
+  eraseDraft.value = null;
+  erase.push(d);
+}
+function undoEraseDraftLine(): void {
+  const d = eraseDraft.value;
+  if (!d) return;
+  eraseDraft.value = d.more?.length ? { ...d, more: d.more.slice(0, -1) } : null;
+}
+function discardEraseDraft(): void { eraseDraft.value = null; }
 function removeErase(id: string): void {
   const i = erase.findIndex(s => s.id === id);
   if (i >= 0) erase.splice(i, 1);
@@ -784,7 +810,7 @@ const {
   onPointerDown: onErasePointerDown, onPointerMove: onErasePointerMove, onPointerUp: onErasePointerUp,
   onPointerLeave: onErasePointerLeave,
 } = useEraseEditor({
-  crop, srcW, srcH, strokes: erase, brush: eraseBrush, ofPerScreen,
+  crop, srcW, srcH, strokes: () => (eraseDraft.value ? [...erase, eraseDraft.value] : erase), brush: eraseBrush, ofPerScreen,
   lens: viewLens,
   onStroke: addEraseStroke,
 });
@@ -938,6 +964,10 @@ const gradingEdited = computed(() => {
 // it in).
 let bakedBasic: BasicAdjust | null = DEFAULT_BASIC;
 
+// The history step the pointer is resting on, drawn in place of the live edit
+// until it leaves (see the history panel below). Never applied to the state.
+const historyPreview = shallowRef<Snapshot | null>(null);
+
 function currentBasic(r: Recipe = recipe): BasicAdjust {
   return { contrast: r.contrast, blacks: r.blacks, whites: r.whites };
 }
@@ -950,6 +980,15 @@ function bakeCurveLUT(): void {
   // into the 'before' view, with nothing to restore it until the key is released.
   if (showOriginal.value) {
     webglRenderer.uploadCurveLUT(IDENTITY_CURVE_LUT);
+    bakedBasic = null;
+    return;
+  }
+  // A hovered history step draws with its own curve and Basic values; bakedBasic
+  // stays null so the live ones are rebaked the frame the hover ends.
+  const s = historyPreview.value;
+  if (s) {
+    const b = new Set(s.bypass ?? []);
+    webglRenderer.uploadCurveLUT(buildToneCurveLUT(b.has("curve") ? defaultToneCurve() : s.curve, currentBasic(effectiveRecipe(s.recipe, b))));
     bakedBasic = null;
     return;
   }
@@ -1172,6 +1211,28 @@ function formatSliderValue(key: RecipeKey, v: number): string {
   if (key === "exposure") return `${v > 0 ? "+" : ""}${v.toFixed(2)}`;
   return `${v > 0 ? "+" : ""}${v}`;
 }
+// Hovering a step for a moment draws it on the canvas — draw parameters and
+// curve LUT only, like hold-to-compare: the sliders, history and stored edit
+// stay on the live state, and leaving the step puts the live render back. What
+// is baked into the decoded pixels (crop, engine, denoise) is not previewed.
+const HISTORY_PREVIEW_DELAY_MS = 350;
+let historyPreviewTimer = 0;
+function hoverHistoryStep(i: number): void {
+  clearTimeout(historyPreviewTimer);
+  historyPreviewTimer = window.setTimeout(() => {
+    historyPreview.value = i === historyIndex.value ? null : history.value[i] ?? null;
+  }, HISTORY_PREVIEW_DELAY_MS);
+}
+function endHistoryPreview(): void {
+  clearTimeout(historyPreviewTimer);
+  historyPreviewTimer = 0;
+  historyPreview.value = null;
+}
+watch(historyPreview, () => {
+  if (!webglRenderer) return;
+  bakeCurveLUT();
+  scheduleWebGLDraw();
+});
 // Newest first, the way a photographer reads it back.
 const historySteps = computed(() => history.value.map((snap, i) => ({
   index: i,
@@ -1305,6 +1366,11 @@ const moveTargets = computed(() => {
 // start one under the folder that is open rather than inventing a name here.
 const folderTree = ref<InstanceType<typeof FolderTree> | null>(null);
 
+// The grid's group navigator (in the sidebar, under the tree): which section is
+// at the top of the grid, and the grid itself to scroll when a group is picked.
+const photoGrid = ref<InstanceType<typeof PhotoGrid> | null>(null);
+const librarySection = ref(-1);
+
 function toggleSortDir(): void { setSort(sortKey.value, sortDir.value === "asc" ? "desc" : "asc"); }
 function onGridRename(id: string, name: string): void { void renamePhoto(id, name); }
 function onGridMove(ids: string[], folderId: number): void { void movePhotos(ids, folderId); }
@@ -1373,6 +1439,13 @@ const EDIT_TABS: { key: EditTab; icon: Icon }[] = [
 ];
 
 const editTab = ref<EditTab>((localStorage.getItem("llr.tab") as EditTab | null) ?? "light");
+
+// The history panel's hover preview: anything that changes what the live state
+// is — a step taken, another photo, another tab — ends it.
+watch([historyIndex, () => activeSource.value?.id, editTab], endHistoryPreview);
+// An unfilled erase draft belongs to the photo it was brushed on.
+watch(() => activeSource.value?.id, discardEraseDraft);
+
 // Where the rail was before the crop editor took it, so Done lands back on the
 // group being edited instead of resetting to Light.
 let tabBeforeCrop: EditTab = editTab.value;
@@ -2057,13 +2130,15 @@ function drawWebGL(): void {
   // Contrast/Blacks/Whites all live in the curve LUT bake, not shader uniforms.
   // Draws are rAF-coalesced (scheduleWebGLDraw), so this rebakes at most once
   // per frame during a slider drag (sub-millisecond on the CPU).
-  if (!showOriginal.value && (bakedBasic === null || !sameBasic(bakedBasic, currentBasic(effectiveRecipe(recipe))))) {
+  if (!showOriginal.value && !historyPreview.value
+    && (bakedBasic === null || !sameBasic(bakedBasic, currentBasic(effectiveRecipe(recipe))))) {
     bakeCurveLUT();
   }
   updateRenderWindow();
   webglRenderer.setViewWindow(renderWindow.value);
   webglRenderer.setPreviewScale(computePreviewScale());
   if (showOriginal.value) { webglRenderer.draw(baselineParams()); return; }
+  if (historyPreview.value) { webglRenderer.draw(buildPipelineParams(historyPreview.value)); return; }
   const params = buildPipelineParams();
   syncBrushLayer(params);
   webglRenderer.draw(params);
@@ -2195,6 +2270,7 @@ function onKeyDown(e: KeyboardEvent): void {
   // Undo / redo — work regardless of whether an image is loaded
   if ((e.ctrlKey || e.metaKey) && !inEditableText) {
     const k = e.key.toLowerCase();
+    if (k === "z" && !e.shiftKey && eraseDraft.value && editTab.value === "erase") { e.preventDefault(); undoEraseDraftLine(); return; }
     if (k === "z") { e.preventDefault(); if (e.shiftKey) redo(); else undo(); return; }
     if (k === "y") { e.preventDefault(); redo(); return; }
     // Lightroom's copy / paste settings.
@@ -2237,6 +2313,12 @@ function onKeyDown(e: KeyboardEvent): void {
     if (cropMode.value && (e.key === "x" || e.key === "X")) { e.preventDefault(); swapAspect(); return; }
     if (cropMode.value && e.key === "O") { e.preventDefault(); cycleCropGuideVariant(); return; }
     if (cropMode.value && e.key === "o") { e.preventDefault(); cycleCropGuide(); return; }
+  }
+
+  // Erase: Enter fills what the draft has brushed, Esc drops it.
+  if (!inEditableText && eraseDraft.value && editTab.value === "erase" && libraryView.value === "develop" && !cropMode.value) {
+    if (e.key === "Enter") { e.preventDefault(); commitEraseDraft(); return; }
+    if (e.key === "Escape") { e.preventDefault(); discardEraseDraft(); return; }
   }
 
   // Backslash holds the "before" view; release (onKeyUp) restores the edit.
@@ -3642,7 +3724,11 @@ const vWheelAdjust = {
       @select="selectFolder" @toggle="toggleExpanded"
       @create="(parentId, name) => createFolder(parentId, name)" @rename="renameFolder" @delete="deleteFolder"
       @move-photos="movePhotos" @move-folder="moveFolder"
-      @drop-files="onTreeDrop" @import-files="pickFiles" @import-folder="pickFolder" />
+      @drop-files="onTreeDrop" @import-files="pickFiles" @import-folder="pickFolder">
+      <GroupNav v-if="libraryView === 'library' && library.grouped && folderPhotos.length"
+        :title="groupOptions.find(o => o.value === groupKey)?.label ?? t('library.group')"
+        :sections="library.sections" :current="librarySection" @jump="(i) => photoGrid?.scrollToSection(i)" />
+    </FolderTree>
 
     <main class="center">
       <!-- The grid and the stage swap by v-show, not v-if: the canvas and its
@@ -3664,12 +3750,12 @@ const vWheelAdjust = {
             :title="groupControlLabel" :aria-label="groupControlLabel" @update:model-value="setGroup" />
         </div>
       </div>
-      <PhotoGrid v-show="libraryView === 'library'" :sections="library.sections" :grouped="library.grouped" :active-id="activeId"
+      <PhotoGrid ref="photoGrid" v-show="libraryView === 'library'" :sections="library.sections" :grouped="library.grouped" :active-id="activeId"
         :selected-ids="selectedIds" :loading="folderLoading" :thumb-src="thumbSrc" :is-invalid="(id) => activeSource?.id === id && !!activeSource.invalid"
         :move-targets="moveTargets" :can-paste="!!recipeClipboard"
         @copy-settings="openCopyDialog" @paste-settings="pasteToPhotos"
         @open="openPhoto" @remove="removePhotosConfirmed" @rename="onGridRename" @move="onGridMove"
-        @new-folder="onGridNewFolder" @import-files="pickFiles" />
+        @new-folder="onGridNewFolder" @import-files="pickFiles" @section="(i) => librarySection = i" />
       <div class="viewport" ref="viewportRef" v-show="libraryView === 'develop'"
         @wheel="onWheel"
         @mousedown="startPan"
@@ -3811,8 +3897,14 @@ const vWheelAdjust = {
           :viewBox="eraseViewBox" preserveAspectRatio="none"
           @pointerdown="onErasePointerDown" @pointermove="onErasePointerMove" @pointerup="onErasePointerUp"
           @pointerleave="onErasePointerLeave">
-          <template v-for="p in erasePaths" :key="p.id">
-            <path v-if="eraseShowStrokes || eraseHover === p.id" class="erase-stroke" :class="{ 'is-hover': eraseHover === p.id }"
+          <!-- The draft's lines in one translucent group, so where they
+               overlap reads as one region, not as a darker seam. -->
+          <g v-if="eraseDraft" class="erase-draft-layer">
+            <path v-for="p in erasePaths.filter(p => p.id === eraseDraft?.id)" :key="p.key" class="erase-stroke is-draft"
+              :d="p.d" :stroke-width="p.width" />
+          </g>
+          <template v-for="p in erasePaths" :key="p.key">
+            <path v-if="p.id !== eraseDraft?.id && (eraseShowStrokes || eraseHover === p.id)" class="erase-stroke" :class="{ 'is-hover': eraseHover === p.id }"
               :d="p.d" :stroke-width="p.width" />
           </template>
           <path v-if="eraseLivePath" class="erase-stroke is-live" :d="eraseLivePath" :stroke-width="2 * eraseCursorR" />
@@ -4091,11 +4183,11 @@ const vWheelAdjust = {
           <span>{{ t('panel.history') }}</span>
           <span class="panel-hint">{{ t('history.count', { n: history.length }) }}</span>
         </header>
-        <ol class="history-list">
+        <ol class="history-list" @pointerleave="endHistoryPreview">
           <li v-for="step in historySteps" :key="step.index">
             <button type="button" class="history-step"
-              :class="{ 'is-current': step.index === historyIndex, 'is-undone': step.index > historyIndex }"
-              @click="jumpHistory(step.index)">
+              :class="{ 'is-current': step.index === historyIndex, 'is-undone': step.index > historyIndex, 'is-previewing': historyPreview === history[step.index] }"
+              @pointerenter="hoverHistoryStep(step.index)" @click="jumpHistory(step.index)">
               <span class="history-label">{{ step.label }}</span>
               <span class="history-author" v-if="step.author">{{ step.author }}</span>
             </button>
@@ -4426,6 +4518,13 @@ const vWheelAdjust = {
         <progress v-if="eraseDownloading" class="erase-progress" :value="eraseStatus?.received ?? 0" :max="eraseStatus?.total || 1" />
         <button v-if="eraseStatus?.reason === 'models-missing' && eraseStatus.detail" class="ghost" type="button" @click="refreshEraseStatus(true)">{{ t('erase.retryDownload') }}</button>
         <SliderRow v-model="eraseBrush" :label="t('erase.brush')" :min="4" :max="200" :reset-value="24" />
+        <!-- The fill being brushed: its strokes so far, and the button that runs it. -->
+        <div class="erase-draft" v-if="eraseMode === 'fill' || eraseDraft">
+          <span class="erase-draft-count">{{ eraseDraft ? t('erase.draft', { n: eraseDraftLines }) : t('erase.draftEmpty') }}</span>
+          <button class="ghost" type="button" :disabled="!eraseDraft" :title="t('erase.discardHint')" @click="discardEraseDraft">{{ t('erase.discard') }}</button>
+          <button class="primary" type="button" :disabled="!eraseDraft || erase.length >= ERASE_MAX_STROKES"
+            :title="t('erase.fillHint')" @click="commitEraseDraft">{{ t('erase.fill') }}</button>
+        </div>
         <div class="control-row">
           <label class="control-label" for="erase-strokes">{{ t('erase.showStrokes') }}</label>
           <label class="switch">
@@ -4622,7 +4721,7 @@ const vWheelAdjust = {
       </nav>
     </aside>
 
-    <Filmstrip v-if="folderPhotos.length && libraryView === 'develop'" :photos="folderPhotos" :active-id="activeId"
+    <Filmstrip v-if="folderPhotos.length && libraryView === 'develop'" :sections="library.sections" :grouped="library.grouped" :active-id="activeId"
       :rendering="status === 'rendering'" :thumb-src="thumbSrc" :is-invalid="(id) => activeSource?.id === id && !!activeSource.invalid"
       @select="selectSource" @remove="(id) => removePhotosConfirmed([id])" @import="pickFiles" />
 

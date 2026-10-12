@@ -19,7 +19,9 @@ which leaks the object being removed back into the fill as a ghost.
 Strokes arrive in source-normalised coordinates (y down, the decode's own
 orientation; the browser maps its view through crop, orientation and lens
 correction before sending them), each a polyline with a radius in units of the
-frame's long edge. Each stroke is one fill, applied in order on the frame the
+frame's long edge; a stroke may carry further polylines (`more`) that paint the
+same region, so one fill can be brushed in several goes. Each stroke is one
+fill, applied in order on the frame the
 previous ones produced, and cached by everything it depends on: the base decode
 (minus its size — preview and export share a fill) and the strokes up to it.
 """
@@ -68,6 +70,7 @@ GUIDANCE = 2.0
 # Limits on what a request may ask for; the API clamps to the same numbers.
 MAX_STROKES = 64
 MAX_POINTS = 4096
+MAX_LINES = 32  # polylines in one stroke: the first plus `more`
 
 # How much of the frame around a stroke the model gets to see, as a fraction of
 # the stroke's own extent on each side. Less starves it of context to continue;
@@ -95,6 +98,9 @@ def model_dir() -> Path:
 FETCHER = Fetcher("erase", model_dir, MODEL_SOURCES)
 
 
+Line = tuple[tuple[tuple[float, float], ...], float]  # polyline, radius
+
+
 @dataclass(frozen=True)
 class Stroke:
     points: tuple[tuple[float, float], ...]
@@ -102,11 +108,43 @@ class Stroke:
     # "fill": the generative model; "heal": copied from a matching patch nearby
     # and blended to its surroundings (make_heal_patch) — no model involved.
     mode: str = "fill"
+    # Further polylines painting the same region, each with its own radius.
+    more: tuple[Line, ...] = ()
+
+    def lines(self) -> tuple[Line, ...]:
+        return ((self.points, self.radius), *self.more)
+
+    def extent(self, width: int, height: int) -> tuple[float, float, float, float]:
+        """The px box (x0, y0, x1, y1) every line covers, brush included."""
+        long_edge = max(width, height)
+        x0 = y0 = np.inf
+        x1 = y1 = -np.inf
+        for pts, radius in self.lines():
+            r = radius * long_edge
+            x0 = min(x0, min(u for u, _ in pts) * width - r)
+            x1 = max(x1, max(u for u, _ in pts) * width + r)
+            y0 = min(y0, min(v for _, v in pts) * height - r)
+            y1 = max(y1, max(v for _, v in pts) * height + r)
+        return x0, y0, x1, y1
 
     def key(self) -> str:
         # A fill's key is what it always was, so existing fills stay cached.
         pts = [[round(x, 5), round(y, 5)] for x, y in self.points] + [round(self.radius, 5)]
+        if self.more:
+            pts.append([[[round(x, 5), round(y, 5)] for x, y in line] + [round(r, 5)] for line, r in self.more])
         return json.dumps([*pts, "heal"] if self.mode == "heal" else pts)
+
+
+def _parse_line(points: Any, radius: Any) -> Line | None:
+    if not isinstance(radius, (int, float)) or not isinstance(points, list) or not points:
+        return None
+    pts: list[tuple[float, float]] = []
+    for p in points[:MAX_POINTS]:
+        if (isinstance(p, (list, tuple)) and len(p) == 2
+                and all(isinstance(v, (int, float)) and np.isfinite(v) for v in p)):
+            pts.append((float(p[0]), float(p[1])))
+    r = float(radius)
+    return (tuple(pts), r) if pts and np.isfinite(r) and 0.0 < r <= 0.5 else None
 
 
 def parse_strokes(raw: Any) -> list[Stroke]:
@@ -117,18 +155,16 @@ def parse_strokes(raw: Any) -> list[Stroke]:
     for item in raw[:MAX_STROKES]:
         if not isinstance(item, dict):
             continue
-        radius = item.get("radius")
-        points = item.get("points")
-        if not isinstance(radius, (int, float)) or not isinstance(points, list) or not points:
+        first = _parse_line(item.get("points"), item.get("radius"))
+        if first is None:
             continue
-        pts: list[tuple[float, float]] = []
-        for p in points[:MAX_POINTS]:
-            if (isinstance(p, (list, tuple)) and len(p) == 2
-                    and all(isinstance(v, (int, float)) and np.isfinite(v) for v in p)):
-                pts.append((float(p[0]), float(p[1])))
-        r = float(radius)
-        if pts and np.isfinite(r) and 0.0 < r <= 0.5:
-            out.append(Stroke(tuple(pts), r, "heal" if item.get("mode") == "heal" else "fill"))
+        raw_more = item.get("more")
+        more: list[Line] = []
+        for extra in (raw_more if isinstance(raw_more, list) else [])[:MAX_LINES - 1]:
+            line = _parse_line(extra.get("points"), extra.get("radius")) if isinstance(extra, dict) else None
+            if line is not None:
+                more.append(line)
+        out.append(Stroke(first[0], first[1], "heal" if item.get("mode") == "heal" else "fill", tuple(more)))
     return out
 
 
@@ -240,24 +276,21 @@ def start_download() -> dict[str, Any]:
 def stroke_mask(stroke: Stroke, width: int, height: int, box: tuple[int, int, int, int]) -> np.ndarray:
     """The stroke rasterised over `box` (x0, y0, x1, y1 in px of a width x height frame)."""
     x0, y0, x1, y1 = box
-    r = stroke.radius * max(width, height)
     img = Image.new("L", (x1 - x0, y1 - y0), 0)
     draw = ImageDraw.Draw(img)
-    pts = [(u * width - x0, v * height - y0) for u, v in stroke.points]
-    if len(pts) > 1:
-        draw.line(pts, fill=255, width=max(1, round(2 * r)), joint="curve")
-    for x, y in pts:
-        draw.ellipse((x - r, y - r, x + r, y + r), fill=255)
+    for line, radius in stroke.lines():
+        r = radius * max(width, height)
+        pts = [(u * width - x0, v * height - y0) for u, v in line]
+        if len(pts) > 1:
+            draw.line(pts, fill=255, width=max(1, round(2 * r)), joint="curve")
+        for x, y in pts:
+            draw.ellipse((x - r, y - r, x + r, y + r), fill=255)
     return np.asarray(img) > 127
 
 
 def region_for(stroke: Stroke, width: int, height: int) -> tuple[int, int, int, int]:
     """A square-as-possible box around the stroke with context, inside the frame."""
-    r = stroke.radius * max(width, height)
-    xs = [u * width for u, _ in stroke.points]
-    ys = [v * height for _, v in stroke.points]
-    bx0, bx1 = min(xs) - r, max(xs) + r
-    by0, by1 = min(ys) - r, max(ys) + r
+    bx0, by0, bx1, by1 = stroke.extent(width, height)
     side = max(bx1 - bx0, by1 - by0) * (1 + 2 * CONTEXT)
     side = max(side, MIN_REGION * max(width, height))
     cx, cy = (bx0 + bx1) / 2, (by0 + by1) / 2
@@ -403,12 +436,11 @@ def make_heal_patch(frame: np.ndarray, stroke: Stroke) -> Patch:
     the surroundings set its level.
     """
     height, width = frame.shape[:2]
-    r = stroke.radius * max(width, height)
-    xs = [u * width for u, _ in stroke.points]
-    ys = [v * height for _, v in stroke.points]
-    margin = 1.5 * r + 4
-    bx0, by0 = max(0, int(min(xs) - margin)), max(0, int(min(ys) - margin))
-    bx1, by1 = min(width, int(max(xs) + margin) + 1), min(height, int(max(ys) + margin) + 1)
+    r = max(radius for _, radius in stroke.lines()) * max(width, height)
+    ex0, ey0, ex1, ey1 = stroke.extent(width, height)   # brush included, so the margin is the rest
+    margin = 0.5 * r + 4
+    bx0, by0 = max(0, int(ex0 - margin)), max(0, int(ey0 - margin))
+    bx1, by1 = min(width, int(ex1 + margin) + 1), min(height, int(ey1 + margin) + 1)
     box = (bx0, by0, bx1, by1)
     rw, rh = bx1 - bx0, by1 - by0
     f = min(1.0, HEAL_MAX / max(rw, rh))

@@ -239,5 +239,8 @@ defineExpose({ startCreate });
         </div>
       </template>
     </div>
+    <!-- Below the tree: whatever the view wants docked there (the library's
+         group navigator). -->
+    <slot />
   </aside>
 </template>

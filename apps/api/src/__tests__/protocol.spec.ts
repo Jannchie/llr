@@ -6,6 +6,7 @@ import {
   clampDroStrength,
   clampErase,
   clampRenderParams,
+  ERASE_MAX_LINES,
   ERASE_MAX_STROKES,
   PHOTO_NAME_MAX,
   isAllowedHost,
@@ -74,6 +75,14 @@ describe("clampErase", () => {
   it("caps the stroke count", () => {
     const many = Array.from({ length: ERASE_MAX_STROKES + 5 }, () => ({ points: [[0.5, 0.5]], radius: 0.01 }));
     expect(clampErase(many)).toHaveLength(ERASE_MAX_STROKES);
+  });
+
+  it("keeps a stroke's further lines, dropping the malformed ones", () => {
+    const more = [{ points: [[0.6, 0.5]], radius: 0.03 }, { points: [], radius: 0.1 }, "junk"];
+    expect(clampErase([{ points: [[0.5, 0.5]], radius: 0.01, more }]))
+      .toEqual([{ points: [[0.5, 0.5]], radius: 0.01, more: [{ points: [[0.6, 0.5]], radius: 0.03 }] }]);
+    const lines = Array.from({ length: ERASE_MAX_LINES + 5 }, () => ({ points: [[0.5, 0.5]], radius: 0.01 }));
+    expect(clampErase([{ points: [[0.5, 0.5]], radius: 0.01, more: lines }])[0].more).toHaveLength(ERASE_MAX_LINES - 1);
   });
 });
 

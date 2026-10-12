@@ -52,6 +52,8 @@ export function useVirtualRows(opts: {
   tops: ComputedRef<number[]>;
   /** Vertical extent of the scroll container, px — what a PageDown covers. */
   viewport: Ref<number>;
+  /** The container's scroll offset, px — which row is at the top. */
+  scrollPos: Ref<number>;
   scrollToRow: (row: number) => void;
 } {
   const overscan = opts.overscan ?? 2;
@@ -110,5 +112,5 @@ export function useVirtualRows(opts: {
     if (next !== pos) el.scrollTop = next;
   }
 
-  return { visible, totalSize, tops, viewport, scrollToRow };
+  return { visible, totalSize, tops, viewport, scrollPos, scrollToRow };
 }

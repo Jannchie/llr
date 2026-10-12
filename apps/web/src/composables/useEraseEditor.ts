@@ -1,6 +1,6 @@
 import { computed, ref, type Ref } from "vue";
 import { cropOutputRect, imageDims, imagePxToOutFrame, outFrameToImagePx, type CropState } from "../rendering/crop";
-import { strokeToView, viewToStroke, type EraseStroke, type LensWarp } from "../rendering/erase";
+import { eraseLines, strokeToView, viewToStroke, type EraseLine, type LensWarp } from "../rendering/erase";
 
 // The erase brush on the canvas. Drawn on an SVG that shares the crop overlay's
 // placement (like useMaskEditor), so a pointer position is an output-frame
@@ -8,11 +8,14 @@ import { strokeToView, viewToStroke, type EraseStroke, type LensWarp } from "../
 // (rendering/erase.ts viewToStroke) and handed to `onStroke`. Stored strokes
 // come back the other way to be drawn, so they stay on the pixels they cover
 // through any later crop, rotation or flip.
+type Stroke = EraseLine & { id: string; more?: EraseLine[] };
+
 export function useEraseEditor(opts: {
   crop: CropState;                       // reactive
   srcW: Ref<number>;
   srcH: Ref<number>;
-  strokes: readonly EraseStroke[] | (() => readonly EraseStroke[]);  // reactive, or a getter over reactive state
+  // reactive, or a getter over reactive state; a stroke's `more` lines are drawn with it
+  strokes: readonly Stroke[] | (() => readonly Stroke[]);
   brush: Ref<number>;                    // brush radius in screen px
   ofPerScreen: Ref<number>;              // output-frame units per screen px
   lens: () => LensWarp;
@@ -37,21 +40,23 @@ export function useEraseEditor(opts: {
   const pathOf = (pts: Pt[]): string =>
     pts.length ? `M${pts[0][0]} ${pts[0][1]}${pts.length === 1 ? "l0 0" : pts.slice(1).map(([x, y]) => `L${x} ${y}`).join("")}` : "";
 
-  // Stored strokes as output-frame paths. A stroke's width is in source px, which
-  // are image px, which are output-frame px (crop and straighten do not scale).
+  // Stored strokes as output-frame paths, one per line (`id` is the stroke's, so
+  // a hover lights all of its lines). A line's width is in source px, which are
+  // image px, which are output-frame px (crop and straighten do not scale).
   const paths = computed(() => {
     if (!srcW.value) return [];
     const [iw, ih] = dims();
     const lens = opts.lens();
     const list = typeof opts.strokes === "function" ? opts.strokes() : opts.strokes;
-    return list.map(s => ({
+    return list.flatMap(s => eraseLines(s).map((line, i) => ({
       id: s.id,
-      width: 2 * s.radius * longEdge(),
-      d: pathOf(s.points.map(([u, v]) => {
+      key: `${s.id}:${i}`,
+      width: 2 * line.radius * longEdge(),
+      d: pathOf(line.points.map(([u, v]) => {
         const [x, y] = strokeToView(u, v, crop, lens);
         return imagePxToOutFrame(crop, iw, ih, x * iw, y * ih);
       })),
-    }));
+    })));
   });
 
   // The stroke in progress, in output-frame points.
