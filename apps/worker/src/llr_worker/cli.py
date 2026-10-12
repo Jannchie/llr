@@ -833,27 +833,30 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     # every return below, denoising on or off, so the answer cannot flip with
     # the toggle. Sony's own filter has no such control; the wavelet does.
     dn_uses_chroma = file_model is not None and model_uses_chroma(file_model)
-    if dn_auto and file_model is not None:
-        iso = _exif_int(read_exiftool_metadata(input_path).get("ISO"))
-        # An unreadable ISO leaves the request alone rather than silently
-        # denoising at four tenths -- guessing here would be invisible.
-        if iso:
-            if file_model == "sony":
-                dn_strength = iso_strength(float(iso))
-            else:
-                dn_amount = iso_strength(float(iso))
-    elif file_model == "sony":
+    if file_model == "sony":
         # Edit's manual panel, measured at export: its default amount of 50 is
         # Auto to the bit, and the ISO write-back applies at every amount. The
         # amount itself goes to the filter -- it rebuilds the thresholds and
         # the blend weight (denoise.py SonyRawNRDenoiser, verified bit for bit
         # at 75 and 100) -- never onto a blend of two decodes; 0 is off because
         # a zeroed table admits no neighbour, so it need not decode at all.
+        #
+        # `auto` is ignored here, not honoured: Auto *is* this panel at 50, and
+        # the browser cannot know a frame is Sony's until its first decode
+        # answers, so that first request still says auto. Taking it would blend
+        # a noisy decode back in by the slider's amount — twice the work, half
+        # the denoise, and a cache key no later request for the frame matches.
         iso = _exif_int(read_exiftool_metadata(input_path).get("ISO"))
         if iso:
             dn_strength = iso_strength(float(iso))
             dn_amount_ui = dn_amount * 100.0
             dn_amount = 1.0 if dn_amount_ui > 0.0 else 0.0
+    elif dn_auto and file_model is not None:
+        iso = _exif_int(read_exiftool_metadata(input_path).get("ISO"))
+        # An unreadable ISO leaves the request alone rather than silently
+        # denoising at four tenths -- guessing here would be invisible.
+        if iso:
+            dn_amount = iso_strength(float(iso))
     # Forcing denoise off here for a rendered image (rather than no-op'ing
     # deeper) keeps the two-decode blend below from decoding an identical image
     # twice.
