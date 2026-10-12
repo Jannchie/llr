@@ -29,6 +29,7 @@ from llr_worker.sony.chroma import (
     LUMA_LUT_SIZE,
     LUMA_LUT_WIRE,
     _luma_luts,
+    _whittaker,
     luma_gamma,
     luma_lut,
     luma_lut_dequantised,
@@ -370,3 +371,14 @@ def test_the_dequantised_advanced_table_has_no_comb_and_stays_within_the_quantis
     # ...and it is what the profile ships for the match.
     assert np.array_equal(luma_lut(_calibration(LUMA_LUT_FLAT), advanced=True, dequantised=True), smooth)
 
+
+
+def test_the_banded_smoother_solves_the_dense_system() -> None:
+    """_whittaker is (I + lam D2'D2) z = y solved as a band: the same answer
+    the dense solve gives, at every size down to the ones with no D2 rows."""
+    rng = np.random.default_rng(0)
+    for n in (1, 2, 3, 4, 7, 1025):
+        y = rng.random(n) * 16383
+        d2 = np.diff(np.eye(n), 2, axis=0)
+        dense = np.linalg.solve(np.eye(n) + 1e3 * (d2.T @ d2), y)
+        assert np.allclose(_whittaker(y, 1e3), dense, rtol=0, atol=1e-6), n

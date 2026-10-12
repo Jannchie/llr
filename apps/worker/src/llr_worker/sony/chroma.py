@@ -176,6 +176,56 @@ LUMA_LUT_COARSE_STEP = 16
 LUMA_LUT_DEQUANT_LAMBDA = 1e3
 
 
+def _whittaker(y: np.ndarray, lam: float) -> np.ndarray:
+    """Solve (I + lam D2'D2) z = y, D2 the second-difference operator.
+
+    The matrix is symmetric pentadiagonal, so this is a banded Cholesky in
+    O(n) rather than a dense solve: the dense one went through OpenBLAS, which
+    on a 24-thread Windows box spent 0.5-1 s on 1025 unknowns — on the first
+    decode of every session — where any thread count up to 16 takes 20 ms.
+    """
+    n = y.size
+    # The three diagonals of I + lam D2'D2: each row of D2 is (1, -2, 1) at k..k+2.
+    a0 = np.ones(n)
+    a1 = np.zeros(max(n - 1, 0))
+    a2 = np.zeros(max(n - 2, 0))
+    if n >= 3:
+        k = np.arange(n - 2)
+        np.add.at(a0, k, lam)
+        np.add.at(a0, k + 1, 4 * lam)
+        np.add.at(a0, k + 2, lam)
+        np.add.at(a1, k, -2 * lam)
+        np.add.at(a1, k + 1, -2 * lam)
+        a2 += lam
+    a0, a1, a2 = a0.tolist(), a1.tolist(), a2.tolist()
+    # L's diagonal and its first two sub-diagonals: l1[i] = L[i, i-1], l2[i] = L[i, i-2].
+    d = [0.0] * n
+    l1 = [0.0] * n
+    l2 = [0.0] * n
+    for i in range(n):
+        if i >= 2:
+            l2[i] = a2[i - 2] / d[i - 2]
+        if i >= 1:
+            l1[i] = (a1[i - 1] - l2[i] * l1[i - 1]) / d[i - 1]
+        d[i] = (a0[i] - l1[i] * l1[i] - l2[i] * l2[i]) ** 0.5
+    w = [0.0] * n
+    for i, v in enumerate(np.asarray(y, np.float64).tolist()):
+        if i >= 1:
+            v -= l1[i] * w[i - 1]
+        if i >= 2:
+            v -= l2[i] * w[i - 2]
+        w[i] = v / d[i]
+    z = [0.0] * n
+    for i in range(n - 1, -1, -1):
+        v = w[i]
+        if i + 1 < n:
+            v -= l1[i + 1] * z[i + 1]
+        if i + 2 < n:
+            v -= l2[i + 2] * z[i + 2]
+        z[i] = v / d[i]
+    return np.array(z)
+
+
 def luma_lut_dequantised(lut: np.ndarray, lam: float = LUMA_LUT_DEQUANT_LAMBDA) -> np.ndarray:
     """The smooth curve a YGamma table is the 10-bit quantisation of.
 
@@ -205,10 +255,7 @@ def luma_lut_dequantised(lut: np.ndarray, lam: float = LUMA_LUT_DEQUANT_LAMBDA) 
     # it stays the table's own, and the solve is a quarter of the size.
     top = LUMA_LUT_WIRE
     coarse = x[:top + 1:step]
-    n = coarse.size
-    # (I + lam D2'D2) z = y, dense: 1025 x 1025, once per table (see luma_lut).
-    d2 = np.diff(np.eye(n), 2, axis=0)
-    z = np.linalg.solve(np.eye(n) + lam * (d2.T @ d2), coarse)
+    z = _whittaker(coarse, lam)
     fine = np.interp(np.arange(top + 1), np.arange(0, top + 1, step), z)
     out = x.copy()
     out[:top + 1] = np.maximum.accumulate(fine)   # the curve is monotone; the fit's last-bit dips are not
