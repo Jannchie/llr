@@ -3615,6 +3615,10 @@ input[type="range"]:focus::-moz-range-thumb {
    read as one region. Blue like a live selection, until Fill turns it red. */
 .erase-draft-layer { opacity: 0.45; }
 .erase-stroke.is-draft { stroke: rgb(80, 160, 255); }
+/* How far the fill reaches once grown and feathered: the same lines, wider and
+   fainter, under the brushed ones. */
+.erase-reach-layer { opacity: 0.16; }
+.erase-stroke.is-reach { stroke: rgba(255, 64, 48, 0.16); }
 
 .erase-draft {
   display: flex;
@@ -3647,6 +3651,14 @@ input[type="range"]:focus::-moz-range-thumb {
 }
 
 .erase-head { cursor: default; }
+.erase-name {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  text-align: left;
+  cursor: pointer;
+}
+.erase-tune { padding: 2px 0 6px; }
 
 /* ---------- Relight rig ---------- */
 .relight-overlay { z-index: 6; pointer-events: all; cursor: crosshair; touch-action: none; }

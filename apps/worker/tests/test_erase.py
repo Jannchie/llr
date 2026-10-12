@@ -232,3 +232,90 @@ def test_more_lines_change_the_key_but_a_single_line_keeps_its_own():
     single = erase.Stroke(pts, 0.01)
     assert single.key() == json.dumps([[0.5, 0.5], 0.01])
     assert erase.Stroke(pts, 0.01, "fill", ((((0.6, 0.5),), 0.01),)).key() != single.key()
+
+
+class TintedEngine(FakeEngine):
+    """Gives back the model's input with a cast on it — a fill whose texture is
+    right and whose colour is not, which is what the colour match is for."""
+
+    def fill(self, image: np.ndarray, mask: np.ndarray, seed: int) -> np.ndarray:
+        super().fill(image, mask, seed)
+        return np.clip(image * np.array([1.25, 1.0, 0.8], np.float32), 0, 1)
+
+
+def test_grow_and_feather_parse_clamp_and_key():
+    base = {"points": [[0.5, 0.5]], "radius": 0.01}
+    legacy, soft, clamped, junk = erase.parse_strokes([
+        base, {**base, "grow": 0.2, "feather": 0.4}, {**base, "grow": 9, "feather": -1}, {**base, "grow": "x"}])
+    # A stroke without the two keeps its fixed edge and its key.
+    assert legacy.grow is None and legacy.feather is None and not legacy.soft
+    assert legacy.key() == json.dumps([[0.5, 0.5], 0.01])
+    assert (soft.grow, soft.feather) == (0.2, 0.4) and soft.key() != legacy.key()
+    assert (clamped.grow, clamped.feather) == (erase.MAX_SOFT, 0.0)
+    assert not junk.soft
+    # Grow and feather widen the region the fill may touch.
+    lx0, _, lx1, _ = erase.region_for(legacy, 600, 400)
+    sx0, _, sx1, _ = erase.region_for(soft, 600, 400)
+    assert sx1 - sx0 > lx1 - lx0
+
+
+def test_stroke_mask_extra_dilates_by_a_disc():
+    s = erase.Stroke(((0.5, 0.5),), 0.02)   # 12 px radius on 600 x 400
+    plain = erase.stroke_mask(s, 600, 400, (0, 0, 600, 400))
+    grown = erase.stroke_mask(s, 600, 400, (0, 0, 600, 400), 6.0)
+    assert plain[200, 311] and not plain[200, 314]
+    assert grown[200, 317] and not grown[200, 320]
+    assert grown[200 + 12, 300 + 12] and not plain[200 + 12, 300 + 12]   # round, not square
+
+
+def test_blur_keeps_flat_fields_and_mass():
+    flat = np.full((40, 50), 0.7, np.float32)
+    assert np.allclose(erase._blur(flat, 3.0), 0.7)
+    spike = np.zeros((61, 61), np.float32)
+    spike[30, 30] = 1.0
+    b = erase._blur(spike, 4.0)
+    assert np.isclose(b.sum(), 1.0, atol=1e-5)
+    ys = np.mgrid[:61, :61][0]
+    assert np.isclose(np.sqrt((b * (ys - 30) ** 2).sum()), 4.0, rtol=0.1)   # sigma as asked
+
+
+def test_match_surroundings_takes_a_cast_off_the_fill():
+    rng = np.random.default_rng(3)
+    original = rng.uniform(0.1, 0.5, (80, 80, 3)).astype(np.float32)
+    hole = np.zeros((80, 80), bool)
+    hole[25:55, 25:55] = True
+    fill = original * np.array([1.4, 1.0, 0.7], np.float32)
+    out = erase.match_surroundings(fill, original, hole, 10.0)
+    ratio = (out[hole] / original[hole]).mean(0)
+    assert np.allclose(ratio, 1.0, atol=0.03)
+    # The texture inside is the fill's own, only its level moves.
+    assert np.corrcoef(out[hole][:, 1], fill[hole][:, 1])[0, 1] > 0.999
+
+
+def test_soft_fill_is_opaque_over_the_grown_stroke_and_fades_past_it():
+    f = frame()
+    r = 0.03 * 600   # 18 px: grow 9 px, feather 18 px
+    s = erase.parse_strokes([{"points": [[0.5, 0.5]], "radius": 0.03, "grow": 0.5, "feather": 1.0}])
+    patch = erase.make_patch(f, s[0], erase.exposure_scale(f), 1, FakeEngine())
+    out = f.copy()
+    erase.apply_patch(out, patch)
+    assert patch.alpha.max() == 1.0
+    # Within brush + grow (27 px) the fill replaces the frame...
+    assert not np.allclose(out[200, 300 + int(r * 1.4)], f[200, 300 + int(r * 1.4)], rtol=0.02)
+    # ...past grow + feather (45 px) the frame is untouched.
+    assert np.array_equal(out[200, 300 + int(r * 2.6)], f[200, 300 + int(r * 2.6)])
+
+
+def test_soft_fill_matches_the_surrounding_colour(tmp_path):
+    f = np.full((400, 600, 3), 0.2, np.float32)
+    legacy = erase.Stroke(((0.5, 0.5),), 0.03)
+    soft = erase.Stroke(((0.5, 0.5),), 0.03, grow=0.2, feather=0.5)
+    k = erase.exposure_scale(f)
+    for stroke, tol in ((legacy, None), (soft, 0.02)):
+        out = f.copy()
+        erase.apply_patch(out, erase.make_patch(f, stroke, k, 1, TintedEngine()))
+        centre = out[200, 300] / f[200, 300]
+        if tol is None:
+            assert centre[0] > 1.1   # the cast lands as is
+        else:
+            assert np.allclose(centre, 1.0, atol=tol)

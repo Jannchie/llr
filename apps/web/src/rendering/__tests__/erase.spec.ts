@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { defaultCrop, type CropState } from "../crop";
-import { cloneErase, eraseLines, eraseWire, lensForward, lensInverse, lensWarp, strokeToView, viewToStroke } from "../erase";
+import { cloneErase, eraseLines, eraseReach, eraseWire, lensForward, lensInverse, lensWarp, strokeToView, viewToStroke } from "../erase";
 import { LENS_IDENTITY } from "../lens";
 
 // The FE 50-150mm F2 GM at 150mm (lens.spec.ts SONY_DIST): a real pincushion.
@@ -89,5 +89,16 @@ describe("stroke data", () => {
     expect(s[0].more[0].points[0][0]).toBe(0.3);
     expect(eraseLines(s[0]).map(l => l.radius)).toEqual([0.01, 0.02]);
     expect(eraseWire(s)).toEqual([{ points: [[0.1, 0.2]], radius: 0.01, more: [{ points: [[0.3, 0.4]], radius: 0.02 }] }]);
+  });
+
+  it("carries grow and feather only where the stroke has them", () => {
+    const line = { radius: 0.01, points: [[0.1, 0.2]] as [number, number][] };
+    const soft = { id: "s", ...line, grow: 0.2, feather: 0, more: [{ radius: 0.03, points: [[0.3, 0.4]] as [number, number][] }] };
+    expect(cloneErase([soft])[0]).toMatchObject({ grow: 0.2, feather: 0 });
+    expect(eraseWire([soft])[0]).toMatchObject({ grow: 0.2, feather: 0 });
+    expect(eraseWire([{ id: "l", ...line }])[0]).toEqual({ points: [[0.1, 0.2]], radius: 0.01 });
+    // Reach is scaled by the stroke's largest radius, not its first.
+    expect(eraseReach(soft)).toBeCloseTo(0.2 * 0.03, 12);
+    expect(eraseReach({ ...line })).toBe(0);
   });
 });

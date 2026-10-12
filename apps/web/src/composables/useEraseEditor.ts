@@ -1,6 +1,6 @@
 import { computed, ref, type Ref } from "vue";
 import { cropOutputRect, imageDims, imagePxToOutFrame, outFrameToImagePx, type CropState } from "../rendering/crop";
-import { eraseLines, strokeToView, viewToStroke, type EraseLine, type LensWarp } from "../rendering/erase";
+import { eraseLines, eraseReach, strokeToView, viewToStroke, type EraseLine, type LensWarp } from "../rendering/erase";
 
 // The erase brush on the canvas. Drawn on an SVG that shares the crop overlay's
 // placement (like useMaskEditor), so a pointer position is an output-frame
@@ -8,7 +8,7 @@ import { eraseLines, strokeToView, viewToStroke, type EraseLine, type LensWarp }
 // (rendering/erase.ts viewToStroke) and handed to `onStroke`. Stored strokes
 // come back the other way to be drawn, so they stay on the pixels they cover
 // through any later crop, rotation or flip.
-type Stroke = EraseLine & { id: string; more?: EraseLine[] };
+type Stroke = EraseLine & { id: string; more?: EraseLine[]; grow?: number; feather?: number };
 
 export function useEraseEditor(opts: {
   crop: CropState;                       // reactive
@@ -43,6 +43,8 @@ export function useEraseEditor(opts: {
   // Stored strokes as output-frame paths, one per line (`id` is the stroke's, so
   // a hover lights all of its lines). A line's width is in source px, which are
   // image px, which are output-frame px (crop and straighten do not scale).
+  // `reachWidth` is the same line widened by the stroke's grow and feather:
+  // how far the fill may touch, which is wider than what was brushed.
   const paths = computed(() => {
     if (!srcW.value) return [];
     const [iw, ih] = dims();
@@ -52,6 +54,7 @@ export function useEraseEditor(opts: {
       id: s.id,
       key: `${s.id}:${i}`,
       width: 2 * line.radius * longEdge(),
+      reachWidth: 2 * (line.radius + eraseReach(s)) * longEdge(),
       d: pathOf(line.points.map(([u, v]) => {
         const [x, y] = strokeToView(u, v, crop, lens);
         return imagePxToOutFrame(crop, iw, ih, x * iw, y * ih);
