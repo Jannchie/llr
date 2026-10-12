@@ -14,9 +14,9 @@ import threading
 import traceback
 from collections import OrderedDict
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -138,8 +138,9 @@ class RawMetadata:
     # the same reason as dro_gain — it is the only point the RAW is open — but
     # it costs a pass over the Bayer data, so it is only built when there is a
     # curve to index with it. None means the shader falls back to the global
-    # approximation.
-    dro_grid: dict[str, Any] | None = None
+    # approximation. Straight out of read_raw_metadata it may still be a Future
+    # (dro_grid_soon); prepare_linear settles it before anything reads it.
+    dro_grid: dict[str, Any] | Future[dict[str, Any] | None] | None = None
     # The M/S-size YCbCr frame's white-balance ratio (sony/sr2.ycc_wb_scale),
     # which Imaging Edge multiplies into the camera's WB and LibRaw does not
     # know about. None for a mosaic frame. Read here because the tag is the
@@ -605,6 +606,45 @@ def dro_grid_cached(input_path: Path, exif: dict[str, Any],
         value = None
     _remember(_DRO_GRID_CACHE, key, value, _DRO_GRID_CACHE_MAX)
     return value
+
+
+class _MosaicSnapshot:
+    """A rawpy handle seen through a copy of its mosaic, for a reader on another thread.
+
+    The RAW-domain denoiser rewrites the handle's mosaic in place while the
+    DRO grid is still binning it; the grid has to see the RAW as read.
+    """
+
+    def __init__(self, raw: rawpy.RawPy) -> None:
+        self._raw = raw
+        self.raw_image = fastcopy.contiguous(raw.raw_image)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._raw, name)
+
+
+_DRO_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dro-grid")
+
+
+def dro_grid_soon(input_path: Path, exif: dict[str, Any], raw: rawpy.RawPy) -> Any:
+    """dro_grid_cached, started on its own thread unless the cache already has it.
+
+    The grid is a quarter of a second of single-threaded binning that nothing
+    needs until the colour stage, so a decode starts it here and runs its
+    denoise and demosaic meanwhile. Returns the grid, or a Future of it;
+    _settle_dro_grid turns the metadata holding it back into a plain one.
+    """
+    key = _file_stamp(input_path)
+    with _CACHE_LOCK:
+        if key in _DRO_GRID_CACHE:
+            _DRO_GRID_CACHE.move_to_end(key)
+            return _DRO_GRID_CACHE[key]
+    return _DRO_POOL.submit(dro_grid_cached, input_path, exif, _MosaicSnapshot(raw))
+
+
+def _settle_dro_grid(metadata: RawMetadata) -> RawMetadata:
+    grid = metadata.dro_grid
+    return replace(metadata, dro_grid=grid.result()) if isinstance(grid, Future) else metadata
 
 
 def _write_linear_f16(linear_arr: np.ndarray, output_path: Path) -> int:
@@ -1837,6 +1877,7 @@ def prepare_linear(
             linear = apply_camera_crop(linear, metadata.camera_crop)
             if max_size:
                 linear = downsample_linear(linear, max_size)
+            metadata = _settle_dro_grid(metadata)
             color_profile = libraw_color_profile_info()
             if store_cache:
                 _remember_pixels(_FALLBACK_CACHE, cache_key, (linear, metadata, color_profile), _FALLBACK_CACHE_BYTES_MAX)
@@ -1847,6 +1888,8 @@ def prepare_linear(
                 raise ValueError("Profiled rendering currently supports only three-channel camera RGB data")
             if max_size:
                 camera_rgb = downsample_linear(camera_rgb, max_size)
+            # The grid was binned on its own thread meanwhile (dro_grid_soon).
+            metadata = _settle_dro_grid(metadata)
             # Cache camera RGB so colour-pipeline changes skip RAW re-decode
             if store_cache:
                 _remember_pixels(RAW_CAMERA_CACHE, cache_key, (camera_rgb, metadata), RAW_CAMERA_CACHE_BYTES_MAX)
@@ -2042,7 +2085,7 @@ def read_raw_metadata(input_path: Path, raw: rawpy.RawPy) -> RawMetadata:
     # Only worth the raw pass when there is a curve for it to index; the RAW
     # being open here is what makes this the cheap place to fill the cache
     # the look-profile path reads from.
-    grid = dro_grid_cached(input_path, exif, raw) if dro_gain else None
+    grid = dro_grid_soon(input_path, exif, raw) if dro_gain else None
     return RawMetadata(
         make=exif.get("Make"),
         model=exif.get("Model"),
