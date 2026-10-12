@@ -1009,8 +1009,8 @@ def apply_sony_profile(
     here beforehand. That is what keeps the strength control off the decode path.
     """
     matrix = SegmentedMatrix(unpack_param_block(cal.param_block))
-    rec709 = matrix.apply(camera_rgb)
-    linear_prophoto = np.clip(rec709 @ REC709_TO_PROPHOTO_D50.T, 0, None)
+    # Rec.709 -> ProPhoto and the clip ride in the matrix kernel's own pass.
+    linear_prophoto = matrix.apply(camera_rgb, post=REC709_TO_PROPHOTO_D50)
     return linear_prophoto, look_render_info(cal, style, tweaks, dro=dro, dro_gain=dro_gain,
                                              dro_grid=dro_grid, sharpen=sharpen,
                                              spica=spica, chroma_suppres=chroma_suppres,

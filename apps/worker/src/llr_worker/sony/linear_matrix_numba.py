@@ -31,8 +31,11 @@ _TWO_PI = F(2.0 * math.pi)
 
 
 @njit(cache=True, nogil=True)
-def _rows(a: np.ndarray, table: np.ndarray, lut: np.ndarray, r0: int, r1: int, out: np.ndarray) -> None:
-    """Rows [r0, r1) of a (h, w, 3) float32 frame through the segment table."""
+def _rows(a: np.ndarray, table: np.ndarray, lut: np.ndarray, r0: int, r1: int, out: np.ndarray,
+          post: np.ndarray, use_post: bool) -> None:
+    """Rows [r0, r1) of a (h, w, 3) float32 frame through the segment table,
+    then — when `use_post` — through `post` and clipped at zero, which is what
+    the caller would otherwise do as two more whole-frame passes."""
     n = lut.shape[0]
     n_f = F(n)
     n_index = table.shape[0]
@@ -55,15 +58,27 @@ def _rows(a: np.ndarray, table: np.ndarray, lut: np.ndarray, r0: int, r1: int, o
                 k = 0
             elif k > n_index - 1:
                 k = n_index - 1
-            for i in range(3):
-                # einsum's float32 accumulation, left to right.
-                out[y, x, i] = (table[k, i, 0] * r + table[k, i, 1] * g) + table[k, i, 2] * b
+            # einsum's float32 accumulation, left to right.
+            v0 = (table[k, 0, 0] * r + table[k, 0, 1] * g) + table[k, 0, 2] * b
+            v1 = (table[k, 1, 0] * r + table[k, 1, 1] * g) + table[k, 1, 2] * b
+            v2 = (table[k, 2, 0] * r + table[k, 2, 1] * g) + table[k, 2, 2] * b
+            if use_post:
+                for i in range(3):
+                    o = (post[i, 0] * v0 + post[i, 1] * v1) + post[i, 2] * v2
+                    out[y, x, i] = o if o > F(0.0) else F(0.0)
+            else:
+                out[y, x, 0] = v0
+                out[y, x, 1] = v1
+                out[y, x, 2] = v2
 
 
 def apply(a: np.ndarray, table: np.ndarray, lut: np.ndarray, workers: int = 12,
-          strip_rows: int = 256) -> np.ndarray:
+          strip_rows: int = 256, post: np.ndarray | None = None) -> np.ndarray:
     """A (..., 3) float32 array through the (1024, 3, 3) table, by row strips
-    on threads (rawnr_simd._run_rows: the kernel is nogil, so they overlap)."""
+    on threads (rawnr_simd._run_rows: the kernel is nogil, so they overlap).
+
+    `post`, a 3x3, is applied to each result and the sum clipped at zero:
+    `np.clip(apply(a) @ post.T, 0, None)` in the frame's one pass."""
     a = np.ascontiguousarray(a, dtype=np.float32)
     shape = a.shape
     # An image goes through as its rows; anything else (a list of pixels, a
@@ -73,11 +88,14 @@ def apply(a: np.ndarray, table: np.ndarray, lut: np.ndarray, workers: int = 12,
     out = np.empty_like(frame)
     table = np.ascontiguousarray(table, dtype=np.float32)
     lut = np.ascontiguousarray(lut, dtype=np.float32)
-    _run_rows(h, lambda r0, r1: _rows(frame, table, lut, r0, r1, out), strip_rows, workers)
+    use_post = post is not None
+    pm = np.ascontiguousarray(post if use_post else np.eye(3), dtype=np.float32)
+    _run_rows(h, lambda r0, r1: _rows(frame, table, lut, r0, r1, out, pm, use_post), strip_rows, workers)
     return out.reshape(shape)
 
 
 def warmup() -> None:
     """Compile the kernel so the first frame does not pay for it."""
-    _rows(np.zeros((1, 2, 3), np.float32), np.zeros((2, 3, 3), np.float32),
-          np.zeros(4, np.float32), 0, 1, np.zeros((1, 2, 3), np.float32))
+    for use_post in (False, True):
+        _rows(np.zeros((1, 2, 3), np.float32), np.zeros((2, 3, 3), np.float32),
+              np.zeros(4, np.float32), 0, 1, np.zeros((1, 2, 3), np.float32), np.eye(3, dtype=np.float32), use_post)
