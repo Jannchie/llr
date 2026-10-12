@@ -115,11 +115,28 @@ export interface RenderParams {
 
 // One brushed region to refill: a polyline in source-normalised coordinates
 // (y down, the decode's orientation; may stray a little past the frame where
-// the brush did) with a radius in units of the frame's long edge. The worker
-// fills each in order (worker erase.py); its limits match these.
-export type EraseStroke = { points: [number, number][]; radius: number; mode?: "heal" };
+// the brush did) with a radius in units of the frame's long edge, plus any
+// further polylines (`more`) painting the same region — one fill brushed in
+// several goes. The worker fills each stroke in order (worker erase.py); its
+// limits match these.
+export type EraseLine = { points: [number, number][]; radius: number };
+export type EraseStroke = EraseLine & { mode?: "heal"; more?: EraseLine[] };
 export const ERASE_MAX_STROKES = 64;
 export const ERASE_MAX_POINTS = 4096;
+export const ERASE_MAX_LINES = 32;
+
+function clampEraseLine(item: unknown): EraseLine | null {
+  if (!item || typeof item !== "object") return null;
+  const { points, radius } = item as { points?: unknown; radius?: unknown };
+  if (typeof radius !== "number" || !(radius > 0 && radius <= 0.5) || !Array.isArray(points)) return null;
+  const pts: [number, number][] = [];
+  for (const p of points.slice(0, ERASE_MAX_POINTS)) {
+    if (Array.isArray(p) && p.length === 2 && p.every((v) => typeof v === "number" && Number.isFinite(v) && v > -1 && v < 2)) {
+      pts.push([p[0] as number, p[1] as number]);
+    }
+  }
+  return pts.length ? { points: pts, radius } : null;
+}
 
 // Keep only well-formed strokes. A malformed one is dropped rather than
 // repaired: a guessed stroke would fill pixels the user never brushed.
@@ -127,16 +144,13 @@ export function clampErase(erase: unknown): EraseStroke[] {
   if (!Array.isArray(erase)) return [];
   const out: EraseStroke[] = [];
   for (const item of erase.slice(0, ERASE_MAX_STROKES)) {
-    if (!item || typeof item !== "object") continue;
-    const { points, radius } = item as { points?: unknown; radius?: unknown };
-    if (typeof radius !== "number" || !(radius > 0 && radius <= 0.5) || !Array.isArray(points)) continue;
-    const pts: [number, number][] = [];
-    for (const p of points.slice(0, ERASE_MAX_POINTS)) {
-      if (Array.isArray(p) && p.length === 2 && p.every((v) => typeof v === "number" && Number.isFinite(v) && v > -1 && v < 2)) {
-        pts.push([p[0] as number, p[1] as number]);
-      }
-    }
-    if (pts.length) out.push((item as { mode?: unknown }).mode === "heal" ? { points: pts, radius, mode: "heal" } : { points: pts, radius });
+    const first = clampEraseLine(item);
+    if (!first) continue;
+    const { mode, more } = item as { mode?: unknown; more?: unknown };
+    const lines = Array.isArray(more)
+      ? more.slice(0, ERASE_MAX_LINES - 1).map(clampEraseLine).filter((l): l is EraseLine => l !== null)
+      : [];
+    out.push({ ...first, ...(mode === "heal" ? { mode: "heal" as const } : {}), ...(lines.length ? { more: lines } : {}) });
   }
   return out;
 }

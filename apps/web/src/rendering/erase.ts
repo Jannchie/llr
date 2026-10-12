@@ -16,22 +16,38 @@
 import { imageNormToTexcoord, sourceNormToImageNorm, type CropState } from "./crop";
 import { LENS_IDENTITY, lensCaFillScale, lensFillScale, lensInterp } from "./lens";
 
-/** One brushed region: a polyline in source-norm coordinates, radius in units
- * of the frame's long edge. `id` is for the panel's list only. */
-export type EraseStroke = { id: string; points: [number, number][]; radius: number; mode?: "heal" };
+/** One polyline in source-norm coordinates, radius in units of the frame's long edge. */
+export type EraseLine = { points: [number, number][]; radius: number };
 
-export const ERASE_MAX_STROKES = 64; // the API's and the worker's limit
+/** One brushed region, filled as one: its first line, plus any further lines
+ * (`more`) brushed into the same region. `id` is for the panel's list only. */
+export type EraseStroke = EraseLine & { id: string; mode?: "heal"; more?: EraseLine[] };
+
+export const ERASE_MAX_STROKES = 64; // the API's and the worker's limits
 export const ERASE_MAX_POINTS = 4096;
+export const ERASE_MAX_LINES = 32;   // lines in one stroke, the first included
+
+const cloneLine = (l: EraseLine): EraseLine => ({ radius: l.radius, points: l.points.map(([u, v]) => [u, v] as [number, number]) });
+
+/** Every line of a stroke, first one first. */
+export function eraseLines(s: EraseLine & { more?: EraseLine[] }): EraseLine[] {
+  return [s, ...(s.more ?? [])];
+}
 
 export function cloneErase(strokes: readonly EraseStroke[]): EraseStroke[] {
-  return strokes.map(s => ({ id: s.id, radius: s.radius, ...(s.mode ? { mode: s.mode } : {}),
-    points: s.points.map(([u, v]) => [u, v] as [number, number]) }));
+  return strokes.map(s => ({ id: s.id, ...cloneLine(s), ...(s.mode ? { mode: s.mode } : {}),
+    ...(s.more?.length ? { more: s.more.map(cloneLine) } : {}) }));
 }
 
 /** What render-linear takes: the strokes without their ids, so renaming nothing
- * and reordering nothing cannot change the worker's cache key. */
-export function eraseWire(strokes: readonly EraseStroke[]): { points: [number, number][]; radius: number; mode?: "heal" }[] {
-  return strokes.map(s => (s.mode === "heal" ? { points: s.points, radius: s.radius, mode: "heal" } : { points: s.points, radius: s.radius }));
+ * and reordering nothing cannot change the worker's cache key. A one-line
+ * stroke goes out exactly as it did before strokes could have more. */
+export function eraseWire(strokes: readonly EraseStroke[]): { points: [number, number][]; radius: number; mode?: "heal"; more?: EraseLine[] }[] {
+  return strokes.map(s => ({
+    points: s.points, radius: s.radius,
+    ...(s.mode === "heal" ? { mode: "heal" as const } : {}),
+    ...(s.more?.length ? { more: s.more.map(l => ({ points: l.points, radius: l.radius })) } : {}),
+  }));
 }
 
 /** The shader's lens warp, as the renderer sets it up (pipeline-renderer

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { defaultCrop, type CropState } from "../crop";
-import { cloneErase, eraseWire, lensForward, lensInverse, lensWarp, strokeToView, viewToStroke } from "../erase";
+import { cloneErase, eraseLines, eraseWire, lensForward, lensInverse, lensWarp, strokeToView, viewToStroke } from "../erase";
 import { LENS_IDENTITY } from "../lens";
 
 // The FE 50-150mm F2 GM at 150mm (lens.spec.ts SONY_DIST): a real pincushion.
@@ -79,5 +79,15 @@ describe("stroke data", () => {
     c[0].points[0][0] = 0.9;
     expect(s[0].points[0][0]).toBe(0.1);
     expect(eraseWire(s)).toEqual([{ points: [[0.1, 0.2]], radius: 0.01 }]);
+  });
+
+  it("carries a stroke's further lines, deep-cloned, and lists them after the first", () => {
+    const s = [{ id: "a", radius: 0.01, points: [[0.1, 0.2]] as [number, number][],
+      more: [{ radius: 0.02, points: [[0.3, 0.4]] as [number, number][] }] }];
+    const c = cloneErase(s);
+    c[0].more![0].points[0][0] = 0.9;
+    expect(s[0].more[0].points[0][0]).toBe(0.3);
+    expect(eraseLines(s[0]).map(l => l.radius)).toEqual([0.01, 0.02]);
+    expect(eraseWire(s)).toEqual([{ points: [[0.1, 0.2]], radius: 0.01, more: [{ points: [[0.3, 0.4]], radius: 0.02 }] }]);
   });
 });

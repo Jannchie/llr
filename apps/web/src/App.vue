@@ -20,7 +20,7 @@ import { API, fetchAiMasks, fetchModelStatus, fetchLinear, fetchRelightGeometry,
 import { type PersistedEdit } from "./edits";
 import { gradingTint, gradingHueDeg } from "./rendering/grading";
 import { parseLensCorr, mixLensTable, LENS_IDENTITY, type LensCorr } from "./rendering/lens";
-import { cloneErase, eraseWire, lensWarp, strokeToView, viewToStroke, ERASE_MAX_POINTS, ERASE_MAX_STROKES, type EraseStroke } from "./rendering/erase";
+import { cloneErase, eraseWire, lensWarp, strokeToView, viewToStroke, ERASE_MAX_LINES, ERASE_MAX_POINTS, ERASE_MAX_STROKES, type EraseStroke } from "./rendering/erase";
 import { rasterBrushes, sameBrushes, type BrushStroke } from "./rendering/brush";
 import { AUX_LAYER } from "./rendering/pipeline-renderer";
 import { cloneRelight, defaultRelight, packRelight, relightActive, RELIGHT_MAX_LIGHTS, LIGHT_KINDS, type RelightGeometry, type RelightState } from "./rendering/relight";
@@ -681,11 +681,36 @@ const eraseStatus = ref<ModelStatus | null>(null);
 // matched and blended in by the worker — no model, near-instant). View state.
 const eraseMode = ref<"fill" | "heal">((localStorage.getItem("llr.eraseMode") as "fill" | "heal" | null) ?? "fill");
 watch(eraseMode, v => localStorage.setItem("llr.eraseMode", v));
+// A generative fill is brushed in as many strokes as it takes and run on
+// demand: strokes collect in a draft (view state — not in the edit, history or
+// the decode) until "Fill" turns the draft into one region, filled as one. The
+// healing brush is near-instant and patches each stroke on its own, so its
+// strokes land straight away.
+const eraseDraft = shallowRef<EraseStroke | null>(null);
+const eraseDraftLines = computed(() => eraseDraft.value ? 1 + (eraseDraft.value.more?.length ?? 0) : 0);
 function addEraseStroke(points: [number, number][], radius: number): void {
   if (erase.length >= ERASE_MAX_STROKES || !points.length) return;
-  erase.push({ id: newMaskId(), points: points.slice(0, ERASE_MAX_POINTS), radius: Math.min(radius, 0.5),
-    ...(eraseMode.value === "heal" ? { mode: "heal" as const } : {}) });
+  const line = { points: points.slice(0, ERASE_MAX_POINTS), radius: Math.min(radius, 0.5) };
+  if (eraseMode.value === "heal") {
+    erase.push({ id: newMaskId(), ...line, mode: "heal" });
+    return;
+  }
+  const d = eraseDraft.value;
+  if (!d) eraseDraft.value = { id: newMaskId(), ...line };
+  else if (eraseDraftLines.value < ERASE_MAX_LINES) eraseDraft.value = { ...d, more: [...(d.more ?? []), line] };
 }
+function commitEraseDraft(): void {
+  const d = eraseDraft.value;
+  if (!d || erase.length >= ERASE_MAX_STROKES) return;
+  eraseDraft.value = null;
+  erase.push(d);
+}
+function undoEraseDraftLine(): void {
+  const d = eraseDraft.value;
+  if (!d) return;
+  eraseDraft.value = d.more?.length ? { ...d, more: d.more.slice(0, -1) } : null;
+}
+function discardEraseDraft(): void { eraseDraft.value = null; }
 function removeErase(id: string): void {
   const i = erase.findIndex(s => s.id === id);
   if (i >= 0) erase.splice(i, 1);
@@ -785,7 +810,7 @@ const {
   onPointerDown: onErasePointerDown, onPointerMove: onErasePointerMove, onPointerUp: onErasePointerUp,
   onPointerLeave: onErasePointerLeave,
 } = useEraseEditor({
-  crop, srcW, srcH, strokes: erase, brush: eraseBrush, ofPerScreen,
+  crop, srcW, srcH, strokes: () => (eraseDraft.value ? [...erase, eraseDraft.value] : erase), brush: eraseBrush, ofPerScreen,
   lens: viewLens,
   onStroke: addEraseStroke,
 });
@@ -1418,6 +1443,8 @@ const editTab = ref<EditTab>((localStorage.getItem("llr.tab") as EditTab | null)
 // The history panel's hover preview: anything that changes what the live state
 // is — a step taken, another photo, another tab — ends it.
 watch([historyIndex, () => activeSource.value?.id, editTab], endHistoryPreview);
+// An unfilled erase draft belongs to the photo it was brushed on.
+watch(() => activeSource.value?.id, discardEraseDraft);
 
 // Where the rail was before the crop editor took it, so Done lands back on the
 // group being edited instead of resetting to Light.
@@ -2243,6 +2270,7 @@ function onKeyDown(e: KeyboardEvent): void {
   // Undo / redo — work regardless of whether an image is loaded
   if ((e.ctrlKey || e.metaKey) && !inEditableText) {
     const k = e.key.toLowerCase();
+    if (k === "z" && !e.shiftKey && eraseDraft.value && editTab.value === "erase") { e.preventDefault(); undoEraseDraftLine(); return; }
     if (k === "z") { e.preventDefault(); if (e.shiftKey) redo(); else undo(); return; }
     if (k === "y") { e.preventDefault(); redo(); return; }
     // Lightroom's copy / paste settings.
@@ -2285,6 +2313,12 @@ function onKeyDown(e: KeyboardEvent): void {
     if (cropMode.value && (e.key === "x" || e.key === "X")) { e.preventDefault(); swapAspect(); return; }
     if (cropMode.value && e.key === "O") { e.preventDefault(); cycleCropGuideVariant(); return; }
     if (cropMode.value && e.key === "o") { e.preventDefault(); cycleCropGuide(); return; }
+  }
+
+  // Erase: Enter fills what the draft has brushed, Esc drops it.
+  if (!inEditableText && eraseDraft.value && editTab.value === "erase" && libraryView.value === "develop" && !cropMode.value) {
+    if (e.key === "Enter") { e.preventDefault(); commitEraseDraft(); return; }
+    if (e.key === "Escape") { e.preventDefault(); discardEraseDraft(); return; }
   }
 
   // Backslash holds the "before" view; release (onKeyUp) restores the edit.
@@ -3863,8 +3897,14 @@ const vWheelAdjust = {
           :viewBox="eraseViewBox" preserveAspectRatio="none"
           @pointerdown="onErasePointerDown" @pointermove="onErasePointerMove" @pointerup="onErasePointerUp"
           @pointerleave="onErasePointerLeave">
-          <template v-for="p in erasePaths" :key="p.id">
-            <path v-if="eraseShowStrokes || eraseHover === p.id" class="erase-stroke" :class="{ 'is-hover': eraseHover === p.id }"
+          <!-- The draft's lines in one translucent group, so where they
+               overlap reads as one region, not as a darker seam. -->
+          <g v-if="eraseDraft" class="erase-draft-layer">
+            <path v-for="p in erasePaths.filter(p => p.id === eraseDraft?.id)" :key="p.key" class="erase-stroke is-draft"
+              :d="p.d" :stroke-width="p.width" />
+          </g>
+          <template v-for="p in erasePaths" :key="p.key">
+            <path v-if="p.id !== eraseDraft?.id && (eraseShowStrokes || eraseHover === p.id)" class="erase-stroke" :class="{ 'is-hover': eraseHover === p.id }"
               :d="p.d" :stroke-width="p.width" />
           </template>
           <path v-if="eraseLivePath" class="erase-stroke is-live" :d="eraseLivePath" :stroke-width="2 * eraseCursorR" />
@@ -4478,6 +4518,13 @@ const vWheelAdjust = {
         <progress v-if="eraseDownloading" class="erase-progress" :value="eraseStatus?.received ?? 0" :max="eraseStatus?.total || 1" />
         <button v-if="eraseStatus?.reason === 'models-missing' && eraseStatus.detail" class="ghost" type="button" @click="refreshEraseStatus(true)">{{ t('erase.retryDownload') }}</button>
         <SliderRow v-model="eraseBrush" :label="t('erase.brush')" :min="4" :max="200" :reset-value="24" />
+        <!-- The fill being brushed: its strokes so far, and the button that runs it. -->
+        <div class="erase-draft" v-if="eraseMode === 'fill' || eraseDraft">
+          <span class="erase-draft-count">{{ eraseDraft ? t('erase.draft', { n: eraseDraftLines }) : t('erase.draftEmpty') }}</span>
+          <button class="ghost" type="button" :disabled="!eraseDraft" :title="t('erase.discardHint')" @click="discardEraseDraft">{{ t('erase.discard') }}</button>
+          <button class="primary" type="button" :disabled="!eraseDraft || erase.length >= ERASE_MAX_STROKES"
+            :title="t('erase.fillHint')" @click="commitEraseDraft">{{ t('erase.fill') }}</button>
+        </div>
         <div class="control-row">
           <label class="control-label" for="erase-strokes">{{ t('erase.showStrokes') }}</label>
           <label class="switch">

@@ -1,3 +1,4 @@
+import json
 import os
 
 import numpy as np
@@ -211,3 +212,23 @@ def test_heal_stroke_key_keeps_fill_keys():
     assert "heal" not in erase.Stroke(pts, 0.01).key()
     assert erase.Stroke(pts, 0.01, "heal").key() != erase.Stroke(pts, 0.01).key()
     assert erase.parse_strokes([{"points": [[0.5, 0.5]], "radius": 0.01, "mode": "heal"}])[0].mode == "heal"
+
+
+def test_stroke_with_more_lines_is_one_fill_over_all_of_them(tmp_path):
+    s = erase.parse_strokes([{"points": [[0.3, 0.5]], "radius": 0.02,
+                              "more": [{"points": [[0.7, 0.5]], "radius": 0.03}, {"points": [], "radius": 0.1}, "junk"]}])
+    assert s == [erase.Stroke(((0.3, 0.5),), 0.02, "fill", ((((0.7, 0.5),), 0.03),))]
+    x0, _, x1, _ = erase.region_for(s[0], 600, 400)
+    assert x0 <= 0.3 * 600 - 12 and x1 >= 0.7 * 600 + 18
+    mask = erase.stroke_mask(s[0], 600, 400, (0, 0, 600, 400))
+    assert mask[200, 180] and mask[200, 420] and not mask[200, 300]
+    eng = FakeEngine()
+    erase.apply_erase(frame(), s, ("photo", 9), tmp_path, engine=eng)
+    assert eng.calls == 1
+
+
+def test_more_lines_change_the_key_but_a_single_line_keeps_its_own():
+    pts = ((0.5, 0.5),)
+    single = erase.Stroke(pts, 0.01)
+    assert single.key() == json.dumps([[0.5, 0.5], 0.01])
+    assert erase.Stroke(pts, 0.01, "fill", ((((0.6, 0.5),), 0.01),)).key() != single.key()
