@@ -14,9 +14,9 @@ import threading
 import traceback
 from collections import OrderedDict
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +27,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from . import ai_masks as ai_module
 from . import denoise as denoise_module
 from . import erase as erase_module
+from . import fastcopy
 from . import relight as relight_module
 from .catalog_meta import catalog_meta_from_exif
 from .creative_style import normalize_style
@@ -40,6 +41,7 @@ from .denoise import (
 )
 from .fit_profile import camera_match_path, libraw_wb_kwargs, postprocess_camera_native
 from .imported import decode_image_linear
+from .model_fetch import cache_root
 from .sony import (
     NO_TWEAKS,
     LookTweaks,
@@ -137,8 +139,9 @@ class RawMetadata:
     # the same reason as dro_gain — it is the only point the RAW is open — but
     # it costs a pass over the Bayer data, so it is only built when there is a
     # curve to index with it. None means the shader falls back to the global
-    # approximation.
-    dro_grid: dict[str, Any] | None = None
+    # approximation. Straight out of read_raw_metadata it may still be a Future
+    # (dro_grid_soon); prepare_linear settles it before anything reads it.
+    dro_grid: dict[str, Any] | Future[dict[str, Any] | None] | None = None
     # The M/S-size YCbCr frame's white-balance ratio (sony/sr2.ycc_wb_scale),
     # which Imaging Edge multiplies into the camera's WB and LibRaw does not
     # know about. None for a mosaic frame. Read here because the tag is the
@@ -355,7 +358,33 @@ def _warm_kernels() -> None:
             sys.stderr.flush()
 
 
+def _opt_out_of_power_throttling() -> None:
+    """Ask Windows not to run this process as background work (EcoQoS).
+
+    The daemon is spawned by the API with no window, so Windows 11 classes it
+    as background and, a few seconds into a sustained load, throttles it onto
+    efficiency settings: on a 12900K a demosaic that takes 1.1 s fresh settles
+    at 2.5 s within three frames, at an unchanged clock. Every decode is
+    something the user is waiting on, so the daemon opts out once at start.
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    class _ThrottlingState(ctypes.Structure):
+        _fields_ = [("Version", wintypes.ULONG), ("ControlMask", wintypes.ULONG), ("StateMask", wintypes.ULONG)]
+
+    # ProcessPowerThrottling = 4; control EXECUTION_SPEED (1), state 0 = never throttle it
+    state = _ThrottlingState(1, 1, 0)
+    kernel32 = ctypes.windll.kernel32
+    kernel32.SetProcessInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    if not kernel32.SetProcessInformation(kernel32.GetCurrentProcess(), 4, ctypes.byref(state), ctypes.sizeof(state)):
+        sys.stderr.write("could not opt out of power throttling; decodes may slow under sustained load\n")
+
+
 def run_daemon(root: Path) -> None:
+    _opt_out_of_power_throttling()
     sys.stderr.write("llr-worker daemon ready\n")
     sys.stderr.flush()
     threading.Thread(target=_warm_kernels, name="kernel-warmup", daemon=True).start()
@@ -580,6 +609,45 @@ def dro_grid_cached(input_path: Path, exif: dict[str, Any],
     return value
 
 
+class _MosaicSnapshot:
+    """A rawpy handle seen through a copy of its mosaic, for a reader on another thread.
+
+    The RAW-domain denoiser rewrites the handle's mosaic in place while the
+    DRO grid is still binning it; the grid has to see the RAW as read.
+    """
+
+    def __init__(self, raw: rawpy.RawPy) -> None:
+        self._raw = raw
+        self.raw_image = fastcopy.contiguous(raw.raw_image)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._raw, name)
+
+
+_DRO_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dro-grid")
+
+
+def dro_grid_soon(input_path: Path, exif: dict[str, Any], raw: rawpy.RawPy) -> Any:
+    """dro_grid_cached, started on its own thread unless the cache already has it.
+
+    The grid is a quarter of a second of single-threaded binning that nothing
+    needs until the colour stage, so a decode starts it here and runs its
+    denoise and demosaic meanwhile. Returns the grid, or a Future of it;
+    _settle_dro_grid turns the metadata holding it back into a plain one.
+    """
+    key = _file_stamp(input_path)
+    with _CACHE_LOCK:
+        if key in _DRO_GRID_CACHE:
+            _DRO_GRID_CACHE.move_to_end(key)
+            return _DRO_GRID_CACHE[key]
+    return _DRO_POOL.submit(dro_grid_cached, input_path, exif, _MosaicSnapshot(raw))
+
+
+def _settle_dro_grid(metadata: RawMetadata) -> RawMetadata:
+    grid = metadata.dro_grid
+    return replace(metadata, dro_grid=grid.result()) if isinstance(grid, Future) else metadata
+
+
 def _write_linear_f16(linear_arr: np.ndarray, output_path: Path) -> int:
     """Write scene-linear pixels as float16, halving the transfer size.
 
@@ -588,7 +656,7 @@ def _write_linear_f16(linear_arr: np.ndarray, output_path: Path) -> int:
     below sensor noise for 12-14-bit RAW data. The in-memory caches stay
     float32 so repeated DCP/denoise blends never accumulate quantisation.
     """
-    out = linear_arr.astype(np.float16)
+    out = fastcopy.contiguous(linear_arr, np.float16)
     with open(output_path, "wb") as f:
         out.tofile(f)
     return out.nbytes
@@ -807,27 +875,30 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     # every return below, denoising on or off, so the answer cannot flip with
     # the toggle. Sony's own filter has no such control; the wavelet does.
     dn_uses_chroma = file_model is not None and model_uses_chroma(file_model)
-    if dn_auto and file_model is not None:
-        iso = _exif_int(read_exiftool_metadata(input_path).get("ISO"))
-        # An unreadable ISO leaves the request alone rather than silently
-        # denoising at four tenths -- guessing here would be invisible.
-        if iso:
-            if file_model == "sony":
-                dn_strength = iso_strength(float(iso))
-            else:
-                dn_amount = iso_strength(float(iso))
-    elif file_model == "sony":
+    if file_model == "sony":
         # Edit's manual panel, measured at export: its default amount of 50 is
         # Auto to the bit, and the ISO write-back applies at every amount. The
         # amount itself goes to the filter -- it rebuilds the thresholds and
         # the blend weight (denoise.py SonyRawNRDenoiser, verified bit for bit
         # at 75 and 100) -- never onto a blend of two decodes; 0 is off because
         # a zeroed table admits no neighbour, so it need not decode at all.
+        #
+        # `auto` is ignored here, not honoured: Auto *is* this panel at 50, and
+        # the browser cannot know a frame is Sony's until its first decode
+        # answers, so that first request still says auto. Taking it would blend
+        # a noisy decode back in by the slider's amount — twice the work, half
+        # the denoise, and a cache key no later request for the frame matches.
         iso = _exif_int(read_exiftool_metadata(input_path).get("ISO"))
         if iso:
             dn_strength = iso_strength(float(iso))
             dn_amount_ui = dn_amount * 100.0
             dn_amount = 1.0 if dn_amount_ui > 0.0 else 0.0
+    elif dn_auto and file_model is not None:
+        iso = _exif_int(read_exiftool_metadata(input_path).get("ISO"))
+        # An unreadable ISO leaves the request alone rather than silently
+        # denoising at four tenths -- guessing here would be invisible.
+        if iso:
+            dn_amount = iso_strength(float(iso))
     # Forcing denoise off here for a rendered image (rather than no-op'ing
     # deeper) keeps the two-decode blend below from decoding an identical image
     # twice.
@@ -1807,6 +1878,7 @@ def prepare_linear(
             linear = apply_camera_crop(linear, metadata.camera_crop)
             if max_size:
                 linear = downsample_linear(linear, max_size)
+            metadata = _settle_dro_grid(metadata)
             color_profile = libraw_color_profile_info()
             if store_cache:
                 _remember_pixels(_FALLBACK_CACHE, cache_key, (linear, metadata, color_profile), _FALLBACK_CACHE_BYTES_MAX)
@@ -1817,6 +1889,8 @@ def prepare_linear(
                 raise ValueError("Profiled rendering currently supports only three-channel camera RGB data")
             if max_size:
                 camera_rgb = downsample_linear(camera_rgb, max_size)
+            # The grid was binned on its own thread meanwhile (dro_grid_soon).
+            metadata = _settle_dro_grid(metadata)
             # Cache camera RGB so colour-pipeline changes skip RAW re-decode
             if store_cache:
                 _remember_pixels(RAW_CAMERA_CACHE, cache_key, (camera_rgb, metadata), RAW_CAMERA_CACHE_BYTES_MAX)
@@ -1993,7 +2067,7 @@ def apply_camera_crop(
     y1 = min(max(round((y + h) * sy), y0 + 1), ah)
     if x0 == 0 and y0 == 0 and x1 == aw and y1 == ah:
         return arr
-    return np.ascontiguousarray(arr[y0:y1, x0:x1])
+    return fastcopy.contiguous(arr[y0:y1, x0:x1])
 
 
 def read_raw_metadata(input_path: Path, raw: rawpy.RawPy) -> RawMetadata:
@@ -2012,7 +2086,7 @@ def read_raw_metadata(input_path: Path, raw: rawpy.RawPy) -> RawMetadata:
     # Only worth the raw pass when there is a curve for it to index; the RAW
     # being open here is what makes this the cheap place to fill the cache
     # the look-profile path reads from.
-    grid = dro_grid_cached(input_path, exif, raw) if dro_gain else None
+    grid = dro_grid_soon(input_path, exif, raw) if dro_gain else None
     return RawMetadata(
         make=exif.get("Make"),
         model=exif.get("Model"),
@@ -2338,7 +2412,27 @@ def read_exiftool_metadata(input_path: Path) -> dict[str, Any]:
 
 @functools.lru_cache(maxsize=64)
 def _read_exiftool_metadata_cached(path: str, size: int, mtime_ns: int) -> dict[str, Any]:
-    input_path = Path(path)
+    # Kept on disk too: exiftool is a Perl start-up per file, a fifth of a
+    # second ahead of every first decode after the daemon restarts. Keyed by
+    # the file's identity and by this code (the tag list lives here), so a
+    # changed file or a changed list asks exiftool again.
+    digest = hashlib.sha1(repr((_CODE_STAMP, path, size, mtime_ns)).encode()).hexdigest()[:24]
+    disk = cache_root() / "exif" / f"{digest}.json"
+    try:
+        return json.loads(disk.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    out = _run_exiftool(Path(path))
+    if out:
+        with suppress(OSError):
+            disk.parent.mkdir(parents=True, exist_ok=True)
+            tmp = disk.with_suffix(f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(out), encoding="utf-8")
+            os.replace(tmp, disk)
+    return out
+
+
+def _run_exiftool(input_path: Path) -> dict[str, Any]:
     command = detect_exiftool()
     if command is None:
         return {}

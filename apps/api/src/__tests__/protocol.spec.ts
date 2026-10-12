@@ -84,6 +84,13 @@ describe("clampErase", () => {
     const lines = Array.from({ length: ERASE_MAX_LINES + 5 }, () => ({ points: [[0.5, 0.5]], radius: 0.01 }));
     expect(clampErase([{ points: [[0.5, 0.5]], radius: 0.01, more: lines }])[0].more).toHaveLength(ERASE_MAX_LINES - 1);
   });
+
+  it("clamps grow and feather, and leaves a stroke without them as it was", () => {
+    const line = { points: [[0.5, 0.5]], radius: 0.01 };
+    expect(clampErase([{ ...line, grow: 0.2, feather: 0.4 }])).toEqual([{ ...line, grow: 0.2, feather: 0.4 }]);
+    expect(clampErase([{ ...line, grow: 5, feather: -1 }])).toEqual([{ ...line, grow: 1, feather: 0 }]);
+    expect(clampErase([{ ...line, grow: "wide", feather: Number.NaN }])).toEqual([line]);
+  });
 });
 
 describe("clampRenderParams", () => {

@@ -20,12 +20,22 @@ import { LENS_IDENTITY, lensCaFillScale, lensFillScale, lensInterp } from "./len
 export type EraseLine = { points: [number, number][]; radius: number };
 
 /** One brushed region, filled as one: its first line, plus any further lines
- * (`more`) brushed into the same region. `id` is for the panel's list only. */
-export type EraseStroke = EraseLine & { id: string; mode?: "heal"; more?: EraseLine[] };
+ * (`more`) brushed into the same region. `id` is for the panel's list only.
+ * `grow` and `feather` (fractions of the stroke's largest radius) widen the
+ * region past the brush and fade it into the frame; a stroke saved before
+ * they existed has neither and keeps the fixed edge it was filled with. */
+export type EraseStroke = EraseLine & { id: string; mode?: "heal"; more?: EraseLine[]; grow?: number; feather?: number };
 
 export const ERASE_MAX_STROKES = 64; // the API's and the worker's limits
 export const ERASE_MAX_POINTS = 4096;
 export const ERASE_MAX_LINES = 32;   // lines in one stroke, the first included
+export const ERASE_MAX_SOFT = 1;     // grow and feather, each at most the stroke's radius
+
+/** How far past its brush a stroke's fill reaches, in units of the frame's long
+ * edge: grow plus feather, scaled by its largest radius. */
+export function eraseReach(s: EraseLine & { more?: EraseLine[]; grow?: number; feather?: number }): number {
+  return ((s.grow ?? 0) + (s.feather ?? 0)) * Math.max(...eraseLines(s).map(l => l.radius));
+}
 
 const cloneLine = (l: EraseLine): EraseLine => ({ radius: l.radius, points: l.points.map(([u, v]) => [u, v] as [number, number]) });
 
@@ -36,17 +46,21 @@ export function eraseLines(s: EraseLine & { more?: EraseLine[] }): EraseLine[] {
 
 export function cloneErase(strokes: readonly EraseStroke[]): EraseStroke[] {
   return strokes.map(s => ({ id: s.id, ...cloneLine(s), ...(s.mode ? { mode: s.mode } : {}),
-    ...(s.more?.length ? { more: s.more.map(cloneLine) } : {}) }));
+    ...(s.more?.length ? { more: s.more.map(cloneLine) } : {}),
+    ...(s.grow !== undefined ? { grow: s.grow } : {}), ...(s.feather !== undefined ? { feather: s.feather } : {}) }));
 }
 
 /** What render-linear takes: the strokes without their ids, so renaming nothing
  * and reordering nothing cannot change the worker's cache key. A one-line
  * stroke goes out exactly as it did before strokes could have more. */
-export function eraseWire(strokes: readonly EraseStroke[]): { points: [number, number][]; radius: number; mode?: "heal"; more?: EraseLine[] }[] {
+export function eraseWire(strokes: readonly EraseStroke[]): {
+  points: [number, number][]; radius: number; mode?: "heal"; more?: EraseLine[]; grow?: number; feather?: number;
+}[] {
   return strokes.map(s => ({
     points: s.points, radius: s.radius,
     ...(s.mode === "heal" ? { mode: "heal" as const } : {}),
     ...(s.more?.length ? { more: s.more.map(l => ({ points: l.points, radius: l.radius })) } : {}),
+    ...(s.grow !== undefined ? { grow: s.grow } : {}), ...(s.feather !== undefined ? { feather: s.feather } : {}),
   }));
 }
 

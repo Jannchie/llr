@@ -71,6 +71,7 @@ GUIDANCE = 2.0
 MAX_STROKES = 64
 MAX_POINTS = 4096
 MAX_LINES = 32  # polylines in one stroke: the first plus `more`
+MAX_SOFT = 1.0  # grow and feather, each at most the stroke's own radius
 
 # How much of the frame around a stroke the model gets to see, as a fraction of
 # the stroke's own extent on each side. Less starves it of context to continue;
@@ -110,9 +111,25 @@ class Stroke:
     mode: str = "fill"
     # Further polylines painting the same region, each with its own radius.
     more: tuple[Line, ...] = ()
+    # How far past the brush the fill reaches (grow) and over how much more it
+    # fades into the frame (feather), both as fractions of the stroke's largest
+    # radius. None on a stroke from before the two existed: it keeps the fixed
+    # edge it was made with, its cache key, and so its pixels.
+    grow: float | None = None
+    feather: float | None = None
 
     def lines(self) -> tuple[Line, ...]:
         return ((self.points, self.radius), *self.more)
+
+    @property
+    def soft(self) -> bool:
+        """Whether this stroke takes grow / feather (and, as a fill, the colour match)."""
+        return self.grow is not None or self.feather is not None
+
+    def reach(self, width: int, height: int) -> tuple[float, float]:
+        """(grow, feather) in px of a width x height frame."""
+        r = max(radius for _, radius in self.lines()) * max(width, height)
+        return (self.grow or 0.0) * r, (self.feather or 0.0) * r
 
     def extent(self, width: int, height: int) -> tuple[float, float, float, float]:
         """The px box (x0, y0, x1, y1) every line covers, brush included."""
@@ -132,6 +149,8 @@ class Stroke:
         pts = [[round(x, 5), round(y, 5)] for x, y in self.points] + [round(self.radius, 5)]
         if self.more:
             pts.append([[[round(x, 5), round(y, 5)] for x, y in line] + [round(r, 5)] for line, r in self.more])
+        if self.soft:
+            pts.append(["soft", round(self.grow or 0.0, 3), round(self.feather or 0.0, 3)])
         return json.dumps([*pts, "heal"] if self.mode == "heal" else pts)
 
 
@@ -164,8 +183,18 @@ def parse_strokes(raw: Any) -> list[Stroke]:
             line = _parse_line(extra.get("points"), extra.get("radius")) if isinstance(extra, dict) else None
             if line is not None:
                 more.append(line)
-        out.append(Stroke(first[0], first[1], "heal" if item.get("mode") == "heal" else "fill", tuple(more)))
+        grow, feather = _fraction(item.get("grow")), _fraction(item.get("feather"))
+        soft = grow is not None or feather is not None
+        out.append(Stroke(first[0], first[1], "heal" if item.get("mode") == "heal" else "fill", tuple(more),
+                          (grow or 0.0) if soft else None, (feather or 0.0) if soft else None))
     return out
+
+
+def _fraction(value: Any) -> float | None:
+    """A grow / feather amount: a finite number, clamped to [0, MAX_SOFT]; else absent."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value):
+        return None
+    return float(min(max(value, 0.0), MAX_SOFT))
 
 
 # ── Tone map: scene-linear ProPhoto <-> display sRGB the model can read ──
@@ -273,13 +302,18 @@ def start_download() -> dict[str, Any]:
 # ── Geometry ──
 
 
-def stroke_mask(stroke: Stroke, width: int, height: int, box: tuple[int, int, int, int]) -> np.ndarray:
-    """The stroke rasterised over `box` (x0, y0, x1, y1 in px of a width x height frame)."""
+def stroke_mask(stroke: Stroke, width: int, height: int, box: tuple[int, int, int, int],
+                extra: float = 0.0) -> np.ndarray:
+    """The stroke rasterised over `box` (x0, y0, x1, y1 in px of a width x height frame).
+
+    `extra` px widen every line — the stroke dilated by a disc, exactly, since
+    a brushed line is the set of points within its radius of the polyline.
+    """
     x0, y0, x1, y1 = box
     img = Image.new("L", (x1 - x0, y1 - y0), 0)
     draw = ImageDraw.Draw(img)
     for line, radius in stroke.lines():
-        r = radius * max(width, height)
+        r = radius * max(width, height) + extra
         pts = [(u * width - x0, v * height - y0) for u, v in line]
         if len(pts) > 1:
             draw.line(pts, fill=255, width=max(1, round(2 * r)), joint="curve")
@@ -291,6 +325,8 @@ def stroke_mask(stroke: Stroke, width: int, height: int, box: tuple[int, int, in
 def region_for(stroke: Stroke, width: int, height: int) -> tuple[int, int, int, int]:
     """A square-as-possible box around the stroke with context, inside the frame."""
     bx0, by0, bx1, by1 = stroke.extent(width, height)
+    pad = sum(stroke.reach(width, height))   # the region the fill may touch, not just the brush
+    bx0, by0, bx1, by1 = bx0 - pad, by0 - pad, bx1 + pad, by1 + pad
     side = max(bx1 - bx0, by1 - by0) * (1 + 2 * CONTEXT)
     side = max(side, MIN_REGION * max(width, height))
     cx, cy = (bx0 + bx1) / 2, (by0 + by1) / 2
@@ -350,6 +386,53 @@ def _save_patch(path: Path, p: Patch) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def _blur(a: np.ndarray, sigma: float) -> np.ndarray:
+    """A float Gaussian (three box passes) over the first two axes, edges clamped.
+
+    The box widths mix two neighbouring odd sizes so the three passes' variance
+    lands on sigma^2 (Kovesi's scheme) rather than wherever one odd width does.
+    """
+    if sigma < 0.3:
+        return a.astype(np.float32)
+    n = 3
+    lo = int(np.sqrt(12 * sigma * sigma / n + 1))
+    lo -= 1 - lo % 2   # the largest odd width at or under the ideal
+    m = round((12 * sigma * sigma - n * lo * lo - 4 * n * lo - 3 * n) / (-4 * lo - 4))
+    widths = [lo if i < m else lo + 2 for i in range(n)]
+    out = a.astype(np.float64)
+    for axis in (0, 1):
+        for w in widths:
+            pad = [(0, 0)] * out.ndim
+            pad[axis] = (w // 2 + 1, w // 2)
+            c = np.cumsum(np.pad(out, pad, mode="edge"), axis=axis)
+            out = np.take(c, np.arange(w, c.shape[axis]), axis=axis) - np.take(c, np.arange(0, c.shape[axis] - w), axis=axis)
+            out /= w
+    return out.astype(np.float32)
+
+
+def match_surroundings(fill: np.ndarray, original: np.ndarray, hole: np.ndarray, radius: float) -> np.ndarray:
+    """`fill` (linear) corrected so its low frequencies meet `original` at the hole's edge.
+
+    The model paints on a tone-mapped 512 px picture, so its fill can sit a
+    shade or a cast away from the frame around it — a seam no feather hides,
+    only widens. Outside the hole the fill is the model's re-rendering of
+    pixels the frame already has, so their ratio there says how far off it is.
+    That ratio, low-passed (texture is the model's to keep) and carried into
+    the hole as a membrane, is the same correction the healing brush applies.
+    """
+    known = (~hole).astype(np.float32)
+    if known.sum() == 0 or hole.sum() == 0:
+        return fill
+    ratio = np.log(np.maximum(original, 1e-5)) - np.log(np.maximum(fill, 1e-5))
+    sigma = max(1.5, 0.25 * radius)
+    weight = _blur(known, sigma)
+    low = _blur(ratio * known[..., None], sigma) / np.maximum(weight, 1e-6)[..., None]
+    membrane = _push_pull(low, (weight > 0.05).astype(np.float32) * known)
+    for _ in range(2):
+        membrane = np.where(hole[..., None], _blur3(membrane), membrane)
+    return np.clip(fill * np.exp(np.clip(membrane, -4, 4)), 0, None).astype(np.float32)
+
+
 def make_patch(frame: np.ndarray, stroke: Stroke, k: float, seed: int, engine: Any) -> Patch:
     """Fill one stroke on `frame` (H x W x 3 linear). `engine.fill` is the model call."""
     height, width = frame.shape[:2]
@@ -363,11 +446,17 @@ def make_patch(frame: np.ndarray, stroke: Stroke, k: float, seed: int, engine: A
     # bytes, not detail, so the patch stays at this size too.
     f = min(1.0, MODEL_SIZE / max(rw, rh))
     sw, sh = max(1, round(rw * f)), max(1, round(rh * f))
-    mask = stroke_mask(stroke, width, height, box).astype(np.float32)
+    grow, feather = stroke.reach(width, height)
+    mask = stroke_mask(stroke, width, height, box, grow).astype(np.float32)
+    # Where the feather is centred: half of it past the grown edge, so the fade
+    # runs from that edge outwards and never into what the fill replaces.
+    reach = stroke_mask(stroke, width, height, box, grow + feather / 2).astype(np.float32) if stroke.soft else None
     region = frame[y0:y1, x0:x1]
     if f < 1:
         region = _resize(region, (sw, sh), Image.Resampling.BOX)
         mask = _resize(mask, (sw, sh), Image.Resampling.BOX)
+        if reach is not None:
+            reach = _resize(reach, (sw, sh), Image.Resampling.BOX)
     sq_img, (py, px) = _square(to_display(region, k))
     sq_mask, _ = _square(mask)
     n = sq_img.shape[0]
@@ -379,11 +468,23 @@ def make_patch(frame: np.ndarray, stroke: Stroke, k: float, seed: int, engine: A
     m512 = np.asarray(Image.fromarray(m512.astype(np.uint8) * 255).filter(ImageFilter.MaxFilter(5))) > 127
     out512 = engine.fill(img512, m512, seed)
     filled = out512 if n == MODEL_SIZE else _resize(out512, (n, n), Image.Resampling.LANCZOS)
-    alpha = _resize(m512.astype(np.float32), (n, n), Image.Resampling.BILINEAR)
-    alpha = np.asarray(Image.fromarray((np.clip(alpha, 0, 1) * 255).astype(np.uint8)).filter(
-        ImageFilter.GaussianBlur(max(1.0, n / 256)))).astype(np.float32) / 255
+    hole = np.clip(_resize(m512.astype(np.float32), (n, n), Image.Resampling.BILINEAR), 0, 1)
+    if reach is None:   # blurred on the padded square, before the crop, as these fills always were
+        alpha = np.asarray(Image.fromarray((hole * 255).astype(np.uint8)).filter(
+            ImageFilter.GaussianBlur(max(1.0, n / 256)))).astype(np.float32) / 255
+        alpha = alpha[py:py + sh, px:px + sw]
     filled = filled[py:py + sh, px:px + sw]
-    alpha = alpha[py:py + sh, px:px + sw]
+    hole = hole[py:py + sh, px:px + sw]
+    linear = from_display(np.clip(filled, 0, 1), k)
+    if reach is not None:
+        r = max(radius for _, radius in stroke.lines()) * max(width, height) * f
+        linear = match_surroundings(linear, region, hole > 0.5, r)
+        # 1 over everything the model drew, then a fade over `feather` px:
+        # a disc dilation by half of it, blurred by a sixth (three sigma
+        # either side of the dilated edge spans the whole feather, so the
+        # fade is done by the time it reaches grow + feather).
+        alpha = _blur(np.clip(reach, 0, 1), feather * f / 6)
+        alpha = np.maximum(alpha, hole)
     # Keep only the part the fill actually covers: the context around it was
     # for the model to read, and blending it back would cost time for nothing.
     ys, xs = np.nonzero(alpha > 1 / 255)
@@ -391,14 +492,14 @@ def make_patch(frame: np.ndarray, stroke: Stroke, k: float, seed: int, engine: A
         ty0, ty1, tx0, tx1 = int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
     else:
         ty0, ty1, tx0, tx1 = 0, sh, 0, sw
-    filled, alpha = filled[ty0:ty1, tx0:tx1], alpha[ty0:ty1, tx0:tx1]
+    linear, alpha = linear[ty0:ty1, tx0:tx1], alpha[ty0:ty1, tx0:tx1]
     sx, sy = rw / sw, rh / sh
     norm_box = ((x0 + tx0 * sx) / width, (y0 + ty0 * sy) / height, (x0 + tx1 * sx) / width, (y0 + ty1 * sy) / height)
     # A region smaller than the model's input was filled at the frame's own
     # resolution, so a larger frame later could give it more pixels: remember
     # how large this one was. Otherwise 0 — 512 px a side is all the fill has.
     limited = max(width, height) if f == 1 and max(rw, rh) < MODEL_SIZE else 0
-    return Patch(norm_box, from_display(np.clip(filled, 0, 1), k), alpha, limited)
+    return Patch(norm_box, linear, alpha, limited)
 
 
 # ── Heal: a nearby patch, matched and blended — no model ──
@@ -438,7 +539,8 @@ def make_heal_patch(frame: np.ndarray, stroke: Stroke) -> Patch:
     height, width = frame.shape[:2]
     r = max(radius for _, radius in stroke.lines()) * max(width, height)
     ex0, ey0, ex1, ey1 = stroke.extent(width, height)   # brush included, so the margin is the rest
-    margin = 0.5 * r + 4
+    grow, feather = stroke.reach(width, height)
+    margin = 0.5 * r + 4 + grow + feather
     bx0, by0 = max(0, int(ex0 - margin)), max(0, int(ey0 - margin))
     bx1, by1 = min(width, int(ex1 + margin) + 1), min(height, int(ey1 + margin) + 1)
     box = (bx0, by0, bx1, by1)
@@ -449,11 +551,14 @@ def make_heal_patch(frame: np.ndarray, stroke: Stroke) -> Patch:
         reg = frame[y0:y0 + rh, x0:x0 + rw].astype(np.float32)
         return reg if f == 1 else _resize(reg, (max(1, round(rw * f)), max(1, round(rh * f))), Image.Resampling.BOX)
 
-    mask = stroke_mask(stroke, width, height, box).astype(np.float32)
+    mask = stroke_mask(stroke, width, height, box, grow).astype(np.float32)
+    reach = stroke_mask(stroke, width, height, box, grow + feather / 2).astype(np.float32) if stroke.soft else None
     target = region(bx0, by0)
     sh, sw = target.shape[:2]
     if f < 1:
         mask = _resize(mask, (sw, sh), Image.Resampling.BOX)
+        if reach is not None:
+            reach = _resize(reach, (sw, sh), Image.Resampling.BOX)
     hole = mask > 0.05
     grow = max(2, round(0.6 * r * f))
     ring = (np.asarray(Image.fromarray(hole.astype(np.uint8) * 255).filter(ImageFilter.MaxFilter(2 * min(grow, 25) + 1))) > 127) & ~hole
@@ -488,8 +593,11 @@ def make_heal_patch(frame: np.ndarray, stroke: Stroke) -> Patch:
     for _ in range(2):   # smooth the coarse levels' blockiness inside the hole
         membrane = np.where(hole[..., None], _blur3(membrane), membrane)
     healed = best * np.exp(np.clip(membrane, -6, 6))
-    alpha = np.asarray(Image.fromarray((np.clip(mask, 0, 1) * 255).astype(np.uint8)).filter(
-        ImageFilter.GaussianBlur(max(1.0, 0.15 * r * f)))).astype(np.float32) / 255
+    if reach is None:
+        alpha = np.asarray(Image.fromarray((np.clip(mask, 0, 1) * 255).astype(np.uint8)).filter(
+            ImageFilter.GaussianBlur(max(1.0, 0.15 * r * f)))).astype(np.float32) / 255
+    else:   # the fade over `feather` past the grown edge, as make_patch does it
+        alpha = _blur(np.clip(reach, 0, 1), feather * f / 6)
     alpha = np.maximum(alpha, mask)
     norm_box = (bx0 / width, by0 / height, bx1 / width, by1 / height)
     return Patch(norm_box, np.clip(healed, 0, None).astype(np.float32), alpha, 0)

@@ -118,12 +118,15 @@ export interface RenderParams {
 // the brush did) with a radius in units of the frame's long edge, plus any
 // further polylines (`more`) painting the same region — one fill brushed in
 // several goes. The worker fills each stroke in order (worker erase.py); its
-// limits match these.
+// limits match these. `grow` and `feather` (fractions of the stroke's largest
+// radius) widen the filled region and fade it out; a stroke without them keeps
+// the fixed edge it was made with.
 export type EraseLine = { points: [number, number][]; radius: number };
-export type EraseStroke = EraseLine & { mode?: "heal"; more?: EraseLine[] };
+export type EraseStroke = EraseLine & { mode?: "heal"; more?: EraseLine[]; grow?: number; feather?: number };
 export const ERASE_MAX_STROKES = 64;
 export const ERASE_MAX_POINTS = 4096;
 export const ERASE_MAX_LINES = 32;
+export const ERASE_MAX_SOFT = 1;
 
 function clampEraseLine(item: unknown): EraseLine | null {
   if (!item || typeof item !== "object") return null;
@@ -138,6 +141,10 @@ function clampEraseLine(item: unknown): EraseLine | null {
   return pts.length ? { points: pts, radius } : null;
 }
 
+function clampSoft(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? Math.min(ERASE_MAX_SOFT, Math.max(0, value)) : undefined;
+}
+
 // Keep only well-formed strokes. A malformed one is dropped rather than
 // repaired: a guessed stroke would fill pixels the user never brushed.
 export function clampErase(erase: unknown): EraseStroke[] {
@@ -146,11 +153,15 @@ export function clampErase(erase: unknown): EraseStroke[] {
   for (const item of erase.slice(0, ERASE_MAX_STROKES)) {
     const first = clampEraseLine(item);
     if (!first) continue;
-    const { mode, more } = item as { mode?: unknown; more?: unknown };
+    const { mode, more, grow, feather } = item as { mode?: unknown; more?: unknown; grow?: unknown; feather?: unknown };
     const lines = Array.isArray(more)
       ? more.slice(0, ERASE_MAX_LINES - 1).map(clampEraseLine).filter((l): l is EraseLine => l !== null)
       : [];
-    out.push({ ...first, ...(mode === "heal" ? { mode: "heal" as const } : {}), ...(lines.length ? { more: lines } : {}) });
+    const soft = { grow: clampSoft(grow), feather: clampSoft(feather) };
+    out.push({
+      ...first, ...(mode === "heal" ? { mode: "heal" as const } : {}), ...(lines.length ? { more: lines } : {}),
+      ...(soft.grow !== undefined ? { grow: soft.grow } : {}), ...(soft.feather !== undefined ? { feather: soft.feather } : {}),
+    });
   }
   return out;
 }

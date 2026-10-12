@@ -223,7 +223,17 @@ def _decrypted_sr2(path: str | Path) -> tuple[bytes, int, str]:
     Decryption covers the entire block at once, so callers wanting several tags
     do this once and then walk the result. Raises KeyError when the file is not
     a Sony RAW carrying an SR2Private IFD.
+
+    One decode asks for half a dozen of these tags, each through here, and each
+    used to read and decrypt the whole file again (0.15 s a frame together), so
+    the result is kept for the last couple of files by their identity.
     """
+    st = Path(path).stat()
+    return _decrypted_sr2_cached(str(path), st.st_size, st.st_mtime_ns)
+
+
+@lru_cache(maxsize=2)
+def _decrypted_sr2_cached(path: str, size: int, mtime: int) -> tuple[bytes, int, str]:
     buf = Path(path).read_bytes()
     if buf[:2] == b"II":
         endian = "<"

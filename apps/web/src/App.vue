@@ -671,6 +671,19 @@ function resetMasks(): void { masks.splice(0); selectedMask.value = null; }
 const erase = reactive<EraseStroke[]>([]);
 const eraseBrush = ref(Number(localStorage.getItem("llr.eraseBrush")) || 24);
 watch(eraseBrush, v => localStorage.setItem("llr.eraseBrush", String(v)));
+// How far past the brush a new stroke's fill reaches and how softly it fades
+// out, in percent of its radius. View state, stamped onto each stroke as it is
+// committed (a fill) or lands (a heal); a committed stroke keeps its own and
+// can be retuned from the list.
+const eraseGrow = ref(storedPercent("llr.eraseGrow", 15));
+const eraseFeather = ref(storedPercent("llr.eraseFeather", 35));
+watch(eraseGrow, v => localStorage.setItem("llr.eraseGrow", String(v)));
+watch(eraseFeather, v => localStorage.setItem("llr.eraseFeather", String(v)));
+function storedPercent(key: string, fallback: number): number {
+  const v = Number(localStorage.getItem(key) ?? NaN);
+  return Number.isFinite(v) ? Math.min(100, Math.max(0, v)) : fallback;
+}
+const eraseSoft = () => ({ grow: eraseGrow.value / 100, feather: eraseFeather.value / 100 });
 const eraseShowStrokes = ref(false);
 const eraseHover = ref<string | null>(null);
 const eraseBusy = ref(false);
@@ -692,7 +705,7 @@ function addEraseStroke(points: [number, number][], radius: number): void {
   if (erase.length >= ERASE_MAX_STROKES || !points.length) return;
   const line = { points: points.slice(0, ERASE_MAX_POINTS), radius: Math.min(radius, 0.5) };
   if (eraseMode.value === "heal") {
-    erase.push({ id: newMaskId(), ...line, mode: "heal" });
+    erase.push({ id: newMaskId(), ...line, mode: "heal", ...eraseSoft() });
     return;
   }
   const d = eraseDraft.value;
@@ -703,7 +716,7 @@ function commitEraseDraft(): void {
   const d = eraseDraft.value;
   if (!d || erase.length >= ERASE_MAX_STROKES) return;
   eraseDraft.value = null;
-  erase.push(d);
+  erase.push({ ...d, ...eraseSoft() });
 }
 function undoEraseDraftLine(): void {
   const d = eraseDraft.value;
@@ -714,6 +727,30 @@ function discardEraseDraft(): void { eraseDraft.value = null; }
 function removeErase(id: string): void {
   const i = erase.findIndex(s => s.id === id);
   if (i >= 0) erase.splice(i, 1);
+}
+// Retuning a committed stroke's grow / feather from its row. Every change
+// re-runs that fill (and any after it), so a drag is held here and lands once
+// the slider rests; the row shows the held value meanwhile.
+const eraseOpen = ref<string | null>(null);
+const erasePending = reactive<Record<string, { grow?: number; feather?: number }>>({});
+let erasePendingTimer: number | undefined;
+function eraseParam(s: EraseStroke, key: "grow" | "feather"): number {
+  return Math.round((erasePending[s.id]?.[key] ?? s[key] ?? 0) * 100);
+}
+function setEraseParam(id: string, key: "grow" | "feather", percent: number): void {
+  erasePending[id] = { ...erasePending[id], [key]: percent / 100 };
+  window.clearTimeout(erasePendingTimer);
+  erasePendingTimer = window.setTimeout(flushEraseParams, 450);
+}
+function flushEraseParams(): void {
+  window.clearTimeout(erasePendingTimer);
+  for (const [id, held] of Object.entries(erasePending)) {
+    const i = erase.findIndex(s => s.id === id);
+    // A stroke from before grow/feather takes both at once, from 0: one of
+    // them alone would still switch it to the soft edge.
+    if (i >= 0) erase[i] = { ...erase[i], grow: held.grow ?? erase[i].grow ?? 0, feather: held.feather ?? erase[i].feather ?? 0 };
+    delete erasePending[id];
+  }
 }
 function resetErase(): void { erase.splice(0); }
 
@@ -810,7 +847,9 @@ const {
   onPointerDown: onErasePointerDown, onPointerMove: onErasePointerMove, onPointerUp: onErasePointerUp,
   onPointerLeave: onErasePointerLeave,
 } = useEraseEditor({
-  crop, srcW, srcH, strokes: () => (eraseDraft.value ? [...erase, eraseDraft.value] : erase), brush: eraseBrush, ofPerScreen,
+  crop, srcW, srcH, brush: eraseBrush, ofPerScreen,
+  // The draft is drawn with the grow / feather it will be committed with.
+  strokes: () => (eraseDraft.value ? [...erase, { ...eraseDraft.value, ...eraseSoft() }] : erase),
   lens: viewLens,
   onStroke: addEraseStroke,
 });
@@ -3899,13 +3938,20 @@ const vWheelAdjust = {
           @pointerleave="onErasePointerLeave">
           <!-- The draft's lines in one translucent group, so where they
                overlap reads as one region, not as a darker seam. -->
+          <!-- Under each: how far the fill may reach once grown and feathered. -->
+          <g v-if="eraseDraft" class="erase-reach-layer">
+            <path v-for="p in erasePaths.filter(p => p.id === eraseDraft?.id)" :key="p.key" class="erase-stroke is-draft"
+              :d="p.d" :stroke-width="p.reachWidth" />
+          </g>
           <g v-if="eraseDraft" class="erase-draft-layer">
             <path v-for="p in erasePaths.filter(p => p.id === eraseDraft?.id)" :key="p.key" class="erase-stroke is-draft"
               :d="p.d" :stroke-width="p.width" />
           </g>
           <template v-for="p in erasePaths" :key="p.key">
-            <path v-if="p.id !== eraseDraft?.id && (eraseShowStrokes || eraseHover === p.id)" class="erase-stroke" :class="{ 'is-hover': eraseHover === p.id }"
-              :d="p.d" :stroke-width="p.width" />
+            <template v-if="p.id !== eraseDraft?.id && (eraseShowStrokes || eraseHover === p.id)">
+              <path v-if="eraseHover === p.id" class="erase-stroke is-reach" :d="p.d" :stroke-width="p.reachWidth" />
+              <path class="erase-stroke" :class="{ 'is-hover': eraseHover === p.id }" :d="p.d" :stroke-width="p.width" />
+            </template>
           </template>
           <path v-if="eraseLivePath" class="erase-stroke is-live" :d="eraseLivePath" :stroke-width="2 * eraseCursorR" />
           <circle v-if="eraseCursor" class="erase-cursor" :cx="eraseCursor.x" :cy="eraseCursor.y" :r="eraseCursorR" />
@@ -4518,6 +4564,8 @@ const vWheelAdjust = {
         <progress v-if="eraseDownloading" class="erase-progress" :value="eraseStatus?.received ?? 0" :max="eraseStatus?.total || 1" />
         <button v-if="eraseStatus?.reason === 'models-missing' && eraseStatus.detail" class="ghost" type="button" @click="refreshEraseStatus(true)">{{ t('erase.retryDownload') }}</button>
         <SliderRow v-model="eraseBrush" :label="t('erase.brush')" :min="4" :max="200" :reset-value="24" />
+        <SliderRow v-model="eraseGrow" :label="t('erase.grow')" :min="0" :max="100" :reset-value="15" />
+        <SliderRow v-model="eraseFeather" :label="t('erase.feather')" :min="0" :max="100" :reset-value="35" />
         <!-- The fill being brushed: its strokes so far, and the button that runs it. -->
         <div class="erase-draft" v-if="eraseMode === 'fill' || eraseDraft">
           <span class="erase-draft-count">{{ eraseDraft ? t('erase.draft', { n: eraseDraftLines }) : t('erase.draftEmpty') }}</span>
@@ -4535,12 +4583,19 @@ const vWheelAdjust = {
         <ol class="mask-list" v-if="erase.length">
           <li v-for="(s, i) in erase" :key="s.id" class="mask-row" @mouseenter="eraseHover = s.id" @mouseleave="eraseHover = null">
             <div class="mask-head erase-head">
-              <span class="mask-name">
+              <button type="button" class="mask-name erase-name" :aria-expanded="eraseOpen === s.id"
+                :title="t('erase.tune')" @click="eraseOpen = eraseOpen === s.id ? null : s.id">
                 <JIcon v-if="s.mode === 'heal'" :icon="IconBandage" />
-                {{ t(s.mode === 'heal' ? 'erase.itemHeal' : 'erase.item', { n: i + 1 }) }}</span>
+                {{ t(s.mode === 'heal' ? 'erase.itemHeal' : 'erase.item', { n: i + 1 }) }}</button>
               <button class="icon-mini" type="button" :title="t('erase.remove')" :aria-label="t('erase.remove')" @click="removeErase(s.id)">
                 <JIcon :icon="IconX" />
               </button>
+            </div>
+            <div v-if="eraseOpen === s.id" class="erase-tune">
+              <SliderRow :model-value="eraseParam(s, 'grow')" @update:model-value="v => setEraseParam(s.id, 'grow', v)"
+                :label="t('erase.grow')" :min="0" :max="100" :reset-value="15" />
+              <SliderRow :model-value="eraseParam(s, 'feather')" @update:model-value="v => setEraseParam(s.id, 'feather', v)"
+                :label="t('erase.feather')" :min="0" :max="100" :reset-value="35" />
             </div>
           </li>
         </ol>

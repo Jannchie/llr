@@ -231,11 +231,34 @@ export async function fetchModelStatus(model: WorkerModel, download = false): Pr
 // POST a decode body to an endpoint that answers framed like render-linear:
 // [u32 header length][JSON header, padded to 4 bytes][payload]. Null on 404
 // (the source evicted server-side).
+// The framed responses carry whole frames (~200 MB for 33 MP). In dev, a page
+// opened on this machine fetches them from the API itself rather than through
+// vite's proxy, whose re-chunking costs half a second a frame; the API allows
+// local origins (setCors). Anywhere else — another device on the LAN, a build —
+// the API is only reachable through the page's own origin, so that stays.
+const API_DIRECT = import.meta.env.VITE_API_DIRECT as string | undefined;
+let directFailed = false;
+function bulkBase(): string {
+  if (import.meta.env.VITE_API_URL || !API_DIRECT || directFailed) return API;
+  const host = location.hostname;
+  return host === "localhost" || host === "127.0.0.1" || host === "[::1]" ? API_DIRECT : API;
+}
+
 async function postFramed<M>(path: string, body: Record<string, unknown>): Promise<{ meta: M; buf: ArrayBuffer; offset: number } | null> {
-  const res = await fetch(`${API}/${path}`, {
+  const init: RequestInit = {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
-  });
+  };
+  const base = bulkBase();
+  let res: Response;
+  try {
+    res = await fetch(`${base}/${path}`, init);
+  } catch (error) {
+    // Unreachable directly (another port, a firewall): the proxy, from now on.
+    if (base === API) throw error;
+    directFailed = true;
+    res = await fetch(`${API}/${path}`, init);
+  }
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(await res.text());
   const buf = await res.arrayBuffer();

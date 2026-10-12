@@ -78,6 +78,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
+from .. import fastcopy
 from . import itp_numba
 
 F = np.float32
@@ -222,11 +223,11 @@ def orient(arr: np.ndarray, flip: int) -> np.ndarray:
     uses the same convention for the crop rectangle): 3 is 180 degrees, 5 is
     90 counter-clockwise, 6 is 90 clockwise."""
     if flip == 3:
-        return np.ascontiguousarray(np.rot90(arr, 2))
+        return fastcopy.contiguous(np.rot90(arr, 2))
     if flip == 5:
-        return np.ascontiguousarray(np.rot90(arr, 1))
+        return fastcopy.contiguous(np.rot90(arr, 1))
     if flip == 6:
-        return np.ascontiguousarray(np.rot90(arr, -1))
+        return fastcopy.contiguous(np.rot90(arr, -1))
     return arr
 
 
