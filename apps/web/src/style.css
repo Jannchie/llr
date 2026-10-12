@@ -3302,6 +3302,11 @@ input[type="range"]:focus::-moz-range-thumb {
   color: var(--text);
 }
 
+/* The step drawn on the canvas while the pointer rests on it. */
+.history-step.is-previewing {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
 .history-step.is-undone {
   color: var(--text-dim);
   text-decoration: line-through;

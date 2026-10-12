@@ -939,6 +939,10 @@ const gradingEdited = computed(() => {
 // it in).
 let bakedBasic: BasicAdjust | null = DEFAULT_BASIC;
 
+// The history step the pointer is resting on, drawn in place of the live edit
+// until it leaves (see the history panel below). Never applied to the state.
+const historyPreview = shallowRef<Snapshot | null>(null);
+
 function currentBasic(r: Recipe = recipe): BasicAdjust {
   return { contrast: r.contrast, blacks: r.blacks, whites: r.whites };
 }
@@ -951,6 +955,15 @@ function bakeCurveLUT(): void {
   // into the 'before' view, with nothing to restore it until the key is released.
   if (showOriginal.value) {
     webglRenderer.uploadCurveLUT(IDENTITY_CURVE_LUT);
+    bakedBasic = null;
+    return;
+  }
+  // A hovered history step draws with its own curve and Basic values; bakedBasic
+  // stays null so the live ones are rebaked the frame the hover ends.
+  const s = historyPreview.value;
+  if (s) {
+    const b = new Set(s.bypass ?? []);
+    webglRenderer.uploadCurveLUT(buildToneCurveLUT(b.has("curve") ? defaultToneCurve() : s.curve, currentBasic(effectiveRecipe(s.recipe, b))));
     bakedBasic = null;
     return;
   }
@@ -1173,6 +1186,28 @@ function formatSliderValue(key: RecipeKey, v: number): string {
   if (key === "exposure") return `${v > 0 ? "+" : ""}${v.toFixed(2)}`;
   return `${v > 0 ? "+" : ""}${v}`;
 }
+// Hovering a step for a moment draws it on the canvas — draw parameters and
+// curve LUT only, like hold-to-compare: the sliders, history and stored edit
+// stay on the live state, and leaving the step puts the live render back. What
+// is baked into the decoded pixels (crop, engine, denoise) is not previewed.
+const HISTORY_PREVIEW_DELAY_MS = 350;
+let historyPreviewTimer = 0;
+function hoverHistoryStep(i: number): void {
+  clearTimeout(historyPreviewTimer);
+  historyPreviewTimer = window.setTimeout(() => {
+    historyPreview.value = i === historyIndex.value ? null : history.value[i] ?? null;
+  }, HISTORY_PREVIEW_DELAY_MS);
+}
+function endHistoryPreview(): void {
+  clearTimeout(historyPreviewTimer);
+  historyPreviewTimer = 0;
+  historyPreview.value = null;
+}
+watch(historyPreview, () => {
+  if (!webglRenderer) return;
+  bakeCurveLUT();
+  scheduleWebGLDraw();
+});
 // Newest first, the way a photographer reads it back.
 const historySteps = computed(() => history.value.map((snap, i) => ({
   index: i,
@@ -1379,6 +1414,11 @@ const EDIT_TABS: { key: EditTab; icon: Icon }[] = [
 ];
 
 const editTab = ref<EditTab>((localStorage.getItem("llr.tab") as EditTab | null) ?? "light");
+
+// The history panel's hover preview: anything that changes what the live state
+// is — a step taken, another photo, another tab — ends it.
+watch([historyIndex, () => activeSource.value?.id, editTab], endHistoryPreview);
+
 // Where the rail was before the crop editor took it, so Done lands back on the
 // group being edited instead of resetting to Light.
 let tabBeforeCrop: EditTab = editTab.value;
@@ -2063,13 +2103,15 @@ function drawWebGL(): void {
   // Contrast/Blacks/Whites all live in the curve LUT bake, not shader uniforms.
   // Draws are rAF-coalesced (scheduleWebGLDraw), so this rebakes at most once
   // per frame during a slider drag (sub-millisecond on the CPU).
-  if (!showOriginal.value && (bakedBasic === null || !sameBasic(bakedBasic, currentBasic(effectiveRecipe(recipe))))) {
+  if (!showOriginal.value && !historyPreview.value
+    && (bakedBasic === null || !sameBasic(bakedBasic, currentBasic(effectiveRecipe(recipe))))) {
     bakeCurveLUT();
   }
   updateRenderWindow();
   webglRenderer.setViewWindow(renderWindow.value);
   webglRenderer.setPreviewScale(computePreviewScale());
   if (showOriginal.value) { webglRenderer.draw(baselineParams()); return; }
+  if (historyPreview.value) { webglRenderer.draw(buildPipelineParams(historyPreview.value)); return; }
   const params = buildPipelineParams();
   syncBrushLayer(params);
   webglRenderer.draw(params);
@@ -4101,11 +4143,11 @@ const vWheelAdjust = {
           <span>{{ t('panel.history') }}</span>
           <span class="panel-hint">{{ t('history.count', { n: history.length }) }}</span>
         </header>
-        <ol class="history-list">
+        <ol class="history-list" @pointerleave="endHistoryPreview">
           <li v-for="step in historySteps" :key="step.index">
             <button type="button" class="history-step"
-              :class="{ 'is-current': step.index === historyIndex, 'is-undone': step.index > historyIndex }"
-              @click="jumpHistory(step.index)">
+              :class="{ 'is-current': step.index === historyIndex, 'is-undone': step.index > historyIndex, 'is-previewing': historyPreview === history[step.index] }"
+              @pointerenter="hoverHistoryStep(step.index)" @click="jumpHistory(step.index)">
               <span class="history-label">{{ step.label }}</span>
               <span class="history-author" v-if="step.author">{{ step.author }}</span>
             </button>
