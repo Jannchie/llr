@@ -27,6 +27,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from . import ai_masks as ai_module
 from . import denoise as denoise_module
 from . import erase as erase_module
+from . import fastcopy
 from . import relight as relight_module
 from .catalog_meta import catalog_meta_from_exif
 from .creative_style import normalize_style
@@ -614,7 +615,7 @@ def _write_linear_f16(linear_arr: np.ndarray, output_path: Path) -> int:
     below sensor noise for 12-14-bit RAW data. The in-memory caches stay
     float32 so repeated DCP/denoise blends never accumulate quantisation.
     """
-    out = linear_arr.astype(np.float16)
+    out = fastcopy.contiguous(linear_arr, np.float16)
     with open(output_path, "wb") as f:
         out.tofile(f)
     return out.nbytes
@@ -2022,7 +2023,7 @@ def apply_camera_crop(
     y1 = min(max(round((y + h) * sy), y0 + 1), ah)
     if x0 == 0 and y0 == 0 and x1 == aw and y1 == ah:
         return arr
-    return np.ascontiguousarray(arr[y0:y1, x0:x1])
+    return fastcopy.contiguous(arr[y0:y1, x0:x1])
 
 
 def read_raw_metadata(input_path: Path, raw: rawpy.RawPy) -> RawMetadata:
