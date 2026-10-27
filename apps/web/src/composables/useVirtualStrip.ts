@@ -70,5 +70,5 @@ export function useVirtualStrip(opts: {
     if (next !== pos) el.scrollLeft = next;
   }
 
-  return { range, scrollToIndex };
+  return { range, scrollPos, viewport, scrollToIndex };
 }

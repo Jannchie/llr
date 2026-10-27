@@ -1408,7 +1408,10 @@ const folderTree = ref<InstanceType<typeof FolderTree> | null>(null);
 // The grid's group navigator (in the sidebar, under the tree): which section is
 // at the top of the grid, and the grid itself to scroll when a group is picked.
 const photoGrid = ref<InstanceType<typeof PhotoGrid> | null>(null);
+const filmstrip = ref<InstanceType<typeof Filmstrip> | null>(null);
 const librarySection = ref(-1);
+// The same for the filmstrip, while developing.
+const filmSection = ref(-1);
 
 function toggleSortDir(): void { setSort(sortKey.value, sortDir.value === "asc" ? "desc" : "asc"); }
 function onGridRename(id: string, name: string): void { void renamePhoto(id, name); }
@@ -3764,9 +3767,11 @@ const vWheelAdjust = {
       @create="(parentId, name) => createFolder(parentId, name)" @rename="renameFolder" @delete="deleteFolder"
       @move-photos="movePhotos" @move-folder="moveFolder"
       @drop-files="onTreeDrop" @import-files="pickFiles" @import-folder="pickFolder">
-      <GroupNav v-if="libraryView === 'library' && library.grouped && folderPhotos.length"
+      <!-- The grid's groups in the library, the filmstrip's while developing. -->
+      <GroupNav v-if="library.grouped && folderPhotos.length"
         :title="groupOptions.find(o => o.value === groupKey)?.label ?? t('library.group')"
-        :sections="library.sections" :current="librarySection" @jump="(i) => photoGrid?.scrollToSection(i)" />
+        :sections="library.sections" :current="libraryView === 'library' ? librarySection : filmSection"
+        @jump="(i) => libraryView === 'library' ? photoGrid?.scrollToSection(i) : filmstrip?.scrollToSection(i)" />
     </FolderTree>
 
     <main class="center">
@@ -4776,9 +4781,10 @@ const vWheelAdjust = {
       </nav>
     </aside>
 
-    <Filmstrip v-if="folderPhotos.length && libraryView === 'develop'" :sections="library.sections" :grouped="library.grouped" :active-id="activeId"
+    <Filmstrip ref="filmstrip" v-if="folderPhotos.length && libraryView === 'develop'" :sections="library.sections" :grouped="library.grouped" :active-id="activeId"
       :rendering="status === 'rendering'" :thumb-src="thumbSrc" :is-invalid="(id) => activeSource?.id === id && !!activeSource.invalid"
-      @select="selectSource" @remove="(id) => removePhotosConfirmed([id])" @import="pickFiles" />
+      @select="selectSource" @remove="(id) => removePhotosConfirmed([id])" @import="pickFiles"
+      @section="(i) => filmSection = i" />
 
     <input ref="fileInput" type="file" :accept="IMPORT_ACCEPT" hidden multiple @change="onFileChange" />
     <input ref="folderInput" type="file" hidden multiple webkitdirectory @change="onFolderChange" />

@@ -2,7 +2,7 @@
 import { computed, ref, toRef, watch } from "vue";
 import { formatBytes, type Photo } from "../ui";
 import { t } from "../i18n";
-import { useVirtualStrip } from "../composables/useVirtualStrip";
+import { firstItemAfter, useVirtualStrip } from "../composables/useVirtualStrip";
 import { buildFilmLayout, FILM_CELL } from "../filmLayout";
 import type { Section } from "../librarySort";
 import { IconPlus, IconX } from "@jannchie/icons";
@@ -27,12 +27,14 @@ const emit = defineEmits<{
   (e: "select", id: string): void;
   (e: "remove", id: string): void;
   (e: "import"): void;
+  /** The section at the strip's left edge changed (-1 when not grouped). */
+  (e: "section", index: number): void;
 }>();
 
 const track = ref<HTMLElement | null>(null);
 const layout = computed(() => buildFilmLayout(props.sections, props.grouped));
 const items = computed(() => layout.value.items);
-const { range, scrollToIndex } = useVirtualStrip({ container: track, items, overscan: 3 });
+const { range, scrollPos, viewport, scrollToIndex } = useVirtualStrip({ container: track, items, overscan: 3 });
 
 const visible = computed(() => items.value.slice(range.value.start, range.value.end));
 
@@ -47,6 +49,55 @@ watch(toRef(props, "activeId"), (id) => {
   const i = layout.value.itemOfPhoto.get(id);
   if (i !== undefined) scrollToIndex(i);
 }, { immediate: true });
+
+// ── Sections (the sidebar's group navigator, as in the library grid) ──
+
+// Item index of each section's divider, in section order; empty when not grouped.
+const headerItems = computed(() => {
+  const out: number[] = [];
+  items.value.forEach((it, i) => { if (it.kind === "header") out.push(i); });
+  return out;
+});
+
+// The section picked in the navigator, while its divider is still in view: the
+// strip cannot scroll a group near the end of the folder to its left edge.
+const jumped = ref<number | null>(null);
+// Where that jump left the strip; scrolling away from it lets go of the pick.
+let jumpedPos = 0;
+watch(scrollPos, (pos) => {
+  if (jumped.value !== null && Math.abs(pos - jumpedPos) > 1) jumped.value = null;
+});
+
+// The section whose cells start the strip: the last divider at or left of it.
+const currentSection = computed(() => {
+  const hs = headerItems.value;
+  if (!hs.length) return -1;
+  const all = items.value;
+  const j = jumped.value;
+  if (j !== null && j < hs.length) {
+    const x = all[hs[j]].x;
+    if (x >= scrollPos.value - 1 && x < scrollPos.value + viewport.value) return j;
+  }
+  const first = firstItemAfter(all, scrollPos.value + 1);
+  let si = 0;
+  while (si + 1 < hs.length && hs[si + 1] <= first) si++;
+  return si;
+});
+watch(currentSection, si => emit("section", si), { immediate: true });
+watch(() => props.sections, () => { jumped.value = null; });
+
+/** Scroll so section `si` opens at the strip's left edge. */
+function scrollToSection(si: number): void {
+  const item = items.value[headerItems.value[si]];
+  const el = track.value;
+  if (!el || !item) return;
+  el.scrollLeft = item.x;
+  // Read back: the browser clamps a group near the end short of item.x.
+  jumpedPos = el.scrollLeft;
+  jumped.value = si;
+}
+
+defineExpose({ scrollToSection });
 
 // A plain mouse wheel only has a vertical axis; on a one-row strip that is the
 // scroll. Trackpads that already send deltaX are left to native scrolling.
