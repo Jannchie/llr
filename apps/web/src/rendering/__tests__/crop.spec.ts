@@ -4,7 +4,7 @@ import {
   cropOutputRect, cropOutputSize, cropOutputSizeForAspect, cssRecomposeMatrix, customAspectKey, defaultCrop, recomposeMatrix,
   imageDims, isDefaultCrop, parseCustomAspect, ratioToFraction, resolveAspectFraction,
   resolveAspectRatio, rotate90, straightenedBBox, straightenAngle, cropGuideShapes, cropCornersImage, CROP_GUIDES,
-  defaultTransform, transformMatrix, guidedHomography, flipCrop, outFrameToImagePx, imagePxToOutFrame,
+  defaultTransform, transformMatrix, guidedHomography, flipCrop, outFrameToImagePx, imagePxToOutFrame, sourceSpan,
   type CropState, type Transform,
 } from "../crop";
 
@@ -531,5 +531,44 @@ describe("guidedHomography", () => {
     const G = guidedHomography([[0.1, 0.5, 0.9, 0.6]], iw, ih);
     expect(G[6]).toBe(0); expect(G[7]).toBe(0);
     expect(Math.abs(direction(G, [0.1, 0.5, 0.9, 0.6])[1])).toBeLessThan(1e-9);
+  });
+});
+
+describe("sourceSpan", () => {
+  const W = 6000, H = 4000;
+  const span = (c: CropState) => {
+    const [iw, ih] = imageDims(W, H, c.orientation);
+    const rect = cropOutputRect(c, iw, ih);
+    return { span: sourceSpan(buildCropTransform(c, W, H, rect), W, H), out: cropOutputSize(c, W, H) };
+  };
+
+  it("is the source size for the untouched frame", () => {
+    const { span: [sx, sy], out } = span(defaultCrop());
+    expect(sx).toBeCloseTo(W, 3);
+    expect(sy).toBeCloseTo(H, 3);
+    expect(out).toEqual([W, H]);
+  });
+
+  it("follows a quarter turn: the frame's x runs down the source's height", () => {
+    const { span: [sx, sy], out } = span(rotate90(defaultCrop(), 1));
+    expect(out).toEqual([H, W]);
+    // One output pixel per source pixel on both axes — not 4000 / 6000.
+    expect(sx).toBeCloseTo(out[0], 3);
+    expect(sy).toBeCloseTo(out[1], 3);
+  });
+
+  it("is the crop box, per axis, when the crop changes the aspect", () => {
+    const c = { ...defaultCrop(), w: 4000 / 6000 };  // a centred square out of a 3:2 frame
+    const { span: [sx, sy], out } = span(c);
+    expect(out).toEqual([4000, 4000]);
+    expect(sx).toBeCloseTo(4000, 3);
+    expect(sy).toBeCloseTo(4000, 3);
+  });
+
+  it("stays one-to-one under a straighten", () => {
+    const c = constrainCrop({ ...defaultCrop(), angle: 5 }, W, H);
+    const { span: [sx, sy], out } = span(c);
+    expect(sx / out[0]).toBeCloseTo(1, 3);
+    expect(sy / out[1]).toBeCloseTo(1, 3);
   });
 });

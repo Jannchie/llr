@@ -305,6 +305,21 @@ export function buildCropTransform(c: CropState, srcW: number, srcH: number, out
   return toColMajor(mul3(T, mul3(Hinv, R)));
 }
 
+/**
+ * How many source pixels the rendered frame spans along its own x and y axes,
+ * from the matrix buildCropTransform returns. Each output axis is a column of
+ * it, in texcoords, so its length in pixels weighs u by the source width and v
+ * by the source height — a quarter turn puts the output's x along the source's
+ * v, and a straighten puts it along both. (For a perspective transform this is
+ * the span at the frame's origin, which is as good as one number gets.)
+ */
+export function sourceSpan(xform: ArrayLike<number>, srcW: number, srcH: number): [number, number] {
+  return [
+    Math.hypot(xform[0] * srcW, xform[1] * srcH),
+    Math.hypot(xform[3] * srcW, xform[4] * srcH),
+  ];
+}
+
 /** Committed crop output rect (the crop box) in output-frame pixels. */
 export function cropOutputRect(c: CropState, iw: number, ih: number): Rect {
   const b = pixelBox(c, iw, ih);
