@@ -24,6 +24,7 @@ import {
   type PromptBody,
   type ToolResultBody,
 } from "./agent.js";
+import { writeDailyBackup } from "./catalog-backup.js";
 import { Catalog, CatalogError, ROOT_FOLDER_ID, type PhotoMeta, type PhotoRow } from "./catalog.js";
 import {
   FOLDER_ID,
@@ -58,7 +59,10 @@ const cacheRoot = process.env.LLR_CACHE_DIR ?? resolve(process.env.XDG_CACHE_HOM
 const sessionsRoot = resolve(cacheRoot, "sessions");
 // What is in the library: folders, photos and their edits (catalog.ts). The
 // files a photo owns live in sessions/<id>/ beside the worker's decode cache.
-const catalog = new Catalog(resolve(cacheRoot, "catalog.db"));
+// It is the only copy of every edit, so it is copied: before a schema
+// migration (the Catalog does that itself), and once a day (catalog-backup.ts).
+const backupsRoot = resolve(cacheRoot, "backups");
+const catalog = new Catalog(resolve(cacheRoot, "catalog.db"), backupsRoot);
 // Provider keys saved from the assistant's settings (credentials.ts).
 openCredentials(resolve(cacheRoot, "credentials.json"));
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
@@ -152,6 +156,19 @@ server.listen(port, host, () => {
 
 void cleanupSessions();
 setInterval(() => void cleanupSessions(), 60 * 60 * 1000).unref();
+
+// A day's copy is written the first time this runs on that day; the hourly
+// tick is what carries a server left running across midnight into the next.
+function backupCatalog(): void {
+  try {
+    const written = writeDailyBackup(catalog, backupsRoot);
+    if (written) console.log(`Library backed up to ${written}`);
+  } catch (error) {
+    console.warn(`library backup failed: ${errorMessage(error)}`);
+  }
+}
+backupCatalog();
+setInterval(backupCatalog, 60 * 60 * 1000).unref();
 
 async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);

@@ -87,7 +87,11 @@ What is in the library lives in one SQLite file, `$LLR_CACHE_DIR/catalog.db`
 with the EXIF a library view sorts and labels by, and each photo's edit —
 snapshot plus capped undo history — as JSON. The browser holds none of it
 beyond what is on screen, so two tabs cannot disagree and a cleared browser
-profile loses nothing. A photo's files stay in `sessions/<id>/`: the copied
+profile loses nothing. Being the one copy of every edit, it is copied
+(`catalog-backup.ts`): `VACUUM INTO backups/catalog-<date>.db` once a day,
+seven kept, and once more before a schema migration alters it in place — a
+copy of `catalog.db` alone would miss whatever is still in the WAL. A catalog
+with a newer schema than the build knows is refused rather than opened. A photo's files stay in `sessions/<id>/`: the copied
 source, the camera preview (`embedded.jpg`), a 384px `thumb.jpg` the worker
 cuts from the same decode at import, and the decode cache above. Import is
 `POST /photos`: copy the bytes, insert the row, ask the worker for previews

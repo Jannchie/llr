@@ -13,7 +13,7 @@
  */
 
 import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from "node:sqlite";
 
 // Every library has one root folder, the drop target when nothing else is
@@ -184,8 +184,12 @@ const META_COLUMNS: Record<keyof PhotoMeta, string> = {
 export class Catalog {
   private readonly db: DatabaseSync;
 
-  /** `path` may be `:memory:` (tests). The parent directory is created. */
-  constructor(path: string) {
+  /**
+   * `path` may be `:memory:` (tests). The parent directory is created.
+   * `backupDir`, when given, receives a copy of the database as it was before
+   * a schema migration touches it.
+   */
+  constructor(path: string, private readonly backupDir?: string) {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     // WAL: readers never block the writer, and a crash mid-write leaves the
@@ -200,7 +204,21 @@ export class Catalog {
   private migrate(): void {
     const row = this.db.prepare("PRAGMA user_version").get() as Row;
     const version = num(row.user_version) ?? 0;
-    if (version >= SCHEMA_VERSION) return;
+    // A library a newer build has migrated: this one would read and write
+    // columns by an older understanding of them. Stopping is the only safe
+    // answer; the edits are not this build's to guess at.
+    if (version > SCHEMA_VERSION) {
+      this.db.close();
+      throw new Error(`The library was written by a newer LLR (schema ${version}; this build reads up to ${SCHEMA_VERSION}). Update LLR to open it.`);
+    }
+    if (version === SCHEMA_VERSION) return;
+    // The one copy of every edit is about to be altered in place: keep what it
+    // was. A failure to write the copy stops the migration rather than letting
+    // it run unprotected.
+    if (version > 0 && this.backupDir) {
+      mkdirSync(this.backupDir, { recursive: true });
+      this.backupTo(join(this.backupDir, `catalog-before-schema-${SCHEMA_VERSION}-${Date.now()}.db`));
+    }
     this.db.exec("BEGIN");
     try {
       if (version < 1) {
@@ -230,6 +248,17 @@ export class Catalog {
 
   close(): void {
     this.db.close();
+  }
+
+  /**
+   * Write a consistent copy of the whole library to `path`, which must not
+   * exist. VACUUM INTO reads through the WAL, so the copy holds everything
+   * committed — unlike a copy of catalog.db alone, which lacks whatever has
+   * not been checkpointed yet (days of edits, on a server that is rarely
+   * shut down cleanly).
+   */
+  backupTo(path: string): void {
+    this.db.exec(`VACUUM INTO '${path.replaceAll("'", "''")}'`);
   }
 
   private transaction<T>(fn: () => T): T {
