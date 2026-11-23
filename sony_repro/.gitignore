@@ -34,4 +34,5 @@ tools/spica_lbp.json
 # Edit.exe 的反汇编 / Ghidra 反编译输出:逐字衍生物,不进仓库(见 README.md)。
 # 重新生成的那一份放回这里也不会被提交。
 tools/disasm_*.txt
+tools/marble_disasm/
 tools/*_decomp.c
