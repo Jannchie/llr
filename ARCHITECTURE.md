@@ -141,6 +141,12 @@ export looks like on screen.
 `App.vue` holds the editing state; the mechanics live in composables
 (`useCatalog`, `useHistory`, `useViewport`, `useCropEditor`, `useToneCurve`,
 `useHistogram`, `useExport`) and `api.ts` (the binary protocol client).
+One photo's edit is a `Snapshot` (`snapshot.ts`): the shape stored in the
+catalog, embedded in an export, copied between photos and handed to the
+assistant. `normalizeSnapshot` holds every rule about reading one an older
+build stored, and runs wherever a stored snapshot is read — loading it into
+the live state, and planning an export or a preview of a photo that is not
+open — so the two cannot treat an old edit differently.
 What the app is busy with is one state per owner (`activity.ts`): the active
 photo's decode is a `DecodeState` only `loadSource`'s newest call moves, while
 import and export keep their own flags and errors go to the toast — none of

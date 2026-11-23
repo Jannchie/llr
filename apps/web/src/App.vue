@@ -7,7 +7,7 @@ import { loadToneFamily, rebuildLookProfile, toneFamilyLoaded } from "./renderin
 import {
   curveToLUT, buildToneCurveLUT, defaultToneCurve, normalizeToneCurve,
   DEFAULT_BASIC, sameBasic,
-  type BasicAdjust, type ToneCurve,
+  type BasicAdjust,
 } from "./rendering/curve";
 import {
   defaultCrop, cloneCrop, isDefaultCrop, imageDims, buildCropTransform,
@@ -25,7 +25,7 @@ import { rasterBrushes, sameBrushes, type BrushStroke } from "./rendering/brush"
 import { AUX_LAYER } from "./rendering/pipeline-renderer";
 import { cloneRelight, defaultRelight, packRelight, relightActive, RELIGHT_MAX_LIGHTS, LIGHT_KINDS, type RelightGeometry, type RelightState } from "./rendering/relight";
 import {
-  packMasks, presetGroup, defaultComponent, defaultAdjust, MASK_PRESETS, MASK_GROUPS, MASK_COMPS, AI_KINDS,
+  packMasks, presetGroup, defaultComponent, defaultAdjust, cloneMasks, MASK_PRESETS, MASK_GROUPS, MASK_COMPS, AI_KINDS,
   type MaskGroup, type MaskType, type MaskAdjust, type MaskPresetName, type MaskComponent,
 } from "./rendering/masks";
 import { formatBytes, clamp, IMPORT_ACCEPT, IMPORT_FORMAT_HINT } from "./ui";
@@ -41,7 +41,11 @@ import PhotoGrid from "./components/PhotoGrid.vue";
 import { useViewport } from "./composables/useViewport";
 import { useHistory } from "./composables/useHistory";
 import { useToneCurve } from "./composables/useToneCurve";
-import { useCropEditor, DEFAULT_ASPECT } from "./composables/useCropEditor";
+import { useCropEditor } from "./composables/useCropEditor";
+import {
+  DRO_AUTO, LOOK_SCALE, defaultDenoise, defaultGrading, defaultRecipe, defaultSnapshot, lookStopsToPanel, normalizeSnapshot,
+  type BypassKey, type GroupTitle, type ProfileId, type Recipe, type RecipeKey, type Snapshot,
+} from "./snapshot";
 import { useMaskEditor } from "./composables/useMaskEditor";
 import { useEraseEditor } from "./composables/useEraseEditor";
 import { useRelightEditor, useFocusPicker } from "./composables/useRelightEditor";
@@ -71,44 +75,18 @@ import {
 
 // ── types ──
 
-type RecipeKey = "exposure"|"contrast"|"highlights"|"shadows"|"whites"|"blacks"|"vibrance"|"saturation"|"temperature"|"tint"|"clarity"|"dehaze"|"lensDistortion"|"lensVignetting"|"nrLuminance"|"nrDetail"
-  |"sharpAmount"|"sharpRadius"|"sharpDetail"|"sharpMasking"|"defringePurple"|"defringeGreen"
-  |"blurAmount"|"blurRange"|"blurFocusX"|"blurFocusY"|"fogAmount"|"fogStart"
-  |"vigAmount"|"vigMidpoint"|"vigFeather"|"vigRoundness"|"grainAmount"|"grainSize"|"grainRoughness";
-type Recipe = Record<RecipeKey, number>;
 // Labels are not stored: a slider's caption is always `slider.<key>` and a
 // group's is `panel.<title>`, so the catalog can't drift from the controls.
 type SliderSpec = { key: RecipeKey; min: number; max: number; step: number };
 // needsLensCorr: the group's controls do nothing but blend the shot's own
 // correction tables toward identity, so they only mean something when the file
 // carried a pair (see lensCorrAvailable).
-type GroupTitle = "tone" | "presence" | "color" | "lens" | "noise" | "sharpen" | "defringe" | "lensBlur" | "fog" | "vignette" | "grain";
 type SliderGroup = { title: GroupTitle; tab: EditTab; items: SliderSpec[]; needsLensCorr?: boolean };
 
 // The rail shows one group at a time, picked from the icon strip along its
 // outer edge. Nine always-open panels stacked to 2400px — reaching the curve
 // meant scrolling two and a half screens past controls nobody was using.
 type EditTab = "light" | "color" | "masks" | "erase" | "relight" | "effects" | "recipes" | "detail" | "look" | "crop" | "assistant" | "history" | "settings";
-
-// Distortion correction defaults to fully applied (mirrorless glass is designed
-// around it — uncorrected geometry reads as broken). Vignetting stays off by
-// default: natural falloff is often part of the look, so brightening the
-// corners is an opt-in, not a baseline.
-const defaultRecipe = (): Recipe => ({
-  exposure: 0, contrast: 0, highlights: 0, shadows: 0,
-  whites: 0, blacks: 0, vibrance: 0, saturation: 0,
-  temperature: 6500, tint: 0, clarity: 0, dehaze: 0,
-  lensDistortion: 100, lensVignetting: 0,
-  nrLuminance: 0, nrDetail: 50,
-  sharpAmount: 0, sharpRadius: 1, sharpDetail: 25, sharpMasking: 0,
-  defringePurple: 0, defringeGreen: 0,
-  // The lens blur's focus point is source-norm (y down), -1 = the frame's centre;
-  // set by clicking the image, not by a slider.
-  blurAmount: 0, blurRange: 20, blurFocusX: -1, blurFocusY: -1,
-  fogAmount: 0, fogStart: 30,
-  vigAmount: 0, vigMidpoint: 50, vigFeather: 50, vigRoundness: 0,
-  grainAmount: 0, grainSize: 25, grainRoughness: 50,
-});
 
 const groups: SliderGroup[] = [
   { title: "tone", tab: "light", items: [
@@ -192,23 +170,6 @@ const groups: SliderGroup[] = [
 const LOOK_TWEAK_ORDER = [
   "contrast", "highlights", "shadows", "white", "black", "fade", "hue", "saturation", "clarity",
 ] as const;
-// Sessions saved before the panel scale stored the camera's stops. The same
-// conversion the worker does (sony/profile.py stops_to_panel), so a restored
-// session lands where it rendered; the three sliders the camera lacks were
-// never stored and start at zero.
-const LOOK_SCALE = "panel";
-const SATURATION_STOPS = [0, 10, 20, 25, 30, 35, 40, 45, 50, 55];
-function lookStopsToPanel(old: Partial<Record<string, number>>): LookTweaks {
-  const n = (k: string) => Math.trunc(old[k] ?? 0);
-  const sat = Math.min(Math.abs(n("saturation")), SATURATION_STOPS.length - 1);
-  return {
-    contrast: n("contrast") * 5, highlights: n("highlights") * 5, shadows: n("shadows") * 5,
-    white: 0, black: 0, fade: n("fade") * 10, hue: 0,
-    saturation: SATURATION_STOPS[sat]! * (n("saturation") < 0 ? -1 : 1),
-    clarity: n("clarity") * 10,
-  };
-}
-
 function aspectLabel(a: AspectPreset): string {
   return a.labelKey ? t(a.labelKey) : a.label;
 }
@@ -233,7 +194,6 @@ const SLIDER_DEFAULTS: Record<string, number> = { ...defaultRecipe() };
 // would from Lightroom. The keys are the panels that have a Reset, minus the
 // crop box (which has no switch in Lightroom either: an off crop is a
 // different image, not a comparison).
-type BypassKey = GroupTitle | "hsl" | "grading" | "curve" | "transform" | "look" | "masks";
 const bypass = reactive(new Set<BypassKey>());
 function isBypassed(key: BypassKey): boolean { return bypass.has(key); }
 function toggleBypass(key: BypassKey): void { if (bypass.has(key)) bypass.delete(key); else bypass.add(key); }
@@ -275,7 +235,6 @@ const dcpCode = ref("");  // empty = auto-detect
 // the body wrote into the RAW (worker sony/profile.py) and needs no profile
 // files — but only Sony RAWs carry it, so the worker falls back on its own.
 // Baked into linear.bin, so switching re-decodes like dcpCode.
-type ProfileId = "standard" | "sony";
 const profileId = ref<ProfileId>("standard");
 // The engine the last decode actually used (see loadSource) and, on the Sony
 // path, which Creative Look's tone curve it applied.
@@ -356,7 +315,6 @@ const effectiveDro = computed(() => droStrength.value ?? droAsShot.value);
 // of the ten built-in presets. The ladder of offered levels comes from the
 // worker rather than being repeated here, so the buttons cannot drift from the
 // curves it actually renders.
-const DRO_AUTO = -1;
 const droLevel = ref(DRO_AUTO);
 const droLevels = ref<number[]>([]);
 // DRO belongs to the same panel, so the switch puts it back to what the camera
@@ -512,13 +470,6 @@ const sonyAdvancedColour = ref(false);
 // fitted on another body would be a guess, so the row hides instead.
 const sonyCameraMatch = ref(true);
 const hasSonyCameraMatch = ref(false);
-// 50 for every slider: the camera's own position on the Sony filter, and
-// Edit's default. (Amount used to start at 100, which on a Sony frame renders
-// exactly as 50 — above it the engine changes the filter itself, which the
-// transcription cannot follow, so the strength holds at Auto's.)
-const defaultDenoise = () => ({
-  enabled: true, auto: true, amount: 50, edge: 50, chroma: 50,
-});
 const denoise = reactive(defaultDenoise());
 const denoiseBusy = computed(() => decodingFor(decode.value, "denoise"));
 // Hold-to-compare: while true we draw the unedited original (baseline params +
@@ -569,13 +520,6 @@ const hslSat = reactive([0, 0, 0, 0, 0, 0, 0, 0]);
 const hslLum = reactive([0, 0, 0, 0, 0, 0, 0, 0]);
 const hslTab = ref<"hue"|"sat"|"lum">("hue");
 
-const defaultGrading = () => ({
-  shH: 0, shS: 0,
-  mdH: 0, mdS: 0,
-  hlH: 0, hlS: 0,
-  blend: 50,
-  balance: 0,
-});
 const grading = reactive(defaultGrading());
 
 const GRADING_BANDS = [
@@ -606,7 +550,6 @@ const cropMode = ref(false);
 const masks = reactive<MaskGroup[]>([]);
 const maskPreview = ref(false);
 const selectedMask = ref<string | null>(null);
-const cloneMasks = (m: readonly MaskGroup[]): MaskGroup[] => JSON.parse(JSON.stringify(m));
 const selectedGroup = computed(() => masks.find(g => g.id === selectedMask.value) ?? null);
 
 const MASK_TYPES: MaskType[] = ["luminance", "color", "linear", "radial", "depth", "brush", "ai"];
@@ -1045,82 +988,10 @@ function applyCurveLUT(): void {
 
 // ── History (undo / redo) ──
 
-type Snapshot = {
-  recipe: Recipe;
-  hslHue: number[]; hslSat: number[]; hslLum: number[];
-  grading: typeof grading;
-  curve: ToneCurve;
-  crop: CropState;
-  aspect?: string;  // crop aspect-lock key; optional: absent in older persisted sessions
-  dcp: string;
-  profile?: ProfileId;  // colour engine; optional: absent in pre-Sony persisted sessions
-  denoise?: typeof denoise;  // optional: absent in pre-denoise persisted sessions
-  // Creative Look tweaks; null (or absent, in older sessions) means as shot.
-  look?: LookTweaks | null;
-  // Which scale `look` is on. Absent means the camera's stops, which is what
-  // every session before Edit's panel scale stored (see lookStopsToPanel).
-  lookScale?: typeof LOOK_SCALE;
-  // Which Creative Look to render, when it is not the body's own. Same "null
-  // means as shot" convention, and likewise absent in older sessions.
-  lookStyle?: string | null;
-  // DRO strength, on the same convention: null is what the camera applied.
-  dro?: number | null;
-  // Which DRO curve: -1 for the shot's own (Auto), 0..99 for a built-in preset.
-  droLevel?: number | null;
-  // Sony's advanced colour reproduction (ZcTask3DLut). Absent in older
-  // sessions, which rendered with it off, and off is the default again.
-  sonyAdvancedColour?: boolean;
-  // Camera match (the fitted correction toward the body's JPEG). Absent in
-  // older sessions, which rendered without it; a new snapshot starts with it on.
-  sonyCameraMatch?: boolean;
-  // Local adjustments; absent in sessions that predate them, which is empty.
-  masks?: MaskGroup[];
-  // Generative erase strokes (rendering/erase.ts); absent before erase existed.
-  erase?: EraseStroke[];
-  // Added lights (rendering/relight.ts); absent before relight existed.
-  relight?: RelightState;
-  // Panels switched off (see BypassKey); absent in older sessions, i.e. none.
-  bypass?: BypassKey[];
-};
-
 let isRestoring = false;
 // When true, the dcpCode watcher skips its re-decode — used while we load a
 // source explicitly (switching images / restoring) to avoid a double decode.
 let suppressDcpReload = false;
-
-// Sony's own engine for Sony's own files: ARW (and the older SRF/SR2) carry the
-// calibration it renders from, and the worker falls back to the DCP when a shot
-// has none. Anything else has only the DCP, so Adobe is the honest default.
-function defaultProfile(name?: string): ProfileId {
-  return /\.(arw|srf|sr2)$/i.test(name ?? "") ? "sony" : "standard";
-}
-
-function defaultSnapshot(name?: string): Snapshot {
-  return {
-    recipe: defaultRecipe(),
-    hslHue: [0, 0, 0, 0, 0, 0, 0, 0],
-    hslSat: [0, 0, 0, 0, 0, 0, 0, 0],
-    hslLum: [0, 0, 0, 0, 0, 0, 0, 0],
-    grading: defaultGrading(),
-    curve: defaultToneCurve(),
-    crop: defaultCrop(),
-    aspect: DEFAULT_ASPECT,
-    dcp: "",
-    profile: defaultProfile(name),
-    denoise: defaultDenoise(),
-    look: null,
-    lookScale: LOOK_SCALE,
-    lookStyle: null,
-    dro: null,
-    droLevel: DRO_AUTO,
-    sonyAdvancedColour: false,
-    sonyCameraMatch: true,
-    masks: [],
-    erase: [],
-    relight: defaultRelight(),
-    bypass: [],
-  };
-}
 
 const {
   history, historyIndex, pendingDirty, canUndo, canRedo,
@@ -1160,48 +1031,39 @@ function captureSnapshot(): Snapshot {
 
 // Push a snapshot into the live reactive edit state (no draw scheduling — the
 // caller decides whether to redraw or re-decode).
-function setEditState(s: Snapshot): void {
-  // Layer over defaults: snapshots persisted before a recipe key existed (e.g.
-  // the lens corrections) must reset it, not inherit the previous image's value.
-  Object.assign(recipe, defaultRecipe(), s.recipe);
+function setEditState(stored: Snapshot): void {
+  // Every rule about what an older snapshot lacks lives in normalizeSnapshot;
+  // what arrives here has all of today's fields, on today's scales. The live
+  // state is overwritten whole, so nothing of the previous photo survives.
+  const s = normalizeSnapshot(stored);
+  Object.assign(recipe, s.recipe);
   for (let i = 0; i < 8; i++) { hslHue[i] = s.hslHue[i]; hslSat[i] = s.hslSat[i]; hslLum[i] = s.hslLum[i]; }
   Object.assign(grading, s.grading);
-  toneCurve.value = normalizeToneCurve(s.curve);
+  toneCurve.value = s.curve;
   curveActive.value = -1;
   bypass.clear();
-  for (const key of s.bypass ?? []) bypass.add(key);
-  Object.assign(crop, s.crop ? cloneCrop(s.crop) : defaultCrop());
-  // Older snapshots have no aspect: fall back to "free" so a legacy crop box
-  // that doesn't match the new default lock isn't reshaped by the next drag.
-  cropAspect.value = s.aspect ?? "free";
-  // Spread the defaults underneath rather than only when `denoise` is absent:
-  // Object.assign leaves keys the snapshot does not carry at whatever the
-  // previously loaded image left them, so a snapshot predating a field would
-  // inherit that field from its neighbour instead of from the default. `auto`
-  // is the first field to have a predecessor, and off is not its default.
-  Object.assign(denoise, { ...defaultDenoise(), ...(s.denoise ?? {}) });
-  look.value = s.look ? (s.lookScale === LOOK_SCALE ? { ...s.look } : lookStopsToPanel(s.look)) : null;
-  lookStyle.value = s.lookStyle ?? null;
-  droStrength.value = s.dro ?? null;
-  // Snapshots taken before manual levels existed carry none, and Auto is what
-  // they were rendered with.
-  droLevel.value = s.droLevel ?? DRO_AUTO;
-  // Absent in a snapshot predating the switch, and off is what it rendered as.
-  sonyAdvancedColour.value = s.sonyAdvancedColour ?? false;
-  // Same rule: a snapshot from before the stage existed was rendered without it.
-  sonyCameraMatch.value = s.sonyCameraMatch ?? false;
-  masks.splice(0, masks.length, ...cloneMasks(s.masks ?? []).map(g => ({ ...g, adjust: { ...defaultAdjust(), ...g.adjust } })));
+  for (const key of s.bypass) bypass.add(key);
+  Object.assign(crop, s.crop);
+  cropAspect.value = s.aspect;
+  Object.assign(denoise, s.denoise);
+  look.value = s.look;
+  lookStyle.value = s.lookStyle;
+  droStrength.value = s.dro;
+  droLevel.value = s.droLevel;
+  sonyAdvancedColour.value = s.sonyAdvancedColour;
+  sonyCameraMatch.value = s.sonyCameraMatch;
+  masks.splice(0, masks.length, ...s.masks);
   if (selectedMask.value && !masks.some(g => g.id === selectedMask.value)) selectedMask.value = null;
-  erase.splice(0, erase.length, ...cloneErase(s.erase ?? []));
+  erase.splice(0, erase.length, ...s.erase);
   {
     // In place: the editor holds the lights array itself.
-    const r = cloneRelight(s.relight);
+    const r = s.relight;
     relight.lights.splice(0, relight.lights.length, ...r.lights);
     relight.ambient = r.ambient; relight.wrap = r.wrap; relight.falloff = r.falloff; relight.shadows = r.shadows;
     if (selectedLight.value && !relight.lights.some(l => l.id === selectedLight.value)) selectedLight.value = null;
   }
   dcpCode.value = s.dcp;
-  profileId.value = s.profile ?? "standard";
+  profileId.value = s.profile;
   // Rebake with the snapshot's Basic values (bakeCurveLUT also syncs bakedBasic).
   // Uploading a curve-only LUT here would leave a stale bakedBasic: if the
   // snapshot's Contrast/Blacks happen to equal it, drawWebGL's sameBasic check
@@ -3489,7 +3351,10 @@ function flashCopyNotice(msg: string): void {
 async function snapshotFor(id: string | null): Promise<Snapshot | null> {
   if (!id || id === activeSource.value?.id) return activeSource.value ? captureSnapshot() : null;
   const photo = photoById(id);
-  return (await snapshotOf(id)) ?? (photo ? defaultSnapshot(photo.name) : null);
+  // Normalised here because nothing else will: the export and the background
+  // render read a stored snapshot without it ever becoming the live edit.
+  const stored = await snapshotOf(id);
+  return stored ? normalizeSnapshot(stored) : photo ? defaultSnapshot(photo.name) : null;
 }
 
 async function copyRecipe(from: string | null = null, sections: readonly RecipeSection[] = copySections.value): Promise<void> {
