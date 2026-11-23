@@ -1314,10 +1314,10 @@ const {
   sortKey, sortDir, groupKey, setSort, setGroup,
   folderPhotos, activeId, activeSource, selectedIds, importProgress, importing,
   photoById, resolveUrl, thumbSrc, markInvalid, clearInvalid,
-  persistNow, persistOnUnload: persistForUnload, schedulePersist,
+  persistNow, persistOnUnload: persistForUnload, schedulePersist, saveFailing, retrySave,
   selectSource, openPhoto, setView,
   selectFolder, toggleExpanded, createFolder, renameFolder, moveFolder, deleteFolder,
-  removePhotos, renamePhoto, movePhotos, importFiles, importDropped, importPickedDirectory,
+  removePhotos, pendingRemoval, undoRemoval, renamePhoto, movePhotos, importFiles, importDropped, importPickedDirectory,
   savePreview, boot, updateEdits, snapshotOf,
 } = useCatalog<Snapshot, typeof viewSettings>({
   api: API,
@@ -2359,6 +2359,9 @@ function onKeyDown(e: KeyboardEvent): void {
   if ((e.ctrlKey || e.metaKey) && !inEditableText) {
     const k = e.key.toLowerCase();
     if (k === "z" && !e.shiftKey && eraseDraft.value && editTab.value === "erase") { e.preventDefault(); undoEraseDraftLine(); return; }
+    // A removal that can still be taken back is the most recent thing done,
+    // and the one a reflexive Ctrl+Z is for — ahead of the open photo's edits.
+    if (k === "z" && !e.shiftKey && pendingRemoval.value) { e.preventDefault(); void undoRemoval(); return; }
     if (k === "z") { e.preventDefault(); if (e.shiftKey) redo(); else undo(); return; }
     if (k === "y") { e.preventDefault(); redo(); return; }
     // Lightroom's copy / paste settings.
@@ -2718,7 +2721,13 @@ const eraseNotice = computed(() => {
 // Flush the latest edit on tab close. Only a keepalive request survives the
 // unload, so also flush whenever the tab goes hidden — that fires earlier and
 // more reliably than beforeunload (mobile tab switches, window close).
-function persistOnUnload(): void { persistForUnload(); }
+function persistOnUnload(event: BeforeUnloadEvent): void {
+  persistForUnload();
+  // Edits the server has not taken: the keepalive request above is one last
+  // try, and if the server is the problem it will fail like the rest did. Ask
+  // before the tab — the only other place they exist — goes away.
+  if (saveFailing.value) event.preventDefault();
+}
 function persistOnHidden(): void { if (document.visibilityState === "hidden") persistNow(); }
 
 onBeforeUnmount(() => {
@@ -3494,6 +3503,15 @@ async function copyRecipe(from: string | null = null, sections: readonly RecipeS
 function openCopyDialog(from: string | null = null): void {
   copyDialog.value = { from };
 }
+const copyDialogEl = ref<HTMLDialogElement | null>(null);
+// flush: "post" so the dialog's content is rendered before it is shown, and
+// showModal() finds something to put the focus on.
+watch(copyDialog, open => {
+  const el = copyDialogEl.value;
+  if (!el) return;
+  if (open && !el.open) el.showModal();
+  else if (!open && el.open) el.close();
+}, { flush: "post" });
 async function confirmCopy(): Promise<void> {
   const from = copyDialog.value?.from ?? null;
   storeCopySections(copySections.value);
@@ -4127,6 +4145,12 @@ const vWheelAdjust = {
           <div class="status-cell" v-if="importProgress">
             <span class="spinner" aria-hidden="true" />
             <span class="status-value">{{ t('status.importProgress', { done: importProgress.done, total: importProgress.total }) }}</span>
+          </div>
+          <!-- Stays for as long as an edit has not reached the server: the
+               sliders keep working without it, so nothing else would say. -->
+          <div class="status-cell status-alert" v-if="saveFailing" role="alert" :title="t('error.saveFailed')">
+            <span class="status-value">{{ t('status.saveFailed') }}</span>
+            <button class="status-action" type="button" @click="retrySave">{{ t('status.saveRetry') }}</button>
           </div>
         </div>
         <div class="status-right">
@@ -4893,8 +4917,15 @@ const vWheelAdjust = {
     <input ref="folderInput" type="file" hidden multiple webkitdirectory @change="onFolderChange" />
     <transition name="fade"><div v-if="isDragging" class="drag-overlay">{{ t('drag.overlay') }}</div></transition>
     <!-- Copy Settings: which sections a copy takes (rendering/recipes.ts). -->
-    <div v-if="copyDialog" class="copy-dialog-backdrop" @click.self="copyDialog = null" @keydown.esc="copyDialog = null">
-      <div class="copy-dialog" role="dialog" aria-modal="true" :aria-label="t('recipe.copyTitle')">
+    <!-- A native modal dialog, like the model settings: the focus is moved
+         into it and held there, and the page behind is inert — so a Delete or
+         a single-key shortcut pressed while it is open cannot land on the grid
+         (where Delete removes the selected photos). Escape closes it. The
+         padding is on the inner box, so a click on the dialog element itself
+         is a click on the backdrop. -->
+    <dialog ref="copyDialogEl" class="copy-dialog" :aria-label="t('recipe.copyTitle')"
+      @close="copyDialog = null" @click.self="copyDialog = null">
+      <div v-if="copyDialog" class="copy-dialog-body">
         <header class="copy-dialog-head">
           <span>{{ t('recipe.copyTitle') }}</span>
           <button class="icon-mini" type="button" :aria-label="t('common.done')" @click="copyDialog = null"><JIcon :icon="IconX" /></button>
@@ -4913,7 +4944,14 @@ const vWheelAdjust = {
           <button class="primary" type="button" :disabled="!copySections.length" @click="confirmCopy">{{ t('recipe.copy') }}</button>
         </footer>
       </div>
-    </div>
+    </dialog>
+    <!-- A removal inside its undo window (useCatalog removePhotos). -->
+    <transition name="fade">
+      <div v-if="pendingRemoval" class="copy-pill undo-pill" role="status">
+        <span>{{ t('grid.removed', { n: pendingRemoval.ids.length }) }}</span>
+        <button type="button" class="status-action" @click="undoRemoval">{{ t('common.undo') }}</button>
+      </div>
+    </transition>
     <transition name="fade">
       <div v-if="copyNotice || previewProgress" class="copy-pill">
         {{ previewProgress ? t('recipe.refreshing', { done: previewProgress.done, total: previewProgress.total }) : copyNotice }}

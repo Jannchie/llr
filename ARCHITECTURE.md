@@ -149,7 +149,11 @@ downloading → available) is followed in one place, `useModelStatus`.
 `useCatalog` is the browser's half of the catalog: the folder tree, the open
 folder's photos as plain (non-reactive) records, the active photo — which need
 not be in that folder — and the edits touched this session, saved with a
-debounce (`PUT /photos/:id/edit`; a keepalive request on unload). The library
+debounce (`PUT /photos/:id/edit`; a keepalive request on unload). A save that
+fails is retried until it lands and the footer says so meanwhile
+(`editSaver.ts`) — the pixels are the browser's, so nothing else would show
+that the server is gone. Removing photos is undoable for a few seconds: they
+leave every list at once, but the server is told only when that window closes. The library
 grid is ordered by `librarySort.ts` (a sort key and direction, then grouping
 into sections) and windowed a row at a time (`useVirtualRows`: group headers
 over bands of cells, so a row that was never mounted can still be hit-tested —

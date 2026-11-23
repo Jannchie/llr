@@ -1,7 +1,8 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef, type Ref } from "vue";
 import * as api from "../catalog-api";
 import { buildTree, pathOf, type FolderRow } from "../catalogTree";
-import { fitForKeepalive, trimEdit, type PersistedEdit } from "../edits";
+import { createEditSaver } from "../editSaver";
+import { trimEdit, type PersistedEdit } from "../edits";
 import { t } from "../i18n";
 import { GROUP_KEYS, SORT_KEYS, type GroupKey, type SortDir, type SortKey } from "../librarySort";
 import { clearState, clearThumbs, loadSession } from "../persistence";
@@ -30,6 +31,8 @@ const ADOPTED_KEY = "llr.catalog.adopted";
 // be decoding the photo being edited; more uploads would only queue there.
 const IMPORT_CONCURRENCY = 3;
 const PERSIST_DEBOUNCE = 600;
+// How long a removed photo can still be brought back.
+export const REMOVE_UNDO_MS = 8000;
 
 type UiState<V> = {
   activeId: string | null;
@@ -119,8 +122,17 @@ export function useCatalog<S, V>(opts: {
   // null = the server has nothing stored (the photo is at its defaults), so a
   // second activation does not ask again.
   const edits = new Map<string, PersistedEdit<S> | null>();
-  const dirtyEditIds = new Set<string>();
+  // Which edits still have to reach the server, and whether they are getting
+  // there (editSaver.ts): a save that fails is retried until it lands, and
+  // `saver.failing` — the footer's alert — stands for as long as it has not.
+  // Not a toast: that sits over the footer, on top of the retry it would offer.
+  const saver = createEditSaver<S>({ edit: id => edits.get(id), put: api.putEdit });
   let persistTimer = 0;
+  // A removal inside its undo window: gone from every list here, untouched on
+  // the server. `perFolder` is how many each folder lost, for the tree's counts;
+  // `reopen` is the photo that was being edited when it went.
+  const pendingRemoval = shallowRef<{ ids: string[]; perFolder: Map<number, number>; reopen: string | null } | null>(null);
+  let removalTimer = 0;
   // The photo whose edit is still on its way from the server. Until it lands,
   // the live state belongs to the previous photo — capturing it under the new
   // id would overwrite that photo's edit with someone else's.
@@ -151,7 +163,7 @@ export function useCatalog<S, V>(opts: {
     if (!id || id === pendingActivation) return;
     opts.flushPendingHistory();
     edits.set(id, opts.captureEdit());
-    dirtyEditIds.add(id);
+    saver.mark(id);
   }
 
   function saveUiState(): void {
@@ -192,11 +204,7 @@ export function useCatalog<S, V>(opts: {
   function persistNow(): void {
     if (persistTimer) { clearTimeout(persistTimer); persistTimer = 0; }
     syncLiveToMap(activeId.value);
-    for (const id of dirtyEditIds) {
-      const e = edits.get(id);
-      if (e) api.putEdit(id, trimEdit(e)).catch(() => { dirtyEditIds.add(id); });
-    }
-    dirtyEditIds.clear();
+    saver.flush();
     saveUiState();
   }
 
@@ -204,11 +212,10 @@ export function useCatalog<S, V>(opts: {
   function persistOnUnload(): void {
     if (persistTimer) { clearTimeout(persistTimer); persistTimer = 0; }
     syncLiveToMap(activeId.value);
-    for (const id of dirtyEditIds) {
-      const e = edits.get(id);
-      if (e) void api.putEdit(id, fitForKeepalive(e), { keepalive: true }).catch(() => {});
-    }
-    dirtyEditIds.clear();
+    saver.flushOnUnload();
+    // A removal still inside its undo window was meant; the tab closing is not
+    // an undo.
+    commitRemoval({ keepalive: true });
     saveUiState();
   }
 
@@ -232,7 +239,7 @@ export function useCatalog<S, V>(opts: {
       if (!next) continue;
       const history = [...(e ? e.history.slice(0, e.historyIndex + 1) : [current]), next];
       edits.set(id, trimEdit({ snapshot: next, history, historyIndex: history.length - 1 }));
-      dirtyEditIds.add(id);
+      saver.mark(id);
       done.push(id);
     }
     persistNow();
@@ -327,7 +334,11 @@ export function useCatalog<S, V>(opts: {
   // ── Folder navigation ──
 
   async function refreshTree(): Promise<void> {
-    folders.value = await api.catalogTree();
+    const rows = await api.catalogTree();
+    // Photos inside their undo window are still on the server; the tree's
+    // counts should not bring them back.
+    const held = pendingRemoval.value?.perFolder;
+    folders.value = held ? rows.map(f => held.has(f.id) ? { ...f, count: Math.max(0, f.count - held.get(f.id)!) } : f) : rows;
   }
 
   function bumpCount(folderId: number, delta: number): void {
@@ -339,7 +350,8 @@ export function useCatalog<S, V>(opts: {
     if (!opts.keepSelection) selectedIds.clear();
     folderLoading.value = true;
     try {
-      const photos = await api.listPhotos(id);
+      const held = new Set(pendingRemoval.value?.ids);
+      const photos = (await api.listPhotos(id)).filter(p => !held.has(p.id));
       if (selectedFolderId.value !== id) return; // the user moved on
       for (const p of photos) photosById.set(p.id, p);
       folderPhotos.value = photos;
@@ -409,7 +421,7 @@ export function useCatalog<S, V>(opts: {
     for (const id of gone) {
       photosById.delete(id);
       edits.delete(id);
-      dirtyEditIds.delete(id);
+      saver.forget(id);
       selectedIds.delete(id);
       invalidIds.delete(id);
     }
@@ -467,8 +479,19 @@ export function useCatalog<S, V>(opts: {
   // touched — imports only ever copy bytes into the server cache.
   async function removePhotos(ids: string[]): Promise<void> {
     if (!ids.length) return;
+    // One undo at a time: an earlier removal is final once another starts.
+    commitRemoval();
+    // What the photo looks like right now has to be on the server before it
+    // is forgotten here, or an undo would bring back an older edit.
+    persistNow();
     const gone = new Set(ids);
     const list = folderPhotos.value;
+    const perFolder = new Map<number, number>();
+    for (const id of ids) {
+      const p = photosById.get(id);
+      if (p) perFolder.set(p.folderId, (perFolder.get(p.folderId) ?? 0) + 1);
+    }
+    const reopen = activeId.value && gone.has(activeId.value) ? activeId.value : null;
     // The neighbour that takes over when the active photo goes: the first
     // survivor after the last removed one, else the last survivor of all.
     let next: Photo | null = null;
@@ -488,8 +511,36 @@ export function useCatalog<S, V>(opts: {
     }
     // Persist the removal now — not after the neighbour's multi-second decode.
     persistNow();
-    api.deletePhotos(ids).catch(fail);
+    // The server is told only when the undo window closes: until then the
+    // photo, its edit and its history are all still there to come back to.
+    pendingRemoval.value = { ids, perFolder, reopen };
+    removalTimer = window.setTimeout(() => commitRemoval(), REMOVE_UNDO_MS);
     await loading;
+  }
+
+  /** Make the pending removal final (the window closed, another removal began, the tab is closing). */
+  function commitRemoval(init: { keepalive?: boolean } = {}): void {
+    const pending = pendingRemoval.value;
+    if (!pending) return;
+    window.clearTimeout(removalTimer);
+    pendingRemoval.value = null;
+    api.deletePhotos(pending.ids, init).catch(fail);
+  }
+
+  /** Bring back the photos of the pending removal, as they were. */
+  async function undoRemoval(): Promise<void> {
+    const pending = pendingRemoval.value;
+    if (!pending) return;
+    window.clearTimeout(removalTimer);
+    pendingRemoval.value = null;
+    // Nothing was deleted, so the server still has all of it: ask again.
+    try {
+      await Promise.all([refreshTree(), selectFolder(selectedFolderId.value, { keepSelection: true })]);
+      for (const id of pending.ids) if (photosById.has(id)) selectedIds.add(id);
+      if (pending.reopen) await selectSource(pending.reopen);
+    } catch (error) {
+      fail(error);
+    }
   }
 
   async function movePhotos(ids: string[], folderId: number): Promise<void> {
@@ -733,10 +784,10 @@ export function useCatalog<S, V>(opts: {
     sortKey, sortDir, groupKey, setSort, setGroup,
     folderPhotos, activeId, activeSource, selectedIds, importProgress,
     importing, photoById, resolveUrl, thumbSrc, markInvalid, clearInvalid,
-    persistNow, persistOnUnload, schedulePersist,
+    persistNow, persistOnUnload, schedulePersist, saveFailing: saver.failing, retrySave: saver.retry,
     activateSource, selectSource, openPhoto, setView,
     selectFolder, toggleExpanded, createFolder, renameFolder, moveFolder, deleteFolder,
-    removePhotos, renamePhoto, movePhotos, importFiles, importDropped, importPickedDirectory,
+    removePhotos, pendingRemoval, undoRemoval, renamePhoto, movePhotos, importFiles, importDropped, importPickedDirectory,
     savePreview, boot, updateEdits, snapshotOf,
   };
 }
