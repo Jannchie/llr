@@ -8,14 +8,23 @@
 import type { ServerResponse } from "node:http";
 
 import { Agent, type AgentEvent, type AgentMessage, type AgentTool, type AgentToolResult } from "@earendil-works/pi-agent-core";
-import { clampThinkingLevel, type Api, type ImageContent, type Model, type ModelThinkingLevel, type TextContent, type TSchema } from "@earendil-works/pi-ai";
+import { clampThinkingLevel, type Api, type ImageContent, type Model, type ModelThinkingLevel, type TextContent } from "@earendil-works/pi-ai";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 
-// Every built-in provider, its model catalog and its auth (the provider's
-// usual env var: ANTHROPIC_API_KEY, OPENAI_API_KEY, …). The catalog knows each
-// model's request surface — Claude's adaptive-only thinking, effort levels,
-// which parameters a model rejects — so requests need no patching here.
-const models = builtinModels();
+import { FileCredentialStore } from "./credentials.js";
+
+// Every built-in provider, its model catalog and its auth: a key saved from
+// the browser (credentials.ts), else the provider's usual env var
+// (ANTHROPIC_API_KEY, OPENAI_API_KEY, …). The catalog knows each model's
+// request surface — Claude's adaptive-only thinking, effort levels, which
+// parameters a model rejects — so requests need no patching here.
+const credentials = new FileCredentialStore();
+const models = builtinModels({ credentials });
+
+/** Where keys saved from the browser are kept; unopened, they last as long as the process. */
+export function openCredentials(path: string): void {
+  credentials.open(path);
+}
 
 // `role` is all the API knows about a tool: whether it changes the photo or
 // looks at it, so the nudge below can tell "edited and never looked" without
@@ -67,19 +76,57 @@ export function resolveModel(spec: ModelSpec): Model<Api> {
 
 /**
  * What the model dialog offers: every provider the catalog knows, the ids it
- * ships for it, and whether this server holds that provider's key. An id newer
- * than the catalog can still be typed — the browser only needs the list to
- * show what is usual.
+ * ships for it, and where this server stands on that provider's key. An id
+ * newer than the catalog can still be typed — the browser only needs the list
+ * to show what is usual.
+ *
+ * `hasKey`: requests to the provider can authenticate. `keySource`: what makes
+ * that so, when it is not a key saved here — the env var's name, "OAuth", ….
+ * `keyHint`: the tail of the key saved here, enough to tell two keys apart and
+ * all of it that ever leaves the server. `takesKey`: the provider can be given
+ * a key at all (a few only sign in).
  */
-export type ProviderCatalogEntry = { id: string; hasKey: boolean; models: { id: string; name: string }[] };
+export type ProviderCatalogEntry = {
+  id: string; hasKey: boolean; keySource?: string; keyHint?: string; takesKey: boolean;
+  models: { id: string; name: string }[];
+};
 
 export async function agentCatalog(): Promise<ProviderCatalogEntry[]> {
-  return Promise.all(models.getProviders().map(async p => ({
-    id: p.id,
-    // A broken credential (expired OAuth) reads as "no key" rather than failing the list.
-    hasKey: !!(await models.getAuth(p.id).catch(() => undefined)),
-    models: models.getModels(p.id).map(m => ({ id: m.id, name: m.name })),
-  })));
+  return Promise.all(models.getProviders().map(async p => {
+    // A broken credential (expired OAuth, an unreadable store) reads as "no key" rather than failing the list.
+    const [auth, stored] = await Promise.all([
+      models.getAuth(p.id).catch(() => undefined),
+      credentials.read(p.id).catch(() => undefined),
+    ]);
+    const saved = stored?.type === "api_key" ? stored.key : undefined;
+    return {
+      id: p.id,
+      hasKey: !!auth,
+      ...(auth?.source && !saved ? { keySource: auth.source } : {}),
+      ...(saved ? { keyHint: saved.slice(-4) } : {}),
+      takesKey: !!p.auth.apiKey?.login,
+      models: models.getModels(p.id).map(m => ({ id: m.id, name: m.name })),
+    };
+  }));
+}
+
+/**
+ * Save the key the browser sent for a provider, replacing the one saved before.
+ * From then on it is the key that provider's requests use, ahead of the
+ * environment; running sessions pick it up on their next call.
+ */
+export async function setProviderKey(provider: string, key: string): Promise<void> {
+  const p = models.getProvider(provider);
+  if (!p) throw new Error(`Unknown provider "${provider}"`);
+  if (!p.auth.apiKey?.login) throw new Error(`${p.name} does not take an API key`);
+  // Whatever else the credential carries (a provider's account ids) stays.
+  await credentials.modify(provider, async current => ({ ...(current?.type === "api_key" ? current : {}), type: "api_key", key }));
+}
+
+/** Forget the saved key; the provider falls back to the environment, if it has one there. */
+export async function clearProviderKey(provider: string): Promise<void> {
+  if (!models.getProvider(provider)) throw new Error(`Unknown provider "${provider}"`);
+  await credentials.delete(provider);
 }
 
 function getSession(id: string, init: { model: Model<Api>; systemPrompt: string }): Session {
@@ -105,7 +152,7 @@ function browserTools(s: Session, specs: ToolSpec[]): AgentTool[] {
     name: spec.name,
     label: spec.name,
     description: spec.description,
-    parameters: spec.parameters as unknown as TSchema,
+    parameters: spec.parameters,
     execute: (toolCallId, _params, signal) => new Promise<AgentToolResult<undefined>>((resolve, reject) => {
       s.pending.set(toolCallId, { resolve, reject });
       signal?.addEventListener("abort", () => {
