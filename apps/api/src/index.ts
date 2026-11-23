@@ -49,6 +49,10 @@ import {
 
 const port = Number(process.env.PORT ?? 8790);
 const host = process.env.HOST ?? "127.0.0.1";
+// `pnpm dev:lan`: the web app is being served to other machines on the
+// network, so pages opened by a private-network IP are trusted like localhost
+// (protocol.ts isLocalHostname). Off, only this machine is.
+const lan = process.argv.includes("--lan") || process.env.LLR_LAN === "1";
 const repoRoot = resolveRepoRoot();
 // Everything the server keeps for the user — uploaded sources, their embedded
 // previews, the worker's decode cache — lives outside the checkout, so a
@@ -152,6 +156,7 @@ server.listen(port, host, () => {
   console.log(`LLR API listening on http://${host}:${port}`);
   console.log(`Workspace root: ${repoRoot}`);
   console.log(`Cache root: ${cacheRoot}`);
+  if (lan) console.log("LAN mode: pages opened by a private-network IP are trusted like localhost");
 });
 
 void cleanupSessions();
@@ -1135,15 +1140,15 @@ function sendJson(response: ServerResponse, body: unknown, status = 200): void {
 // LibRaw's parser) just because the reply it gets back is opaque to it.
 function isTrustedRequest(request: IncomingMessage): boolean {
   const origin = request.headers.origin;
-  if (typeof origin === "string" && !isLocalOrigin(origin)) {
+  if (typeof origin === "string" && !isLocalOrigin(origin, lan)) {
     return false;
   }
-  return isAllowedHost(request.headers.host, host);
+  return isAllowedHost(request.headers.host, host, lan);
 }
 
 function setCors(request: IncomingMessage, response: ServerResponse): void {
   const origin = request.headers.origin;
-  if (typeof origin !== "string" || !isLocalOrigin(origin)) {
+  if (typeof origin !== "string" || !isLocalOrigin(origin, lan)) {
     return;
   }
   response.setHeader("Access-Control-Allow-Origin", origin);

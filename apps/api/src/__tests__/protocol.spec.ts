@@ -254,14 +254,16 @@ describe("isLocalOrigin", () => {
     expect(isLocalOrigin("http://[::1]:5173")).toBe(true);
   });
 
-  it("allows private-network IP literals (vite --host 0.0.0.0 opened by LAN IP)", () => {
+  it("allows private-network IP literals in LAN mode only (dev:lan, opened by LAN IP)", () => {
     for (const origin of [
       "http://172.19.63.184:5180", // WSL seen from the Windows browser
       "http://192.168.1.10:5180",
       "http://10.255.255.254:5180",
       "http://100.100.7.7:5180", // Tailscale
     ]) {
-      expect(isLocalOrigin(origin), origin).toBe(true);
+      expect(isLocalOrigin(origin, true), origin).toBe(true);
+      // By default a router's admin page or a captive portal is not this machine.
+      expect(isLocalOrigin(origin), origin).toBe(false);
     }
   });
 
@@ -277,6 +279,7 @@ describe("isLocalOrigin", () => {
       "",
     ]) {
       expect(isLocalOrigin(origin), origin).toBe(false);
+      expect(isLocalOrigin(origin, true), origin).toBe(false);
     }
   });
 });
@@ -300,6 +303,11 @@ describe("isAllowedHost", () => {
     expect(isAllowedHost("localhost:8790", "127.0.0.1")).toBe(true);
     expect(isAllowedHost("dev.box:8790", "dev.box")).toBe(true);
     expect(isAllowedHost(undefined, "127.0.0.1")).toBe(true); // HTTP/1.0 clients
+  });
+
+  it("takes a private-network Host in LAN mode only", () => {
+    expect(isAllowedHost("192.168.1.10:8790", "127.0.0.1", true)).toBe(true);
+    expect(isAllowedHost("192.168.1.10:8790", "127.0.0.1")).toBe(false);
   });
 
   it("rejects a rebound hostname pointed at the bind address", () => {

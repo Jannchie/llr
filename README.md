@@ -72,6 +72,11 @@ pnpm install
 pnpm dev        # api on :8790, web on the port Vite prints
 ```
 
+Both listen on this machine only. `pnpm dev:lan` serves the web app to the
+local network instead (a phone, the Windows side of WSL) — and with it the
+library and the saved API keys to anything on that network, so use it on one
+you trust.
+
 Drop a RAW on the page. Then, optionally:
 
 - Adobe DCP profiles for non-Sony RAWs: copy `Camera/` from a DNG Converter or
