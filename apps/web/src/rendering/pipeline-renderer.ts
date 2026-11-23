@@ -26,7 +26,7 @@ import { computeWbMatrix, halfToFloat, ppLuma } from "./color-spaces";
 import { LUT_SIZE, buildToneCurveLUT, defaultToneCurve } from "./curve";
 import { LOG2_MID } from "./tonal-model";
 import { GROUP_STRIDE, MASK_UBO_BYTES, MASK_USE, imgFromTex } from "./masks";
-import { defaultCrop, sourceSpan } from "./crop";
+import { defaultCrop, fitLongEdge, sourceSpan } from "./crop";
 import { RELIGHT_MAX_LIGHTS, geometryStats, type RelightGeometry } from "./relight";
 import { binRgba, type HistogramBins } from "./histogram";
 
@@ -2864,14 +2864,33 @@ void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
    * composited onto a 2D canvas in the same colour space, so the export
    * matches the preview.
    */
-  async toBlob(type = "image/jpeg", quality = 0.92): Promise<Blob> {
+  /**
+   * Encode the last frame. `maxEdge` scales the finished frame down so its
+   * long edge is at most that many pixels — after the render, not instead of
+   * it: the neighbourhood stages (sharpening, noise reduction, Clarity) are
+   * tied to sensor pixels, so a smaller export is the full-size render made
+   * smaller, not a different render.
+   */
+  async toBlob(type = "image/jpeg", quality = 0.92, maxEdge = 0): Promise<Blob> {
     const { w, h, data: flipped, colorSpace } = this.readFrame();
-    const cvs = document.createElement("canvas");
+    let cvs = document.createElement("canvas");
     cvs.width = w;
     cvs.height = h;
     const ctx = cvs.getContext("2d", { colorSpace });
     if (!ctx) throw new Error("2D context unavailable");
     ctx.putImageData(new ImageData(flipped, w, h, { colorSpace }), 0, 0);
+    const [ow, oh] = fitLongEdge(w, h, maxEdge);
+    if (ow !== w || oh !== h) {
+      const small = document.createElement("canvas");
+      small.width = ow;
+      small.height = oh;
+      const sctx = small.getContext("2d", { colorSpace });
+      if (!sctx) throw new Error("2D context unavailable");
+      sctx.imageSmoothingEnabled = true;
+      sctx.imageSmoothingQuality = "high";
+      sctx.drawImage(cvs, 0, 0, ow, oh);
+      cvs = small;
+    }
     return await new Promise<Blob>((res, rej) =>
       cvs.toBlob((b) => (b ? res(b) : rej(new Error("toBlob failed"))), type, quality));
   }

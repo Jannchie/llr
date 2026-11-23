@@ -531,7 +531,11 @@ const GRADING_BANDS = [
 // View settings (not part of the per-image recipe): display gamut + EXIF policy.
 // exportStripPrivate: exports copy the RAW's full EXIF by default; 1 opts into
 // stripping GPS/serials/owner/maker notes for exports meant to be shared.
-const viewSettings = reactive({ displayGamut: 0, exportStripPrivate: 0 });
+// exportLongEdge (0 = the full size), exportQuality (percent) and exportGamut
+// (0 = sRGB, 1 = Display P3) describe the file an export writes. The gamut is
+// the export's own: what this screen shows in has no bearing on what a file
+// sent elsewhere should be in, and sRGB is what is safe to send.
+const viewSettings = reactive({ displayGamut: 0, exportStripPrivate: 0, exportLongEdge: 0, exportQuality: 100, exportGamut: 0 });
 
 // ── Crop & Straighten ──
 //
@@ -1305,6 +1309,11 @@ const gamutOptions = computed(() => [
   { value: 0, label: "sRGB" },
   { value: 1, label: t("display.p3") },
 ]);
+const exportSizeOptions = computed(() => [
+  { value: 0, label: t("export.sizeFull") },
+  ...[4096, 3072, 2048, 1600].map(px => ({ value: px, label: t("export.sizeEdge", { px }) })),
+]);
+const exportQualityOptions = [100, 95, 90, 80].map(q => ({ value: q, label: `${q}` }));
 const exifOptions = computed(() => [
   { value: 0, label: t("exif.full") },
   { value: 1, label: t("exif.private") },
@@ -3575,6 +3584,11 @@ function buildPlan(
     filename: id === currentSourceId ? exportFilename() : `${(photoById(id)?.name ?? "export").replace(/\.[^.]+$/, "")}.jpg`,
     settings,
     stripPrivate: viewSettings.exportStripPrivate === 1,
+    file: {
+      longEdge: viewSettings.exportLongEdge,
+      quality: Math.min(100, Math.max(1, viewSettings.exportQuality)) / 100,
+      wideGamut: viewSettings.exportGamut === 1 && p3Supported.value,
+    },
     dcpCode: settings.dcp,
     profileId: settings.profile ?? "standard",
     denoise: denoisePayload(settings.denoise),
@@ -4325,6 +4339,23 @@ const vWheelAdjust = {
           <label class="control-label">{{ t('settings.display') }}</label>
           <SelectMenu v-model="viewSettings.displayGamut" :options="gamutOptions"
             :aria-label="t('settings.display')" />
+        </div>
+        <!-- The file an export writes. Its colour space is asked for here and
+             not taken from the display setting above: that one is about this
+             screen. -->
+        <div class="control-row">
+          <label class="control-label">{{ t('settings.exportSize') }}</label>
+          <SelectMenu v-model="viewSettings.exportLongEdge" :options="exportSizeOptions" :aria-label="t('settings.exportSize')" />
+        </div>
+        <div class="control-row">
+          <label class="control-label" :title="t('export.qualityHint')">{{ t('settings.exportQuality') }}</label>
+          <SelectMenu v-model="viewSettings.exportQuality" :options="exportQualityOptions" :title="t('export.qualityHint')"
+            :aria-label="t('settings.exportQuality')" />
+        </div>
+        <div class="control-row" v-if="p3Supported">
+          <label class="control-label" :title="t('export.gamutHint')">{{ t('settings.exportGamut') }}</label>
+          <SelectMenu v-model="viewSettings.exportGamut" :options="gamutOptions" :title="t('export.gamutHint')"
+            :aria-label="t('settings.exportGamut')" />
         </div>
         <div class="control-row" v-if="activeSource">
           <label class="control-label">{{ t('settings.exportExif') }}</label>

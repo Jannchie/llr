@@ -4,6 +4,16 @@ import { API, fetchLinear, type DenoisePayload, type LinearMeta, type LinearRequ
 import { t } from "../i18n";
 import type { RelightGeometry } from "../rendering/relight";
 
+/** The file an export writes: its size, its JPEG quality and its colour space. */
+export interface ExportFile {
+  /** Long edge in pixels; 0 keeps the render's own size. */
+  longEdge: number;
+  /** JPEG quality, 0..1. */
+  quality: number;
+  /** Display P3 rather than sRGB. */
+  wideGamut: boolean;
+}
+
 /**
  * Everything the export mechanics need, frozen at click time. The full-res
  * decode takes seconds and the filmstrip stays clickable, so every value is
@@ -17,6 +27,10 @@ export interface ExportPlan {
   settings: unknown;
   /** Exclude GPS/serials/owner/maker notes from the copied EXIF (opt-in). */
   stripPrivate: boolean;
+  /** What file the export writes — its own settings, apart from how the
+   * photo is shown on this screen. Absent for a background preview, which
+   * takes its size and quality from the caller. */
+  file?: ExportFile;
   dcpCode: string | undefined;
   /** Which colour engine renders camera RGB — must match the preview's. */
   profileId: string;
@@ -63,6 +77,7 @@ export interface ExportPlan {
  * that is not open (the edited previews a paste onto a selection refreshes).
  */
 export async function renderPlan(plan: ExportPlan, opts: { maxEdge?: number; quality?: number } = {}): Promise<Blob> {
+  const file = plan.file;
   let renderer: PipelineRenderer | null = null;
   try {
     // Full resolution for an export (no half-size, no cap); purpose keeps
@@ -93,9 +108,11 @@ export async function renderPlan(plan: ExportPlan, opts: { maxEdge?: number; qua
     const out = plan.output(meta);
     const f = opts.maxEdge ? Math.min(1, opts.maxEdge / Math.max(out.width, out.height)) : 1;
     renderer.setOutput(Math.max(1, Math.round(out.width * f)), Math.max(1, Math.round(out.height * f)), out.texXform, plan.background);
-    renderer.draw(params);
+    // The export's colour space is its own setting; the display's is for this
+    // screen. (The renderer falls back to sRGB where P3 is not available.)
+    renderer.draw(file ? { ...params, displayGamut: file.wideGamut ? 1 : 0 } : params);
     // quality 1.0 also disables the browser encoder's 4:2:0 chroma subsampling
-    return await renderer.toBlob("image/jpeg", opts.quality ?? 1.0);
+    return await renderer.toBlob("image/jpeg", opts.quality ?? file?.quality ?? 1.0, file?.longEdge ?? 0);
   } finally {
     renderer?.destroy();
   }
@@ -201,7 +218,12 @@ async function finishedJpeg(plan: ExportPlan): Promise<Blob> {
   const blob = await renderPlan(plan);
   const fd = new FormData();
   fd.append("file", blob, "export.jpg");
-  fd.append("meta", JSON.stringify({ sourceId: plan.sourceId, settings: plan.settings, stripPrivate: plan.stripPrivate }));
+  fd.append("meta", JSON.stringify({
+    sourceId: plan.sourceId, settings: plan.settings, stripPrivate: plan.stripPrivate,
+    // So the EXIF says what the pixels are: the encoder embeds the P3 profile,
+    // and a ColorSpace tag still reading sRGB would contradict it.
+    wideGamut: plan.file?.wideGamut === true,
+  }));
   const res = await fetch(`${API}/export`, { method: "POST", body: fd });
   if (!res.ok) throw new Error(await res.text());
   return res.blob();
