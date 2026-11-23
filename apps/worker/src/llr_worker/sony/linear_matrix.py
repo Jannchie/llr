@@ -108,9 +108,17 @@ class SegmentedMatrix:
         return linear_matrix_numba.apply(np.asarray(rgb, dtype=np.float32), self.table, lut, post=post)
 
     def apply_reference(self, rgb: np.ndarray) -> np.ndarray:
-        """The whole-array numpy form: a 3x3 gathered per pixel, then einsum.
-        2.35 s and a 1.2 GB temporary on a 33 MP frame, which is why it is no
-        longer what apply runs — but it is what the kernel is held to."""
+        """The whole-array numpy form: a 3x3 gathered per pixel, then its three
+        products summed left to right. 2.35 s and a 1.2 GB temporary on a 33 MP
+        frame, which is why it is no longer what apply runs — but it is what
+        the kernel is held to.
+
+        The sum is written out rather than left to einsum, whose inner loop is
+        SIMD code chosen for the host: on AVX-512 it fuses the multiply into
+        the add, which rounds once where the kernel (and the engine) round
+        twice. An oracle that changes with the CPU is not one.
+        """
         a = np.asarray(rgb, dtype=np.float32)
         m = self.table[hue_index(a, self._hue_lut)]
-        return np.einsum("...ij,...j->...i", m, a)
+        r, g, b = a[..., None, 0], a[..., None, 1], a[..., None, 2]
+        return m[..., 0] * r + m[..., 1] * g + m[..., 2] * b
