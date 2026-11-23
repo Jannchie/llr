@@ -56,3 +56,14 @@ python -m pytest -q
 
 每个模块的测试独立:`tests/test_tone_lut.py`、`tests/test_color_profile.py`、
 `tests/test_dro.py`。
+
+## 原始反汇编与反编译产物
+
+`tools/disasm_*.txt`(逐函数反汇编)和 `tools/*_decomp.c`(Ghidra 反编译输出)
+**不随仓库分发**。它们是 `Edit.exe` 的逐字衍生物,不是这个项目写的东西;仓库里留的是
+从中得出的结论(`PIPELINE.md`、`notes/`)和照着结论重写的实现。
+
+`PIPELINE.md` 和 `notes/` 里仍然按原文件名和行号引用它们,作为每条结论的出处 ——
+那些引用指向私有存档。需要对照时对自己手里的 `Edit.exe` 重新生成:反编译用
+`tools/pyg_stage2.py`(Ghidra),反汇编用任意反汇编器按 notes 里给的函数地址导出。
+这两类文件名已在 `.gitignore` 里,放回 `tools/` 也不会被误提交。

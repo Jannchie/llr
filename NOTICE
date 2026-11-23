@@ -1,0 +1,44 @@
+LLR
+Copyright (c) 2026 Jianqi Pan
+
+The source code in this repository is licensed under the MIT License (see
+LICENSE). That license covers the code written for this project and nothing
+else. The material below is not the author's to license, and the MIT License
+grants no rights in it.
+
+Sony calibration data
+---------------------
+
+LLR reproduces the rendering of Sony's RAW converter. To do so it ships tables
+that were read out of Sony's Imaging Edge Desktop ("Edit") or out of RAW files
+written by Sony cameras, rather than authored here:
+
+  apps/worker/src/llr_worker/sony/data/   (tone, luma, 3-D LUT, hue and look tables)
+  apps/web/public/sony-lut3d.bin
+  apps/web/public/sony-tone-family.bin
+
+The test fixtures under apps/worker/tests/fixtures/, apps/web/scripts/ and
+apps/web/src/rendering/__tests__/, and the measurement data under sony_repro/,
+were likewise captured from that software's input and output, to check this
+project's implementation against it.
+
+These files remain the property of their owner. They are included for
+interoperability with files produced by Sony cameras. apps/worker/src/
+llr_worker/sony/data/camera_match.json is the exception: it is a correction
+fitted by this project against camera JPEGs, and is covered by the MIT License.
+
+Not included
+------------
+
+Adobe DNG camera profiles (used for non-Sony RAWs) are not distributed; the
+README says how to supply your own copy. The models LLR can download at run
+time (generative erase, relight geometry, AI masks) are fetched from their
+publishers and are subject to their own licenses.
+
+Trademarks and affiliation
+--------------------------
+
+Sony, Imaging Edge, Creative Look and the camera model names are trademarks of
+Sony Group Corporation. Adobe, Lightroom and DNG are trademarks of Adobe Inc.
+LLR is an independent project. It is not affiliated with, endorsed by, or
+supported by Sony or Adobe.

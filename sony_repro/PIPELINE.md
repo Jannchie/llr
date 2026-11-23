@@ -2853,7 +2853,7 @@ DRO / 锐化那一轮新增的(§7.10、§7.11):
 | `vatr_inject.py` / `vatr_flat.py` | 灌图案 / **整块 tile 灌均匀场**,`--const V` 让 35 块同值(§7.10.4) |
 | `vatr_curve.py` | 从注入结果读传递函数,与块里那条曲线对照 |
 | `vatr_verify.py` | **纯离线**:拿 ARW 的 `0x781b`/`0x781c` 重建曲线,与 `vatr+0x7c4` 逐项比(16/16) |
-| `sharpness_decomp.c` / `spica_decomp.c` / `itp_decomp.c` / `vatr_decomp.c` / `rawnr_decomp.c` / `chroma_suppres_decomp.c` | Ghidra 反编译产物 |
+| `sharpness_decomp.c` / `spica_decomp.c` / `itp_decomp.c` / `vatr_decomp.c` / `rawnr_decomp.c` / `chroma_suppres_decomp.c` | Ghidra 反编译产物。**不在仓库里**(见 `README.md`「原始反汇编与反编译产物」);本文和 `notes/` 里的文件名与行号指的是私有存档里的那一份 |
 
 **逐阶段的完整原始笔记在 `notes/`**,每篇都比本文详细(含没解出的部分、
 试过不成立的路、以及各自的「会骗人的手法」):
