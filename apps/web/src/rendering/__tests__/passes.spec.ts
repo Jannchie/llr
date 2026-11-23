@@ -183,3 +183,14 @@ describe("DRO placement", () => {
     expect(fn).not.toContain("texture(u_dro_grid");
   });
 });
+
+describe("shader sources", () => {
+  // A stage switched off to bisect a driver hang went out that way once: the
+  // defringe and moiré sliders moved, were saved, and changed nothing.
+  it("carry no bisecting leftovers", async () => {
+    const passes = await import("../passes");
+    for (const [name, value] of Object.entries(passes)) {
+      if (typeof value === "string") expect(value, name).not.toMatch(/BISECT/);
+    }
+  });
+});
