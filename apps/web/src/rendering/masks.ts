@@ -90,6 +90,9 @@ export const MASK_SKIN_C1 = 0.10;
 // is packed as this instead: a step the width of a float ulp on the axis.
 const EPS = 1e-3;
 
+/** A deep copy: groups are plain data (numbers, strings, arrays of them). */
+export const cloneMasks = (m: readonly MaskGroup[]): MaskGroup[] => JSON.parse(JSON.stringify(m));
+
 export function defaultAdjust(): MaskAdjust {
   return { exposure: 0, temperature: 0, tint: 0, saturation: 0, vibrance: 0, highlights: 0, shadows: 0, clarity: 0, dehaze: 0, hue: 0, tintHue: 0, tintSat: 0, moire: 0 };
 }
