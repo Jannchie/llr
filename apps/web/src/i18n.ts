@@ -520,6 +520,8 @@ const en = {
   "grid.clearSelection": "Deselect",
   "grid.remove": "Remove from library",
   "grid.removeConfirm": "Remove {n} photos from the library? The original files on disk are untouched.",
+  "grid.removed": "{n} removed from the library",
+  "common.undo": "Undo",
   "grid.dragCount": "{n} photos",
 
   // Library view: sorting and grouping
@@ -559,6 +561,9 @@ const en = {
   "error.sourceGone": "Source file no longer available (the server cache may have been cleared) — re-import this photo.",
   "error.exportSourceGone": "Source is no longer available server-side",
   "error.contextLost": "Graphics context lost — recovering…",
+  "error.saveFailed": "The LLR server is not answering, so your edits are not being saved. They are kept in this tab and retried; leave it open until this clears.",
+  "status.saveFailed": "Edits not saved — server not answering",
+  "status.saveRetry": "Retry now",
   "error.metadataMissing": "exiftool is not installed, so RAW metadata cannot be read: the Sony rendering, lens corrections and in-camera crop are off. Install exiftool and restart LLR.",
 };
 
@@ -1048,6 +1053,8 @@ const zh: Record<MessageKey, string> = {
   "grid.clearSelection": "取消选择",
   "grid.remove": "从图库移除",
   "grid.removeConfirm": "从图库移除 {n} 张照片？磁盘上的原文件不受影响。",
+  "grid.removed": "已从图库移除 {n} 张",
+  "common.undo": "撤销",
   "grid.dragCount": "{n} 张照片",
 
   // Library view: sorting and grouping
@@ -1086,6 +1093,9 @@ const zh: Record<MessageKey, string> = {
   "error.sourceGone": "源文件已不可用（服务器缓存可能已被清理）——请重新导入这张照片。",
   "error.exportSourceGone": "源文件在服务端已不可用",
   "error.contextLost": "图形上下文丢失——正在恢复…",
+  "error.saveFailed": "LLR 服务没有响应，编辑没有保存成功。编辑内容保留在此标签页中并会自动重试，恢复之前请不要关闭页面。",
+  "status.saveFailed": "编辑未保存——服务没有响应",
+  "status.saveRetry": "立即重试",
   "error.metadataMissing": "未安装 exiftool，无法读取 RAW 元数据：Sony 原厂渲染、镜头校正和机内裁剪均未生效。请安装 exiftool 后重启 LLR。",
 };
 

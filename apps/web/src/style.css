@@ -549,6 +549,37 @@ button {
   color: var(--error);
 }
 
+/* The one thing in the footer that can be acted on: a text button, so it reads
+   as part of the sentence beside it rather than as another control. */
+.status-action {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.status-action:hover {
+  color: var(--accent-strong);
+}
+
+/* Edits that are not reaching the server: the one footer state that must not
+   be missed, so it is a filled block rather than coloured text. */
+.status-alert {
+  background: var(--danger);
+  border-radius: var(--radius-sm);
+}
+
+.status-alert .status-value,
+.status-alert .status-action,
+.status-alert .status-action:hover {
+  color: var(--on-accent);
+}
+
 /* ---------- Side rail: one surface + an outer tab strip ----------
    The rail used to be nine always-open cards stacked 2400px tall — reaching the
    curve meant scrolling two and a half screens. It now shows one group at a
@@ -3713,15 +3744,12 @@ input[type="range"]:focus::-moz-range-thumb {
 .mask-row.is-selected { outline: 1px solid var(--accent); outline-offset: -1px; }
 
 /* ---------- Copy Settings ---------- */
-.copy-dialog-backdrop {
-  position: fixed; inset: 0; z-index: 50; display: grid; place-items: center;
-  background: rgba(0, 0, 0, 0.45);
-}
 .copy-dialog {
-  width: min(440px, calc(100vw - 32px)); padding: 14px 16px; border-radius: 10px;
+  width: min(440px, calc(100vw - 32px)); padding: 0; border-radius: 10px; color: var(--text);
   background: var(--panel, #1b1b1e); border: 1px solid var(--line); box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
-  display: flex; flex-direction: column; gap: 10px;
 }
+.copy-dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
+.copy-dialog-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
 .copy-dialog-head { display: flex; justify-content: space-between; align-items: center; font-weight: 600; }
 .copy-dialog-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 14px; }
 .copy-check { display: flex; align-items: center; gap: 8px; cursor: pointer; }
@@ -3736,6 +3764,9 @@ input[type="range"]:focus::-moz-range-thumb {
   padding: 6px 14px; border-radius: 999px; background: rgba(20, 20, 24, 0.92); border: 1px solid var(--line);
   font-size: 12px; pointer-events: none;
 }
+/* The one pill that is acted on. It sits above the notice pill, which can show
+   at the same time (a paste finishing while a removal is still undoable). */
+.undo-pill { bottom: 156px; display: flex; align-items: center; gap: 12px; pointer-events: auto; }
 
 /* ---------- Lens blur focus ---------- */
 .focus-overlay { z-index: 6; pointer-events: none; }

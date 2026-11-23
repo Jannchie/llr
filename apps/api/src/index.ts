@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
-import { access, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
@@ -25,6 +25,7 @@ import {
   type ToolResultBody,
 } from "./agent.js";
 import { writeDailyBackup } from "./catalog-backup.js";
+import { markRemoved, sweepSessions } from "./sweep.js";
 import { Catalog, CatalogError, ROOT_FOLDER_ID, type PhotoMeta, type PhotoRow } from "./catalog.js";
 import {
   FOLDER_ID,
@@ -100,11 +101,6 @@ const JSON_BODY_LIMIT = 10 * 1024 * 1024;
 // An edited preview is a ~1000px JPEG: a few hundred KB.
 const PREVIEW_BODY_LIMIT = 8 * 1024 * 1024;
 const FORM_BODY_LIMIT = 512 * 1024 * 1024;
-// linear-*.bin / export-*.jpg are per-request scratch that the request itself
-// deletes. Anything still there (the API died mid-render) is orphaned, so it is
-// swept on age. Well above the daemon's request timeout.
-const SCRATCH_TTL_MS = 60 * 60 * 1000;
-const SCRATCH_FILE = /^(?:linear-[\w-]+\.bin|export-[\w-]+\.jpg)$/;
 
 class HttpError extends Error {
   constructor(readonly status: number, message: string) {
@@ -482,14 +478,17 @@ function publicPhoto(p: PhotoRow) {
 }
 
 // Rows are already gone by the time this runs; a directory that will not go
-// (Windows, while the worker still holds the RAW open) is left for the hourly
-// sweep, which removes any directory the catalog no longer names.
+// (Windows, while the worker still holds the RAW open) is marked as meant to
+// be deleted and left for the hourly sweep to finish (sweep.ts). The mark is
+// what tells it apart from a directory whose row went missing some other way.
 async function removePhotoDirs(ids: string[]): Promise<void> {
   for (const id of ids) {
+    const dir = sessionDirFor(id);
     try {
-      await rm(sessionDirFor(id), { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true });
     } catch (error) {
-      console.warn(`could not remove ${id}: ${errorMessage(error)}`);
+      await markRemoved(dir);
+      console.warn(`could not remove ${id} yet: ${errorMessage(error)}`);
     }
   }
 }
@@ -531,7 +530,7 @@ async function handlePhotoUpload(request: IncomingMessage, response: ServerRespo
     // Nothing half-imported stays: no row without previews, no directory
     // without a row.
     catalog.deletePhotos([id]);
-    await rm(sessionDir, { recursive: true, force: true }).catch(() => {});
+    await rm(sessionDir, { recursive: true, force: true }).catch(() => markRemoved(sessionDir));
     throw error;
   }
 }
@@ -757,48 +756,20 @@ async function handleExport(request: IncomingMessage, response: ServerResponse):
 }
 
 async function cleanupSessions(): Promise<void> {
-  let entries;
   try {
-    entries = await readdir(sessionsRoot, { withFileTypes: true });
+    const result = await sweepSessions({
+      sessionsRoot,
+      trashRoot: resolve(cacheRoot, "trash"),
+      // Until the pre-catalog library has been adopted, every directory is one
+      // the browser may still be about to claim — so only scratch is swept.
+      known: catalog.get("legacy_adopted") === "1" ? catalog.photoIds() : null,
+      warn: message => console.warn(message),
+    });
+    if (result.trashed.length) {
+      console.warn(`${result.trashed.length} photo folder(s) the library no longer lists were moved to ${resolve(cacheRoot, "trash")} and are kept for a week: ${result.trashed.join(", ")}`);
+    }
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      console.warn(`session cleanup failed: ${errorMessage(error)}`);
-    }
-    return;
-  }
-  const now = Date.now();
-  // A directory the catalog does not name is a photo that was removed while
-  // something held its file open, or an import that died halfway. Until the
-  // pre-catalog library has been adopted, though, every directory is one the
-  // browser may still be about to claim — so the sweep waits for that.
-  const known = catalog.get("legacy_adopted") === "1" ? catalog.photoIds() : null;
-  for (const entry of entries) {
-    if (!entry.isDirectory()) {
-      continue;
-    }
-    const dir = resolve(sessionsRoot, entry.name);
-    try {
-      if (known && !known.has(entry.name)) {
-        if (now - (await stat(dir)).mtimeMs > SCRATCH_TTL_MS) await rm(dir, { recursive: true, force: true });
-        continue;
-      }
-      await sweepScratch(dir, now);
-    } catch (error) {
-      console.warn(`session cleanup failed for ${dir}: ${errorMessage(error)}`);
-    }
-  }
-}
-
-async function sweepScratch(dir: string, now: number): Promise<void> {
-  for (const entry of await readdir(dir, { withFileTypes: true })) {
-    if (!entry.isFile() || !SCRATCH_FILE.test(entry.name)) {
-      continue;
-    }
-    const path = resolve(dir, entry.name);
-    const stats = await stat(path);
-    if (now - stats.mtimeMs > SCRATCH_TTL_MS) {
-      await rm(path, { force: true });
-    }
+    console.warn(`session cleanup failed: ${errorMessage(error)}`);
   }
 }
 

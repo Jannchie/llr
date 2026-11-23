@@ -87,8 +87,8 @@ export async function movePhotos(ids: string[], folderId: number): Promise<numbe
   return (await request<{ moved: number }>("/photos/move", json("PATCH", { ids, folderId }))).moved;
 }
 
-export async function deletePhotos(ids: string[]): Promise<string[]> {
-  return (await request<{ removed: string[] }>("/photos/delete", json("POST", { ids }))).removed;
+export async function deletePhotos(ids: string[], opts: { keepalive?: boolean } = {}): Promise<string[]> {
+  return (await request<{ removed: string[] }>("/photos/delete", json("POST", { ids }, { keepalive: opts.keepalive === true }))).removed;
 }
 
 // ── Edits ──
