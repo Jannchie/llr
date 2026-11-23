@@ -210,6 +210,7 @@ describe("buildLinearFrameHeader", () => {
       dtype: "float16",
       denoiseUsesChroma: true,
       erase: null,
+      metadataMissing: false,
     });
   });
 
@@ -228,6 +229,12 @@ describe("buildLinearFrameHeader", () => {
     expect(on.denoiseUsesChroma).toBe(false);
     const missing = JSON.parse(buildLinearFrameHeader({ width: 1, height: 1 }).subarray(4).toString("utf8")) as Record<string, unknown>;
     expect(missing.denoiseUsesChroma).toBe(true);
+  });
+
+  it("says when the worker decoded a RAW without its metadata", () => {
+    const header = (m: Record<string, unknown>) => JSON.parse(buildLinearFrameHeader(m).subarray(4).toString("utf8")) as Record<string, unknown>;
+    expect(header({ ...meta, metadataMissing: true }).metadataMissing).toBe(true);
+    expect(header(meta).metadataMissing).toBe(false);
   });
 
   it("stays aligned across header lengths", () => {

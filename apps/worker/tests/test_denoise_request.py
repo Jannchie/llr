@@ -67,3 +67,22 @@ def test_auto_owns_the_edge_only_where_the_switch_exists(monkeypatch: pytest.Mon
     assert wavelet.get("denoise_tweaks") == (50.0, 50.0)
     sony = _first_decode(monkeypatch, tmp_path, "sony", stored)
     assert sony.get("denoise_tweaks") == (80.0, 50.0)
+
+
+def test_a_raw_decoded_without_exiftool_says_so(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # No exiftool means no make, model, Creative Look, ISO, crop or lens tables:
+    # the frame still decodes, but through none of what makes it the camera's.
+    # The response has to carry that, or the browser shows a wrong-looking
+    # photo with nothing to say why.
+    monkeypatch.setattr(cli, "daemon_linear", lambda request, root: {"width": 1, "height": 1})
+    raw = {"command": "render-linear", "input": str(tmp_path / "frame.ARW")}
+    jpeg = {"command": "render-linear", "input": str(tmp_path / "frame.jpg")}
+
+    monkeypatch.setattr(cli, "detect_exiftool", lambda: None)
+    assert cli.handle_daemon_request(raw, tmp_path).get("metadataMissing") is True
+    assert "metadataMissing" not in cli.handle_daemon_request(jpeg, tmp_path)  # nothing lost there
+    assert cli.handle_daemon_request({"command": "ping"}, tmp_path)["exiftool"] is False
+
+    monkeypatch.setattr(cli, "detect_exiftool", lambda: "exiftool")
+    assert "metadataMissing" not in cli.handle_daemon_request(raw, tmp_path)
+    assert cli.handle_daemon_request({"command": "ping"}, tmp_path)["exiftool"] is True

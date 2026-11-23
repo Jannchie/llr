@@ -383,8 +383,20 @@ def _opt_out_of_power_throttling() -> None:
         sys.stderr.write("could not opt out of power throttling; decodes may slow under sustained load\n")
 
 
+# Without exiftool a RAW decodes with no metadata at all: no make or model, no
+# Creative Look, ISO, crop or lens tables — so no Sony rendering, no ITP, and a
+# frame that just looks off with nothing to say why. Said out loud instead: at
+# start-up here, and on every RAW decode's response for the browser to show.
+EXIFTOOL_MISSING = (
+    "exiftool not found (PATH, or vendor/exiftool): RAW metadata cannot be read, so the Sony "
+    "rendering, lens corrections and in-camera crop are off. Install exiftool and restart."
+)
+
+
 def run_daemon(root: Path) -> None:
     _opt_out_of_power_throttling()
+    if detect_exiftool() is None:
+        sys.stderr.write(f"WARNING: {EXIFTOOL_MISSING}\n")
     sys.stderr.write("llr-worker daemon ready\n")
     sys.stderr.flush()
     threading.Thread(target=_warm_kernels, name="kernel-warmup", daemon=True).start()
@@ -431,7 +443,12 @@ _MODELS = {"erase": erase_module, "relight": relight_module, "ai": ai_module}
 def handle_daemon_request(request: dict[str, Any], root: Path) -> dict[str, Any]:
     command = request.get("command")
     if command == "render-linear":
-        return daemon_linear(request, root)
+        response = daemon_linear(request, root)
+        # Looked up per decode rather than once: installing it should not need
+        # a restart to stop the warning, and a decode dwarfs the lookup.
+        if is_raw(Path(str(request.get("input", "")))) and detect_exiftool() is None:
+            response["metadataMissing"] = True
+        return response
     if command == "look-profile":
         return daemon_look_profile(request, root)
     if command == "extract-preview":
@@ -447,7 +464,7 @@ def handle_daemon_request(request: dict[str, Any], root: Path) -> dict[str, Any]
     if command == "ai-masks":
         return daemon_ai_masks(request, root)
     if command == "ping":
-        return {"pong": True, "cacheSize": len(_LINEAR_CACHE)}
+        return {"pong": True, "cacheSize": len(_LINEAR_CACHE), "exiftool": detect_exiftool() is not None}
     raise ValueError(f"unknown command: {command}")
 
 
