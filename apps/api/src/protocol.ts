@@ -310,15 +310,18 @@ function isPrivateIPv4(ip: string): boolean {
   );
 }
 
-// Vite binds 0.0.0.0 precisely so the app can be opened from another machine
-// (the Windows side of WSL, a phone on the LAN) by IP, and that page's origin
-// is the IP it was opened at. An IP-literal origin in private address space
-// can only be a page served from this network, so it gets the same trust as
-// localhost. DNS names stay rejected: a hostile page on the internet carries
-// its own domain, and a rebound domain is still a domain.
-function isLocalHostname(hostname: string): boolean {
+// This machine, always. In LAN mode (`pnpm dev:lan`: Vite on 0.0.0.0, so the
+// app can be opened from another machine — the Windows side of WSL, a phone —
+// by IP) the page's origin is the IP it was opened at, and an IP-literal
+// origin in private address space gets the same trust as localhost. Only
+// then: every device on the network, and every page a router or a captive
+// portal serves from a private address, is such an origin, and what it would
+// be trusted with is the library, its deletion and the saved LLM keys. DNS
+// names stay rejected either way: a hostile page on the internet carries its
+// own domain, and a rebound domain is still a domain.
+function isLocalHostname(hostname: string, lan: boolean): boolean {
   if (hostname === "localhost") return true;
-  if (isIP(hostname) === 4) return isPrivateIPv4(hostname);
+  if (isIP(hostname) === 4) return lan ? isPrivateIPv4(hostname) : hostname.startsWith("127.");
   // WHATWG URL keeps the brackets on an IPv6 hostname.
   return hostname === "[::1]";
 }
@@ -327,9 +330,9 @@ function isLocalHostname(hostname: string): boolean {
 // and the API carries the user's original files. Withholding the CORS headers
 // is not enough — a page the user happens to visit can still fire a
 // simple-request POST and take the side effects — so this gates the request.
-export function isLocalOrigin(origin: string): boolean {
+export function isLocalOrigin(origin: string, lan = false): boolean {
   try {
-    return isLocalHostname(new URL(origin).hostname);
+    return isLocalHostname(new URL(origin).hostname, lan);
   } catch {
     return false;
   }
@@ -339,12 +342,12 @@ export function isLocalOrigin(origin: string): boolean {
 // hostname that has been re-pointed at 127.0.0.1 is *same-origin* with the API,
 // so its requests carry no Origin at all. The Host header still names the
 // attacker's domain, which is what makes it separable from a real client.
-export function isAllowedHost(hostHeader: string | undefined, bindHost: string): boolean {
+export function isAllowedHost(hostHeader: string | undefined, bindHost: string, lan = false): boolean {
   // Only HTTP/1.0 clients omit Host; no browser can be made to.
   if (hostHeader === undefined) return true;
   try {
     const { hostname } = new URL(`http://${hostHeader}`);
-    return isLocalHostname(hostname) || hostname === bindHost;
+    return isLocalHostname(hostname, lan) || hostname === bindHost;
   } catch {
     return false;
   }

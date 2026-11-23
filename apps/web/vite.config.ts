@@ -15,6 +15,9 @@ export default defineConfig(({ command }) => ({
     ? { "import.meta.env.VITE_API_DIRECT": JSON.stringify(apiTarget.replace("//localhost", "//127.0.0.1")) }
     : {},
   server: {
+    // The host is the script's: `dev` binds this machine only, `dev:lan`
+    // 0.0.0.0 (and starts the API in its LAN mode, which is what lets a page
+    // opened by a network IP through the origin gate).
     port: 5180,
     proxy: {
       "/api": {

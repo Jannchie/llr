@@ -14,6 +14,7 @@
     "test:worker": "uv run --project apps/worker pytest -q apps/worker/tests",
     "lint": "eslint . && uv run --project apps/worker ruff check apps/worker",
     "dev": "pnpm --parallel --filter @llr/api --filter @llr/web dev",
+    "dev:lan": "pnpm --parallel --filter @llr/api --filter @llr/web dev:lan",
     "dev:api": "pnpm --filter @llr/api dev",
     "dev:web": "pnpm --filter @llr/web dev",
     "worker": "uv run --project apps/worker llr-worker"

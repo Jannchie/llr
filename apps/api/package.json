@@ -7,6 +7,7 @@
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "dev": "tsx --disable-warning=ExperimentalWarning src/index.ts",
+    "dev:lan": "tsx --disable-warning=ExperimentalWarning src/index.ts --lan",
     "test": "vitest run"
   },
   "devDependencies": {
