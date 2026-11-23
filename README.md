@@ -99,3 +99,9 @@ Drop a RAW on the page. Then, optionally:
   pipeline was recovered, and how faithful each stage is.
 - [docs/masking.md](docs/masking.md), [docs/assistant-ux.md](docs/assistant-ux.md)
 - `pnpm check` runs typecheck, lint, and the web / api / worker test suites.
+
+## License
+
+MIT for the code — see [LICENSE](LICENSE). The Sony calibration tables LLR
+ships and tests against are not covered by it; [NOTICE](NOTICE) says what they
+are and where they come from. LLR is not affiliated with Sony or Adobe.
