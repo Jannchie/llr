@@ -91,9 +91,50 @@ def test_evicted_raw_handles_are_closed(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(cli.rawpy, "imread", fake_imread)
     monkeypatch.setattr(cli, "_RAW_HANDLE_CACHE", OrderedDict())
+    monkeypatch.setattr(cli, "_RAW_HANDLE_BUSY", {})
     monkeypatch.setattr(cli, "_RAW_HANDLE_CACHE_MAX", 2)
     for name in ("a", "b", "c"):
         p = tmp_path / f"{name}.ARW"
         p.write_bytes(b"x")
-        cli._checkout_raw(p)
+        cli._release_raw(cli._checkout_raw(p))    # a request that came and went
     assert [r.closed for r in opened] == [True, False, False]
+
+
+def test_a_raw_handle_in_use_is_not_evicted(tmp_path, monkeypatch) -> None:
+    """Closing a handle frees the buffer its mosaic is a view of. A slow decode
+    of one file used to lose its handle to two other files passing through the
+    cache meanwhile — as many slots as worker threads left no room for it."""
+    from llr_worker import cli
+
+    opened: list[_FakeRaw] = []
+
+    def fake_imread(_p: str) -> _FakeRaw:
+        opened.append(_FakeRaw())
+        return opened[-1]
+
+    monkeypatch.setattr(cli.rawpy, "imread", fake_imread)
+    monkeypatch.setattr(cli, "_RAW_HANDLE_CACHE", OrderedDict())
+    monkeypatch.setattr(cli, "_RAW_HANDLE_BUSY", {})
+    monkeypatch.setattr(cli, "_RAW_HANDLE_CACHE_MAX", 2)
+    paths = []
+    for name in ("slow", "b", "c", "d"):
+        paths.append(tmp_path / f"{name}.ARW")
+        paths[-1].write_bytes(b"x")
+
+    slow = cli._checkout_raw(paths[0])            # still decoding...
+    again = cli._checkout_raw(paths[0])           # ...its second variant too
+    for p in paths[1:]:
+        cli._release_raw(cli._checkout_raw(p))    # three other files come and go
+    # The oldest entry is the one in use: the idle ones behind it went instead.
+    assert [r.closed for r in opened] == [False, True, True, False]
+
+    cli._release_raw(again)
+    cli._release_raw(slow)
+    assert cli._RAW_HANDLE_BUSY == {}
+    # Released, it is an ordinary entry again — and the oldest, so the next
+    # file through takes its place.
+    assert not slow.closed
+    extra = tmp_path / "e.ARW"
+    extra.write_bytes(b"x")
+    cli._release_raw(cli._checkout_raw(extra))
+    assert [r.closed for r in opened] == [True, True, True, False, False]
