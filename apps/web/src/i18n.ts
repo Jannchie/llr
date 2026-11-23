@@ -559,6 +559,7 @@ const en = {
   "error.sourceGone": "Source file no longer available (the server cache may have been cleared) — re-import this photo.",
   "error.exportSourceGone": "Source is no longer available server-side",
   "error.contextLost": "Graphics context lost — recovering…",
+  "error.metadataMissing": "exiftool is not installed, so RAW metadata cannot be read: the Sony rendering, lens corrections and in-camera crop are off. Install exiftool and restart LLR.",
 };
 
 export type MessageKey = keyof typeof en;
@@ -1085,6 +1086,7 @@ const zh: Record<MessageKey, string> = {
   "error.sourceGone": "源文件已不可用（服务器缓存可能已被清理）——请重新导入这张照片。",
   "error.exportSourceGone": "源文件在服务端已不可用",
   "error.contextLost": "图形上下文丢失——正在恢复…",
+  "error.metadataMissing": "未安装 exiftool，无法读取 RAW 元数据：Sony 原厂渲染、镜头校正和机内裁剪均未生效。请安装 exiftool 后重启 LLR。",
 };
 
 const CATALOG: Record<Locale, Record<MessageKey, string>> = { en, zh };

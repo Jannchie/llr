@@ -279,6 +279,10 @@ export function buildLinearFrameHeader(meta: Record<string, unknown>): Buffer {
     // the count and, when the fills could not run (no model, no runtime), why —
     // the frame then arrives as decoded rather than not at all.
     erase: meta.erase && typeof meta.erase === "object" ? meta.erase : null,
+    // The worker has no exiftool, so this RAW was decoded without its metadata
+    // (no Sony rendering, lens tables or in-camera crop). The frame still
+    // arrives; the browser says why it looks the way it does.
+    metadataMissing: meta.metadataMissing === true,
   });
 }
 

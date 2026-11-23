@@ -63,7 +63,9 @@ $0.40 on `gpt-5.6-sol`. Bring your own key; any provider `pi-ai` knows works.
 ## Run it
 
 Node 22+, pnpm 10, [uv](https://docs.astral.sh/uv/) for the Python worker,
-and a WebGL2 browser.
+[exiftool](https://exiftool.org/) on the `PATH`, and a WebGL2 browser. exiftool
+is not optional for RAWs: it is how the worker reads which camera, Creative Look
+and lens a frame came from, and without it there is no Sony rendering to show.
 
 ```bash
 pnpm install

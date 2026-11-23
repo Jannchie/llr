@@ -220,6 +220,9 @@ export type LinearMeta = {
   // How the request's erase strokes went: null without any; `error` says why
   // the fills did not run (no model, no runtime) — the frame is then as decoded.
   erase?: { strokes: number; error?: string } | null;
+  // The worker could not read the RAW's metadata (no exiftool): the frame is
+  // decoded without the Sony rendering, lens tables and in-camera crop.
+  metadataMissing?: boolean;
 };
 
 // Whether a worker model (erase, relight geometry, AI masks) can run on this

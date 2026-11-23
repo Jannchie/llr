@@ -1645,6 +1645,8 @@ function lookRequest(
   };
 }
 
+let metadataMissingShown = false;
+
 // Decode `id`'s linear data and render it into the (reused) WebGL pipeline.
 // Returns false if the source can no longer be decoded server-side.
 // Concurrent calls can overlap (rapid filmstrip clicks, a dcp/denoise reload
@@ -1688,6 +1690,12 @@ async function loadSource(id: string, opts: { resetView?: boolean; cause?: Decod
     // not — it is read by the render path, not by the template.
     lensCorrAvailable.value = lensCorr !== null;
     eraseError.value = linMeta.erase?.error ?? null;
+    // Once a session: it is the worker's set-up, not this photo's, and a toast
+    // on every photo would bury the ones that are about a photo.
+    if (linMeta.metadataMissing && !metadataMissingShown) {
+      metadataMissingShown = true;
+      errorMessage.value = t("error.metadataMissing");
+    }
     // What the worker *actually* rendered with, which is not always what was
     // asked for: "sony" falls back to the DCP path on a RAW without Sony's
     // calibration. The DCP-only controls follow this, not profileId.
