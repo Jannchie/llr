@@ -954,6 +954,13 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     # slider mints its own full-size decode.
     dn_edge = max(0.0, min(100.0, float(denoise_req.get("edge", 50.0))))
     dn_chroma = max(0.0, min(100.0, float(denoise_req.get("chroma", 50.0))))
+    # On the wavelet, Auto is the manual panel at its defaults with the sliders
+    # greyed out, so the edge is the neutral 50 whatever a manual session left
+    # in the request. Resolved here and not by the browser for the reason
+    # `auto` is ignored on Sony's filter above: only this side knows the file's
+    # denoiser before a first decode, and a batch export never had one.
+    if dn_auto and file_model != "sony":
+        dn_edge = 50.0
 
     # Overrides for the shot's Creative Look tweaks, and for which look to render
     # at all. Both are deliberately absent from the cache key: neither the five

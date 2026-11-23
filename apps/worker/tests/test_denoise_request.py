@@ -55,3 +55,15 @@ def test_wavelet_auto_still_blends_by_iso(monkeypatch: pytest.MonkeyPatch, tmp_p
                           {"enabled": True, "auto": True, "amount": 0.5, "edge": 50, "chroma": 50})
     # ISO 3200 is past 1600, so Auto is the full amount and the noisy decode is skipped.
     assert first.get("denoise_model") == "wavelet"
+
+
+def test_auto_owns_the_edge_only_where_the_switch_exists(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # The browser sends the switch and the sliders as stored: for a photo that
+    # is not open it cannot know which denoiser the file has. On the wavelet
+    # Auto greys the edge slider out, so its stored value must not reach the
+    # decode; Sony's filter has no switch, so there the slider stands.
+    stored = {"enabled": True, "auto": True, "amount": 0.5, "edge": 80, "chroma": 50}
+    wavelet = _first_decode(monkeypatch, tmp_path, "wavelet", stored)
+    assert wavelet.get("denoise_tweaks") == (50.0, 50.0)
+    sony = _first_decode(monkeypatch, tmp_path, "sony", stored)
+    assert sony.get("denoise_tweaks") == (80.0, 50.0)
