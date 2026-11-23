@@ -97,9 +97,12 @@ cuts from the same decode at import, and the decode cache above. Import is
 `POST /photos`: copy the bytes, insert the row, ask the worker for previews
 and metadata (one exiftool call, memoised for the decode that follows), and
 answer with the finished record — the browser never polls for a thumbnail.
-Removal deletes rows first and files best-effort; a directory the catalog no
-longer names is swept on the hour (Windows will not delete a RAW the worker
-still has open). Previews are served `immutable` under their UUID, so a grid
+Removal deletes rows first and files best-effort; a directory that will not
+go (Windows will not delete a RAW the worker still has open) is marked as
+meant to be deleted, and the hourly sweep (`sweep.ts`) finishes it. Any other
+directory the catalog no longer names — its row lost to a restored backup, say
+— is not deleted but moved to `trash/`, without its rebuildable decode cache,
+and kept for a week; one this server would not have named is left alone. Previews are served `immutable` under their UUID, so a grid
 of thousands costs one request per thumbnail, ever.
 
 ## Render: web (`apps/web`)
