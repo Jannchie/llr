@@ -14,6 +14,9 @@
  *
  *     pnpm --filter @llr/web check:shaders
  *
+ * CI does exactly that (.github/workflows/ci.yml, "Compile shaders"), on
+ * SwiftShader, and fails on anything but `failures=0`.
+ *
  * NOTE: that command only writes the page — nothing is compiled until a browser
  * opens it, so it exits 0 even when a shader is broken. Do not chain it into
  * the root `check` script expecting it to gate anything. To get a real verdict,
@@ -28,23 +31,12 @@
 import { writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import {
-  MASK_BLUR_SHADER, MASK_DOWNSAMPLE_SHADER, MASK_VERTEX_SHADER,
-  PROCESS_SHADER, SONY_POST_PROGRAMS, VERTEX_SHADER,
-} from "../src/rendering/passes";
+import { ALL_PROGRAMS } from "../src/rendering/passes";
 
-const PROGRAMS: [name: string, vs: string, fs: string][] = [
-  ["process", VERTEX_SHADER, PROCESS_SHADER],
-  ["mask downsample", MASK_VERTEX_SHADER, MASK_DOWNSAMPLE_SHADER],
-  ["mask blur", MASK_VERTEX_SHADER, MASK_BLUR_SHADER],
-  // Sony's post chain, paired with MASK_VERTEX_SHADER the way
-  // pipeline-renderer.postProgram builds them. These were missing here, which
-  // left the largest shader in the app — Spica's, with its two lookup textures
-  // and three loops — with nothing checking that it compiles at all.
-  ...Object.entries(SONY_POST_PROGRAMS).map(
-    ([name, def]): [string, string, string] =>
-      [`sony ${name}`, MASK_VERTEX_SHADER, def.fsSource]),
-];
+// The list is the renderer's own (passes.ts ALL_PROGRAMS, held complete by
+// passes.spec.ts), so a shader added there is checked here without anyone
+// remembering to add it.
+const PROGRAMS: [name: string, vs: string, fs: string][] = ALL_PROGRAMS.map(p => [p.name, p.vs, p.fs]);
 
 const page = `<meta charset="utf-8"><title>shader compile check</title>
 <pre id="out" style="font:13px ui-monospace,monospace;white-space:pre-wrap"></pre>
@@ -71,7 +63,10 @@ function report(line) {
 }
 
 if (!gl) {
-  out.textContent = "NO WEBGL2 — cannot compile anything here";
+  // Counted as every program failing: a run that compiled nothing must not
+  // read as a run that found nothing wrong.
+  bad = PROGRAMS.length;
+  report("NO WEBGL2 — cannot compile anything here");
 } else {
   for (const [name, vsSrc, fsSrc] of PROGRAMS) {
     const vs = build(gl.VERTEX_SHADER, vsSrc);

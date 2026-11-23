@@ -2426,6 +2426,40 @@ void main() {
   outColor = vec4(srgbOetf3(lin), 1.0);
 }`;
 
+// The refine's final blit: the mipmapped full-resolution frame onto the canvas.
+export const REFINE_COPY_SHADER = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 outColor;
+uniform sampler2D u_input;
+void main() { outColor = texture(u_input, v_uv); }`;
+
+// One point per (pixel, channel). gl_VertexID derives both, the vertex shader
+// fetches the pixel and positions the point at its bin column / channel row.
+export const HISTO_VERTEX_SHADER = `#version 300 es
+precision highp float;
+uniform sampler2D u_src;
+uniform int u_srcW;
+void main() {
+  int vid = gl_VertexID;
+  int pix = vid >> 2;          // pixel index
+  int ch  = vid & 3;           // 0=R 1=G 2=B 3=Luma
+  ivec2 coord = ivec2(pix % u_srcW, pix / u_srcW);
+  vec3 rgb = texelFetch(u_src, coord, 0).rgb;
+  float v = (ch == 0) ? rgb.r
+          : (ch == 1) ? rgb.g
+          : (ch == 2) ? rgb.b
+          : dot(rgb, vec3(0.2126, 0.7152, 0.0722)); // Rec.709 luma, display-encoded
+  int bin = clamp(int(v * 255.0 + 0.5), 0, 255);
+  gl_Position = vec4((float(bin) + 0.5) / 128.0 - 1.0,
+                     (float(ch) + 0.5) / 2.0 - 1.0, 0.0, 1.0);
+  gl_PointSize = 1.0;
+}`;
+export const HISTO_FRAGMENT_SHADER = `#version 300 es
+precision highp float;
+out vec4 o;
+void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
+
 /**
  * The offscreen programs of Sony's post chain, each with the uniforms the
  * renderer resolves for it. The list lives beside the shaders rather than in
@@ -2511,4 +2545,29 @@ export const PASSES: PassDef[] = [
     ...Array.from({ length: LENS_KNOTS }, (_, k) => `u_lensCaR[${k}]`),
     ...Array.from({ length: LENS_KNOTS }, (_, k) => `u_lensCaB[${k}]`),
   ]},
+];
+
+/**
+ * Every program the renderer builds, as the vertex and fragment source it is
+ * linked from. The renderer does not read this — it builds each where it is
+ * first needed — but the shader check (scripts/shader-check.ts) does, and
+ * passes.spec.ts holds it to the sources this module exports: a shader added
+ * here and left off the list fails a test, instead of shipping with nothing
+ * that has ever tried to compile it.
+ */
+export const ALL_PROGRAMS: { name: string; vs: string; fs: string }[] = [
+  { name: "process", vs: VERTEX_SHADER, fs: PROCESS_SHADER },
+  { name: "mask downsample", vs: MASK_VERTEX_SHADER, fs: MASK_DOWNSAMPLE_SHADER },
+  { name: "mask blur", vs: MASK_VERTEX_SHADER, fs: MASK_BLUR_SHADER },
+  { name: "relight shadow", vs: MASK_VERTEX_SHADER, fs: RELIGHT_SHADOW_SHADER },
+  { name: "relight blur", vs: MASK_VERTEX_SHADER, fs: RELIGHT_BLUR_SHADER },
+  { name: "aux copy", vs: MASK_VERTEX_SHADER, fs: AUX_COPY_SHADER },
+  { name: "finish", vs: MASK_VERTEX_SHADER, fs: FINISH_SHADER },
+  { name: "lens blur down", vs: MASK_VERTEX_SHADER, fs: LENS_BLUR_DOWN_SHADER },
+  { name: "lens blur gather", vs: MASK_VERTEX_SHADER, fs: LENS_BLUR_GATHER_SHADER },
+  { name: "refine copy", vs: MASK_VERTEX_SHADER, fs: REFINE_COPY_SHADER },
+  { name: "histogram", vs: HISTO_VERTEX_SHADER, fs: HISTO_FRAGMENT_SHADER },
+  // Sony's post chain, paired with MASK_VERTEX_SHADER the way
+  // pipeline-renderer.postProgram builds them.
+  ...Object.entries(SONY_POST_PROGRAMS).map(([name, def]) => ({ name: `sony ${name}`, vs: MASK_VERTEX_SHADER, fs: def.fsSource })),
 ];
