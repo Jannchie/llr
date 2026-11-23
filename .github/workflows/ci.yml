@@ -41,6 +41,14 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --project apps/worker
+      # The worker's bit-exactness tests have depended on the runner's CPU before
+      # (they failed on AVX-512 machines only). This records which CPU, and which
+      # SIMD paths NumPy dispatches on, so a failure can be read against them.
+      - name: Runner CPU and NumPy dispatch
+        run: |
+          lscpu | grep "Model name"
+          echo "avx512: $(grep -o 'avx512[a-z0-9_]*' /proc/cpuinfo | sort -u | tr '[:space:]' ' ')"
+          uv run --project apps/worker python -c "import numpy as np; f = np._core._multiarray_umath.__cpu_features__; print('numpy', np.__version__, 'enabled:', ' '.join(k for k, v in f.items() if v and k.startswith(('AVX', 'FMA'))))"
       - run: uv run --project apps/worker python -m compileall -q apps/worker/src
       - run: uv run --project apps/worker pytest -q apps/worker/tests
       - run: uv run --project apps/worker ruff check apps/worker
