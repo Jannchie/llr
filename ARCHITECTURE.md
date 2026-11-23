@@ -183,6 +183,12 @@ owner name, and maker notes instead) and embeds the edit recipe as XMP:
 structured `llr:*` fields plus a lossless JSON blob, spilling into
 Extended-XMP chunks when a heavy edit overflows the 64 KB APP1 limit.
 
+What file an export writes is its own setting, apart from how the photo is
+shown on this screen: the long edge (the full-size render scaled down at
+encode, so the stages tied to sensor pixels see the same frame at every size),
+the JPEG quality, and sRGB or Display P3 — a P3 file carries the encoder's
+embedded profile and an EXIF ColorSpace of "uncalibrated" to match.
+
 A selection in the library exports as a batch (`exportMany`): the same
 render, one photo after another, each from its own stored edit — a photo that
 is not open is planned the way its background preview is (`offscreenPlan` in

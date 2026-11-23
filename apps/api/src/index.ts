@@ -729,7 +729,7 @@ async function handleExport(request: IncomingMessage, response: ServerResponse):
     return;
   }
 
-  let meta: { sourceId?: string; settings?: unknown; stripPrivate?: boolean };
+  let meta: { sourceId?: string; settings?: unknown; stripPrivate?: boolean; wideGamut?: boolean };
   try {
     meta = JSON.parse(typeof metaRaw === "string" ? metaRaw : "{}") as typeof meta;
   } catch {
@@ -749,7 +749,8 @@ async function handleExport(request: IncomingMessage, response: ServerResponse):
       input: sourcePath,
       target: exportPath,
       settings: meta.settings ?? {},
-      stripPrivate: meta.stripPrivate === true
+      stripPrivate: meta.stripPrivate === true,
+      wideGamut: meta.wideGamut === true,
     });
     await streamFile(response, exportPath);
   } finally {

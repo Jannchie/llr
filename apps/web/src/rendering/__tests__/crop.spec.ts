@@ -4,7 +4,7 @@ import {
   cropOutputRect, cropOutputSize, cropOutputSizeForAspect, cssRecomposeMatrix, customAspectKey, defaultCrop, recomposeMatrix,
   imageDims, isDefaultCrop, parseCustomAspect, ratioToFraction, resolveAspectFraction,
   resolveAspectRatio, rotate90, straightenedBBox, straightenAngle, cropGuideShapes, cropCornersImage, CROP_GUIDES,
-  defaultTransform, transformMatrix, guidedHomography, flipCrop, outFrameToImagePx, imagePxToOutFrame, sourceSpan,
+  defaultTransform, transformMatrix, guidedHomography, flipCrop, outFrameToImagePx, imagePxToOutFrame, sourceSpan, fitLongEdge,
   type CropState, type Transform,
 } from "../crop";
 
@@ -570,5 +570,23 @@ describe("sourceSpan", () => {
     const { span: [sx, sy], out } = span(c);
     expect(sx / out[0]).toBeCloseTo(1, 3);
     expect(sy / out[1]).toBeCloseTo(1, 3);
+  });
+});
+
+describe("fitLongEdge", () => {
+  it("scales the long edge down to the limit and keeps the aspect", () => {
+    expect(fitLongEdge(7008, 4672, 2048)).toEqual([2048, 1365]);
+    expect(fitLongEdge(4672, 7008, 2048)).toEqual([1365, 2048]);
+    expect(fitLongEdge(4000, 4000, 1600)).toEqual([1600, 1600]);
+  });
+
+  it("never scales up, and 0 means no limit", () => {
+    expect(fitLongEdge(1200, 800, 2048)).toEqual([1200, 800]);
+    expect(fitLongEdge(2048, 1365, 2048)).toEqual([2048, 1365]);
+    expect(fitLongEdge(7008, 4672, 0)).toEqual([7008, 4672]);
+  });
+
+  it("keeps a sliver at least one pixel wide", () => {
+    expect(fitLongEdge(10000, 3, 100)).toEqual([100, 1]);
   });
 });

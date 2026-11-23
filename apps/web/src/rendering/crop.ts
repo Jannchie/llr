@@ -320,6 +320,17 @@ export function sourceSpan(xform: ArrayLike<number>, srcW: number, srcH: number)
   ];
 }
 
+/**
+ * `w` x `h` scaled down, aspect kept, so the long edge is at most `maxEdge`.
+ * Never up: an edge already within the limit (or no limit, 0) is returned as is.
+ */
+export function fitLongEdge(w: number, h: number, maxEdge: number): [number, number] {
+  const long = Math.max(w, h);
+  if (!(maxEdge > 0) || long <= maxEdge) return [w, h];
+  const f = maxEdge / long;
+  return [Math.max(1, Math.round(w * f)), Math.max(1, Math.round(h * f))];
+}
+
 /** Committed crop output rect (the crop box) in output-frame pixels. */
 export function cropOutputRect(c: CropState, iw: number, ih: number): Rect {
   const b = pixelBox(c, iw, ih);

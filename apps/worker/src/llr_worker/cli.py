@@ -1290,7 +1290,8 @@ def daemon_export(request: dict[str, Any], root: Path) -> dict[str, Any]:
     settings = request.get("settings") or {}
     strip_private = bool(request.get("stripPrivate", False))
 
-    exif_copied = copy_exif_provenance(input_path, target_path, strip_private=strip_private)
+    exif_copied = copy_exif_provenance(input_path, target_path, strip_private=strip_private,
+                                       wide_gamut=bool(request.get("wideGamut", False)))
 
     payloads, xmp_bytes = build_xmp_segments(settings)
     data = embed_xmp_app1(target_path.read_bytes(), payloads)
@@ -1304,16 +1305,22 @@ def daemon_export(request: dict[str, Any], root: Path) -> dict[str, Any]:
 # (no :all) because serials hide inside the copied binary blob where
 # member-tag exclusions cannot reach.
 PRIVATE_TAG_EXCLUSIONS = ["--gps:all", "--makernotes", "--*serialnumber*", "--ownername"]
+# EXIF ColorSpace knows two values: sRGB, and "see the embedded profile".
+EXIF_COLORSPACE_SRGB = 1
+EXIF_COLORSPACE_UNCALIBRATED = 65535
 
 
-def copy_exif_provenance(original: Path, target: Path, strip_private: bool = False) -> bool:
+def copy_exif_provenance(original: Path, target: Path, strip_private: bool = False,
+                         wide_gamut: bool = False) -> bool:
     """Copy all camera metadata from the original into the export.
 
     Copies every writable tag group (EXIF, GPS, maker notes, IPTC, ...) so no
     shooting metadata is lost, then overrides the few tags that must describe
     the export itself: orientation/rotation is baked into the pixels, the EXIF
-    pixel dimensions are the export's, the colorspace is the encode's (sRGB),
-    and Software identifies the renderer. XMP is excluded because daemon_export
+    pixel dimensions are the export's, the colorspace is the encode's (sRGB, or
+    "uncalibrated" for a Display-P3 export — EXIF has no value for P3, and the
+    profile the encoder embedded is what says it), and Software identifies the
+    renderer. XMP is excluded because daemon_export
     injects LLR's own packet, and the source ICC profile would mislabel the
     rendered (sRGB) colors. IFD1 is excluded because its embedded thumbnail
     shows the original composition — file managers and gallery grids prefer it
@@ -1344,7 +1351,7 @@ def copy_exif_provenance(original: Path, target: Path, strip_private: bool = Fal
                 "-ExifImageWidth<ImageWidth",
                 "-ExifImageHeight<ImageHeight",
                 "-Orientation#=1",
-                "-ColorSpace#=1",
+                f"-ColorSpace#={EXIF_COLORSPACE_UNCALIBRATED if wide_gamut else EXIF_COLORSPACE_SRGB}",
                 "-Software=LLR",
                 str(target),
             ],
