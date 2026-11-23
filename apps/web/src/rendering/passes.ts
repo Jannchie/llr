@@ -219,7 +219,6 @@ vec3 applyFog(vec3 c, vec2 uv) {
 // neutral; moiré replaces the pixel's chroma, per unit lightness, with the
 // neighbourhood's, leaving its lightness alone.
 vec3 chromaClean(vec3 c, vec2 uv, float moire, vec2 fw) {
-  return c; // BISECT
   vec2 s = max(3.0 * u_srcTexel, 1.5 * fw);
   vec3 lab = proPhotoToOklab(c);
   vec2 ratio = vec2(0.0); float lmin = 1e9, lmax = -1e9;
