@@ -518,8 +518,16 @@ _DRO_GRID_CACHE_MAX = 6
 # pristine copy and restores it before handing the handle out. Per-file locking
 # in daemon_worker keeps two requests off one handle at the same time. Small
 # on purpose: a handle holds ~70 MB of mosaic plus its pristine copy.
+#
+# A handle a request is still decoding from is never evicted: closing it frees
+# the buffer `raw_image` is a view of, under a thread that is reading it. With
+# as many slots as worker threads, two other files passing through during one
+# slow decode was enough to do that. So a checkout is a lease (_RAW_HANDLE_BUSY,
+# by handle identity, under _CACHE_LOCK), eviction skips leased handles — the
+# cache runs over its size for as long as it must — and the release trims it.
 _RAW_HANDLE_CACHE: OrderedDict[tuple[Any, ...], tuple[rawpy.RawPy, np.ndarray]] = OrderedDict()
 _RAW_HANDLE_CACHE_MAX = 3
+_RAW_HANDLE_BUSY: dict[int, int] = {}
 
 
 def open_raw_in_memory(input_path: Path) -> rawpy.RawPy:
@@ -540,30 +548,62 @@ def _checkout_raw(input_path: Path) -> rawpy.RawPy:
     """An unpacked LibRaw handle for this file, its mosaic reset to the file's.
 
     Cached across requests (see _RAW_HANDLE_CACHE). The caller must not close
-    it; the cache evicts and closes. A mosaic the previous request denoised in
-    place is put back before the handle is returned, so every caller sees the
-    RAW as read.
+    it; the cache evicts and closes — but not while the caller holds it, so
+    every checkout is paired with a _release_raw once the decode is done. A
+    mosaic the previous request denoised in place is put back before the
+    handle is returned, so every caller sees the RAW as read.
     """
     key = _file_stamp(input_path)
     with _CACHE_LOCK:
         hit = _RAW_HANDLE_CACHE.get(key)
         if hit is not None:
             _RAW_HANDLE_CACHE.move_to_end(key)
+            # Leased before the lock goes, so no eviction can land between
+            # here and the restore below.
+            _RAW_HANDLE_BUSY[id(hit[0])] = _RAW_HANDLE_BUSY.get(id(hit[0]), 0) + 1
     if hit is not None:
         raw, pristine = hit
         np.copyto(raw.raw_image, pristine)
         return raw
     raw = open_raw_in_memory(input_path)
     pristine = raw.raw_image.copy()   # forces the unpack, and keeps the untouched mosaic
-    evicted: list[rawpy.RawPy] = []
     with _CACHE_LOCK:
         _RAW_HANDLE_CACHE[key] = (raw, pristine)
-        while len(_RAW_HANDLE_CACHE) > _RAW_HANDLE_CACHE_MAX:
-            _, (old, _) = _RAW_HANDLE_CACHE.popitem(last=False)
-            evicted.append(old)
+        _RAW_HANDLE_BUSY[id(raw)] = _RAW_HANDLE_BUSY.get(id(raw), 0) + 1
+        evicted = _evict_idle_raw_handles()
     for old in evicted:
         old.close()
     return raw
+
+
+def _evict_idle_raw_handles() -> list[rawpy.RawPy]:
+    """Oldest-first, down to the cache's size, skipping leased handles.
+
+    Call under _CACHE_LOCK; the caller closes what comes back, outside it.
+    """
+    evicted: list[rawpy.RawPy] = []
+    for key in list(_RAW_HANDLE_CACHE):
+        if len(_RAW_HANDLE_CACHE) <= _RAW_HANDLE_CACHE_MAX:
+            break
+        old = _RAW_HANDLE_CACHE[key][0]
+        if _RAW_HANDLE_BUSY.get(id(old)):
+            continue
+        del _RAW_HANDLE_CACHE[key]
+        evicted.append(old)
+    return evicted
+
+
+def _release_raw(raw: rawpy.RawPy) -> None:
+    """Give back one _checkout_raw of `raw`; the handle may now be evicted."""
+    with _CACHE_LOCK:
+        left = _RAW_HANDLE_BUSY.get(id(raw), 0) - 1
+        if left > 0:
+            _RAW_HANDLE_BUSY[id(raw)] = left
+        else:
+            _RAW_HANDLE_BUSY.pop(id(raw), None)
+        evicted = _evict_idle_raw_handles()
+    for old in evicted:
+        old.close()
 
 
 def _file_stamp(input_path: Path) -> tuple[Any, ...]:
@@ -1002,9 +1042,14 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
     # does the next request for this file: _checkout_raw keeps the handle open
     # across requests (unpacking is the single most expensive step on a
     # lossless-compressed frame) and resets its mosaic between uses. Opening is
-    # skipped entirely when every variant is a cache hit.
+    # skipped entirely when every variant is a cache hit. Each checkout is a
+    # lease, given back once the decodes below are done with the handle.
+    leased: list[rawpy.RawPy] = []
+
     def open_raw() -> rawpy.RawPy:
-        return _checkout_raw(input_path)
+        raw = _checkout_raw(input_path)
+        leased.append(raw)
+        return raw
 
     # Same reasoning as the _LINEAR_CACHE gate below: a one-off export decode
     # must not be pinned in any cache, so the intent is passed down to the decode
@@ -1059,7 +1104,10 @@ def daemon_linear(request: dict[str, Any], root: Path) -> dict[str, Any]:
                     color_profile=prepared.color_profile,
                 )
     finally:
-        pass   # the handle stays in _RAW_HANDLE_CACHE; eviction closes it
+        # The handle stays in _RAW_HANDLE_CACHE for the next request; eviction
+        # closes it, which it may do from here on.
+        for raw in leased:
+            _release_raw(raw)
 
     # Stash full-resolution dims on the color profile so both this response and
     # the _LINEAR_CACHE-hit path above can report zoom relative to the original.
