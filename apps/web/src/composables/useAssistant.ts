@@ -117,7 +117,9 @@ export type ChatEntry =
   // A line about the run itself, not something anyone said.
   | { kind: "status"; status: "stopped" | "nudge" | "limit" };
 
-type Chat = { session: string; entries: ChatEntry[]; busy: boolean };
+// `cost`: what the conversation has spent so far, in dollars. `queued`: a
+// message that arrived as the turn was ending and goes out as the next one.
+type Chat = { session: string; entries: ChatEntry[]; busy: boolean; cost: number; queued: string | null };
 
 function pushEntry<E extends ChatEntry>(chat: Chat, entry: E): E {
   chat.entries.push(entry);
@@ -140,7 +142,7 @@ export function useAssistant(opts: {
   function chatFor(scope: string | null): Chat {
     const key = scope ?? "none";
     let chat = chats.get(key);
-    if (!chat) { chat = reactive({ session: `${page}-${key}`, entries: [], busy: false }); chats.set(key, chat); }
+    if (!chat) { chat = reactive({ session: `${page}-${key}`, entries: [], busy: false, cost: 0, queued: null }); chats.set(key, chat); }
     return chat;
   }
   const current = ref<Chat>(chatFor(opts.scope()));
@@ -207,8 +209,14 @@ export function useAssistant(opts: {
     // Mid-run, the message is steered into the model's next LLM call rather
     // than queued behind it; the bubble goes up now, marked as such.
     if (chat.busy) {
-      chat.entries.push({ kind: "user", text, steered: true });
-      void post(chat.session, "steer", { text });
+      const bubble = pushEntry(chat, { kind: "user", text, steered: true });
+      // The run can end between the keystroke and the request: the server
+      // then has nothing to steer (409), and a bubble marked "steered" would
+      // be a message the model never saw. It becomes the next turn instead.
+      const res = await post(chat.session, "steer", { text }).catch(() => null);
+      if (res?.ok) return;
+      chat.entries.splice(chat.entries.indexOf(bubble), 1);
+      if (chat.busy) chat.queued = text; else void send(text);
       return;
     }
     chat.busy = true;
@@ -245,7 +253,10 @@ export function useAssistant(opts: {
           case "message_end":
             if (ev.message.role === "assistant") {
               const u = ev.message.usage;
-              if (u) { usage.input += u.input; usage.output += u.output; usage.cacheRead += u.cacheRead; usage.cost += u.cost?.total ?? 0; }
+              if (u) {
+                usage.input += u.input; usage.output += u.output; usage.cacheRead += u.cacheRead; usage.cost += u.cost?.total ?? 0;
+                chat.cost += u.cost?.total ?? 0;
+              }
               if (reply?.text.trim()) reply.usage = { ...usage };
               // Thinking cut short (abort, or a provider that never closes the block) still settles.
               if (reply?.thinking && reply.thinkingMs === undefined) reply.thinkingMs = Date.now() - thinkingStart;
@@ -255,6 +266,11 @@ export function useAssistant(opts: {
               if (reply) reply.streaming = false;
               reply = null;
             }
+            break;
+          case "limit":
+            // The server's per-prompt ceiling (agent-budget.ts); the abort that
+            // follows brings its own "stopped" line.
+            chat.entries.push({ kind: "status", status: "limit" });
             break;
           case "tool_execution_start": {
             const entry = pushEntry(chat, { kind: "tool", name: ev.toolName, args: ev.args, done: false });
@@ -267,11 +283,6 @@ export function useAssistant(opts: {
             if (entry && ev.isError && !entry.error) entry.error = String(ev.result?.content?.[0]?.text ?? "error");
             break;
           }
-          case "limit":
-            // The server's per-prompt ceiling (agent-budget.ts); the abort that
-            // follows brings its own "stopped" line.
-            chat.entries.push({ kind: "status", status: "limit" });
-            break;
         }
       }
       await Promise.all(toolRuns);
@@ -279,13 +290,25 @@ export function useAssistant(opts: {
       chat.entries.push({ kind: "assistant", text: "", streaming: false, thinking: "", error: err instanceof Error ? err.message : String(err) });
     } finally {
       chat.busy = false;
+      const queued = chat.queued;
+      chat.queued = null;
+      if (queued) void send(queued);
     }
   }
 
-  function abort(): void { void post(current.value.session, "abort", {}); }
-  function reset(): void { current.value.entries = []; void post(current.value.session, "reset", {}); }
+  function abort(): void { current.value.queued = null; void post(current.value.session, "abort", {}); }
+  function reset(): void { current.value.entries = []; current.value.cost = 0; void post(current.value.session, "reset", {}); }
+  /** What this conversation has cost so far, in dollars (the providers' own figures). */
+  const spent = computed(() => current.value.cost);
 
-  return { entries, busy, models, selected, catalog, providers, setKey, send, abort, reset };
+  // Ask again for the registry: it is fetched once at start-up, and a page
+  // that came up before the API did would otherwise never learn the providers
+  // (the key rows of the model settings are built from it).
+  function refreshCatalog(): void {
+    void fetch(`${API}/agent/models`).then(r => r.ok ? r.json() : null).then(m => { if (m?.providers) catalog.value = m.providers; }).catch(() => {});
+  }
+
+  return { entries, busy, models, selected, catalog, providers, spent, setKey, refreshCatalog, send, abort, reset };
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
