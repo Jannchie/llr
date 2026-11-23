@@ -288,6 +288,8 @@ async function routeAgent(action: string, method: string, request: IncomingMessa
       sendJson(response, { ok: true });
       return;
     case "reset":
+      // Clearing the transcript under a run in flight throws inside the loop.
+      if (isSessionBusy(body.session)) throw new HttpError(409, "Assistant is busy");
       handleAgentReset(body.session);
       sendJson(response, { ok: true });
       return;

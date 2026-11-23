@@ -28,7 +28,7 @@ import {
   packMasks, presetGroup, defaultComponent, defaultAdjust, cloneMasks, MASK_PRESETS, MASK_GROUPS, MASK_COMPS, AI_KINDS,
   type MaskGroup, type MaskType, type MaskAdjust, type MaskPresetName, type MaskComponent,
 } from "./rendering/masks";
-import { formatBytes, clamp, IMPORT_ACCEPT, IMPORT_FORMAT_HINT } from "./ui";
+import { exposureSummary, formatBytes, clamp, IMPORT_ACCEPT, IMPORT_FORMAT_HINT } from "./ui";
 import { buildSections, GROUP_KEYS, SORT_KEYS, type GroupKey, type SortKey } from "./librarySort";
 import { pathOf, type FolderNode } from "./catalogTree";
 import { t, locale, setLocale, LOCALES, type MessageKey } from "./i18n";
@@ -1237,6 +1237,14 @@ const importingFirst = computed(() => importing.value && decode.value.phase === 
 // shows.
 const library = computed(() => buildSections(folderPhotos.value, sortKey.value, sortDir.value, groupKey.value));
 
+// The photo before or after the open one, in the order the filmstrip shows.
+function stepPhoto(delta: 1 | -1): void {
+  const order = library.value.sections.flatMap(s => s.photos);
+  const at = order.findIndex(p => p.id === activeId.value);
+  const next = at < 0 ? undefined : order[at + delta];
+  if (next) void selectSource(next.id);
+}
+
 const sortOptions = computed<{ value: SortKey; label: string }[]>(() =>
   SORT_KEYS.map(key => ({ value: key, label: t(`library.sortBy.${key}`) })));
 const groupOptions = computed<{ value: GroupKey; label: string }[]>(() =>
@@ -2262,6 +2270,14 @@ function onKeyDown(e: KeyboardEvent): void {
   // O cycles the guide overlay, Shift+O mirrors it (Lightroom-style).
   if (!inEditableText && activeSource.value && !e.ctrlKey && !e.metaKey && !e.altKey && libraryView.value === "develop") {
     if (e.key === "r" || e.key === "R") { e.preventDefault(); toggleCropMode(); return; }
+    // Left / right step through the filmstrip, as in Lightroom — unless the
+    // focused control uses the arrows itself (a slider, a list, the tree).
+    if (!cropMode.value && !e.shiftKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")
+      && !ae?.closest("input, select, textarea, dialog, [role=listbox], [role=menu], [role=tree], [contenteditable]")) {
+      e.preventDefault();
+      stepPhoto(e.key === "ArrowRight" ? 1 : -1);
+      return;
+    }
     if (cropMode.value && lineTool.value && e.key === "Escape") { e.preventDefault(); lineTool.value = null; return; }
     if (cropMode.value && (e.key === "Delete" || e.key === "Backspace") && crop.xf.guides.length) { e.preventDefault(); removeLastGuide(); return; }
     if (cropMode.value && (e.key === "Escape" || e.key === "Enter")) { e.preventDefault(); exitCropMode(); return; }
@@ -3214,12 +3230,20 @@ function assistantSystemPrompt(): string {
 
 const {
   entries: chatEntries, busy: chatBusy, models: chatModels, selected: chatModel,
-  catalog: chatCatalog, providers: chatProviders, setKey: setChatKey,
+  catalog: chatCatalog, providers: chatProviders, spent: chatSpent, setKey: setChatKey, refreshCatalog: refreshChatCatalog,
   send: sendChat, abort: abortChat, reset: resetChat,
 } = useAssistant({
   tools: () => assistantTools, systemPrompt: assistantSystemPrompt, scope: () => activeId.value,
   onTurnStart: () => { turnBaseline = editBaseline = activeSource.value && hasLinearData ? captureSnapshot() : null; },
 });
+// The provider of the selected model, when the server has no key for it: the
+// request would come back as a provider's error, with nothing to say where a
+// key goes. Null while the registry is still unknown — nothing to claim yet.
+const chatNeedsKey = computed(() => {
+  const m = chatModels.value.find(x => modelKey(x) === chatModel.value);
+  return m && chatProviders.value !== null && !chatProviders.value.includes(m.provider) ? m.provider : null;
+});
+const costText = (c: number): string => c >= 0.001 ? `$${c.toFixed(c >= 1 ? 2 : 3)}` : c > 0 ? "<$0.001" : "$0";
 const chatModelOptions = computed(() => chatModels.value.map(m => ({
   value: modelKey(m), label: m.id, disabled: chatProviders.value !== null && !chatProviders.value.includes(m.provider),
 })));
@@ -3266,7 +3290,7 @@ function onChatEnter(e: KeyboardEvent): void {
 }
 function usageLine(u: TurnUsage): string {
   const k = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
-  const cost = u.cost >= 0.001 ? `$${u.cost.toFixed(3)}` : u.cost > 0 ? "<$0.001" : "$0";
+  const cost = costText(u.cost);
   return t("chat.usage", { input: k(u.input), output: k(u.output), cached: u.cacheRead ? t("chat.usage.cached", { n: k(u.cacheRead) }) : "", cost });
 }
 // The thinking row: live until the block closes, then labelled with what it took.
@@ -3284,7 +3308,22 @@ function thinkingLine(e: Thinking): string {
   return (thinkingActive(e) ? lines.at(-1) : lines[0]) ?? "";
 }
 // Keep the newest message in view as the reply streams in.
-watch(chatEntries, () => { void nextTick(() => { const el = chatLogRef.value; if (el) el.scrollTop = el.scrollHeight; }); }, { deep: true });
+// The log follows the reply only while the reader is at its end: someone who
+// scrolled up to read a tool's result, or opened one, is not dragged back down
+// by every streamed word. Sending a message is a return to the end.
+let chatPinned = true;
+function onChatScroll(): void {
+  const el = chatLogRef.value;
+  if (el) chatPinned = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+}
+watch(() => chatEntries.value.length, (n, before) => { if (n > before && chatEntries.value[n - 1]?.kind === "user") chatPinned = true; });
+watch(chatEntries, () => {
+  if (!chatPinned) return;
+  void nextTick(() => { const el = chatLogRef.value; if (el) el.scrollTop = el.scrollHeight; });
+}, { deep: true });
+// The registry is fetched once at start-up; opening the settings asks again,
+// so a page that came up before the API did still gets its key rows.
+watch(modelSettingsOpen, open => { if (open) refreshChatCatalog(); });
 // The icon says what kind of thing the call is before the name is read; the
 // state's icon replaces it when the state is the thing worth noticing.
 const TOOL_ICONS: Record<string, ChatIconName> = { view_image: "eye", get_edit: "list", set_edit: "adjust", compare: "columns", measure: "chart" };
@@ -3575,6 +3614,13 @@ function buildPlan(
 
 const { exporting, progress: exportProgress, exportImage, exportMany, cancelExport } = useExport({ errorMessage, plan: buildExportPlan });
 
+// The open photo's exposure, for the top bar; its body and lens for the tooltip.
+const activeExposure = computed(() => activeSource.value ? exposureSummary(activeSource.value).join("  ") : "");
+const activeGear = computed(() => {
+  const p = activeSource.value;
+  return p ? [[p.make, p.model].filter(Boolean).join(" "), p.lens].filter(Boolean).join(" · ") : "";
+});
+
 // What the export button acts on: the grid's selection in the library, else
 // the open photo.
 const exportIds = computed(() => libraryView.value === "library" && selectedIds.size
@@ -3726,6 +3772,8 @@ const vWheelAdjust = {
       <div class="meta-summary">
         <template v-if="activeSource">
           <span>{{ activeSource.name }}</span>
+          <!-- How it was shot; the body and lens are in the tooltip. -->
+          <span v-if="activeExposure" :title="activeGear">{{ activeExposure }}</span>
           <span class="meta-empty">{{ formatBytes(activeSource.size) }}</span>
         </template>
         <span v-else class="meta-empty">{{ t('meta.noImage') }}</span>
@@ -4037,6 +4085,9 @@ const vWheelAdjust = {
       <section class="rail-panels chat" v-if="editTab === 'assistant'">
         <header class="panel-head chat-head">
           <span>{{ t('panel.assistant') }}</span>
+          <!-- What the conversation has cost so far: written out, since an
+               agent's spend is otherwise only visible on the provider's bill. -->
+          <span v-if="chatSpent > 0" class="chat-spent" :title="t('chat.spent')">{{ costText(chatSpent) }}</span>
           <button class="icon-btn chat-gear" type="button" :title="t('models.title')" :aria-label="t('models.title')" @click="modelSettingsOpen = true">
             <JIcon :icon="IconSettings" />
           </button>
@@ -4044,7 +4095,7 @@ const vWheelAdjust = {
         </header>
         <ModelSettings :open="modelSettingsOpen" :models="chatModels" :catalog="chatCatalog" :set-key="setChatKey"
           @update:models="v => chatModels = v" @close="modelSettingsOpen = false" />
-        <div class="chat-log" ref="chatLogRef">
+        <div class="chat-log" ref="chatLogRef" @scroll.passive="onChatScroll">
           <div class="chat-empty" v-if="!chatEntries.length">
             <ChatIcon class="chat-empty-icon" name="chat" />
             <p class="chat-empty-title">{{ t('chat.empty.title') }}</p>
@@ -4102,6 +4153,10 @@ const vWheelAdjust = {
             </details>
           </template>
         </div>
+        <p v-if="chatNeedsKey" class="chat-key-note" role="status">
+          <span>{{ t('chat.needsKey', { provider: chatNeedsKey }) }}</span>
+          <button type="button" class="status-action" @click="modelSettingsOpen = true">{{ t('chat.addKey') }}</button>
+        </p>
         <form class="chat-compose" @submit.prevent="submitChat">
           <textarea ref="chatInputRef" v-model="chatDraft" class="chat-input" rows="2" :placeholder="t('chat.placeholder')"
             @keydown.enter="onChatEnter" />

@@ -85,6 +85,8 @@ Drop a RAW on the page. Then, optionally:
   in its model settings (saved to `credentials.json` in the cache directory
   below). Exporting `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` (or another
   provider's usual variable) before `pnpm dev` works too; a saved key wins.
+  One prompt is stopped after 40 model calls or $2, whichever comes first —
+  `LLR_AGENT_MAX_CALLS` / `LLR_AGENT_MAX_COST` change that, `0` lifts it.
 - Everything the server keeps — the catalog (folders, photos, edits), the
   imported files, decode cache — lives under `~/.cache/llr`
   (`LLR_CACHE_DIR`), never in the checkout, and imports stay until you remove

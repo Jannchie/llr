@@ -11,6 +11,7 @@ import { Agent, type AgentEvent, type AgentMessage, type AgentTool, type AgentTo
 import { clampThinkingLevel, type Api, type ImageContent, type Model, type ModelThinkingLevel, type TextContent } from "@earendil-works/pi-ai";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 
+import { createBudget, limitsFromEnv } from "./agent-budget.js";
 import { FileCredentialStore } from "./credentials.js";
 
 // Every built-in provider, its model catalog and its auth: a key saved from
@@ -213,6 +214,11 @@ export async function handleAgentPrompt(body: PromptBody, response: ServerRespon
   const roles = new Map(body.tools.map(t => [t.name, t.role]));
   let editedSinceLook = false;
   let nudge: AgentMessage | null = null;
+  // What this prompt may spend before it is stopped (agent-budget.ts).
+  const limits = limitsFromEnv(process.env);
+  const budget = createBudget(limits);
+  let overBudget = false;
+  const send = (data: unknown) => { if (!response.writableEnded) response.write(`data: ${JSON.stringify(data)}\n\n`); };
   const unsubscribe = s.agent.subscribe(event => {
     if (event.type === "tool_execution_start") {
       const role = roles.get(event.toolName);
@@ -225,8 +231,22 @@ export async function handleAgentPrompt(body: PromptBody, response: ServerRespon
       s.agent.followUp(nudge);
     }
     const out = serialize(event, nudge);
-    if (out && !response.writableEnded) response.write(`data: ${JSON.stringify(out)}\n\n`);
+    if (out) send(out);
+    // After the turn's own event, so the browser has its usage before it is
+    // told the run stops here. Only a turn that wants to go on (it called
+    // tools) is cut short; one that has just answered is simply done.
+    if (event.type === "turn_end" && event.message.role === "assistant" && !overBudget) {
+      const hit = budget.record(event.message.usage?.cost?.total);
+      if (hit && event.message.content.some(c => c.type === "toolCall")) {
+        overBudget = true;
+        send({ type: "limit", reason: hit, calls: budget.calls, cost: budget.cost, limits });
+        s.agent.abort();
+      }
+    }
   });
+  // A comment line every so often: a model that thinks for minutes without
+  // streaming sends nothing, and the server drops a socket idle for five.
+  const heartbeat = setInterval(() => { if (!response.writableEnded) response.write(": ping\n\n"); }, 15_000);
   // The browser walked away mid-run: nothing will ever answer the pending tool
   // calls, so fail them and stop the loop instead of pinning the session.
   const onClose = () => {
@@ -242,6 +262,7 @@ export async function handleAgentPrompt(body: PromptBody, response: ServerRespon
       await s.agent.prompt(body.text, body.images);
     }
   } finally {
+    clearInterval(heartbeat);
     unsubscribe();
     response.off("close", onClose);
     s.lastUsed = Date.now();

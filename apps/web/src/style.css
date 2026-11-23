@@ -2881,6 +2881,26 @@ input[type="range"]:focus::-moz-range-thumb {
   min-width: 0;
 }
 
+/* The conversation's running cost, beside the title. */
+.chat-head > .chat-spent {
+  flex: none;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-mute);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The selected model has no key: said above the box it would be typed into. */
+.chat-key-note {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin: 0;
+  padding: 6px 11px;
+  font-size: 11.5px;
+  color: var(--error);
+}
+
 .chat-gear {
   width: 22px;
   height: 22px;
@@ -3041,13 +3061,7 @@ input[type="range"]:focus::-moz-range-thumb {
   margin-top: 4px;
   font-size: 11px;
   color: var(--text-mute);
-  opacity: 0;
-  transition: opacity 120ms;
-}
-
-.chat-assistant:hover .chat-usage,
-.chat-assistant:focus-within .chat-usage {
-  opacity: 1;
+  font-variant-numeric: tabular-nums;
 }
 
 /* ---------- Activity rows ----------
