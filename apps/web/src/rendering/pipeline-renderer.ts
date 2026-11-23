@@ -10,6 +10,7 @@ import {
   SONY_POST_PROGRAMS, type SonyPostProgramName,
   MASK_BLUR_SHADER, MASK_DOWNSAMPLE_SHADER, MASK_VERTEX_SHADER, PASSES, VERTEX_SHADER,
   RELIGHT_BLUR_SHADER, RELIGHT_SHADOW_SHADER, FINISH_SHADER, AUX_COPY_SHADER, LENS_BLUR_DOWN_SHADER, LENS_BLUR_GATHER_SHADER,
+  REFINE_COPY_SHADER, HISTO_VERTEX_SHADER, HISTO_FRAGMENT_SHADER,
 } from "./passes";
 import { type MarbleUniforms, type ProfileMarble, marbleUniforms } from "./sony-marble";
 import { type LumaNrParams, type ProfileLumaNr, lumaNrParams } from "./sony-lumanr";
@@ -501,14 +502,6 @@ const NOISE_MIN_STEP = 0.25;
 // close enough to 1:1 that every stage already runs as it does at export.
 const REFINE_DELAY_MS = 200;
 const REFINE_SKIP_ABOVE = 0.95;
-// The refine's final blit: the mipmapped full-resolution frame onto the canvas.
-const REFINE_COPY_SHADER = `#version 300 es
-precision highp float;
-in vec2 v_uv;
-out vec4 outColor;
-uniform sampler2D u_input;
-void main() { outColor = texture(u_input, v_uv); }`;
-
 // Long-edge cap for the blurred log-luminance mask (Highlights/Shadows
 // locality). Fixed regardless of source size so the blur is a constant
 // fraction of the frame and preview/export masks match by construction.
@@ -2800,32 +2793,7 @@ export class PipelineRenderer {
     this.histoBinTex = tex;
     this.histoBinFbo = fbo;
 
-    // One point per (pixel, channel). gl_VertexID derives both, the vertex shader
-    // fetches the pixel and positions the point at its bin column / channel row.
-    const vs = `#version 300 es
-precision highp float;
-uniform sampler2D u_src;
-uniform int u_srcW;
-void main() {
-  int vid = gl_VertexID;
-  int pix = vid >> 2;          // pixel index
-  int ch  = vid & 3;           // 0=R 1=G 2=B 3=Luma
-  ivec2 coord = ivec2(pix % u_srcW, pix / u_srcW);
-  vec3 rgb = texelFetch(u_src, coord, 0).rgb;
-  float v = (ch == 0) ? rgb.r
-          : (ch == 1) ? rgb.g
-          : (ch == 2) ? rgb.b
-          : dot(rgb, vec3(0.2126, 0.7152, 0.0722)); // Rec.709 luma, display-encoded
-  int bin = clamp(int(v * 255.0 + 0.5), 0, 255);
-  gl_Position = vec4((float(bin) + 0.5) / 128.0 - 1.0,
-                     (float(ch) + 0.5) / 2.0 - 1.0, 0.0, 1.0);
-  gl_PointSize = 1.0;
-}`;
-    const fs = `#version 300 es
-precision highp float;
-out vec4 o;
-void main() { o = vec4(1.0, 0.0, 0.0, 0.0); } // each point adds 1 to its bin`;
-    this.histoProgram = this.compileProgramVS(vs, fs);
+    this.histoProgram = this.compileProgramVS(HISTO_VERTEX_SHADER, HISTO_FRAGMENT_SHADER);
     this.histoUniforms = {
       u_src: gl.getUniformLocation(this.histoProgram, "u_src"),
       u_srcW: gl.getUniformLocation(this.histoProgram, "u_srcW"),

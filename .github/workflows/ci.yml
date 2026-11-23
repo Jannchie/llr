@@ -21,6 +21,16 @@ jobs:
       - run: pnpm -r test
       - run: pnpm -r build
       - run: pnpm exec eslint .
+      # Every program the renderer builds, compiled and linked in a real WebGL2
+      # context (software-rendered): nothing above can tell a shader that is
+      # type-checked and unit-tested from one the browser will refuse.
+      - name: Compile shaders
+        run: |
+          pnpm --filter @llr/web check:shaders
+          google-chrome --headless=new --no-sandbox --enable-unsafe-swiftshader --use-angle=swiftshader \
+            --virtual-time-budget=10000 --dump-dom "file://$PWD/apps/web/shader-check.html" > shader-check.txt
+          grep -E "^(OK|FAIL|LINK|NO WEBGL2|DONE)" shader-check.txt || true
+          grep -q "DONE failures=0" shader-check.txt
 
   worker:
     name: Python worker (test + lint)

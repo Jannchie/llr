@@ -194,3 +194,20 @@ describe("shader sources", () => {
     }
   });
 });
+
+describe("ALL_PROGRAMS", () => {
+  it("lists every shader this module exports, so the compile check sees them all", async () => {
+    const passes = await import("../passes");
+    const listed = new Set(passes.ALL_PROGRAMS.flatMap(p => [p.vs, p.fs]));
+    const missing = Object.entries(passes)
+      .filter(([name, value]) => name.endsWith("_SHADER") && typeof value === "string" && !listed.has(value))
+      .map(([name]) => name);
+    expect(missing).toEqual([]);
+  });
+
+  it("names each program once", async () => {
+    const { ALL_PROGRAMS } = await import("../passes");
+    const names = ALL_PROGRAMS.map(p => p.name);
+    expect(new Set(names).size).toBe(names.length);
+  });
+});
