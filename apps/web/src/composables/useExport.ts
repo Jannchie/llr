@@ -1,6 +1,6 @@
 import { ref, type Ref } from "vue";
 import { PipelineRenderer, parseDcpTables, type EditParams, type ProfileCurve } from "../rendering/pipeline-renderer";
-import { API, fetchLinear, type DenoisePayload, type LinearMeta, type LookTweaks } from "../api";
+import { API, fetchLinear, type DenoisePayload, type LinearMeta, type LinearRequest } from "../api";
 import { t } from "../i18n";
 import type { RelightGeometry } from "../rendering/relight";
 
@@ -33,12 +33,10 @@ export interface ExportPlan {
   /** Anything else the renderer needs per image before it draws (mask layers:
    * AI mattes, rasterised brushes) — called once the full-res frame is up. */
   prepare?: (renderer: PipelineRenderer, params: Partial<EditParams>) => void;
-  /** Creative Look tweaks; undefined renders the shot's own (Sony path only). */
-  look: LookTweaks | undefined;
-  /** Which Creative Look; undefined renders the body's own (Sony path only). */
-  lookStyle: string | undefined;
-  /** DRO strength; undefined applies whatever the body did (Sony path only). */
-  dro: number | undefined;
+  /** The Creative Look, its tweaks and DRO (strength and level) the decode is
+   * asked for — the same four the preview's request carried (Sony path only;
+   * undefined renders what the body did). */
+  lookRequest: Pick<LinearRequest, "look" | "style" | "dro" | "droLevel">;
   /** Sony's "advanced colour reproduction" (ZcTask3DLut). Render-time, so it
    * rides the plan rather than the decode — but the export builds its own
    * renderer, so it has to be handed over explicitly or the exported file would
@@ -72,7 +70,7 @@ export async function renderPlan(plan: ExportPlan, opts: { maxEdge?: number; qua
     const lin = await fetchLinear({
       sourceId: plan.sourceId, halfSize: plan.decode?.halfSize ?? false, maxSize: plan.decode?.maxSize ?? 0, purpose: "export",
       profileId: plan.profileId, dcpCode: plan.dcpCode, denoise: plan.denoise,
-      look: plan.look, style: plan.lookStyle, dro: plan.dro, erase: plan.erase,
+      ...plan.lookRequest, erase: plan.erase,
     });
     if (!lin) throw new Error(t("error.exportSourceGone"));
     const { meta, pixels } = lin;

@@ -37,6 +37,23 @@ export type DenoisePayload = {
   edge: number; chroma: number;
 };
 
+// What a decode is asked for: the preview's, an export's and a background
+// render's alike. Every key is required (its value may be undefined, which the
+// worker reads as "as shot") for the reason above: a request assembled by hand
+// that leaves one out still type-checks as a bag of unknowns, and the frame it
+// brings back then differs from the one on screen. `droLevel` went missing
+// from the export that way.
+export type LinearRequest = {
+  sourceId: string; halfSize: boolean; maxSize: number;
+  /** "export" keeps a one-off decode out of the worker's caches. */
+  purpose?: "export";
+  profileId: string; dcpCode: string | undefined;
+  denoise: DenoisePayload;
+  look: LookTweaks | undefined; style: string | undefined;
+  dro: number | undefined; droLevel: number;
+  erase: unknown[];
+};
+
 export type ColorProfileMeta = {
   // How the worker produced the linear data: a DCP profile, Sony's own rendering
   // reproduced from calibration inside the RAW, LibRaw's matrix fallback, or
@@ -269,14 +286,14 @@ async function postFramed<M>(path: string, body: Record<string, unknown>): Promi
 
 // Normals + depth for the relight shader, estimated on the frame render-linear
 // serves for the same body (worker relight.py).
-export async function fetchRelightGeometry(body: Record<string, unknown>): Promise<RelightGeometry | null> {
+export async function fetchRelightGeometry(body: LinearRequest): Promise<RelightGeometry | null> {
   const r = await postFramed<{ width: number; height: number; k: [number, number] }>("relight-geometry", body);
   return r && { width: r.meta.width, height: r.meta.height, k: r.meta.k, data: new Uint16Array(r.buf, r.offset) };
 }
 
 // Subject / sky / person mattes as RGBA8 rows (top-down, the decode's frame),
 // estimated on the frame render-linear serves for the same body.
-export async function fetchAiMasks(body: Record<string, unknown>): Promise<{ data: Uint8Array; w: number; h: number } | null> {
+export async function fetchAiMasks(body: LinearRequest): Promise<{ data: Uint8Array; w: number; h: number } | null> {
   const r = await postFramed<{ width: number; height: number }>("ai-masks", body);
   return r && { w: r.meta.width, h: r.meta.height, data: new Uint8Array(r.buf, r.offset) };
 }
@@ -286,7 +303,7 @@ export async function fetchAiMasks(body: Record<string, unknown>): Promise<{ dat
 // aligned][linear RGB in header.dtype]. float16 payloads (half the bytes of
 // float32) stay as Uint16Array and upload straight into an RGB16F texture.
 // Returns null on 404 (source evicted server-side).
-export async function fetchLinear(body: Record<string, unknown>): Promise<{ meta: LinearMeta; pixels: LinearPixels } | null> {
+export async function fetchLinear(body: LinearRequest): Promise<{ meta: LinearMeta; pixels: LinearPixels } | null> {
   const r = await postFramed<LinearMeta>("render-linear", body);
   if (!r) return null;
   const { meta, buf, offset } = r;

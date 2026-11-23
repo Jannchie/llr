@@ -16,7 +16,7 @@ import {
   ASPECT_PRESETS, defaultTransform,
   type AspectPreset, type CropState,
 } from "./rendering/crop";
-import { API, fetchAiMasks, fetchLinear, fetchRelightGeometry, fetchLookProfile, type ColorProfileMeta, type DenoisePayload, type LookTweaks, type LookTweakKey } from "./api";
+import { API, fetchAiMasks, fetchLinear, fetchRelightGeometry, fetchLookProfile, type ColorProfileMeta, type DenoisePayload, type LinearMeta, type LinearRequest, type LookTweaks, type LookTweakKey } from "./api";
 import { type PersistedEdit } from "./edits";
 import { gradingTint, gradingHueDeg } from "./rendering/grading";
 import { parseLensCorr, mixLensTable, LENS_IDENTITY, type LensCorr } from "./rendering/lens";
@@ -450,8 +450,7 @@ const denoiseUsesChroma = ref(true);
 // slider position does not.
 const sonyDenoiser = computed(() => isRawSource.value && !denoiseUsesChroma.value);
 /** The Auto switch as the render sees it: never on a Sony frame. */
-const effectiveDenoiseAuto = (d: { auto: boolean } = denoise): boolean => d.auto && !sonyDenoiser.value;
-const denoiseAuto = computed(() => effectiveDenoiseAuto());
+const denoiseAuto = computed(() => denoise.auto && !sonyDenoiser.value);
 // Fitted camera-match table (see worker fit_profile.py): pulls the DCP render
 // toward the camera's own JPEG. On by default — it is the point of the profile —
 // but toggleable to compare against Adobe's uncorrected look. Only meaningful
@@ -1604,16 +1603,45 @@ function embeddedHistogramBins() {
 // `settings.denoise` rather than this function's output. Swapping one for the
 // other silently changes the number by 100x, so keep them apart.
 // edge and chroma are *not* rescaled: 0..100 is the wire scale for those.
-function denoisePayload(d: typeof denoise = denoise): DenoisePayload {
-  // On a Sony frame the switch is gone and the sliders rule (sonyDenoiser);
-  // on the wavelet, Auto is the manual panel at its defaults with every
-  // slider greyed out, so the edge value goes out neutral rather than
-  // whatever a manual session left. Colour NR is neutralised the same way
-  // where it is applied (sonyChromaNrSlider).
-  const auto = effectiveDenoiseAuto(d);
+//
+// The switch and the sliders go out as stored. What Auto means depends on the
+// file's denoiser, which only the worker knows before the first decode — and a
+// photo that is not open (a batch export, a background preview) never had one
+// here. So the worker resolves it (cli.py daemon_linear): Sony's filter ignores
+// the switch, and on the wavelet Auto takes the edge at its neutral 50.
+function denoisePayload(stored: Partial<DenoiseState> | undefined): DenoisePayload {
+  const d = { ...defaultDenoise(), ...stored };
+  return { enabled: d.enabled, auto: d.auto, amount: d.amount / 100, edge: d.edge, chroma: d.chroma };
+}
+
+type DenoiseState = ReturnType<typeof defaultDenoise>;
+/** The denoise settings as the render stages after a decode read them. */
+type FrameDenoise = { enabled: boolean; amount: number; edge: number; chroma: number; auto: boolean; sony: boolean };
+// `stored` for a frame whose decode said which denoiser it has: on Sony's the
+// Auto switch does not exist (sonyDenoiser). Takes the settings and the frame
+// rather than reading the open photo's, because an export's and a background
+// render's are another photo's.
+function frameDenoise(stored: Partial<DenoiseState> | undefined, sony: boolean): FrameDenoise {
+  const d = { ...defaultDenoise(), ...stored };
+  return { enabled: d.enabled, amount: d.amount, edge: d.edge, chroma: d.chroma, auto: d.auto && !sony, sony };
+}
+/** Whether a decode ran Sony's own filter (see sonyDenoiser). */
+const sonyDenoiserOf = (meta: LinearMeta): boolean =>
+  meta.colorProfile?.kind !== "rendered-image" && !meta.denoiseUsesChroma;
+
+// The Creative Look and DRO a decode is asked for. One place for the preview,
+// the export and a background render, so they cannot ask for different frames;
+// `off` is the panel's bypass, which puts all of it back to what the camera did.
+function lookRequest(
+  s: Pick<Snapshot, "look" | "lookScale" | "lookStyle" | "dro" | "droLevel">, off: boolean,
+): Pick<LinearRequest, "look" | "style" | "dro" | "droLevel"> {
+  if (off) return { look: undefined, style: undefined, dro: undefined, droLevel: DRO_AUTO };
   return {
-    enabled: d.enabled, auto, amount: d.amount / 100,
-    edge: auto ? 50 : d.edge, chroma: d.chroma,
+    // A look stored before Edit's panel scale is in the camera's stops.
+    look: s.look ? (s.lookScale === LOOK_SCALE ? s.look : lookStopsToPanel(s.look)) : undefined,
+    style: s.lookStyle ?? undefined,
+    dro: s.dro ?? undefined,
+    droLevel: s.droLevel ?? DRO_AUTO,
   };
 }
 
@@ -1647,7 +1675,11 @@ async function loadSource(id: string, opts: { resetView?: boolean; cause?: Decod
     const { meta: linMeta, pixels: linearFloat } = lin;
 
     hasLinearData = true;
-    profileCurveLUT = buildProfileLUT(linMeta.colorProfile);
+    // Before the profile LUT: its denoise-gated stages (YNR, Marble, BSNR_Y)
+    // are this frame's, not the one that was open a moment ago.
+    denoiseUsesChroma.value = linMeta.denoiseUsesChroma;
+    isRawSource.value = linMeta.colorProfile?.kind !== "rendered-image";
+    profileCurveLUT = buildProfileLUT(linMeta.colorProfile, liveFrameDenoise());
     lookBase = lookCurrent = linMeta.colorProfile;
     if (lookBase?.kind === "sony") void loadToneFamily();
     lensCorr = parseLensCorr(linMeta.colorProfile?.lensCorr);
@@ -1655,9 +1687,7 @@ async function loadSource(id: string, opts: { resetView?: boolean; cause?: Decod
     // if the Lens group is worth offering. Reactive because lensCorr itself is
     // not — it is read by the render path, not by the template.
     lensCorrAvailable.value = lensCorr !== null;
-    denoiseUsesChroma.value = linMeta.denoiseUsesChroma;
     eraseError.value = linMeta.erase?.error ?? null;
-    isRawSource.value = linMeta.colorProfile?.kind !== "rendered-image";
     // What the worker *actually* rendered with, which is not always what was
     // asked for: "sony" falls back to the DCP path on a RAW without Sony's
     // calibration. The DCP-only controls follow this, not profileId.
@@ -1775,7 +1805,7 @@ function installLookProfile(profile: ColorProfileMeta): void {
   if (!webglRenderer) return;
   lookCurrent = profile;
   hasSonyCameraMatch.value = parseCameraMatch(profile.profileCameraMatch) !== null;
-  profileCurveLUT = buildProfileLUT(profile);
+  profileCurveLUT = buildProfileLUT(profile, liveFrameDenoise());
   webglRenderer.uploadProfileCurveLUT(profileCurveLUT);
   scheduleWebGLDraw();
 }
@@ -1903,7 +1933,13 @@ let lensCorr: LensCorr | null = null;
 // buildPipelineParams' alias for it (its own `lensCorr` may be another photo's).
 const lensCorrLiveGet = () => lensCorr;
 
-function buildProfileLUT(cp: ColorProfileMeta | null | undefined): ProfileCurve {
+/** The open photo's denoise settings, for the frame on screen. */
+const liveFrameDenoise = (): FrameDenoise => frameDenoise(denoise, sonyDenoiser.value);
+
+// `dn` is the denoise settings of the frame `cp` belongs to — passed in, not
+// read from the panel, because an export or a background render builds this
+// for a photo that is not the open one.
+function buildProfileLUT(cp: ColorProfileMeta | null | undefined, dn: FrameDenoise): ProfileCurve {
   const pts = cp?.profileToneCurve;
   if (!pts || pts.length < 2) return null;
   // A per-channel curve is basis-dependent, and the basis belongs to the profile:
@@ -1976,7 +2012,7 @@ function buildProfileLUT(cp: ColorProfileMeta | null | undefined): ProfileCurve 
     // once per tile (highiso-denoise-gap.md 3). Its mix is (amount - 50) * 2
     // percent, so the default and everything below it leave the chain alone.
     // Sony frames only: the wavelet's amount is a decode blend, not this.
-    ynr: sonyDenoiser.value && denoise.enabled ? Math.max(0, (denoise.amount - 50) * 2) : 0,
+    ynr: dn.sony && dn.enabled ? Math.max(0, (dn.amount - 50) * 2) : 0,
     // Marble's other half, the chroma cleanup — on for the same reason the three
     // above are, that the engine runs it and reproducing the engine means
     // running it. Unlike them it has no per-shot amount to gate on: the worker
@@ -1993,8 +2029,8 @@ function buildProfileLUT(cp: ColorProfileMeta | null | undefined): ProfileCurve 
     // keeps the two in step. The panel's colour-NR value is Edit's own 0..10
     // control at ten times the scale (2.24.2), and that position is what
     // reaches the stage — it moves both the thresholds and the blend.
-    marble: cp?.profileMarble && denoise.enabled
-      ? { ...cp.profileMarble, slider: sonyChromaNrSlider(denoise.chroma, denoiseAuto.value) }
+    marble: cp?.profileMarble && dn.enabled
+      ? { ...cp.profileMarble, slider: sonyChromaNrSlider(dn.chroma, dn.auto) }
       : null,
     // BSNR_Y, the luma NR of an M/S-size (YCbCr) frame — the one the worker
     // cannot run, because the engine runs it after sharpening on the
@@ -2002,8 +2038,8 @@ function buildProfileLUT(cp: ColorProfileMeta | null | undefined): ProfileCurve 
     // NR switch (captured: with NR off the engine never enters the stage), and
     // driven by the same Amount and Edge sliders as the RAW stage would be;
     // the block is only ever sent for such a frame.
-    lumaNr: cp?.profileLumaNr && denoise.enabled
-      ? { ...cp.profileLumaNr, amount: denoise.amount, edge: denoiseAuto.value ? 50 : denoise.edge }
+    lumaNr: cp?.profileLumaNr && dn.enabled
+      ? { ...cp.profileLumaNr, amount: dn.amount, edge: dn.auto ? 50 : dn.edge }
       : null,
     // Camera match, after Marble. The table alone travels here; whether it runs
     // is the switch, pushed at the renderer by applySonyCameraMatch. Null for a
@@ -2575,12 +2611,12 @@ const fmtMB = (n: number) => `${Math.round(n / 1e6)} MB`;
 //
 // The full-resolution decode the preview shows (see loadSource): the relight
 // geometry and the AI mattes are estimated on exactly this frame.
-function decodeBody(id: string): Record<string, unknown> {
+function decodeBody(id: string): LinearRequest {
   return {
     sourceId: id, halfSize: false, maxSize: 0, profileId: profileId.value, dcpCode: dcpCode.value,
-    denoise: denoisePayload(), look: bypass.has("look") ? undefined : look.value ?? undefined,
-    style: bypass.has("look") ? undefined : lookStyle.value ?? undefined,
-    dro: renderDro.value.strength ?? undefined, droLevel: renderDro.value.level, erase: eraseWire(erase),
+    denoise: denoisePayload(denoise),
+    ...lookRequest({ look: look.value, lookScale: LOOK_SCALE, lookStyle: lookStyle.value, dro: droStrength.value, droLevel: droLevel.value }, bypass.has("look")),
+    erase: eraseWire(erase),
   };
 }
 // The decode an analysis belongs to: the source and its erase fills.
@@ -3532,12 +3568,10 @@ async function renderSnapshot(id: string, settings: Snapshot, maxEdge: number): 
  */
 async function offscreenPlan(id: string, settings: Snapshot): Promise<ExportPlan> {
   const off = new Set(settings.bypass ?? []);
-  const body = {
+  const body: LinearRequest = {
     sourceId: id, halfSize: true, maxSize: 2048, purpose: "export",
     profileId: settings.profile ?? "standard", dcpCode: settings.dcp, denoise: denoisePayload(settings.denoise),
-    look: off.has("look") ? undefined : settings.look ?? undefined,
-    style: off.has("look") ? undefined : settings.lookStyle ?? undefined,
-    dro: off.has("look") ? undefined : settings.dro ?? undefined, erase: eraseWire(settings.erase ?? []),
+    ...lookRequest(settings, off.has("look")), erase: eraseWire(settings.erase ?? []),
   };
   const masksOn = off.has("masks") ? [] : settings.masks ?? [];
   const [geo, ai] = await Promise.all([
@@ -3624,15 +3658,15 @@ function buildPlan(
     relightGeometry: snapshotNeedsGeometry({ ...settings, recipe: effectiveRecipe(settings.recipe, off), masks: off.has("masks") ? [] : settings.masks }) ? extra.relightGeometry : null,
     // Absent means as shot, same as everywhere else — the full-res decode then
     // rebuilds the profile the preview was showing (plan.profileLUT).
-    look: off.has("look") ? undefined : settings.look ?? undefined,
-    lookStyle: off.has("look") ? undefined : settings.lookStyle ?? undefined,
-    dro: off.has("look") ? undefined : settings.dro ?? undefined,
+    lookRequest: lookRequest(settings, off.has("look")),
     sonyAdvancedColour: settings.sonyAdvancedColour ?? false,
     sonyCameraMatch: settings.sonyCameraMatch ?? false,
     params: extra.params,
     curveLUT: buildToneCurveLUT(off.has("curve") ? defaultToneCurve() : settings.curve,
       currentBasic(effectiveRecipe(settings.recipe, off))),
-    profileLUT: (meta) => buildProfileLUT(meta.colorProfile),
+    // From the snapshot and the decode it was rendered from, not the panel:
+    // the photo being exported need not be the open one.
+    profileLUT: (meta) => buildProfileLUT(meta.colorProfile, frameDenoise(settings.denoise, sonyDenoiserOf(meta))),
     output: (meta) => {
       const [iw, ih] = imageDims(meta.width, meta.height, cropSnap.orientation);
       const rect = cropOutputRect(cropSnap, iw, ih);
@@ -4505,7 +4539,7 @@ const vWheelAdjust = {
         <SliderRow v-show="denoise.enabled && (denoiseUsesChroma || sonyDenoiser)" v-model="denoise.chroma" style="margin-top: 6px;"
           :label="t('detail.chromaNr')" input-id="denoise-chroma" :min="0" :max="100" :reset-value="50" />
         <!-- Greyed out in Auto in Edit too: Auto is the manual panel at its
-             defaults, and denoisePayload sends the neutral value for it. -->
+             defaults, and the worker takes the neutral value for it. -->
         <SliderRow v-show="denoise.enabled && !denoiseAuto" v-model="denoise.edge" style="margin-top: 6px;"
           :label="t('detail.edgeNr')" input-id="denoise-edge" :min="0" :max="100" :reset-value="50" />
       </section>
