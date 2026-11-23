@@ -83,7 +83,10 @@ Drop a RAW on the page. Then, optionally:
 - Everything the server keeps — the catalog (folders, photos, edits), the
   imported files, decode cache — lives under `~/.cache/llr`
   (`LLR_CACHE_DIR`), never in the checkout, and imports stay until you remove
-  them from the library. Drop files or whole folders onto the folder tree to
+  them from the library. The catalog is the only copy of your edits, so a
+  consistent copy of it is written to `backups/` there once a day (the last
+  seven are kept) and before any schema migration; to restore one, stop LLR
+  and put it in place of `catalog.db`, removing `catalog.db-wal` and `-shm`. Drop files or whole folders onto the folder tree to
   import them (a dropped folder keeps its structure); `G` and `E` switch
   between the library grid and the develop view. In the grid, the bar above it
   sorts by capture time, file modified time, camera, ISO and the rest, and
