@@ -115,7 +115,7 @@ export type ChatEntry =
   // `result` is what went back to the model, kept so the log can show it.
   | { kind: "tool"; name: string; args: unknown; done: boolean; error?: string; result?: ToolContent[] }
   // A line about the run itself, not something anyone said.
-  | { kind: "status"; status: "stopped" | "nudge" };
+  | { kind: "status"; status: "stopped" | "nudge" | "limit" };
 
 type Chat = { session: string; entries: ChatEntry[]; busy: boolean };
 
@@ -267,6 +267,11 @@ export function useAssistant(opts: {
             if (entry && ev.isError && !entry.error) entry.error = String(ev.result?.content?.[0]?.text ?? "error");
             break;
           }
+          case "limit":
+            // The server's per-prompt ceiling (agent-budget.ts); the abort that
+            // follows brings its own "stopped" line.
+            chat.entries.push({ kind: "status", status: "limit" });
+            break;
         }
       }
       await Promise.all(toolRuns);
