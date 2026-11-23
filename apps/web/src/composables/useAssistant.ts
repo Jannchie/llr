@@ -26,9 +26,14 @@ export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 export type ModelSpec = { provider: string; id: string; thinking?: ThinkingLevel };
 export const modelKey = (m: ModelSpec): string => `${m.provider}/${m.id}`;
 
-// One provider the API knows, with the ids its registry ships for it and
-// whether this server holds that provider's key (mirrors the API's own type).
-export type ProviderCatalog = { id: string; hasKey: boolean; models: { id: string; name: string }[] };
+// One provider the API knows, with the ids its registry ships for it and where
+// the server stands on its key (mirrors the API's own type): whether requests
+// can authenticate, what with when it is not a key saved from here (an env
+// var's name), the tail of the key that was, and whether it takes one at all.
+export type ProviderCatalog = {
+  id: string; hasKey: boolean; keySource?: string; keyHint?: string; takesKey?: boolean;
+  models: { id: string; name: string }[];
+};
 
 // Tokens and cost of one turn, summed over its LLM calls (pi-ai's Usage).
 export type TurnUsage = { input: number; output: number; cacheRead: number; cost: number };
@@ -43,7 +48,7 @@ const DEFAULT_MODELS: ModelSpec[] = [
   { provider: "openai", id: "gpt-6-astra" },
   { provider: "anthropic", id: "claude-opus-5-5" },
   { provider: "anthropic", id: "claude-sonnet-5-5" },
-  { provider: "anthropic", id: "claude-fable-5-1" },
+  { provider: "anthropic", id: "claude-fable-5-2" },
   { provider: "deepseek", id: "deepseek-flash" },
 ];
 const MODELS_KEY = "llr.agent.models";
@@ -51,16 +56,28 @@ const SELECTED_KEY = "llr.agent.model";
 // Bumped when the defaults move on; a list saved under an older version gets
 // that move applied once (upgradeModels), after which it is the person's again.
 const MODELS_VERSION_KEY = "llr.agent.models.v";
-const MODELS_VERSION = 2;
+const MODELS_VERSION = 3;
 
-// v2: Claude Opus 5 -> Opus 5.5 (keeping its thinking level), and Sonnet 5.5
-// beside it — the defaults a list saved before them was missing.
-function upgradeModels(list: ModelSpec[], from: number): ModelSpec[] {
-  if (from >= 2) return list;
-  const out = list.map(m => (m.provider === "anthropic" && m.id === "claude-opus-5" ? { ...m, id: "claude-opus-5-5" } : m));
-  const has = (id: string) => out.some(m => m.provider === "anthropic" && m.id === id);
-  if (!has("claude-sonnet-5-5")) {
-    const at = out.findIndex(m => m.provider === "anthropic" && m.id === "claude-opus-5-5");
+// Anthropic models a default was replaced by, and the list version that did it.
+// The entry keeps its place and its thinking level; only the id moves on.
+const SUCCESSORS: { v: number; from: string; to: string }[] = [
+  { v: 2, from: "claude-opus-5", to: "claude-opus-5-5" },
+  { v: 3, from: "claude-fable-5-1", to: "claude-fable-5-2" },
+];
+
+// v2 also put Sonnet 5.5 beside Opus 5.5 — a default a list saved before it
+// was missing.
+export function upgradeModels(list: ModelSpec[], from: number): ModelSpec[] {
+  let out = [...list];
+  const is = (m: ModelSpec, id: string) => m.provider === "anthropic" && m.id === id;
+  const has = (id: string) => out.some(m => is(m, id));
+  for (const s of SUCCESSORS) {
+    if (from >= s.v) continue;
+    // The successor was already added by hand: the old entry just goes.
+    out = has(s.to) ? out.filter(m => !is(m, s.from)) : out.map(m => (is(m, s.from) ? { ...m, id: s.to } : m));
+  }
+  if (from < 2 && !has("claude-sonnet-5-5")) {
+    const at = out.findIndex(m => is(m, "claude-opus-5-5"));
     out.splice(at >= 0 ? at + 1 : out.length, 0, { provider: "anthropic", id: "claude-sonnet-5-5" });
   }
   return out;
@@ -76,8 +93,10 @@ function loadModels(): ModelSpec[] {
       if (from < MODELS_VERSION) {
         localStorage.setItem(MODELS_KEY, JSON.stringify(list));
         localStorage.setItem(MODELS_VERSION_KEY, String(MODELS_VERSION));
-        // The selection followed the renamed entry.
-        if (localStorage.getItem(SELECTED_KEY) === "anthropic/claude-opus-5") localStorage.setItem(SELECTED_KEY, "anthropic/claude-opus-5-5");
+        // The selection follows the entry that moved on.
+        const selected = localStorage.getItem(SELECTED_KEY);
+        const moved = SUCCESSORS.find(s => from < s.v && selected === `anthropic/${s.from}`);
+        if (moved) localStorage.setItem(SELECTED_KEY, `anthropic/${moved.to}`);
       }
       return list;
     }
@@ -142,6 +161,16 @@ export function useAssistant(opts: {
   // Providers the API has a key for; the picker greys out the rest. Null until
   // the catalog lands, so nothing is greyed out before we can know.
   const providers = computed(() => catalog.value?.filter(p => p.hasKey).map(p => p.id) ?? null);
+  // Save a provider's API key on the server, or forget the saved one (null).
+  // The key only ever travels this way; what comes back is the catalog.
+  async function setKey(provider: string, key: string | null): Promise<void> {
+    const r = await fetch(`${API}/agent/keys/${encodeURIComponent(provider)}`, key === null
+      ? { method: "DELETE" }
+      : { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ key }) });
+    const body = await r.json().catch(() => null) as { providers?: ProviderCatalog[]; error?: string } | null;
+    if (!r.ok || !body?.providers) throw new Error(body?.error ?? `${r.status} ${r.statusText}`);
+    catalog.value = body.providers;
+  }
   watch(models, list => {
     localStorage.setItem(MODELS_KEY, JSON.stringify(list));
     if (list.length && !list.some(m => modelKey(m) === selected.value)) selected.value = modelKey(list[0]);
@@ -251,7 +280,7 @@ export function useAssistant(opts: {
   function abort(): void { void post(current.value.session, "abort", {}); }
   function reset(): void { current.value.entries = []; void post(current.value.session, "reset", {}); }
 
-  return { entries, busy, models, selected, catalog, providers, send, abort, reset };
+  return { entries, busy, models, selected, catalog, providers, setKey, send, abort, reset };
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

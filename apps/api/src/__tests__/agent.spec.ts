@@ -5,7 +5,7 @@ describe("assistant model catalog", () => {
   it("offers the current Claude models from pi-ai's own catalog", async () => {
     const anthropic = (await agentCatalog()).find(p => p.id === "anthropic")!;
     const ids = anthropic.models.map(m => m.id);
-    for (const id of ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"]) expect(ids).toContain(id);
+    for (const id of ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-2"]) expect(ids).toContain(id);
   });
 
   it("resolves them with their real window, output cap, vision and adaptive-only thinking", () => {

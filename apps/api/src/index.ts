@@ -12,12 +12,15 @@ import { fileURLToPath } from "node:url";
 
 import {
   agentCatalog,
+  clearProviderKey,
   handleAgentAbort,
   handleAgentSteer,
   handleAgentPrompt,
   handleAgentReset,
   handleAgentToolResult,
   isSessionBusy,
+  openCredentials,
+  setProviderKey,
   type PromptBody,
   type ToolResultBody,
 } from "./agent.js";
@@ -56,6 +59,8 @@ const sessionsRoot = resolve(cacheRoot, "sessions");
 // What is in the library: folders, photos and their edits (catalog.ts). The
 // files a photo owns live in sessions/<id>/ beside the worker's decode cache.
 const catalog = new Catalog(resolve(cacheRoot, "catalog.db"));
+// Provider keys saved from the assistant's settings (credentials.ts).
+openCredentials(resolve(cacheRoot, "credentials.json"));
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.once(signal, () => {
     catalog.close(); // checkpoints the WAL so the next open starts clean
@@ -208,6 +213,25 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
 // an SSE stream that lasts for the whole agent run.
 async function routeAgent(action: string, method: string, request: IncomingMessage, response: ServerResponse): Promise<void> {
   if (method === "GET" && action === "models") {
+    sendJson(response, { providers: await agentCatalog() });
+    return;
+  }
+  // PUT saves a provider's key, DELETE forgets it. Both answer with the catalog
+  // as it now stands — never with the key.
+  const keyOf = /^keys\/([\w.-]{1,64})$/.exec(action);
+  if (keyOf && (method === "PUT" || method === "DELETE")) {
+    try {
+      if (method === "PUT") {
+        const { key } = await readJson<{ key?: unknown }>(request);
+        // A key is one token: anything with whitespace in it is a paste gone wrong.
+        if (typeof key !== "string" || !/^\S{1,1024}$/.test(key.trim())) throw new HttpError(400, "Expected key");
+        await setProviderKey(keyOf[1], key.trim());
+      } else {
+        await clearProviderKey(keyOf[1]);
+      }
+    } catch (error) {
+      throw error instanceof HttpError ? error : new HttpError(400, errorMessage(error));
+    }
     sendJson(response, { providers: await agentCatalog() });
     return;
   }

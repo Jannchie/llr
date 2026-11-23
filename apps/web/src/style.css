@@ -292,6 +292,11 @@ button {
   cursor: default;
 }
 
+/* The batch's running count: digits of one width, so the button holds still. */
+.export-count {
+  font-variant-numeric: tabular-nums;
+}
+
 .export-spinner {
   width: 14px;
   height: 14px;
@@ -534,12 +539,13 @@ button {
   font-variant-numeric: tabular-nums;
 }
 
-.status-value[data-state="rendering"],
-.status-value[data-state="uploading"] {
+.status-value[data-state="decoding"],
+.status-value[data-state="exporting"],
+.status-value[data-state="importing"] {
   color: var(--accent-strong);
 }
 
-.status-value[data-state="error"] {
+.status-value[data-state="failed"] {
   color: var(--error);
 }
 
@@ -3433,6 +3439,36 @@ input[type="range"]:focus::-moz-range-thumb {
 .model-remove svg {
   width: 14px;
   height: 14px;
+}
+
+/* A second section inside a sheet. */
+.sheet-sub {
+  margin: 14px 0 6px;
+  padding-top: 12px;
+  border-top: 1px solid var(--sep);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+/* Keys line up under the model rows: the provider where the provider picker
+   is, the key where the id is. */
+.key-provider {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  padding-left: 8px;
+}
+
+.model-field:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* Nothing saved, nothing to remove — but the column stays, so Save lines up. */
+.model-remove.is-absent {
+  visibility: hidden;
 }
 
 /* ---------- Masks panel ----------

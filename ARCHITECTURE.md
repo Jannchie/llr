@@ -134,6 +134,11 @@ export looks like on screen.
 `App.vue` holds the editing state; the mechanics live in composables
 (`useCatalog`, `useHistory`, `useViewport`, `useCropEditor`, `useToneCurve`,
 `useHistogram`, `useExport`) and `api.ts` (the binary protocol client).
+What the app is busy with is one state per owner (`activity.ts`): the active
+photo's decode is a `DecodeState` only `loadSource`'s newest call moves, while
+import and export keep their own flags and errors go to the toast — none of
+them can end another's state. Whether a worker model can run (missing →
+downloading → available) is followed in one place, `useModelStatus`.
 `useCatalog` is the browser's half of the catalog: the folder tree, the open
 folder's photos as plain (non-reactive) records, the active photo — which need
 not be in that folder — and the edits touched this session, saved with a
@@ -161,6 +166,14 @@ owner name, and maker notes instead) and embeds the edit recipe as XMP:
 structured `llr:*` fields plus a lossless JSON blob, spilling into
 Extended-XMP chunks when a heavy edit overflows the 64 KB APP1 limit.
 
+A selection in the library exports as a batch (`exportMany`): the same
+render, one photo after another, each from its own stored edit — a photo that
+is not open is planned the way its background preview is (`offscreenPlan` in
+`App.vue`), only at full resolution. The files go into a folder the user picks
+where the browser can write to one (`showDirectoryPicker`), else out as one
+download each; a name that is taken gets a number instead of being
+overwritten.
+
 ## Assistant
 
 The Assistant tab is a chat that edits the open photo. The agent loop
@@ -169,9 +182,12 @@ which holds the LLM key and streams events to the browser over SSE; every tool
 the model calls — look at the render, read the edit, apply an edit — executes in
 the browser against the same reactive state the sliders drive, so its changes
 redraw, enter history and persist like hand edits. The tool schemas travel with
-each prompt, so the API knows nothing about photography. `LLR_AGENT_MODEL`
-(`provider/model`) picks the model; the key comes from the provider's usual env
-var.
+each prompt, so the API knows nothing about photography. The browser names the
+model with each prompt. The key is one saved from the model settings
+(`apps/api/src/credentials.ts`: a pi-ai credential store over
+`credentials.json` in the cache directory, written by `PUT /agent/keys/<provider>`
+and never read back out — the browser is told only a saved key's last four
+characters), else the provider's usual env var.
 
 ## Testing
 

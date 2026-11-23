@@ -44,6 +44,7 @@ const emit = defineEmits<{
   (e: "importFiles"): void;
   (e: "copySettings", id: string): void;
   (e: "pasteSettings", ids: string[]): void;
+  (e: "export", ids: string[]): void;
   /** The section at the top of the viewport changed (-1 when not grouped). */
   (e: "section", index: number): void;
 }>();
@@ -487,6 +488,8 @@ function cellMenu(photo: Photo): MenuItem[] {
     { id: `copySettings:${photo.id}`, label: t("grid.copySettings") },
     { id: "pasteSettings", label: t("grid.pasteSettings", { n: ids.length }), disabled: none || !props.canPaste },
     { id: "-" },
+    { id: "export", label: t("grid.export", { n: ids.length }), disabled: none },
+    { id: "-" },
     {
       id: "move", label: t("grid.moveTo"), disabled: none || !props.moveTargets.length,
       children: props.moveTargets.map(f => ({ id: `move:${f.id}`, label: f.label })),
@@ -525,6 +528,7 @@ function onMenuSelect(id: string): void {
   if (id.startsWith("move:")) return emit("move", selection(), Number(id.slice(5)));
   if (id.startsWith("copySettings:")) return emit("copySettings", id.slice(13));
   if (id === "pasteSettings") return emit("pasteSettings", selection());
+  if (id === "export") return emit("export", selection());
   switch (id) {
     case "rename": {
       const only = selection();

@@ -74,9 +74,10 @@ Drop a RAW on the page. Then, optionally:
 
 - Adobe DCP profiles for non-Sony RAWs: copy `Camera/` from a DNG Converter or
   Lightroom install to `vendor/adobe-camera-profiles/Camera/`.
-- The Assistant: export `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` (or another
-  provider's usual variable) before `pnpm dev`, then pick the model in the
-  panel.
+- The Assistant: pick the model in the panel, and paste the provider's API key
+  in its model settings (saved to `credentials.json` in the cache directory
+  below). Exporting `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` (or another
+  provider's usual variable) before `pnpm dev` works too; a saved key wins.
 - Everything the server keeps — the catalog (folders, photos, edits), the
   imported files, decode cache — lives under `~/.cache/llr`
   (`LLR_CACHE_DIR`), never in the checkout, and imports stay until you remove

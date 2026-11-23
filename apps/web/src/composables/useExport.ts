@@ -109,13 +109,30 @@ export async function renderPlan(plan: ExportPlan, opts: { maxEdge?: number; qua
  * server-side, and download the result. How the edit snapshot maps to render
  * params stays with the caller (the `plan` callback).
  */
+/** One photo of a batch: its name for the report, and how to freeze its edit when its turn comes. */
+export interface ExportJob {
+  name: string;
+  plan: () => Promise<ExportPlan | null> | ExportPlan | null;
+}
+
+/** How a batch ended: what was written and where, what was not, and whether it was stopped. */
+export interface BatchResult {
+  saved: number;
+  /** The folder the files went to; null when they were downloaded one by one. */
+  folder: string | null;
+  failed: string[];
+  cancelled: boolean;
+}
+
 export function useExport(opts: {
-  status: Ref<"idle" | "uploading" | "rendering" | "error">;
   errorMessage: Ref<string | null>;
   /** Freeze the current edit into a plan; null = nothing to export. */
   plan: () => ExportPlan | null;
 }) {
   const exporting = ref(false);
+  // A batch in flight: how far it is. Null for a single export and when idle.
+  const progress = ref<{ done: number; total: number } | null>(null);
+  let stop = false;
 
   async function exportImage(): Promise<void> {
     if (exporting.value) return;
@@ -123,25 +140,12 @@ export function useExport(opts: {
     if (!plan) return;
     exporting.value = true;
     opts.errorMessage.value = null;
-    opts.status.value = "rendering";
     try {
-      const blob = await renderPlan(plan);
-
-      // Embed edit settings (llr:* XMP + lossless LLR JSON) into the JPEG server-side
-      const fd = new FormData();
-      fd.append("file", blob, "export.jpg");
-      fd.append("meta", JSON.stringify({ sourceId: plan.sourceId, settings: plan.settings, stripPrivate: plan.stripPrivate }));
-      const exRes = await fetch(`${API}/export`, { method: "POST", body: fd });
-      if (!exRes.ok) throw new Error(await exRes.text());
-
       // Download the finished file
-      downloadBlob(await exRes.blob(), plan.filename);
-      // Don't stomp the status of a decode the user started mid-export.
-      if (opts.status.value === "rendering") opts.status.value = "idle";
+      downloadBlob(await finishedJpeg(plan), plan.filename);
     } catch (err) {
-      // Same ownership rule as the success path: status may belong to a decode
-      // the user started mid-export; the error banner is enough on its own.
-      if (opts.status.value === "rendering") opts.status.value = "error";
+      // The toast only: `exporting` is this export's state, and the decode
+      // state belongs to the photo on screen, not to this off-screen render.
       opts.errorMessage.value = err instanceof Error ? err.message : String(err);
       console.error("[export] failed:", err);
     } finally {
@@ -149,7 +153,115 @@ export function useExport(opts: {
     }
   }
 
-  return { exporting, exportImage };
+  /**
+   * Export several photos one after another — each is a full-resolution decode
+   * and render, so two at once would only fight over the worker and the GPU.
+   * One that fails is reported and the rest carry on. Null = the folder picker
+   * was dismissed, so nothing was started.
+   */
+  async function exportMany(jobs: readonly ExportJob[]): Promise<BatchResult | null> {
+    if (exporting.value || !jobs.length) return null;
+    // Before anything else: the picker needs the click that got us here.
+    const sink = await openSink();
+    if (!sink) return null;
+    exporting.value = true;
+    stop = false;
+    opts.errorMessage.value = null;
+    progress.value = { done: 0, total: jobs.length };
+    const result: BatchResult = { saved: 0, folder: sink.folder, failed: [], cancelled: false };
+    try {
+      for (const job of jobs) {
+        if (stop) { result.cancelled = true; break; }
+        try {
+          const plan = await job.plan();
+          if (!plan) throw new Error(t("error.exportSourceGone"));
+          await sink.write(await finishedJpeg(plan), plan.filename);
+          result.saved += 1;
+        } catch (err) {
+          result.failed.push(job.name);
+          console.error(`[export] ${job.name} failed:`, err);
+        }
+        progress.value = { done: progress.value.done + 1, total: jobs.length };
+      }
+    } finally {
+      exporting.value = false;
+      progress.value = null;
+    }
+    return result;
+  }
+
+  /** Stop a batch once the photo it is on is done. */
+  function cancelExport(): void {
+    stop = true;
+  }
+
+  return { exporting, progress, exportImage, exportMany, cancelExport };
+}
+
+/** Render `plan` at full resolution and have the server embed its edit (llr:* XMP + lossless LLR JSON) and the RAW's EXIF. */
+async function finishedJpeg(plan: ExportPlan): Promise<Blob> {
+  const blob = await renderPlan(plan);
+  const fd = new FormData();
+  fd.append("file", blob, "export.jpg");
+  fd.append("meta", JSON.stringify({ sourceId: plan.sourceId, settings: plan.settings, stripPrivate: plan.stripPrivate }));
+  const res = await fetch(`${API}/export`, { method: "POST", body: fd });
+  if (!res.ok) throw new Error(await res.text());
+  return res.blob();
+}
+
+/** `name`, or `name-2`, `name-3`… — the first that `taken` does not hold. */
+export async function freeName(name: string, taken: (name: string) => boolean | Promise<boolean>): Promise<string> {
+  const dot = name.lastIndexOf(".");
+  const [stem, ext] = dot > 0 ? [name.slice(0, dot), name.slice(dot)] : [name, ""];
+  let candidate = name;
+  for (let n = 2; await taken(candidate); n += 1) candidate = `${stem}-${n}${ext}`;
+  return candidate;
+}
+
+type Sink = { folder: string | null; write: (blob: Blob, filename: string) => Promise<void> };
+type DirectoryPicker = (options?: { id?: string; mode?: "read" | "readwrite"; startIn?: string }) => Promise<FileSystemDirectoryHandle>;
+
+/**
+ * Where a batch goes: a folder the user picks, where the browser can write to
+ * one (Chromium), else the downloads folder a file at a time. Either way a
+ * name that is taken gets a number rather than overwriting what is there —
+ * two photos of a selection can share a name, and so can a file from last time.
+ */
+async function openSink(): Promise<Sink | null> {
+  const picker = (window as { showDirectoryPicker?: DirectoryPicker }).showDirectoryPicker;
+  if (!picker) {
+    const used = new Set<string>();
+    return {
+      folder: null,
+      write: async (blob, filename) => {
+        const name = await freeName(filename, n => used.has(n));
+        used.add(name);
+        downloadBlob(blob, name);
+        // A burst of downloads gets dropped by the browser; give each its moment.
+        await new Promise(resolve => setTimeout(resolve, 300));
+      },
+    };
+  }
+  let dir: FileSystemDirectoryHandle;
+  try {
+    dir = await picker.call(window, { id: "llr-export", mode: "readwrite", startIn: "pictures" });
+  } catch (err) {
+    if ((err as DOMException).name === "AbortError") return null;
+    throw err;
+  }
+  const exists = (name: string) => dir.getFileHandle(name).then(() => true, () => false);
+  return {
+    folder: dir.name,
+    write: async (blob, filename) => {
+      const file = await dir.getFileHandle(await freeName(filename, exists), { create: true });
+      const out = await file.createWritable();
+      try {
+        await out.write(blob);
+      } finally {
+        await out.close();
+      }
+    },
+  };
 }
 
 function downloadBlob(blob: Blob, filename: string): void {

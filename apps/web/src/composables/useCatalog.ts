@@ -64,7 +64,7 @@ function comparePhotos(a: Photo, b: Photo): number {
 
 export function useCatalog<S, V>(opts: {
   api: string;
-  status: Ref<"idle" | "uploading" | "rendering" | "error">;
+  /** The toast. The active photo's decode state is the caller's (loadPixels). */
   errorMessage: Ref<string | null>;
   cropMode: Ref<boolean>;
   /** Snapshot the live edit (snapshot + history) for stashing/persisting. */
@@ -84,7 +84,7 @@ export function useCatalog<S, V>(opts: {
   /** Extra per-browser state stored with the UI state (view settings). */
   sessionExtras: { get: () => V; apply: (v: V) => void };
 }) {
-  const { status, errorMessage, cropMode } = opts;
+  const { errorMessage, cropMode } = opts;
 
   // ── Folders ──
   const folders = shallowRef<FolderRow[]>([]);
@@ -111,6 +111,9 @@ export function useCatalog<S, V>(opts: {
     activePhoto.value ? { ...activePhoto.value, invalid: invalidIds.has(activePhoto.value.id) } : null);
   const selectedIds = reactive(new Set<string>());
   const importProgress = ref<{ done: number; total: number; failed: number } | null>(null);
+  // The one-time handover of the pre-catalog library, which reads as an import.
+  const adopting = ref(false);
+  const importing = computed(() => importProgress.value !== null || adopting.value);
 
   // ── Edits ──
   // null = the server has nothing stored (the photo is at its defaults), so a
@@ -130,13 +133,11 @@ export function useCatalog<S, V>(opts: {
 
   function markInvalid(id: string): void {
     invalidIds.add(id);
-    status.value = "error";
     errorMessage.value = t("error.sourceGone");
   }
   function clearInvalid(id: string): void { invalidIds.delete(id); }
 
   function fail(error: unknown): void {
-    status.value = "error";
     errorMessage.value = error instanceof Error ? error.message : String(error);
   }
 
@@ -296,7 +297,7 @@ export function useCatalog<S, V>(opts: {
     activeId.value = null;
     pendingActivation = null;
     activePhoto.value = null;
-    opts.onEmptied(); // frees the removed image's GPU texture, resets status
+    opts.onEmptied(); // frees the removed image's GPU texture, resets the decode state
     opts.loadEdit(null); // resets the live edit to defaults
   }
 
@@ -539,7 +540,6 @@ export function useCatalog<S, V>(opts: {
     const progress = importProgress.value ?? { done: 0, total: 0, failed: 0 };
     progress.total += entries.length;
     importProgress.value = { ...progress };
-    if (!activeSource.value) status.value = "uploading";
 
     const single = entries.length === 1;
     let opened = false;
@@ -569,12 +569,7 @@ export function useCatalog<S, V>(opts: {
     if (importProgress.value && importProgress.value.done >= importProgress.value.total) {
       const failed = importProgress.value.failed;
       importProgress.value = null;
-      if (failed) {
-        status.value = "error";
-        errorMessage.value = t("status.importFailed", { n: failed });
-      } else if (status.value === "uploading") {
-        status.value = "idle";
-      }
+      if (failed) errorMessage.value = t("status.importFailed", { n: failed });
     }
     if (openTarget) view.value = "develop";
     void refreshTree();
@@ -675,7 +670,7 @@ export function useCatalog<S, V>(opts: {
     } catch { /* fall through: adopt again, it is idempotent */ }
     const legacy = await loadSession<S, V>();
     const photos = legacy?.session.sources.map(s => ({ id: s.id, name: s.name, size: s.size, edit: legacy.edits[s.id] })) ?? [];
-    if (photos.length) status.value = "uploading";
+    adopting.value = photos.length > 0;
     try {
       const result = await api.adoptLegacy(photos);
       if (legacy) {
@@ -690,8 +685,9 @@ export function useCatalog<S, V>(opts: {
     } catch (error) {
       // The API is not there yet; the next boot tries again.
       fail(error);
+    } finally {
+      adopting.value = false;
     }
-    if (status.value === "uploading") status.value = "idle";
     return carried;
   }
 
@@ -736,7 +732,7 @@ export function useCatalog<S, V>(opts: {
     folders, tree, selectedFolderId, expanded, view, folderLoading,
     sortKey, sortDir, groupKey, setSort, setGroup,
     folderPhotos, activeId, activeSource, selectedIds, importProgress,
-    photoById, resolveUrl, thumbSrc, markInvalid, clearInvalid,
+    importing, photoById, resolveUrl, thumbSrc, markInvalid, clearInvalid,
     persistNow, persistOnUnload, schedulePersist,
     activateSource, selectSource, openPhoto, setView,
     selectFolder, toggleExpanded, createFolder, renameFolder, moveFolder, deleteFolder,

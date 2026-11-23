@@ -16,7 +16,7 @@ import {
   ASPECT_PRESETS, defaultTransform,
   type AspectPreset, type CropState,
 } from "./rendering/crop";
-import { API, fetchAiMasks, fetchModelStatus, fetchLinear, fetchRelightGeometry, fetchLookProfile, type ColorProfileMeta, type DenoisePayload, type ModelStatus, type LookTweaks, type LookTweakKey } from "./api";
+import { API, fetchAiMasks, fetchLinear, fetchRelightGeometry, fetchLookProfile, type ColorProfileMeta, type DenoisePayload, type LookTweaks, type LookTweakKey } from "./api";
 import { type PersistedEdit } from "./edits";
 import { gradingTint, gradingHueDeg } from "./rendering/grading";
 import { parseLensCorr, mixLensTable, LENS_IDENTITY, type LensCorr } from "./rendering/lens";
@@ -46,6 +46,8 @@ import { useMaskEditor } from "./composables/useMaskEditor";
 import { useEraseEditor } from "./composables/useEraseEditor";
 import { useRelightEditor, useFocusPicker } from "./composables/useRelightEditor";
 import { useWorkerAnalysis } from "./composables/useWorkerAnalysis";
+import { useModelStatus } from "./composables/useModelStatus";
+import { activityOf, decodingFor, IDLE, type DecodeCause, type DecodeState } from "./activity";
 import { ROOT_FOLDER_ID, useCatalog } from "./composables/useCatalog";
 import { useHistogram } from "./composables/useHistogram";
 import { renderPlan, useExport, type ExportPlan } from "./composables/useExport";
@@ -258,13 +260,15 @@ function effectiveCrop(c: CropState, b: ReadonlySet<BypassKey> = bypass): CropSt
 // ── state ──
 
 const recipe = reactive<Recipe>(defaultRecipe());
-const status = ref<"idle"|"uploading"|"rendering"|"error">("idle");
+// The active photo's decode; who may move it is in activity.ts.
+const decode = shallowRef<DecodeState>(IDLE);
+const isDecoding = computed(() => decode.value.phase === "decoding");
+// The toast: what last went wrong, anywhere. A message, not a state.
 const errorMessage = ref<string | null>(null);
 const isDragging = ref(false);
 const fileInput = ref<HTMLInputElement | null>(null);
 const folderInput = ref<HTMLInputElement | null>(null);
 const canvasRef = ref<HTMLCanvasElement | null>(null);
-const timing = ref<number | null>(null);
 const dcpCode = ref("");  // empty = auto-detect
 // Which colour engine renders camera RGB into the working space. "standard" is
 // Adobe's chain through a DCP; "sony" reproduces Imaging Edge from calibration
@@ -517,7 +521,7 @@ const defaultDenoise = () => ({
   enabled: true, auto: true, amount: 50, edge: 50, chroma: 50,
 });
 const denoise = reactive(defaultDenoise());
-const denoiseBusy = ref(false);
+const denoiseBusy = computed(() => decodingFor(decode.value, "denoise"));
 // Hold-to-compare: while true we draw the unedited original (baseline params +
 // identity tone curve) so the before/after is easy to eyeball; release restores
 // the live edit. crop/denoise/DCP are baked into linear.bin, so they stay applied.
@@ -686,10 +690,9 @@ function storedPercent(key: string, fallback: number): number {
 const eraseSoft = () => ({ grow: eraseGrow.value / 100, feather: eraseFeather.value / 100 });
 const eraseShowStrokes = ref(false);
 const eraseHover = ref<string | null>(null);
-const eraseBusy = ref(false);
+const eraseBusy = computed(() => decodingFor(decode.value, "erase"));
 // Why the last decode's fills did not run (no model, no runtime), from the worker.
 const eraseError = ref<string | null>(null);
-const eraseStatus = ref<ModelStatus | null>(null);
 // Which brush paints: the generative fill, or the healing brush (a nearby patch
 // matched and blended in by the worker — no model, near-instant). View state.
 const eraseMode = ref<"fill" | "heal">((localStorage.getItem("llr.eraseMode") as "fill" | "heal" | null) ?? "fill");
@@ -1310,7 +1313,7 @@ function applyStoredEdit(e: ImageEdit | null): void {
 const {
   folders, tree, selectedFolderId, expanded, view: libraryView, folderLoading,
   sortKey, sortDir, groupKey, setSort, setGroup,
-  folderPhotos, activeId, activeSource, selectedIds, importProgress,
+  folderPhotos, activeId, activeSource, selectedIds, importProgress, importing,
   photoById, resolveUrl, thumbSrc, markInvalid, clearInvalid,
   persistNow, persistOnUnload: persistForUnload, schedulePersist,
   selectSource, openPhoto, setView,
@@ -1319,7 +1322,7 @@ const {
   savePreview, boot, updateEdits, snapshotOf,
 } = useCatalog<Snapshot, typeof viewSettings>({
   api: API,
-  status, errorMessage, cropMode,
+  errorMessage, cropMode,
   captureEdit: () => ({ snapshot: captureSnapshot(), history: history.value.slice(), historyIndex: historyIndex.value }),
   loadEdit: (e) => applyStoredEdit(e),
   loadPixels: (id, o) => loadSource(id, o),
@@ -1343,9 +1346,8 @@ const {
     hasCameraMatch.value = false;
     srcW.value = 0;
     srcH.value = 0;
-    timing.value = null;
     destroyWebGL({ keepContext: true }); // frees the removed image's GPU texture
-    status.value = "idle";
+    decode.value = IDLE;
     errorMessage.value = null;
   },
   isRestoring: () => isRestoring,
@@ -1361,6 +1363,9 @@ const {
     },
   },
 });
+// An import with nothing open yet: the first photo is still on its way, so the
+// viewport says "importing" instead of offering the drop zone.
+const importingFirst = computed(() => importing.value && decode.value.phase === "idle");
 
 // ── Library view: the grid's order, and what its menu can do ──
 
@@ -1498,7 +1503,7 @@ let tabBeforeCrop: EditTab = editTab.value;
 // knows — so while one is in flight the tab stays in the rail, disabled,
 // rather than popping in a few seconds later (or out, on a re-decode).
 const availableTabs = computed(() => {
-  const loading = status.value === "uploading" || status.value === "rendering";
+  const loading = isDecoding.value || importingFirst.value;
   return EDIT_TABS.flatMap(tb => {
     if (!activeSource.value) return tb.key === "settings" ? [{ ...tb, disabled: false }] : [];
     if (tb.key === "look" && !lookAsShot.value) return loading ? [{ ...tb, disabled: true }] : [];
@@ -1618,14 +1623,13 @@ function denoisePayload(d: typeof denoise = denoise): DenoisePayload {
 // racing a switch); only the newest call may touch renderer/UI state after an
 // await, otherwise the slower decode would land last and show stale pixels.
 let loadSeq = 0;
-async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promise<boolean> {
+async function loadSource(id: string, opts: { resetView?: boolean; cause?: DecodeCause } = {}): Promise<boolean> {
   if (!photoById(id)) return false;
   currentSourceId = id;
   const seq = ++loadSeq;
   const stale = () => seq !== loadSeq;
-  status.value = "rendering";
+  decode.value = { phase: "decoding", cause: opts.cause ?? "open" };
   errorMessage.value = null;
-  timing.value = null; // stale timing would mask the live status in the footer
   const t0 = performance.now();
   try {
     // look is sent only when it overrides the shot's own settings; without it
@@ -1639,7 +1643,7 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     // for 24 MP, ~360 MB for 61 MP, as float16).
     const lin = await fetchLinear(decodeBody(id));
     if (stale()) return false;
-    if (!lin) { markInvalid(id); return false; }
+    if (!lin) { decode.value = { phase: "failed" }; markInvalid(id); return false; }
     const { meta: linMeta, pixels: linearFloat } = lin;
 
     hasLinearData = true;
@@ -1725,13 +1729,12 @@ async function loadSource(id: string, opts: { resetView?: boolean } = {}): Promi
     // Apply the current crop/straighten (sets output dims, fit, draws, histogram).
     applyCropRender();
     clearInvalid(id);
-    status.value = "idle";
-    timing.value = Math.round(performance.now() - t0);
+    decode.value = { phase: "ready", ms: Math.round(performance.now() - t0) };
     if (previewDirty) armPreviewTimer();
     return true;
   } catch (err) {
-    if (stale()) return false; // a newer load owns status/errorMessage now
-    status.value = "error";
+    if (stale()) return false; // a newer load owns the decode and the toast now
+    decode.value = { phase: "failed" };
     errorMessage.value = err instanceof Error ? err.message : String(err);
     return false;
   }
@@ -1809,7 +1812,6 @@ async function reloadLookProfile(): Promise<void> {
     installLookProfile(rebuildLookLocally() ?? profile);
   } catch (err) {
     if (seq !== lookProfileSeq) return;
-    status.value = "error";
     errorMessage.value = err instanceof Error ? err.message : String(err);
   }
 }
@@ -2204,13 +2206,13 @@ const webglUnsupported = ref(false);
 function onContextLost(e: Event): void {
   e.preventDefault();
   destroyWebGL({ keepContext: true });
-  status.value = "error";
+  decode.value = { phase: "failed" };
   errorMessage.value = t("error.contextLost");
 }
 
 function onContextRestored(): void {
   errorMessage.value = null;
-  status.value = "idle";
+  decode.value = IDLE;
   if (currentSourceId) void loadSource(currentSourceId, { resetView: false });
 }
 
@@ -2330,6 +2332,8 @@ function onKeyDown(e: KeyboardEvent): void {
       else void pasteRecipe();
       return;
     }
+    // Lightroom's export: the selection in the library, else the open photo.
+    if (e.shiftKey && k === "e") { e.preventDefault(); void exportPhotos(exportIds.value); return; }
   }
 
   // Space held turns drags into pans wherever a tool owns the pointer. A focused
@@ -2522,8 +2526,7 @@ watch(cameraMatch, () => {
 let denoiseReload: Promise<unknown> = Promise.resolve();
 function reloadDenoise(): Promise<unknown> {
   denoiseReloadTimer = 0;
-  denoiseBusy.value = true;
-  return denoiseReload = loadSource(currentSourceId, { resetView: false }).finally(() => { denoiseBusy.value = false; });
+  return denoiseReload = loadSource(currentSourceId, { resetView: false, cause: "denoise" });
 }
 function scheduleDenoiseReload(): void {
   if (suppressDcpReload || !currentSourceId) return;
@@ -2551,8 +2554,7 @@ watch(() => JSON.stringify(erase), () => {
   schedulePersist();
   schedulePreview();
   if (suppressDcpReload || !currentSourceId) return;
-  eraseBusy.value = true;
-  void loadSource(currentSourceId, { resetView: false }).finally(() => { eraseBusy.value = false; });
+  void loadSource(currentSourceId, { resetView: false, cause: "erase" });
 });
 
 // Whether this machine can erase at all, asked when the tab opens (the worker
@@ -2560,26 +2562,10 @@ watch(() => JSON.stringify(erase), () => {
 // A missing model is fetched right away (once per failure: a failed download
 // waits for the retry button), and polled until it lands; strokes that were
 // waiting on it are then filled by reloading the decode.
-let erasePoll: number | undefined;
-function setEraseStatus(st: ModelStatus): void {
-  const was = eraseStatus.value;
-  eraseStatus.value = st;
-  window.clearTimeout(erasePoll);
-  if (st.reason === "downloading") erasePoll = window.setTimeout(() => void refreshEraseStatus(), 1000);
-  if (st.available && was && !was.available && erase.length && currentSourceId) {
-    eraseBusy.value = true;
-    void loadSource(currentSourceId, { resetView: false }).finally(() => { eraseBusy.value = false; });
-  }
-}
-async function refreshEraseStatus(download = false): Promise<void> {
-  try {
-    let st = await fetchModelStatus("erase", download);
-    if (st.reason === "models-missing" && !st.detail && !download) st = await fetchModelStatus("erase", true);
-    setEraseStatus(st);
-  } catch { /* the panel keeps its last word; the next tab visit asks again */ }
-}
+const { status: eraseStatus, refresh: refreshEraseStatus } = useModelStatus("erase", {
+  onAvailable: () => { if (erase.length && currentSourceId) void loadSource(currentSourceId, { resetView: false, cause: "erase" }); },
+});
 watch(editTab, v => { if (v === "erase") void refreshEraseStatus(); }, { immediate: true });
-onBeforeUnmount(() => window.clearTimeout(erasePoll));
 const fmtMB = (n: number) => `${Math.round(n / 1e6)} MB`;
 // ── Relight geometry ──
 //
@@ -2917,7 +2903,7 @@ function flushPreview(): void {
   if (!previewDirty || !id || !webglRenderer || !hasLinearData) return;
   // The pixels must be this photo's and the frame its final crop, not the
   // crop editor's straighten box; otherwise wait for things to settle.
-  if (renderedId.value !== id || status.value !== "idle" || cropMode.value) {
+  if (renderedId.value !== id || decode.value.phase !== "ready" || cropMode.value) {
     armPreviewTimer();
     return;
   }
@@ -3311,7 +3297,7 @@ function assistantSystemPrompt(): string {
 
 const {
   entries: chatEntries, busy: chatBusy, models: chatModels, selected: chatModel,
-  catalog: chatCatalog, providers: chatProviders,
+  catalog: chatCatalog, providers: chatProviders, setKey: setChatKey,
   send: sendChat, abort: abortChat, reset: resetChat,
 } = useAssistant({
   tools: () => assistantTools, systemPrompt: assistantSystemPrompt, scope: () => activeId.value,
@@ -3327,9 +3313,26 @@ const chatThinking = computed({
   set: thinking => { chatModels.value = chatModels.value.map(m => modelKey(m) === chatModel.value ? { ...m, thinking } : m); },
 });
 const chatThinkingOptions = computed(() => THINKING_LEVELS.map(v => ({ value: v, label: t(`chat.thinking.${v}`) })));
-const CHAT_CHIPS = ["chat.chip.1", "chat.chip.2", "chat.chip.3"] as const;
+// Briefs the empty chat offers: a short name on the chip, and behind it a
+// full brief written the way an art director briefs a retoucher — who judges
+// the result, the look in terms of tone, colour and texture, what to avoid,
+// how to check the work, and what to report at the end.
+const CHAT_CHIPS = ["rescue", "style", "cinematic", "film", "bw", "recompose"] as const;
 const modelSettingsOpen = ref(false);
 const chatDraft = ref("");
+// The box grows with what is in it — a brief from a chip runs to a dozen
+// lines — up to a cap, past which it scrolls.
+const chatInputRef = ref<HTMLTextAreaElement | null>(null);
+watch(chatDraft, () => void nextTick(() => {
+  const el = chatInputRef.value;
+  if (!el) return;
+  el.style.height = "auto";
+  el.style.height = `${Math.min(el.scrollHeight, 260)}px`;
+}));
+function useChatChip(key: typeof CHAT_CHIPS[number]): void {
+  chatDraft.value = t(`chat.chip.${key}.prompt`);
+  chatInputRef.value?.focus();
+}
 const chatLogRef = ref<HTMLElement | null>(null);
 function submitChat(): void {
   const text = chatDraft.value;
@@ -3518,6 +3521,16 @@ async function runPreviewQueue(): Promise<void> {
 
 /** Render a photo's snapshot off-screen at `maxEdge` (another photo than the open one). */
 async function renderSnapshot(id: string, settings: Snapshot, maxEdge: number): Promise<Blob> {
+  return renderPlan({ ...await offscreenPlan(id, settings), decode: { halfSize: true, maxSize: 2048 } }, { maxEdge, quality: 0.85 });
+}
+
+/**
+ * The plan for a photo that is not open: its analyses (relight geometry, AI
+ * mattes) come from a half-size decode — they are resolution-free, the same
+ * ones the preview would have had — and its params are built once the decode
+ * says how large the frame is.
+ */
+async function offscreenPlan(id: string, settings: Snapshot): Promise<ExportPlan> {
   const off = new Set(settings.bypass ?? []);
   const body = {
     sourceId: id, halfSize: true, maxSize: 2048, purpose: "export",
@@ -3533,13 +3546,12 @@ async function renderSnapshot(id: string, settings: Snapshot, maxEdge: number): 
     masksOn.some(g => g.enabled && g.components.some(c => c.type === "ai"))
       ? fetchAiMasks(body).catch(() => null) : null,
   ]);
-  const plan = buildPlan(id, settings, {
+  return buildPlan(id, settings, {
     params: (meta) => buildPipelineParams(settings, {
       matte: null, ctx: { lensCorr: parseLensCorr(meta.colorProfile?.lensCorr), srcW: meta.width, srcH: meta.height },
     }),
     relightGeometry: geo, ai,
   });
-  return renderPlan({ ...plan, decode: { halfSize: true, maxSize: 2048 } }, { maxEdge, quality: 0.85 });
 }
 
 // One history step, like the assistant's edits.
@@ -3634,7 +3646,44 @@ function buildPlan(
   };
 }
 
-const { exporting, exportImage } = useExport({ status, errorMessage, plan: buildExportPlan });
+const { exporting, progress: exportProgress, exportImage, exportMany, cancelExport } = useExport({ errorMessage, plan: buildExportPlan });
+
+// What the export button acts on: the grid's selection in the library, else
+// the open photo.
+const exportIds = computed(() => libraryView.value === "library" && selectedIds.size
+  ? [...selectedIds] : activeSource.value ? [activeSource.value.id] : []);
+
+/**
+ * Export photos by id, each with its own stored edit — the open one with what
+ * is on screen, saved or not. One photo that is open is the plain export; any
+ * other set goes out as a batch, into a folder where the browser can write one.
+ */
+async function exportPhotos(ids: readonly string[]): Promise<void> {
+  if (!ids.length || exporting.value) return;
+  if (ids.length === 1 && ids[0] === currentSourceId) return exportImage();
+  try {
+    const result = await exportMany(ids.map(id => ({
+      name: photoById(id)?.name ?? id,
+      plan: async () => {
+        if (id === currentSourceId && activeSource.value) return buildExportPlan();
+        const s = await snapshotFor(id);
+        return s ? offscreenPlan(id, s) : null;
+      },
+    })));
+    if (!result) return;
+    if (result.failed.length) errorMessage.value = t("export.failed", { n: result.failed.length, names: result.failed.join(", ") });
+    if (result.cancelled) flashCopyNotice(t("export.cancelled", { n: result.saved }));
+    else if (result.saved) flashCopyNotice(result.folder ? t("export.savedTo", { n: result.saved, folder: result.folder }) : t("export.saved", { n: result.saved }));
+  } catch (err) {
+    errorMessage.value = err instanceof Error ? err.message : String(err);
+  }
+}
+// The footer's one word (activity.ts).
+const activity = computed(() => activityOf(decode.value, { importing: importing.value, exporting: exporting.value }));
+const activityLabel = computed(() => {
+  const a = activity.value;
+  return a.state === "ready" ? t("status.decodedIn", { ms: a.ms }) : t(`status.${a.state}`);
+});
 
 // White balance reads as a colour axis, not an amount: an accent fill growing
 // from the left would say "this is set" on a slider sitting at its default.
@@ -3754,15 +3803,21 @@ const vWheelAdjust = {
         </template>
         <span v-else class="meta-empty">{{ t('meta.noImage') }}</span>
       </div>
-      <button class="export-btn" type="button" :disabled="!activeSource || exporting" @click="exportImage">
+      <!-- A batch can run for minutes, so while one does the button is how to stop it. -->
+      <button v-if="exportProgress" class="export-btn" type="button" :title="t('action.cancelExport')" :aria-label="t('action.cancelExport')" @click="cancelExport">
+        <span class="export-spinner" aria-hidden="true" />
+        <span class="export-count">{{ exportProgress.done }}/{{ exportProgress.total }}</span>
+        <JIcon :icon="IconX" />
+      </button>
+      <button v-else class="export-btn" type="button" :disabled="!exportIds.length || exporting" @click="exportPhotos(exportIds)">
         <JIcon v-if="!exporting" :icon="IconDownload" />
         <span class="export-spinner" v-else aria-hidden="true" />
-        <span>{{ exporting ? t('action.exporting') : t('action.export') }}</span>
+        <span>{{ exporting ? t('action.exporting') : exportIds.length > 1 ? t('action.exportN', { n: exportIds.length }) : t('action.export') }}</span>
       </button>
     </header>
 
     <FolderTree class="left" ref="folderTree" :folders="folders" :tree="tree" :expanded="expanded" :selected-id="selectedFolderId"
-      :busy="!!importProgress"
+      :busy="importing"
       @select="selectFolder" @toggle="toggleExpanded"
       @create="(parentId, name) => createFolder(parentId, name)" @rename="renameFolder" @delete="deleteFolder"
       @move-photos="movePhotos" @move-folder="moveFolder"
@@ -3797,7 +3852,7 @@ const vWheelAdjust = {
       <PhotoGrid ref="photoGrid" v-show="libraryView === 'library'" :sections="library.sections" :grouped="library.grouped" :active-id="activeId"
         :selected-ids="selectedIds" :loading="folderLoading" :thumb-src="thumbSrc" :is-invalid="(id) => activeSource?.id === id && !!activeSource.invalid"
         :move-targets="moveTargets" :can-paste="!!recipeClipboard"
-        @copy-settings="openCopyDialog" @paste-settings="pasteToPhotos"
+        @copy-settings="openCopyDialog" @paste-settings="pasteToPhotos" @export="exportPhotos"
         @open="openPhoto" @remove="removePhotosConfirmed" @rename="onGridRename" @move="onGridMove"
         @new-folder="onGridNewFolder" @import-files="pickFiles" @section="(i) => librarySection = i" />
       <div class="viewport" ref="viewportRef" v-show="libraryView === 'develop'"
@@ -3808,7 +3863,7 @@ const vWheelAdjust = {
         @mouseleave="stopPan"
         @dblclick="onDoubleClick"
         :class="{ 'is-grabbing': isPanning, 'is-grab': spaceHeld && !isPanning }">
-        <div class="dropzone" v-show="!activeSource && status !== 'uploading'" @click="pickFiles">
+        <div class="dropzone" v-show="!activeSource && !importing" @click="pickFiles">
           <div class="dropzone-inner">
             <JIcon class="dropzone-icon" :icon="IconImage" weight="light" />
             <p class="dropzone-title">{{ t('dropzone.title') }}</p>
@@ -3816,7 +3871,7 @@ const vWheelAdjust = {
             <p class="dropzone-hint">{{ IMPORT_FORMAT_HINT }}</p>
           </div>
         </div>
-        <div v-show="status === 'uploading' && !activeSource" class="preview-loading">
+        <div v-show="importing && !activeSource" class="preview-loading">
           <span class="spinner spinner-lg" aria-hidden="true" />
           <span>{{ t('status.importing') }}</span>
         </div>
@@ -3826,7 +3881,7 @@ const vWheelAdjust = {
         <canvas v-show="webglRenderer != null && activeSource && !activeSource.invalid" ref="canvasRef" class="preview" :style="canvasBoxStyle" />
         <!-- The camera JPEG stands in while a *different* source decodes: the
              fit view is a plain contain, so it lands where the frame will. -->
-        <img v-if="activeSource && !activeSource.invalid && status === 'rendering' && renderedId !== activeSource.id"
+        <img v-if="activeSource && !activeSource.invalid && isDecoding && renderedId !== activeSource.id"
           class="preview-placeholder" draggable="false" :src="activeSource.previewUrl || !activeSource.embeddedUrl ? thumbSrc(activeSource) : resolveUrl(activeSource.embeddedUrl)" :alt="t('aria.preview')" />
         <!-- Camera-JPEG compare: opaque overlay in the canvas's exact box, with
              the full-frame JPEG placed inside it through the edit's own crop /
@@ -3839,10 +3894,10 @@ const vWheelAdjust = {
           <img ref="embeddedImgRef" draggable="false" :style="{ transform: embeddedTransform, width: srcW + 'px', height: srcH + 'px' }"
             :src="embeddedSrc || undefined" :alt="t('aria.cameraJpeg')" />
         </div>
-        <div v-show="activeSource && (status === 'rendering' || status === 'uploading')"
+        <div v-show="activeSource && (isDecoding || importingFirst)"
           class="viewport-busy" aria-live="polite">
           <span class="spinner" aria-hidden="true" />
-          <span>{{ status === 'uploading' ? t('status.importing') : t('status.decoding') }}</span>
+          <span>{{ isDecoding ? t('status.decoding') : t('status.importing') }}</span>
         </div>
         <!-- Space passes the pointer through to the viewport so drags pan. -->
         <svg v-show="cropMode && webglRenderer != null" ref="cropOverlayRef" class="crop-overlay"
@@ -4000,7 +4055,7 @@ const vWheelAdjust = {
             <line :x1="focusMarker.x" :y1="focusMarker.y + 8 * ofPerScreen" :x2="focusMarker.x" :y2="focusMarker.y + 22 * ofPerScreen" />
           </g>
         </svg>
-        <img v-show="activeSource && !activeSource.invalid && !webglRenderer && status !== 'rendering'" class="preview" draggable="false" :style="{ transform: displayTransform }" :src="activeSource ? resolveUrl(activeSource.embeddedUrl) : ''" :alt="t('aria.preview')" />
+        <img v-show="activeSource && !activeSource.invalid && !webglRenderer && !isDecoding" class="preview" draggable="false" :style="{ transform: displayTransform }" :src="activeSource ? resolveUrl(activeSource.embeddedUrl) : ''" :alt="t('aria.preview')" />
         <div v-if="activeSource?.invalid" class="invalid-state">
           <img v-if="activeSource && thumbSrc(activeSource)" draggable="false" :src="thumbSrc(activeSource)" :alt="activeSource.name" />
           <p class="invalid-title">{{ t('invalid.missingTitle') }}</p>
@@ -4016,10 +4071,14 @@ const vWheelAdjust = {
         <div class="status-left">
           <div class="status-cell" v-if="libraryView === 'develop'">
             <span class="status-label">{{ t('status.label') }}</span>
-            <span class="status-value" :data-state="status">{{ timing ? t('status.decodedIn', { ms: timing }) : status }}</span>
+            <span class="status-value" :data-state="activity.state">{{ activityLabel }}</span>
           </div>
           <div class="status-cell" v-else-if="selectedIds.size">
             <span class="status-value">{{ t('grid.selected', { n: selectedIds.size }) }}</span>
+          </div>
+          <div class="status-cell" v-if="exportProgress">
+            <span class="spinner" aria-hidden="true" />
+            <span class="status-value">{{ t('status.exportProgress', { done: exportProgress.done, total: exportProgress.total }) }}</span>
           </div>
           <div class="status-cell" v-if="importProgress">
             <span class="spinner" aria-hidden="true" />
@@ -4050,7 +4109,7 @@ const vWheelAdjust = {
           </button>
           <button class="icon-btn chat-gear" type="button" :disabled="!chatEntries.length || chatBusy" :title="t('chat.clear')" :aria-label="t('chat.clear')" @click="resetChat"><JIcon :icon="IconBroom" /></button>
         </header>
-        <ModelSettings :open="modelSettingsOpen" :models="chatModels" :catalog="chatCatalog"
+        <ModelSettings :open="modelSettingsOpen" :models="chatModels" :catalog="chatCatalog" :set-key="setChatKey"
           @update:models="v => chatModels = v" @close="modelSettingsOpen = false" />
         <div class="chat-log" ref="chatLogRef">
           <div class="chat-empty" v-if="!chatEntries.length">
@@ -4059,7 +4118,7 @@ const vWheelAdjust = {
             <p>{{ t('chat.empty') }}</p>
             <!-- Chips fill the box rather than send: the send key stays where the words become the user's own. -->
             <div class="chat-chips">
-              <button v-for="k in CHAT_CHIPS" :key="k" type="button" class="chat-chip" @click="chatDraft = t(k)">{{ t(k) }}</button>
+              <button v-for="k in CHAT_CHIPS" :key="k" type="button" class="chat-chip" @click="useChatChip(k)">{{ t(`chat.chip.${k}`) }}</button>
             </div>
           </div>
           <template v-for="(entry, i) in chatEntries" :key="i">
@@ -4111,7 +4170,7 @@ const vWheelAdjust = {
           </template>
         </div>
         <form class="chat-compose" @submit.prevent="submitChat">
-          <textarea v-model="chatDraft" class="chat-input" rows="2" :placeholder="t('chat.placeholder')"
+          <textarea ref="chatInputRef" v-model="chatDraft" class="chat-input" rows="2" :placeholder="t('chat.placeholder')"
             @keydown.enter="onChatEnter" />
           <!-- Which model, and how long it thinks, are decided while writing the
                prompt — so they sit with it. -->
@@ -4782,7 +4841,7 @@ const vWheelAdjust = {
     </aside>
 
     <Filmstrip ref="filmstrip" v-if="folderPhotos.length && libraryView === 'develop'" :sections="library.sections" :grouped="library.grouped" :active-id="activeId"
-      :rendering="status === 'rendering'" :thumb-src="thumbSrc" :is-invalid="(id) => activeSource?.id === id && !!activeSource.invalid"
+      :rendering="isDecoding" :thumb-src="thumbSrc" :is-invalid="(id) => activeSource?.id === id && !!activeSource.invalid"
       @select="selectSource" @remove="(id) => removePhotosConfirmed([id])" @import="pickFiles"
       @section="(i) => filmSection = i" />
 
