@@ -56,17 +56,30 @@ M_FWD = np.array([[0x13B2, 0x0CA2, -0x0054], [0x02EC, 0x1ABD, 0x0257], [0x0073, 
 M_INV = np.array([[0x37E2, -0x1AA4, 0x02C3], [-0x0613, 0x2976, -0x0363], [-0x0060, -0x02E3, 0x2345]], np.int64)
 
 
+def _pow32(base: np.ndarray, exponent) -> np.ndarray:
+    """float32 `base ** exponent`, the same on every CPU.
+
+    NumPy's float32 power is not: it is a SIMD routine picked for the host,
+    and on AVX-512 machines it lands a unit in the last place away from the
+    others often enough to move entries of all four tables below — a handful
+    of pixels off the engine on a tile that is bit-exact elsewhere. Taking the
+    power in float64 and rounding it to float32 gives the correctly rounded
+    result, which is what the engine's tables hold (test_marble pins them).
+    """
+    return np.power(base.astype(np.float64), np.float64(exponent)).astype(_f32)
+
+
 def _gen_lut(fn, n):
     u = np.arange(n, dtype=_f32) / _f32(16384.0)
     return np.floor(_f32(_f32(16384.0) * fn(u))).astype(np.int64)
 
 
 def _srgb_eotf(u):
-    return np.where(u <= _f32(0.04045), u / _f32(12.92), np.power((u + _f32(0.055)) / _f32(1.055), _f32(2.4), dtype=_f32))
+    return np.where(u <= _f32(0.04045), u / _f32(12.92), _pow32((u + _f32(0.055)) / _f32(1.055), _f32(2.4)))
 
 
 def _srgb_oetf(u):
-    return np.where(u <= _f32(0.0031308), u * _f32(12.92), _f32(1.055) * np.power(u, _f32(1.0 / 2.4), dtype=_f32) - _f32(0.055))
+    return np.where(u <= _f32(0.0031308), u * _f32(12.92), _f32(1.055) * _pow32(u, _f32(1.0 / 2.4)) - _f32(0.055))
 
 
 class GamutLuts:
@@ -75,8 +88,8 @@ class GamutLuts:
     def __init__(self) -> None:
         with np.errstate(invalid="ignore", over="ignore"):
             self.dec_srgb = _gen_lut(_srgb_eotf, 0x10000)
-            self.dec_pow = _gen_lut(lambda u: np.power(u, _GAMMA_B, dtype=_f32), 0x10000)
-        self.enc_pow = _gen_lut(lambda u: np.power(u, _f32(1.0) / _GAMMA_B, dtype=_f32), 0x4000)
+            self.dec_pow = _gen_lut(lambda u: _pow32(u, _GAMMA_B), 0x10000)
+        self.enc_pow = _gen_lut(lambda u: _pow32(u, _f32(1.0) / _GAMMA_B), 0x4000)
         self.enc_srgb = _gen_lut(_srgb_oetf, 0x4000)
         # The engine stores int16: values above 0x4000 wrap. Inputs are 14-bit, so
         # only [0, 0x4000) is ever read; keep the wrap for parity anyway.

@@ -8,6 +8,7 @@ tile: the engine's input RGB in, the engine's output RGB out, with the luma the
 engine had after its Clarity pass supplied so only the chroma path is tested.
 """
 
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +32,17 @@ def test_gamut_luts_match_the_engine_generator():
     assert luts.dec_srgb[12] == 0 and luts.dec_srgb[13] == 1
     assert luts.enc_pow[0x3FFF] == 16383
     assert luts.dec_pow[0x3FFF] == 16381
+
+
+def test_gamut_luts_are_the_same_tables_on_every_cpu():
+    """The four tables are generated, not shipped, and the engine tile below is
+    bit-exact only with these exact values. They used to come out of NumPy's
+    float32 power, which differs by CPU: on AVX-512 machines every table moved
+    and the tile test failed — on those machines only, for months."""
+    luts = M.GamutLuts()
+    digest = {name: hashlib.sha1(np.ascontiguousarray(getattr(luts, name)).tobytes()).hexdigest()[:10]
+              for name in ("dec_srgb", "dec_pow", "enc_pow", "enc_srgb")}
+    assert digest == {"dec_srgb": "8a081f275e", "dec_pow": "cfb6bac956", "enc_pow": "e319deecbf", "enc_srgb": "f3b262fe14"}
 
 
 def test_chroma_path_is_bit_exact_on_the_engine_tile(tile):
