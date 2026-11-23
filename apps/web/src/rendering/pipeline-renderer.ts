@@ -26,7 +26,7 @@ import { computeWbMatrix, halfToFloat, ppLuma } from "./color-spaces";
 import { LUT_SIZE, buildToneCurveLUT, defaultToneCurve } from "./curve";
 import { LOG2_MID } from "./tonal-model";
 import { GROUP_STRIDE, MASK_UBO_BYTES, MASK_USE, imgFromTex } from "./masks";
-import { defaultCrop } from "./crop";
+import { defaultCrop, sourceSpan } from "./crop";
 import { RELIGHT_MAX_LIGHTS, geometryStats, type RelightGeometry } from "./relight";
 import { binRgba, type HistogramBins } from "./histogram";
 
@@ -1934,8 +1934,11 @@ export class PipelineRenderer {
       this.sonyPostSupported = false;   // permanently: fall back to no post pass
       return null;
     }
-    const zoom = Math.hypot(xform[0], xform[1]) || 1;
-    const detailScale = Math.min(1, w / Math.max(1, this.texWidth * zoom));
+    // Output pixels per source pixel. Measured along each of the frame's own
+    // axes: a rotated frame's x runs down the source's height, so the source
+    // width says nothing about it.
+    const [spanX, spanY] = sourceSpan(xform, this.texWidth, this.texHeight);
+    const detailScale = Math.min(1, w / Math.max(1, spanX));
     // Luminance NR, first in the chain. Its taps step by the render scale
     // (the kernel spans the same sensor pixels at every zoom), so a preview
     // small enough to have averaged the grain away skips it. Like the other
@@ -1989,8 +1992,8 @@ export class PipelineRenderer {
     if (!this.postProgram("down") || !this.postProgram("edge") || !this.postProgram("blur")) return null;
 
     const down = this.sonyClarity.downsample;
-    const bw = Math.max(1, Math.min(w, Math.round((this.texWidth * zoom) / down)));
-    const bh = Math.max(1, Math.min(h, Math.round((this.texHeight * zoom) / down)));
+    const bw = Math.max(1, Math.min(w, Math.round(spanX / down)));
+    const bh = Math.max(1, Math.min(h, Math.round(spanY / down)));
     const pair = this.cachedBasePair(bw, bh);
     if (!pair) return null;
     return { scene, noise, base: { pair, w: bw, h: bh }, mid, ynr, bsnr, marble, match, detailScale };
