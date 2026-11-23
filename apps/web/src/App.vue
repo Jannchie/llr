@@ -28,7 +28,7 @@ import {
   packMasks, presetGroup, defaultComponent, defaultAdjust, cloneMasks, MASK_PRESETS, MASK_GROUPS, MASK_COMPS, AI_KINDS,
   type MaskGroup, type MaskType, type MaskAdjust, type MaskPresetName, type MaskComponent,
 } from "./rendering/masks";
-import { formatBytes, clamp, IMPORT_ACCEPT, IMPORT_FORMAT_HINT } from "./ui";
+import { exposureSummary, formatBytes, clamp, IMPORT_ACCEPT, IMPORT_FORMAT_HINT } from "./ui";
 import { buildSections, GROUP_KEYS, SORT_KEYS, type GroupKey, type SortKey } from "./librarySort";
 import { pathOf, type FolderNode } from "./catalogTree";
 import { t, locale, setLocale, LOCALES, type MessageKey } from "./i18n";
@@ -1237,6 +1237,14 @@ const importingFirst = computed(() => importing.value && decode.value.phase === 
 // shows.
 const library = computed(() => buildSections(folderPhotos.value, sortKey.value, sortDir.value, groupKey.value));
 
+// The photo before or after the open one, in the order the filmstrip shows.
+function stepPhoto(delta: 1 | -1): void {
+  const order = library.value.sections.flatMap(s => s.photos);
+  const at = order.findIndex(p => p.id === activeId.value);
+  const next = at < 0 ? undefined : order[at + delta];
+  if (next) void selectSource(next.id);
+}
+
 const sortOptions = computed<{ value: SortKey; label: string }[]>(() =>
   SORT_KEYS.map(key => ({ value: key, label: t(`library.sortBy.${key}`) })));
 const groupOptions = computed<{ value: GroupKey; label: string }[]>(() =>
@@ -2262,6 +2270,14 @@ function onKeyDown(e: KeyboardEvent): void {
   // O cycles the guide overlay, Shift+O mirrors it (Lightroom-style).
   if (!inEditableText && activeSource.value && !e.ctrlKey && !e.metaKey && !e.altKey && libraryView.value === "develop") {
     if (e.key === "r" || e.key === "R") { e.preventDefault(); toggleCropMode(); return; }
+    // Left / right step through the filmstrip, as in Lightroom — unless the
+    // focused control uses the arrows itself (a slider, a list, the tree).
+    if (!cropMode.value && !e.shiftKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")
+      && !ae?.closest("input, select, textarea, dialog, [role=listbox], [role=menu], [role=tree], [contenteditable]")) {
+      e.preventDefault();
+      stepPhoto(e.key === "ArrowRight" ? 1 : -1);
+      return;
+    }
     if (cropMode.value && lineTool.value && e.key === "Escape") { e.preventDefault(); lineTool.value = null; return; }
     if (cropMode.value && (e.key === "Delete" || e.key === "Backspace") && crop.xf.guides.length) { e.preventDefault(); removeLastGuide(); return; }
     if (cropMode.value && (e.key === "Escape" || e.key === "Enter")) { e.preventDefault(); exitCropMode(); return; }
@@ -3598,6 +3614,13 @@ async function exportPhotos(ids: readonly string[]): Promise<void> {
       },
     })));
     if (!result) return;
+// The open photo's exposure, for the top bar; its body and lens for the tooltip.
+const activeExposure = computed(() => activeSource.value ? exposureSummary(activeSource.value).join("  ") : "");
+const activeGear = computed(() => {
+  const p = activeSource.value;
+  return p ? [[p.make, p.model].filter(Boolean).join(" "), p.lens].filter(Boolean).join(" · ") : "";
+});
+
     if (result.failed.length) errorMessage.value = t("export.failed", { n: result.failed.length, names: result.failed.join(", ") });
     if (result.cancelled) flashCopyNotice(t("export.cancelled", { n: result.saved }));
     else if (result.saved) flashCopyNotice(result.folder ? t("export.savedTo", { n: result.saved, folder: result.folder }) : t("export.saved", { n: result.saved }));
@@ -3749,6 +3772,8 @@ const vWheelAdjust = {
       @create="(parentId, name) => createFolder(parentId, name)" @rename="renameFolder" @delete="deleteFolder"
       @move-photos="movePhotos" @move-folder="moveFolder"
       @drop-files="onTreeDrop" @import-files="pickFiles" @import-folder="pickFolder">
+          <!-- How it was shot; the body and lens are in the tooltip. -->
+          <span v-if="activeExposure" :title="activeGear">{{ activeExposure }}</span>
       <!-- The grid's groups in the library, the filmstrip's while developing. -->
       <GroupNav v-if="library.grouped && folderPhotos.length"
         :title="groupOptions.find(o => o.value === groupKey)?.label ?? t('library.group')"

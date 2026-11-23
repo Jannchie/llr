@@ -44,6 +44,22 @@ export function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
 }
 
+/**
+ * How a frame was shot, as a photographer reads it off a camera: aperture,
+ * shutter, ISO, focal length — whichever of them the file recorded.
+ */
+export function exposureSummary(p: Pick<Photo, "fnumber" | "exposure" | "iso" | "focal">): string[] {
+  const out: string[] = [];
+  if (p.fnumber) out.push(`ƒ/${+p.fnumber.toFixed(1)}`);
+  if (p.exposure) {
+    // Fractions below 0.4 s, the way a shutter dial reads; seconds above it.
+    out.push(p.exposure >= 0.4 ? `${+p.exposure.toFixed(1)}s` : `1/${Math.round(1 / p.exposure)}s`);
+  }
+  if (p.iso) out.push(`ISO ${Math.round(p.iso)}`);
+  if (p.focal) out.push(`${Math.round(p.focal)}mm`);
+  return out;
+}
+
 export function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1048576) return `${(n / 1024).toFixed(0)} KB`;
