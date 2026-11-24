@@ -759,17 +759,18 @@ async function handleExport(request: IncomingMessage, response: ServerResponse):
 }
 
 async function cleanupSessions(): Promise<void> {
+  const trashRoot = resolve(cacheRoot, "trash");
   try {
     const result = await sweepSessions({
       sessionsRoot,
-      trashRoot: resolve(cacheRoot, "trash"),
+      trashRoot,
       // Until the pre-catalog library has been adopted, every directory is one
       // the browser may still be about to claim — so only scratch is swept.
       known: catalog.get("legacy_adopted") === "1" ? catalog.photoIds() : null,
       warn: message => console.warn(message),
     });
     if (result.trashed.length) {
-      console.warn(`${result.trashed.length} photo folder(s) the library no longer lists were moved to ${resolve(cacheRoot, "trash")} and are kept for a week: ${result.trashed.join(", ")}`);
+      console.warn(`${result.trashed.length} photo folder(s) the library no longer lists were moved to ${trashRoot} and are kept for a week: ${result.trashed.join(", ")}`);
     }
   } catch (error) {
     console.warn(`session cleanup failed: ${errorMessage(error)}`);

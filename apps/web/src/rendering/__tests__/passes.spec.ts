@@ -5,6 +5,7 @@ import {
   MASK_VERTEX_SHADER,
   PASSES,
   PROCESS_SHADER,
+  PROGRAMS,
   SHARPEN_BINOMIAL,
   SHARPEN_BLUR_W,
   SHARPEN_CENTER,
@@ -195,19 +196,15 @@ describe("shader sources", () => {
   });
 });
 
-describe("ALL_PROGRAMS", () => {
-  it("lists every shader this module exports, so the compile check sees them all", async () => {
+describe("PROGRAMS", () => {
+  it("uses every shader this module exports, so none goes unlinked and unchecked", async () => {
     const passes = await import("../passes");
-    const listed = new Set(passes.ALL_PROGRAMS.flatMap(p => [p.vs, p.fs]));
+    const listed = new Set(Object.values(PROGRAMS).flatMap(p => [p.vs, p.fs]));
+    // By what the value is, not what it is called: a shader exported under a
+    // name that breaks the _SHADER convention is still a shader.
     const missing = Object.entries(passes)
-      .filter(([name, value]) => name.endsWith("_SHADER") && typeof value === "string" && !listed.has(value))
+      .filter(([, value]) => typeof value === "string" && value.startsWith("#version") && !listed.has(value))
       .map(([name]) => name);
     expect(missing).toEqual([]);
-  });
-
-  it("names each program once", async () => {
-    const { ALL_PROGRAMS } = await import("../passes");
-    const names = ALL_PROGRAMS.map(p => p.name);
-    expect(new Set(names).size).toBe(names.length);
   });
 });

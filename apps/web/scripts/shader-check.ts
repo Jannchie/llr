@@ -10,12 +10,9 @@
  * This checks whole programs rather than lone shaders, because linking is where
  * a second class of error surfaces: a varying that one side declares and the
  * other does not compiles fine twice over and fails only at link. The pairs
- * mirror pipeline-renderer's own (compileProgram / ensureMaskPrograms).
+ * are passes.ts PROGRAMS, the table the renderer itself links from.
  *
  *     pnpm --filter @llr/web check:shaders
- *
- * CI does exactly that (.github/workflows/ci.yml, "Compile shaders"), on
- * SwiftShader, and fails on anything but `failures=0`.
  *
  * NOTE: that command only writes the page — nothing is compiled until a browser
  * opens it, so it exits 0 even when a shader is broken. Do not chain it into
@@ -25,23 +22,21 @@
  *     chrome --headless=new --enable-unsafe-swiftshader --use-angle=swiftshader \
  *            --virtual-time-budget=10000 --dump-dom <file URL> | grep failures=
  *
+ * CI runs both steps (.github/workflows/ci.yml, "Compile shaders") and fails
+ * on anything but `failures=0`.
+ *
  * On Windows Chrome writes nothing to stdout, so there `--screenshot=shot.png`
  * and reading the image is the only way to see the result.
  */
 import { writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { ALL_PROGRAMS } from "../src/rendering/passes";
-
-// The list is the renderer's own (passes.ts ALL_PROGRAMS, held complete by
-// passes.spec.ts), so a shader added there is checked here without anyone
-// remembering to add it.
-const PROGRAMS: [name: string, vs: string, fs: string][] = ALL_PROGRAMS.map(p => [p.name, p.vs, p.fs]);
+import { PROGRAMS } from "../src/rendering/passes";
 
 const page = `<meta charset="utf-8"><title>shader compile check</title>
 <pre id="out" style="font:13px ui-monospace,monospace;white-space:pre-wrap"></pre>
 <script>
-const PROGRAMS = ${JSON.stringify(PROGRAMS)};
+const PROGRAMS = ${JSON.stringify(Object.entries(PROGRAMS).map(([name, source]) => ({ name, ...source })))};
 const gl = document.createElement("canvas").getContext("webgl2");
 const out = document.getElementById("out");
 let bad = 0;
@@ -68,7 +63,7 @@ if (!gl) {
   bad = PROGRAMS.length;
   report("NO WEBGL2 — cannot compile anything here");
 } else {
-  for (const [name, vsSrc, fsSrc] of PROGRAMS) {
+  for (const { name, vs: vsSrc, fs: fsSrc } of PROGRAMS) {
     const vs = build(gl.VERTEX_SHADER, vsSrc);
     const fs = build(gl.FRAGMENT_SHADER, fsSrc);
     if (typeof vs === "string" || typeof fs === "string") {

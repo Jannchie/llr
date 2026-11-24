@@ -495,22 +495,22 @@ export function useCatalog<S, V>(opts: {
     // The neighbour that takes over when the active photo goes: the first
     // survivor after the last removed one, else the last survivor of all.
     let next: Photo | null = null;
-    if (activeId.value && gone.has(activeId.value)) {
+    if (reopen) {
       let lastIdx = -1;
       list.forEach((p, i) => { if (gone.has(p.id)) lastIdx = i; });
       next = list.slice(lastIdx + 1).find(p => !gone.has(p.id)) ?? [...list].reverse().find(p => !gone.has(p.id)) ?? null;
     }
-    const wasActive = !!activeId.value && gone.has(activeId.value);
     forgetPhotos(ids);
-    for (const p of list) if (gone.has(p.id)) bumpCount(p.folderId, -1);
+    for (const [folderId, n] of perFolder) bumpCount(folderId, -n);
     let loading: Promise<boolean> | null = null;
-    if (wasActive) {
+    if (reopen) {
       cropMode.value = false;
       if (next) loading = activateSource(next.id); // synchronously points activeId + live edit at next
       else clearActive();
     }
-    // Persist the removal now — not after the neighbour's multi-second decode.
-    persistNow();
+    // Which photo is open, now — not after the neighbour's multi-second decode.
+    // (The edits went out above; nothing has changed one since.)
+    saveUiState();
     // The server is told only when the undo window closes: until then the
     // photo, its edit and its history are all still there to come back to.
     pendingRemoval.value = { ids, perFolder, reopen };
@@ -518,21 +518,24 @@ export function useCatalog<S, V>(opts: {
     await loading;
   }
 
-  /** Make the pending removal final (the window closed, another removal began, the tab is closing). */
-  function commitRemoval(init: { keepalive?: boolean } = {}): void {
+  /** Close the undo window, handing back the removal that was in it, if any. */
+  function takePendingRemoval() {
     const pending = pendingRemoval.value;
-    if (!pending) return;
     window.clearTimeout(removalTimer);
     pendingRemoval.value = null;
-    api.deletePhotos(pending.ids, init).catch(fail);
+    return pending;
+  }
+
+  /** Make the pending removal final (the window closed, another removal began, the tab is closing). */
+  function commitRemoval(init: { keepalive?: boolean } = {}): void {
+    const pending = takePendingRemoval();
+    if (pending) api.deletePhotos(pending.ids, init).catch(fail);
   }
 
   /** Bring back the photos of the pending removal, as they were. */
   async function undoRemoval(): Promise<void> {
-    const pending = pendingRemoval.value;
+    const pending = takePendingRemoval();
     if (!pending) return;
-    window.clearTimeout(removalTimer);
-    pendingRemoval.value = null;
     // Nothing was deleted, so the server still has all of it: ask again.
     try {
       await Promise.all([refreshTree(), selectFolder(selectedFolderId.value, { keepSelection: true })]);

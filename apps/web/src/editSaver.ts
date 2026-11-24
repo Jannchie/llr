@@ -1,16 +1,14 @@
 // Getting edits to the server, and knowing when that is not happening.
 //
 // The pixels are rendered in the browser, so every slider keeps working with
-// the API gone — and a save that fails used to be dropped back into the dirty
-// set without a word, to be tried again only if the user happened to edit
-// something else. An afternoon of work could sit unsaved behind a UI that
-// looked fine. This owns the dirty set instead: a failed save is retried on a
-// timer until it lands, and `failing` says so for as long as it has not.
+// the API gone, and an afternoon of work could sit unsaved behind a UI that
+// looks fine. So this owns the dirty set: a failed save is retried on a timer
+// until it lands, and `failing` says so for as long as it has not.
 
 import { ref } from "vue";
 import { fitForKeepalive, trimEdit, type PersistedEdit } from "./edits";
 
-/** Seconds between attempts while saves keep failing; the last one repeats. */
+/** Milliseconds between attempts while saves keep failing; the last one repeats. */
 export const SAVE_RETRY_MS = [2_000, 5_000, 15_000, 30_000];
 
 const statusOf = (error: unknown): number | undefined =>

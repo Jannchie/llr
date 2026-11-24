@@ -29,7 +29,8 @@ jobs:
           pnpm --filter @llr/web check:shaders
           google-chrome --headless=new --no-sandbox --enable-unsafe-swiftshader --use-angle=swiftshader \
             --virtual-time-budget=10000 --dump-dom "file://$PWD/apps/web/shader-check.html" > shader-check.txt
-          grep -E "^(OK|FAIL|LINK|NO WEBGL2|DONE)" shader-check.txt || true
+          # The page's whole report, driver logs included, with the markup off.
+          sed -n '/<pre /,/<\/pre>/{s/<[^>]*>//g;p}' shader-check.txt
           grep -q "DONE failures=0" shader-check.txt
 
   worker:
@@ -48,7 +49,7 @@ jobs:
         run: |
           lscpu | grep "Model name"
           echo "avx512: $(grep -o 'avx512[a-z0-9_]*' /proc/cpuinfo | sort -u | tr '[:space:]' ' ')"
-          uv run --project apps/worker python -c "import numpy as np; f = np._core._multiarray_umath.__cpu_features__; print('numpy', np.__version__, 'enabled:', ' '.join(k for k, v in f.items() if v and k.startswith(('AVX', 'FMA'))))"
+          uv run --project apps/worker python -c "import numpy; numpy.show_runtime()"
       - run: uv run --project apps/worker python -m compileall -q apps/worker/src
       - run: uv run --project apps/worker pytest -q apps/worker/tests
       - run: uv run --project apps/worker ruff check apps/worker

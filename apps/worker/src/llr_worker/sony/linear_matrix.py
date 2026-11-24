@@ -20,6 +20,7 @@ preserving — which is why it can be fed camera RGB at any exposure scale.
 
 from __future__ import annotations
 
+from functools import cache
 from pathlib import Path
 
 import numpy as np
@@ -64,6 +65,27 @@ def expand(knots: np.ndarray) -> np.ndarray:
     return (lo + (hi - lo) * t[:, None, None]).astype(np.float32)
 
 
+@cache
+def _libm_atan2f():
+    """The C library's float32 atan2 as a ufunc, one element at a time.
+
+    Not np.arctan2: on AVX-512 under Linux that is a vector routine (SVML),
+    which lands a unit in the last place away from atan2f, and at a bin edge
+    that is the next bin. The kernel (linear_matrix_numba) calls atan2f on
+    every machine, so what it is held to does as well -- an oracle that changes
+    with the CPU is not one. Built on first use: only the reference needs it.
+    """
+    import math
+
+    from numba import float32, vectorize
+
+    @vectorize([float32(float32, float32)])
+    def atan2f(y, x):
+        return math.atan2(y, x)
+
+    return atan2f
+
+
 def hue_index(rgb: np.ndarray, lut: np.ndarray | None = None) -> np.ndarray:
     """Linear RGB -> 0..1023 hue-angle index.
 
@@ -74,7 +96,7 @@ def hue_index(rgb: np.ndarray, lut: np.ndarray | None = None) -> np.ndarray:
         lut = load_hue_lut()
     a = np.asarray(rgb, dtype=np.float32)
     y = a.sum(axis=-1) / np.float32(3.0)
-    ang = np.arctan2(a[..., 0] - y, a[..., 2] - y) % np.float32(2 * np.pi)
+    ang = _libm_atan2f()(a[..., 0] - y, a[..., 2] - y) % np.float32(2 * np.pi)
     n = len(lut)
     bi = np.clip((ang / np.float32(2 * np.pi) * n).astype(np.int32), 0, n - 1)
     return np.clip(np.rint(lut[bi]).astype(np.int32), 0, N_INDEX - 1)
