@@ -8,9 +8,7 @@
 import {
   SPICA_GAIN_SCALE,
   SONY_POST_PROGRAMS, type SonyPostProgramName,
-  MASK_BLUR_SHADER, MASK_DOWNSAMPLE_SHADER, MASK_VERTEX_SHADER, PASSES, VERTEX_SHADER,
-  RELIGHT_BLUR_SHADER, RELIGHT_SHADOW_SHADER, FINISH_SHADER, AUX_COPY_SHADER, LENS_BLUR_DOWN_SHADER, LENS_BLUR_GATHER_SHADER,
-  REFINE_COPY_SHADER, HISTO_VERTEX_SHADER, HISTO_FRAGMENT_SHADER,
+  PASSES, PROGRAMS, type ProgramName,
 } from "./passes";
 import { type MarbleUniforms, type ProfileMarble, marbleUniforms } from "./sony-marble";
 import { type LumaNrParams, type ProfileLumaNr, lumaNrParams } from "./sony-lumanr";
@@ -540,6 +538,14 @@ export const DEFAULT_PARAMS: EditParams = {
   imgFromTex: imgFromTex(defaultCrop()), imgAspect: 1,
 };
 
+/**
+ * Whether this browser has a wide-gamut drawing buffer. A fact about the
+ * browser, not about a context, so it is known before any renderer exists —
+ * the export settings are offered from the library, with no photo open.
+ */
+export const P3_SUPPORTED = typeof WebGL2RenderingContext !== "undefined"
+  && "drawingBufferColorSpace" in WebGL2RenderingContext.prototype;
+
 export class PipelineRenderer {
   private gl: WebGL2RenderingContext;
   private program: WebGLProgram;
@@ -769,7 +775,7 @@ export class PipelineRenderer {
   private wbTint = Number.NaN;
   private readonly wbMat = new Float32Array(9);
   /** Whether the browser exposes a wide-gamut drawing buffer. */
-  readonly p3Supported: boolean = false;
+  readonly p3Supported = P3_SUPPORTED;
 
   constructor(private canvas: HTMLCanvasElement) {
     const gl = canvas.getContext("webgl2", {
@@ -777,7 +783,6 @@ export class PipelineRenderer {
     }) as WebGL2RenderingContext | null;
     if (!gl) throw new Error("WebGL2 not available");
     this.gl = gl;
-    this.p3Supported = "drawingBufferColorSpace" in gl;
     // Full-image GPU histogram needs a float colour buffer we can additively
     // blend into. Calling getExtension also enables it. Where unavailable,
     // readHistogram() falls back to the CPU read-back path.
@@ -794,7 +799,7 @@ export class PipelineRenderer {
     this.rgba16 = norm16?.RGBA16_EXT ?? 0;
 
     const pass = PASSES[0];
-    this.program = this.compileProgram(pass.fsSource);
+    this.program = this.link(pass.name);
     for (const name of pass.uniforms) this.uniforms[name] = gl.getUniformLocation(this.program, name);
     this.uniforms["u_input"] = gl.getUniformLocation(this.program, "u_input");
     this.uniforms["u_curve_lut"] = gl.getUniformLocation(this.program, "u_curve_lut");
@@ -861,8 +866,8 @@ export class PipelineRenderer {
     this.shadowReady = false;
     if (!this.relightShadowProg) {
       try {
-        this.relightShadowProg = this.compileProgramVS(MASK_VERTEX_SHADER, RELIGHT_SHADOW_SHADER);
-        this.relightBlurProg = this.compileProgramVS(MASK_VERTEX_SHADER, RELIGHT_BLUR_SHADER);
+        this.relightShadowProg = this.link("relightShadow");
+        this.relightBlurProg = this.link("relightBlur");
       } catch (err) {
         console.warn("[pipeline] relight shadow programs unavailable:", err);
         return;
@@ -983,7 +988,7 @@ export class PipelineRenderer {
     const aux = this.ensureAux();
     if (!aux) return false;
     if (!this.auxCopyProg) {
-      try { this.auxCopyProg = this.compileProgramVS(MASK_VERTEX_SHADER, AUX_COPY_SHADER); } catch { return false; }
+      try { this.auxCopyProg = this.link("copy"); } catch { return false; }
     }
     const prog = this.auxCopyProg;
     gl.viewport(0, 0, aux.w, aux.h);
@@ -1111,8 +1116,8 @@ export class PipelineRenderer {
     const gl = this.gl;
     if (this.maskProgDown) return true;
     try {
-      this.maskProgDown = this.compileProgramVS(MASK_VERTEX_SHADER, MASK_DOWNSAMPLE_SHADER);
-      this.maskProgBlur = this.compileProgramVS(MASK_VERTEX_SHADER, MASK_BLUR_SHADER);
+      this.maskProgDown = this.link("maskDownsample");
+      this.maskProgBlur = this.link("maskBlur");
     } catch (err) {
       console.warn("[pipeline] mask programs unavailable:", err);
       this.maskSupported = false;
@@ -1670,7 +1675,7 @@ export class PipelineRenderer {
       this.refineTarget = { ...made, w, h };
     }
     if (!this.refineProg) {
-      this.refineProg = this.compileProgramVS(MASK_VERTEX_SHADER, REFINE_COPY_SHADER);
+      this.refineProg = this.link("copy");
     }
     const target = this.refineTarget;
     // The export's render, into the target instead of the canvas.
@@ -1814,7 +1819,7 @@ export class PipelineRenderer {
   private prepareFinish(w: number, h: number): RenderTarget | null {
     if (!this.finishProg) {
       try {
-        this.finishProg = this.compileProgramVS(MASK_VERTEX_SHADER, FINISH_SHADER);
+        this.finishProg = this.link("finish");
       } catch (err) {
         console.warn("[pipeline] finish program unavailable:", err);
         return null;
@@ -1866,8 +1871,8 @@ export class PipelineRenderer {
     if (!this.lensBlurProgs) {
       try {
         this.lensBlurProgs = {
-          down: this.compileProgramVS(MASK_VERTEX_SHADER, LENS_BLUR_DOWN_SHADER),
-          gather: this.compileProgramVS(MASK_VERTEX_SHADER, LENS_BLUR_GATHER_SHADER),
+          down: this.link("lensBlurDown"),
+          gather: this.link("lensBlurGather"),
         };
       } catch (err) {
         console.warn("[pipeline] lens blur programs unavailable:", err);
@@ -2506,7 +2511,7 @@ export class PipelineRenderer {
     const def = SONY_POST_PROGRAMS[name];
     let built: PostProgram;
     try {
-      const prog = this.compileProgramVS(MASK_VERTEX_SHADER, def.fsSource);
+      const prog = this.link(`sony ${name}`);
       const u: Record<string, WebGLUniformLocation | null> = {};
       for (const n of def.uniforms) u[n] = gl.getUniformLocation(prog, n);
       built = { prog, u };
@@ -2793,13 +2798,18 @@ export class PipelineRenderer {
     this.histoBinTex = tex;
     this.histoBinFbo = fbo;
 
-    this.histoProgram = this.compileProgramVS(HISTO_VERTEX_SHADER, HISTO_FRAGMENT_SHADER);
+    this.histoProgram = this.link("histogram");
     this.histoUniforms = {
       u_src: gl.getUniformLocation(this.histoProgram, "u_src"),
       u_srcW: gl.getUniformLocation(this.histoProgram, "u_srcW"),
     };
     this.histoVao = gl.createVertexArray(); // attribute-less: positions come from gl_VertexID
     return true;
+  }
+
+  /** The colour space the last draw() rendered in: P3 only when it was asked for and is available. */
+  get outputColorSpace(): PredefinedColorSpace {
+    return this.lastParams.displayGamut === 1 && this.p3Supported ? "display-p3" : "srgb";
   }
 
   /**
@@ -2814,8 +2824,7 @@ export class PipelineRenderer {
     const w = this.canvas.width;
     const h = this.canvas.height;
     if (!w || !h) throw new Error("nothing to read back");
-    const colorSpace: PredefinedColorSpace =
-      this.lastParams.displayGamut === 1 && this.p3Supported ? "display-p3" : "srgb";
+    const colorSpace = this.outputColorSpace;
     const raw = new Uint8Array(w * h * 4);
     gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, raw);
     const flipped = new Uint8ClampedArray(w * h * 4);
@@ -2828,16 +2837,12 @@ export class PipelineRenderer {
   }
 
   /**
-   * Read the currently-drawn frame back into an encoded image Blob: readFrame()
-   * composited onto a 2D canvas in the same colour space, so the export
-   * matches the preview.
-   */
-  /**
-   * Encode the last frame. `maxEdge` scales the finished frame down so its
-   * long edge is at most that many pixels — after the render, not instead of
-   * it: the neighbourhood stages (sharpening, noise reduction, Clarity) are
-   * tied to sensor pixels, so a smaller export is the full-size render made
-   * smaller, not a different render.
+   * Encode the last frame: readFrame() composited onto a 2D canvas in the same
+   * colour space, so the export matches the preview. `maxEdge` scales the
+   * finished frame down so its long edge is at most that many pixels — after
+   * the render, not instead of it: the neighbourhood stages (sharpening, noise
+   * reduction, Clarity) are tied to sensor pixels, so a smaller export is the
+   * full-size render made smaller, not a different render.
    */
   async toBlob(type = "image/jpeg", quality = 0.92, maxEdge = 0): Promise<Blob> {
     const { w, h, data: flipped, colorSpace } = this.readFrame();
@@ -3135,15 +3140,17 @@ export class PipelineRenderer {
     }
   }
 
-  private compileProgram(fsSource: string): WebGLProgram {
-    return this.compileProgramVS(VERTEX_SHADER, fsSource);
-  }
-
-  private compileProgramVS(vsSource: string, fsSource: string): WebGLProgram {
+  /**
+   * Link one of passes.ts PROGRAMS. The only way a program is built here, and
+   * by name on purpose: whatever this renderer can run is in the table the
+   * shader check compiles.
+   */
+  private link(name: ProgramName): WebGLProgram {
     const gl = this.gl;
+    const source = PROGRAMS[name];
     const prog = gl.createProgram()!;
-    const vs = this.compile(gl.VERTEX_SHADER, vsSource);
-    const fs = this.compile(gl.FRAGMENT_SHADER, fsSource);
+    const vs = this.compile(gl.VERTEX_SHADER, source.vs);
+    const fs = this.compile(gl.FRAGMENT_SHADER, source.fs);
     gl.attachShader(prog, vs); gl.attachShader(prog, fs);
     gl.linkProgram(prog);
     if (!gl.getProgramParameter(prog, gl.LINK_STATUS))

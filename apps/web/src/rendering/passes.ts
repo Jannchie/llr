@@ -1396,8 +1396,10 @@ void main() {
   outColor = vec4(sum / wsum, r0);
 }`;
 
-// A plain copy, for writing a 2D texture into an aux layer.
-export const AUX_COPY_SHADER = `#version 300 es
+// A plain copy of u_input. Two programs are linked from it: one writes a 2D
+// texture into an aux layer, the other is the refine's final blit of the
+// mipmapped full-resolution frame onto the canvas.
+export const COPY_SHADER = `#version 300 es
 precision highp float;
 in vec2 v_uv;
 out vec4 outColor;
@@ -2426,14 +2428,6 @@ void main() {
   outColor = vec4(srgbOetf3(lin), 1.0);
 }`;
 
-// The refine's final blit: the mipmapped full-resolution frame onto the canvas.
-export const REFINE_COPY_SHADER = `#version 300 es
-precision highp float;
-in vec2 v_uv;
-out vec4 outColor;
-uniform sampler2D u_input;
-void main() { outColor = texture(u_input, v_uv); }`;
-
 // One point per (pixel, channel). gl_VertexID derives both, the vertex shader
 // fetches the pixel and positions the point at its bin column / channel row.
 export const HISTO_VERTEX_SHADER = `#version 300 es
@@ -2504,14 +2498,14 @@ export const SONY_POST_PROGRAMS = {
 export type SonyPostProgramName = keyof typeof SONY_POST_PROGRAMS;
 
 export interface PassDef {
-  name: string;
-  fsSource: string;
+  /** Its program, in PROGRAMS below. */
+  name: ProgramName;
   uniforms: string[];
 }
 
 /** Single pass — all operations fused. */
 export const PASSES: PassDef[] = [
-  { name: "process", fsSource: PROCESS_SHADER, uniforms: [
+  { name: "process", uniforms: [
     "u_texXform", "u_bgColor",
     "u_wbMatrix", "u_exposure", "u_sonyLinearExposure", "u_displayGamut",
     "u_highlights", "u_shadows",
@@ -2547,27 +2541,34 @@ export const PASSES: PassDef[] = [
   ]},
 ];
 
+/** One program: the vertex and the fragment source it is linked from. */
+export interface ProgramSource { vs: string; fs: string }
+
+// Sony's post chain, each on the offscreen passes' shared vertex shader.
+const SONY_PROGRAMS = Object.fromEntries(
+  Object.entries(SONY_POST_PROGRAMS).map(([name, def]) => [`sony ${name}`, { vs: MASK_VERTEX_SHADER, fs: def.fsSource }]),
+) as Record<`sony ${SonyPostProgramName}`, ProgramSource>;
+
 /**
- * Every program the renderer builds, as the vertex and fragment source it is
- * linked from. The renderer does not read this — it builds each where it is
- * first needed — but the shader check (scripts/shader-check.ts) does, and
- * passes.spec.ts holds it to the sources this module exports: a shader added
- * here and left off the list fails a test, instead of shipping with nothing
- * that has ever tried to compile it.
+ * Every program the renderer links, by name. It links from this table and
+ * from nothing else (pipeline-renderer `link`), and the shader check compiles
+ * every entry (scripts/shader-check.ts) — so a program cannot be built here
+ * without also being one CI has tried in a real WebGL2 context. passes.spec.ts
+ * holds the other direction: no shader exported from this module that no
+ * program uses.
  */
-export const ALL_PROGRAMS: { name: string; vs: string; fs: string }[] = [
-  { name: "process", vs: VERTEX_SHADER, fs: PROCESS_SHADER },
-  { name: "mask downsample", vs: MASK_VERTEX_SHADER, fs: MASK_DOWNSAMPLE_SHADER },
-  { name: "mask blur", vs: MASK_VERTEX_SHADER, fs: MASK_BLUR_SHADER },
-  { name: "relight shadow", vs: MASK_VERTEX_SHADER, fs: RELIGHT_SHADOW_SHADER },
-  { name: "relight blur", vs: MASK_VERTEX_SHADER, fs: RELIGHT_BLUR_SHADER },
-  { name: "aux copy", vs: MASK_VERTEX_SHADER, fs: AUX_COPY_SHADER },
-  { name: "finish", vs: MASK_VERTEX_SHADER, fs: FINISH_SHADER },
-  { name: "lens blur down", vs: MASK_VERTEX_SHADER, fs: LENS_BLUR_DOWN_SHADER },
-  { name: "lens blur gather", vs: MASK_VERTEX_SHADER, fs: LENS_BLUR_GATHER_SHADER },
-  { name: "refine copy", vs: MASK_VERTEX_SHADER, fs: REFINE_COPY_SHADER },
-  { name: "histogram", vs: HISTO_VERTEX_SHADER, fs: HISTO_FRAGMENT_SHADER },
-  // Sony's post chain, paired with MASK_VERTEX_SHADER the way
-  // pipeline-renderer.postProgram builds them.
-  ...Object.entries(SONY_POST_PROGRAMS).map(([name, def]) => ({ name: `sony ${name}`, vs: MASK_VERTEX_SHADER, fs: def.fsSource })),
-];
+export const PROGRAMS = {
+  process: { vs: VERTEX_SHADER, fs: PROCESS_SHADER },
+  maskDownsample: { vs: MASK_VERTEX_SHADER, fs: MASK_DOWNSAMPLE_SHADER },
+  maskBlur: { vs: MASK_VERTEX_SHADER, fs: MASK_BLUR_SHADER },
+  relightShadow: { vs: MASK_VERTEX_SHADER, fs: RELIGHT_SHADOW_SHADER },
+  relightBlur: { vs: MASK_VERTEX_SHADER, fs: RELIGHT_BLUR_SHADER },
+  copy: { vs: MASK_VERTEX_SHADER, fs: COPY_SHADER },
+  finish: { vs: MASK_VERTEX_SHADER, fs: FINISH_SHADER },
+  lensBlurDown: { vs: MASK_VERTEX_SHADER, fs: LENS_BLUR_DOWN_SHADER },
+  lensBlurGather: { vs: MASK_VERTEX_SHADER, fs: LENS_BLUR_GATHER_SHADER },
+  histogram: { vs: HISTO_VERTEX_SHADER, fs: HISTO_FRAGMENT_SHADER },
+  ...SONY_PROGRAMS,
+} satisfies Record<string, ProgramSource>;
+
+export type ProgramName = keyof typeof PROGRAMS;
