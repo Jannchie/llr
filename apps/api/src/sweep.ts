@@ -14,7 +14,6 @@
 // minus the decode cache that can be rebuilt, and kept there for a week. A
 // directory this server would not have named is not touched at all.
 
-import type { Dirent } from "node:fs";
 import { mkdir, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
@@ -42,6 +41,16 @@ export async function markRemoved(dir: string): Promise<void> {
 
 const exists = (path: string) => stat(path).then(() => true, () => false);
 
+/** The names of the directories in `root`: none when it is not there yet, none (and `onError`) when it cannot be read. */
+async function subdirs(root: string, onError: (error: unknown) => void): Promise<string[]> {
+  try {
+    return (await readdir(root, { withFileTypes: true })).filter(entry => entry.isDirectory()).map(entry => entry.name);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") onError(error);
+    return [];
+  }
+}
+
 export type SweepResult = { deleted: string[]; trashed: string[]; expired: string[] };
 
 /**
@@ -61,50 +70,37 @@ export async function sweepSessions(opts: {
   const warn = opts.warn ?? (() => {});
   const result: SweepResult = { deleted: [], trashed: [], expired: [] };
 
-  let entries: Dirent[];
-  try {
-    entries = await readdir(sessionsRoot, { withFileTypes: true });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") warn(`session cleanup failed: ${message(error)}`);
-    entries = [];
-  }
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const dir = resolve(sessionsRoot, entry.name);
+  for (const name of await subdirs(sessionsRoot, error => warn(`session cleanup failed: ${message(error)}`))) {
+    const dir = resolve(sessionsRoot, name);
     try {
-      if (!known || known.has(entry.name)) {
+      if (!known || known.has(name)) {
         await sweepScratch(dir, now);
         continue;
       }
       if (now - (await stat(dir)).mtimeMs <= SCRATCH_TTL_MS) continue;
       if (await exists(resolve(dir, REMOVED_MARK))) {
         await rm(dir, { recursive: true, force: true });
-        result.deleted.push(entry.name);
-      } else if (PHOTO_DIR.test(entry.name)) {
-        await moveToTrash(dir, resolve(trashRoot, entry.name), now);
-        result.trashed.push(entry.name);
+        result.deleted.push(name);
+      } else if (PHOTO_DIR.test(name)) {
+        await moveToTrash(dir, resolve(trashRoot, name), now);
+        result.trashed.push(name);
       }
     } catch (error) {
       warn(`session cleanup failed for ${dir}: ${message(error)}`);
     }
   }
 
-  try {
-    for (const entry of await readdir(trashRoot, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const dir = resolve(trashRoot, entry.name);
-      try {
-        // Its own mtime is from before it was trashed; the mark is the clock.
-        const since = await stat(resolve(dir, TRASHED_MARK)).then(s => s.mtimeMs, () => null);
-        if (since === null || now - since <= TRASH_TTL_MS) continue;
-        await rm(dir, { recursive: true, force: true });
-        result.expired.push(entry.name);
-      } catch (error) {
-        warn(`trash cleanup failed for ${dir}: ${message(error)}`);
-      }
+  for (const name of await subdirs(trashRoot, error => warn(`trash cleanup failed: ${message(error)}`))) {
+    const dir = resolve(trashRoot, name);
+    try {
+      // Its own mtime is from before it was trashed; the mark is the clock.
+      const since = await stat(resolve(dir, TRASHED_MARK)).then(s => s.mtimeMs, () => null);
+      if (since === null || now - since <= TRASH_TTL_MS) continue;
+      await rm(dir, { recursive: true, force: true });
+      result.expired.push(name);
+    } catch (error) {
+      warn(`trash cleanup failed for ${dir}: ${message(error)}`);
     }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") warn(`trash cleanup failed: ${message(error)}`);
   }
   return result;
 }
