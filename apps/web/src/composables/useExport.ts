@@ -2,16 +2,35 @@ import { ref, type Ref } from "vue";
 import { PipelineRenderer, parseDcpTables, type EditParams, type ProfileCurve } from "../rendering/pipeline-renderer";
 import { API, fetchLinear, type DenoisePayload, type LinearMeta, type LinearRequest } from "../api";
 import { t } from "../i18n";
+import { fitLongEdge } from "../rendering/crop";
 import type { RelightGeometry } from "../rendering/relight";
 
-/** The file an export writes: its size, its JPEG quality and its colour space. */
+/**
+ * The file an export writes — its own settings, apart from how the photo is
+ * shown on this screen. Read once when the export is asked for, so a batch
+ * writes every file alike whatever is changed while it runs.
+ */
 export interface ExportFile {
   /** Long edge in pixels; 0 keeps the render's own size. */
   longEdge: number;
   /** JPEG quality, 0..1. */
   quality: number;
-  /** Display P3 rather than sRGB. */
+  /** Display P3 rather than sRGB, where the browser can encode it. */
   wideGamut: boolean;
+  /** Exclude GPS/serials/owner/maker notes from the copied EXIF (opt-in). */
+  stripPrivate: boolean;
+}
+
+/** How one render is encoded. */
+export interface RenderOutput {
+  /** JPEG quality, 0..1; 1.0 also disables the browser encoder's 4:2:0 chroma subsampling. */
+  quality: number;
+  /** Render at most this large (a small rendering of a photo that is not open). */
+  maxEdge?: number;
+  /** Scale the finished full-size render down to this long edge (an export's size). */
+  longEdge?: number;
+  /** The file's colour space; absent keeps this screen's (the plan's params). */
+  wideGamut?: boolean;
 }
 
 /**
@@ -25,12 +44,6 @@ export interface ExportPlan {
   filename: string;
   /** The full edit snapshot, embedded server-side as llr:* XMP + JSON. */
   settings: unknown;
-  /** Exclude GPS/serials/owner/maker notes from the copied EXIF (opt-in). */
-  stripPrivate: boolean;
-  /** What file the export writes — its own settings, apart from how the
-   * photo is shown on this screen. Absent for a background preview, which
-   * takes its size and quality from the caller. */
-  file?: ExportFile;
   dcpCode: string | undefined;
   /** Which colour engine renders camera RGB — must match the preview's. */
   profileId: string;
@@ -75,9 +88,10 @@ export interface ExportPlan {
  * Decode `plan`'s photo and render its frozen edit off-screen: the whole of an
  * export but the download, and — with `maxEdge` — a small rendering of a photo
  * that is not open (the edited previews a paste onto a selection refreshes).
+ * `wideGamut` is what was encoded, which is sRGB where P3 is not available
+ * whatever was asked for.
  */
-export async function renderPlan(plan: ExportPlan, opts: { maxEdge?: number; quality?: number } = {}): Promise<Blob> {
-  const file = plan.file;
+export async function renderPlan(plan: ExportPlan, out: RenderOutput): Promise<{ blob: Blob; wideGamut: boolean }> {
   let renderer: PipelineRenderer | null = null;
   try {
     // Full resolution for an export (no half-size, no cap); purpose keeps
@@ -105,14 +119,12 @@ export async function renderPlan(plan: ExportPlan, opts: { maxEdge?: number; qua
     renderer.setSonyCameraMatch(plan.sonyCameraMatch);
     renderer.uploadRelightGeometry(plan.relightGeometry);
     plan.prepare?.(renderer, params);
-    const out = plan.output(meta);
-    const f = opts.maxEdge ? Math.min(1, opts.maxEdge / Math.max(out.width, out.height)) : 1;
-    renderer.setOutput(Math.max(1, Math.round(out.width * f)), Math.max(1, Math.round(out.height * f)), out.texXform, plan.background);
-    // The export's colour space is its own setting; the display's is for this
-    // screen. (The renderer falls back to sRGB where P3 is not available.)
-    renderer.draw(file ? { ...params, displayGamut: file.wideGamut ? 1 : 0 } : params);
-    // quality 1.0 also disables the browser encoder's 4:2:0 chroma subsampling
-    return await renderer.toBlob("image/jpeg", opts.quality ?? file?.quality ?? 1.0, file?.longEdge ?? 0);
+    const frame = plan.output(meta);
+    const [width, height] = fitLongEdge(frame.width, frame.height, out.maxEdge ?? 0);
+    renderer.setOutput(width, height, frame.texXform, plan.background);
+    renderer.draw(out.wideGamut === undefined ? params : { ...params, displayGamut: out.wideGamut ? 1 : 0 });
+    const blob = await renderer.toBlob("image/jpeg", out.quality, out.longEdge ?? 0);
+    return { blob, wideGamut: renderer.outputColorSpace === "display-p3" };
   } finally {
     renderer?.destroy();
   }
@@ -143,6 +155,8 @@ export function useExport(opts: {
   errorMessage: Ref<string | null>;
   /** Freeze the current edit into a plan; null = nothing to export. */
   plan: () => ExportPlan | null;
+  /** The export settings as they stand. */
+  file: () => ExportFile;
 }) {
   const exporting = ref(false);
   // A batch in flight: how far it is. Null for a single export and when idle.
@@ -157,7 +171,7 @@ export function useExport(opts: {
     opts.errorMessage.value = null;
     try {
       // Download the finished file
-      downloadBlob(await finishedJpeg(plan), plan.filename);
+      downloadBlob(await finishedJpeg(plan, opts.file()), plan.filename);
     } catch (err) {
       // The toast only: `exporting` is this export's state, and the decode
       // state belongs to the photo on screen, not to this off-screen render.
@@ -183,6 +197,7 @@ export function useExport(opts: {
     stop = false;
     opts.errorMessage.value = null;
     progress.value = { done: 0, total: jobs.length };
+    const file = opts.file();
     const result: BatchResult = { saved: 0, folder: sink.folder, failed: [], cancelled: false };
     try {
       for (const job of jobs) {
@@ -190,7 +205,7 @@ export function useExport(opts: {
         try {
           const plan = await job.plan();
           if (!plan) throw new Error(t("error.exportSourceGone"));
-          await sink.write(await finishedJpeg(plan), plan.filename);
+          await sink.write(await finishedJpeg(plan, file), plan.filename);
           result.saved += 1;
         } catch (err) {
           result.failed.push(job.name);
@@ -213,16 +228,17 @@ export function useExport(opts: {
   return { exporting, progress, exportImage, exportMany, cancelExport };
 }
 
-/** Render `plan` at full resolution and have the server embed its edit (llr:* XMP + lossless LLR JSON) and the RAW's EXIF. */
-async function finishedJpeg(plan: ExportPlan): Promise<Blob> {
-  const blob = await renderPlan(plan);
+/** Render `plan` at full resolution as `file`, and have the server embed its edit (llr:* XMP + lossless LLR JSON) and the RAW's EXIF. */
+async function finishedJpeg(plan: ExportPlan, file: ExportFile): Promise<Blob> {
+  const { blob, wideGamut } = await renderPlan(plan, { quality: file.quality, longEdge: file.longEdge, wideGamut: file.wideGamut });
   const fd = new FormData();
   fd.append("file", blob, "export.jpg");
   fd.append("meta", JSON.stringify({
-    sourceId: plan.sourceId, settings: plan.settings, stripPrivate: plan.stripPrivate,
+    sourceId: plan.sourceId, settings: plan.settings, stripPrivate: file.stripPrivate,
     // So the EXIF says what the pixels are: the encoder embeds the P3 profile,
-    // and a ColorSpace tag still reading sRGB would contradict it.
-    wideGamut: plan.file?.wideGamut === true,
+    // and a ColorSpace tag still reading sRGB would contradict it. From the
+    // render, not the setting — the two differ where P3 is not available.
+    wideGamut,
   }));
   const res = await fetch(`${API}/export`, { method: "POST", body: fd });
   if (!res.ok) throw new Error(await res.text());

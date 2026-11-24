@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from "vue";
-import { PipelineRenderer, parseDcpTables, type EditParams, type ProfileCurve, type ViewWindow } from "./rendering/pipeline-renderer";
+import { P3_SUPPORTED, PipelineRenderer, parseDcpTables, type EditParams, type ProfileCurve, type ViewWindow } from "./rendering/pipeline-renderer";
 import { sonyChromaNrSlider } from "./rendering/sony-denoise";
 import { parseCameraMatch } from "./rendering/camera-match";
 import { loadToneFamily, rebuildLookProfile, toneFamilyLoaded } from "./rendering/sony-look";
@@ -43,8 +43,8 @@ import { useHistory } from "./composables/useHistory";
 import { useToneCurve } from "./composables/useToneCurve";
 import { useCropEditor } from "./composables/useCropEditor";
 import {
-  DRO_AUTO, LOOK_SCALE, defaultDenoise, defaultGrading, defaultRecipe, defaultSnapshot, lookStopsToPanel, normalizeSnapshot,
-  type BypassKey, type GroupTitle, type ProfileId, type Recipe, type RecipeKey, type Snapshot,
+  DRO_AUTO, LOOK_SCALE, defaultDenoise, defaultGrading, defaultRecipe, defaultSnapshot, normalizeSnapshot,
+  type BypassKey, type DenoiseState, type GroupTitle, type NormalizedSnapshot, type ProfileId, type Recipe, type RecipeKey, type Snapshot,
 } from "./snapshot";
 import { useMaskEditor } from "./composables/useMaskEditor";
 import { useEraseEditor } from "./composables/useEraseEditor";
@@ -54,7 +54,7 @@ import { useModelStatus } from "./composables/useModelStatus";
 import { activityOf, decodingFor, IDLE, type DecodeCause, type DecodeState } from "./activity";
 import { ROOT_FOLDER_ID, useCatalog } from "./composables/useCatalog";
 import { useHistogram } from "./composables/useHistogram";
-import { renderPlan, useExport, type ExportPlan } from "./composables/useExport";
+import { renderPlan, useExport, type ExportFile, type ExportPlan } from "./composables/useExport";
 import { useAssistant, modelKey, THINKING_LEVELS, type AssistantTool, type ToolContent, type TurnUsage } from "./composables/useAssistant";
 import { binImageThrough, measureHint, measureHistogram, measurePixels } from "./rendering/histogram";
 import ModelSettings from "./components/ModelSettings.vue";
@@ -484,7 +484,7 @@ const showEmbedded = ref(false);
 let currentSourceId = "";  // server id of the image currently in the renderer
 
 let webglRenderer: PipelineRenderer | null = null;
-const p3Supported = ref(false);
+const p3Supported = P3_SUPPORTED;
 let rafId = 0;
 let drawPending = false;
 
@@ -955,6 +955,9 @@ let bakedBasic: BasicAdjust | null = DEFAULT_BASIC;
 // The history step the pointer is resting on, drawn in place of the live edit
 // until it leaves (see the history panel below). Never applied to the state.
 const historyPreview = shallowRef<Snapshot | null>(null);
+// What is drawn for it. A step stored by an older build lacks what that build
+// did not have, and what its absence means is normalizeSnapshot's to say.
+const historyPreviewEdit = computed(() => historyPreview.value ? normalizeSnapshot(historyPreview.value) : null);
 
 function currentBasic(r: Recipe = recipe): BasicAdjust {
   return { contrast: r.contrast, blacks: r.blacks, whites: r.whites };
@@ -973,9 +976,9 @@ function bakeCurveLUT(): void {
   }
   // A hovered history step draws with its own curve and Basic values; bakedBasic
   // stays null so the live ones are rebaked the frame the hover ends.
-  const s = historyPreview.value;
+  const s = historyPreviewEdit.value;
   if (s) {
-    const b = new Set(s.bypass ?? []);
+    const b = new Set(s.bypass);
     webglRenderer.uploadCurveLUT(buildToneCurveLUT(b.has("curve") ? defaultToneCurve() : s.curve, currentBasic(effectiveRecipe(s.recipe, b))));
     bakedBasic = null;
     return;
@@ -1008,7 +1011,7 @@ const {
   onCommitted: () => { schedulePersist(); schedulePreview(); },
 });
 
-function captureSnapshot(): Snapshot {
+function captureSnapshot(): NormalizedSnapshot {
   return {
     recipe: { ...recipe },
     hslHue: [...hslHue], hslSat: [...hslSat], hslLum: [...hslLum],
@@ -1493,7 +1496,6 @@ function denoisePayload(stored: Partial<DenoiseState> | undefined): DenoisePaylo
   return { enabled: d.enabled, auto: d.auto, amount: d.amount / 100, edge: d.edge, chroma: d.chroma };
 }
 
-type DenoiseState = ReturnType<typeof defaultDenoise>;
 /** The denoise settings as the render stages after a decode read them. */
 type FrameDenoise = { enabled: boolean; amount: number; edge: number; chroma: number; auto: boolean; sony: boolean };
 // `stored` for a frame whose decode said which denoiser it has: on Sony's the
@@ -1511,17 +1513,12 @@ const sonyDenoiserOf = (meta: LinearMeta): boolean =>
 // The Creative Look and DRO a decode is asked for. One place for the preview,
 // the export and a background render, so they cannot ask for different frames;
 // `off` is the panel's bypass, which puts all of it back to what the camera did.
+// Takes a normalised snapshot's fields: the look is on the panel scale already.
 function lookRequest(
-  s: Pick<Snapshot, "look" | "lookScale" | "lookStyle" | "dro" | "droLevel">, off: boolean,
+  s: Pick<NormalizedSnapshot, "look" | "lookStyle" | "dro" | "droLevel">, off: boolean,
 ): Pick<LinearRequest, "look" | "style" | "dro" | "droLevel"> {
   if (off) return { look: undefined, style: undefined, dro: undefined, droLevel: DRO_AUTO };
-  return {
-    // A look stored before Edit's panel scale is in the camera's stops.
-    look: s.look ? (s.lookScale === LOOK_SCALE ? s.look : lookStopsToPanel(s.look)) : undefined,
-    style: s.lookStyle ?? undefined,
-    dro: s.dro ?? undefined,
-    droLevel: s.droLevel ?? DRO_AUTO,
-  };
+  return { look: s.look ?? undefined, style: s.lookStyle ?? undefined, dro: s.dro ?? undefined, droLevel: s.droLevel };
 }
 
 let metadataMissingShown = false;
@@ -1532,11 +1529,17 @@ let metadataMissingShown = false;
 // racing a switch); only the newest call may touch renderer/UI state after an
 // await, otherwise the slower decode would land last and show stale pixels.
 let loadSeq = 0;
+// The decode in flight. A newer load gives it up rather than let it arrive —
+// hundreds of MB a frame — only to be dropped: an arrow key held down starts
+// one for every photo it passes.
+let loadAbort: AbortController | null = null;
 async function loadSource(id: string, opts: { resetView?: boolean; cause?: DecodeCause } = {}): Promise<boolean> {
   if (!photoById(id)) return false;
   currentSourceId = id;
   const seq = ++loadSeq;
   const stale = () => seq !== loadSeq;
+  loadAbort?.abort();
+  const abort = loadAbort = new AbortController();
   decode.value = { phase: "decoding", cause: opts.cause ?? "open" };
   errorMessage.value = null;
   const t0 = performance.now();
@@ -1550,7 +1553,7 @@ async function loadSource(id: string, opts: { resetView?: boolean; cause?: Decod
     // buffer by on-screen device pixels, so a fit view shades the same number of
     // fragments it always did. What it does cost is transfer and VRAM (~140 MB
     // for 24 MP, ~360 MB for 61 MP, as float16).
-    const lin = await fetchLinear(decodeBody(id));
+    const lin = await fetchLinear(decodeBody(id), abort.signal);
     if (stale()) return false;
     if (!lin) { decode.value = { phase: "failed" }; markInvalid(id); return false; }
     const { meta: linMeta, pixels: linearFloat } = lin;
@@ -1623,7 +1626,6 @@ async function loadSource(id: string, opts: { resetView?: boolean; cause?: Decod
         webglUnsupported.value = true;
         throw err;
       }
-      p3Supported.value = webglRenderer.p3Supported;
     }
     webglRenderer.uploadImage(linearFloat, linMeta.width, linMeta.height);
     renderedId.value = id;
@@ -1746,21 +1748,21 @@ async function reloadLookProfile(): Promise<void> {
 // `ctx` stands in for the open photo's own facts — its lens tables and size —
 // when the snapshot is another photo's (a background preview render).
 function buildPipelineParams(
-  s?: Snapshot, opts: { matte?: string | null; ctx?: { lensCorr: LensCorr | null; srcW: number; srcH: number } } = {},
+  s?: NormalizedSnapshot, opts: { matte?: string | null; ctx?: { lensCorr: LensCorr | null; srcW: number; srcH: number } } = {},
 ): Partial<EditParams> {
   const lensCorr = opts.ctx ? opts.ctx.lensCorr : lensCorrLiveGet();
   const sw = opts.ctx ? opts.ctx.srcW : srcW.value, sh = opts.ctx ? opts.ctx.srcH : srcH.value;
   // Switched-off panels render at their defaults; a snapshot carries its own
   // switches, the live state its live ones.
-  const b: ReadonlySet<BypassKey> = s ? new Set(s.bypass ?? []) : bypass;
+  const b: ReadonlySet<BypassKey> = s ? new Set(s.bypass) : bypass;
   const r = effectiveRecipe(s?.recipe ?? recipe, b);
   const zero = () => [0, 0, 0, 0, 0, 0, 0, 0];
   const [hue, sat, lum] = b.has("hsl") ? [zero(), zero(), zero()] : s ? [s.hslHue, s.hslSat, s.hslLum] : [hslHue, hslSat, hslLum];
   const g = b.has("grading") ? defaultGrading() : (s?.grading ?? grading);
   // Per-shot lens tables with the slider amounts mixed in. The renderer derives
   // the fill scale from these, so easing the slider eases the scale with it.
-  const lensDist = lensCorr ? mixLensTable(lensCorr.distortion, (r.lensDistortion ?? 100) / 100) : [...LENS_IDENTITY];
-  const lensVig = lensCorr ? mixLensTable(lensCorr.vignetting, (r.lensVignetting ?? 100) / 100) : [...LENS_IDENTITY];
+  const lensDist = lensCorr ? mixLensTable(lensCorr.distortion, r.lensDistortion / 100) : [...LENS_IDENTITY];
+  const lensVig = lensCorr ? mixLensTable(lensCorr.vignetting, r.lensVignetting / 100) : [...LENS_IDENTITY];
   // Lateral CA has no slider: the body's switch decides (the worker sends the
   // tables only when it is on), as in Edit, where it is part of the same
   // geometric stage as the distortion. A switched-off panel renders at its
@@ -2105,7 +2107,7 @@ function drawWebGL(): void {
   webglRenderer.setViewWindow(renderWindow.value);
   webglRenderer.setPreviewScale(computePreviewScale());
   if (showOriginal.value) { webglRenderer.draw(baselineParams()); return; }
-  if (historyPreview.value) { webglRenderer.draw(buildPipelineParams(historyPreview.value)); return; }
+  if (historyPreviewEdit.value) { webglRenderer.draw(buildPipelineParams(historyPreviewEdit.value)); return; }
   const params = buildPipelineParams();
   syncBrushLayer(params);
   webglRenderer.draw(params);
@@ -2231,6 +2233,8 @@ function toggleCropMode(): void {
 
 function onKeyDown(e: KeyboardEvent): void {
   const ae = document.activeElement as HTMLElement | null;
+  // A modal dialog has the keyboard: no shortcut here is for what is behind it.
+  if (ae?.closest("dialog[open]")) return;
   const inEditableText = !!ae && (ae.tagName === "TEXTAREA" ||
     (ae.tagName === "INPUT" && !["range", "checkbox", "radio", "button", "submit"].includes((ae as HTMLInputElement).type)));
 
@@ -2282,7 +2286,7 @@ function onKeyDown(e: KeyboardEvent): void {
     // Left / right step through the filmstrip, as in Lightroom — unless the
     // focused control uses the arrows itself (a slider, a list, the tree).
     if (!cropMode.value && !e.shiftKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")
-      && !ae?.closest("input, select, textarea, dialog, [role=listbox], [role=menu], [role=tree], [contenteditable]")) {
+      && !ae?.closest("input, select, textarea, [role=listbox], [role=menu], [role=tree], [contenteditable]")) {
       e.preventDefault();
       stepPhoto(e.key === "ArrowRight" ? 1 : -1);
       return;
@@ -2513,7 +2517,7 @@ function decodeBody(id: string): LinearRequest {
   return {
     sourceId: id, halfSize: false, maxSize: 0, profileId: profileId.value, dcpCode: dcpCode.value,
     denoise: denoisePayload(denoise),
-    ...lookRequest({ look: look.value, lookScale: LOOK_SCALE, lookStyle: lookStyle.value, dro: droStrength.value, droLevel: droLevel.value }, bypass.has("look")),
+    ...lookRequest({ look: look.value, lookStyle: lookStyle.value, dro: droStrength.value, droLevel: droLevel.value }, bypass.has("look")),
     erase: eraseWire(erase),
   };
 }
@@ -2794,10 +2798,10 @@ function describeEdit(): unknown {
 // or history. Borrows the preview renderer for one draw: window off, scale set
 // from the target size, the snapshot's own curve LUT uploaded; then bakedBasic
 // is dropped so the next frame rebakes the live LUT and puts the view back.
-function renderFrame(s: Snapshot | null, maxEdge: number, matte?: string): PipelineRenderer {
+function renderFrame(s: NormalizedSnapshot | null, maxEdge: number, matte?: string): PipelineRenderer {
   requireImage();
   if (!webglRenderer) throw new Error("WebGL renderer unavailable");
-  const b: ReadonlySet<BypassKey> = s ? new Set(s.bypass ?? []) : bypass;
+  const b: ReadonlySet<BypassKey> = s ? new Set(s.bypass) : bypass;
   webglRenderer.uploadCurveLUT(buildToneCurveLUT(
     b.has("curve") ? defaultToneCurve() : (s?.curve ?? toneCurve.value),
     currentBasic(effectiveRecipe(s?.recipe ?? recipe, b))));
@@ -2809,7 +2813,7 @@ function renderFrame(s: Snapshot | null, maxEdge: number, matte?: string): Pipel
   return webglRenderer;
 }
 
-async function captureFrame(s: Snapshot | null, maxEdge: number, matte?: string): Promise<Blob> {
+async function captureFrame(s: NormalizedSnapshot | null, maxEdge: number, matte?: string): Promise<Blob> {
   return renderFrame(s, maxEdge, matte).toBlob("image/jpeg", 0.85);
 }
 
@@ -2864,7 +2868,7 @@ async function blobToBase64(blob: Blob): Promise<string> {
 
 // Before/after side by side on one canvas, labels burnt in, the way a person
 // would flick hold-to-compare — the model gets both halves in one look.
-function compareFrames(before: Snapshot, halfEdge = 512): Promise<Blob> {
+function compareFrames(before: NormalizedSnapshot, halfEdge = 512): Promise<Blob> {
   return sideBySide(captureFrame(before, halfEdge), captureFrame(null, halfEdge), ["before", "after"]);
 }
 
@@ -2929,8 +2933,8 @@ function diffEdit(before: Snapshot, after: Snapshot): Record<string, { from: unk
 // What the photo looked like when the current turn started, and just before
 // the last set_edit: the two "before"s compare can be asked for. Neither is
 // reactive state or history — they are the model's memory, not the user's.
-let turnBaseline: Snapshot | null = null;
-let editBaseline: Snapshot | null = null;
+let turnBaseline: NormalizedSnapshot | null = null;
+let editBaseline: NormalizedSnapshot | null = null;
 
 async function measureFrame(): Promise<unknown> {
   const renderer = renderFrame(null, 256);
@@ -3396,7 +3400,7 @@ function flashCopyNotice(msg: string): void {
   copyNoticeTimer = window.setTimeout(() => { copyNotice.value = null; }, 2600);
 }
 
-async function snapshotFor(id: string | null): Promise<Snapshot | null> {
+async function snapshotFor(id: string | null): Promise<NormalizedSnapshot | null> {
   if (!id || id === activeSource.value?.id) return activeSource.value ? captureSnapshot() : null;
   const photo = photoById(id);
   // Normalised here because nothing else will: the export and the background
@@ -3497,8 +3501,9 @@ async function runPreviewQueue(): Promise<void> {
 }
 
 /** Render a photo's snapshot off-screen at `maxEdge` (another photo than the open one). */
-async function renderSnapshot(id: string, settings: Snapshot, maxEdge: number): Promise<Blob> {
-  return renderPlan({ ...await offscreenPlan(id, settings), decode: { halfSize: true, maxSize: 2048 } }, { maxEdge, quality: 0.85 });
+async function renderSnapshot(id: string, settings: NormalizedSnapshot, maxEdge: number): Promise<Blob> {
+  const plan = { ...await offscreenPlan(id, settings), decode: { halfSize: true, maxSize: 2048 } };
+  return (await renderPlan(plan, { maxEdge, quality: 0.85 })).blob;
 }
 
 /**
@@ -3507,14 +3512,14 @@ async function renderSnapshot(id: string, settings: Snapshot, maxEdge: number): 
  * ones the preview would have had — and its params are built once the decode
  * says how large the frame is.
  */
-async function offscreenPlan(id: string, settings: Snapshot): Promise<ExportPlan> {
-  const off = new Set(settings.bypass ?? []);
+async function offscreenPlan(id: string, settings: NormalizedSnapshot): Promise<ExportPlan> {
+  const off = new Set(settings.bypass);
   const body: LinearRequest = {
     sourceId: id, halfSize: true, maxSize: 2048, purpose: "export",
-    profileId: settings.profile ?? "standard", dcpCode: settings.dcp, denoise: denoisePayload(settings.denoise),
-    ...lookRequest(settings, off.has("look")), erase: eraseWire(settings.erase ?? []),
+    profileId: settings.profile, dcpCode: settings.dcp, denoise: denoisePayload(settings.denoise),
+    ...lookRequest(settings, off.has("look")), erase: eraseWire(settings.erase),
   };
-  const masksOn = off.has("masks") ? [] : settings.masks ?? [];
+  const masksOn = off.has("masks") ? [] : settings.masks;
   const [geo, ai] = await Promise.all([
     snapshotNeedsGeometry({ ...settings, recipe: effectiveRecipe(settings.recipe, off), masks: masksOn })
       ? fetchRelightGeometry(body).catch(() => null) : null,
@@ -3573,26 +3578,21 @@ function buildExportPlan(): ExportPlan | null {
 
 // The plan for `settings` on photo `id`: the export's, and the background
 // preview's (which brings its own params builder and per-photo analyses).
+// Normalised settings only: what an older snapshot lacks is snapshot.ts's to say.
 function buildPlan(
-  id: string, settings: Snapshot,
+  id: string, settings: NormalizedSnapshot,
   extra: { params: ExportPlan["params"]; relightGeometry: RelightGeometry | null; ai: { data: Uint8Array; w: number; h: number } | null },
 ): ExportPlan {
-  const off = new Set(settings.bypass ?? []);
+  const off = new Set(settings.bypass);
   const cropSnap = effectiveCrop(settings.crop, off);
   return {
     sourceId: id,
     filename: id === currentSourceId ? exportFilename() : `${(photoById(id)?.name ?? "export").replace(/\.[^.]+$/, "")}.jpg`,
     settings,
-    stripPrivate: viewSettings.exportStripPrivate === 1,
-    file: {
-      longEdge: viewSettings.exportLongEdge,
-      quality: Math.min(100, Math.max(1, viewSettings.exportQuality)) / 100,
-      wideGamut: viewSettings.exportGamut === 1 && p3Supported.value,
-    },
     dcpCode: settings.dcp,
-    profileId: settings.profile ?? "standard",
+    profileId: settings.profile,
     denoise: denoisePayload(settings.denoise),
-    erase: eraseWire(settings.erase ?? []),
+    erase: eraseWire(settings.erase),
     prepare: (r, params) => {
       const p = params as Partial<EditParams> & { maskBrushes?: BrushStroke[][]; maskUsesAi?: boolean };
       const dims = r.auxDims();
@@ -3605,8 +3605,8 @@ function buildPlan(
     // Absent means as shot, same as everywhere else — the full-res decode then
     // rebuilds the profile the preview was showing (plan.profileLUT).
     lookRequest: lookRequest(settings, off.has("look")),
-    sonyAdvancedColour: settings.sonyAdvancedColour ?? false,
-    sonyCameraMatch: settings.sonyCameraMatch ?? false,
+    sonyAdvancedColour: settings.sonyAdvancedColour,
+    sonyCameraMatch: settings.sonyCameraMatch,
     params: extra.params,
     curveLUT: buildToneCurveLUT(off.has("curve") ? defaultToneCurve() : settings.curve,
       currentBasic(effectiveRecipe(settings.recipe, off))),
@@ -3618,7 +3618,7 @@ function buildPlan(
       const rect = cropOutputRect(cropSnap, iw, ih);
       // Snap the output dims to the locked aspect so e.g. a 4:3 crop exports at
       // an exact 4:3 pixel size instead of each axis rounding independently.
-      const fraction = resolveAspectFraction(settings.aspect ?? "free", meta.width, meta.height, cropSnap);
+      const fraction = resolveAspectFraction(settings.aspect, meta.width, meta.height, cropSnap);
       const [width, height] = cropOutputSizeForAspect(cropSnap, meta.width, meta.height, fraction);
       return { width, height, texXform: buildCropTransform(cropSnap, meta.width, meta.height, rect) };
     },
@@ -3626,7 +3626,17 @@ function buildPlan(
   };
 }
 
-const { exporting, progress: exportProgress, exportImage, exportMany, cancelExport } = useExport({ errorMessage, plan: buildExportPlan });
+// The file an export writes, as the settings stand when it is asked for.
+function exportFile(): ExportFile {
+  return {
+    longEdge: viewSettings.exportLongEdge,
+    quality: clamp(viewSettings.exportQuality, 1, 100) / 100,
+    wideGamut: viewSettings.exportGamut === 1,
+    stripPrivate: viewSettings.exportStripPrivate === 1,
+  };
+}
+
+const { exporting, progress: exportProgress, exportImage, exportMany, cancelExport } = useExport({ errorMessage, plan: buildExportPlan, file: exportFile });
 
 // The open photo's exposure, for the top bar; its body and lens for the tooltip.
 const activeExposure = computed(() => activeSource.value ? exposureSummary(activeSource.value).join("  ") : "");

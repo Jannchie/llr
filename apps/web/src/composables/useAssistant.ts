@@ -159,7 +159,13 @@ export function useAssistant(opts: {
   const selected = ref(localStorage.getItem(SELECTED_KEY) ?? modelKey(models.value[0]));
   // The API's registry: what the model dialog offers to pick from.
   const catalog = ref<ProviderCatalog[] | null>(null);
-  void fetch(`${API}/agent/models`).then(r => r.ok ? r.json() : null).then(m => { catalog.value = m?.providers ?? []; }).catch(() => {});
+  // Fetched here, and again on request: a page that came up before the API did
+  // would otherwise never learn the providers (the key rows of the model
+  // settings are built from them). An answer without any leaves what is known.
+  function refreshCatalog(): void {
+    void fetch(`${API}/agent/models`).then(r => r.ok ? r.json() : null).then(m => { catalog.value = m?.providers ?? catalog.value ?? []; }).catch(() => {});
+  }
+  refreshCatalog();
   // Providers the API has a key for; the picker greys out the rest. Null until
   // the catalog lands, so nothing is greyed out before we can know.
   const providers = computed(() => catalog.value?.filter(p => p.hasKey).map(p => p.id) ?? null);
@@ -300,13 +306,6 @@ export function useAssistant(opts: {
   function reset(): void { current.value.entries = []; current.value.cost = 0; void post(current.value.session, "reset", {}); }
   /** What this conversation has cost so far, in dollars (the providers' own figures). */
   const spent = computed(() => current.value.cost);
-
-  // Ask again for the registry: it is fetched once at start-up, and a page
-  // that came up before the API did would otherwise never learn the providers
-  // (the key rows of the model settings are built from it).
-  function refreshCatalog(): void {
-    void fetch(`${API}/agent/models`).then(r => r.ok ? r.json() : null).then(m => { if (m?.providers) catalog.value = m.providers; }).catch(() => {});
-  }
 
   return { entries, busy, models, selected, catalog, providers, spent, setKey, refreshCatalog, send, abort, reset };
 }

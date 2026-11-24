@@ -264,10 +264,10 @@ function bulkBase(): string {
   return host === "localhost" || host === "127.0.0.1" || host === "[::1]" ? API_DIRECT : API;
 }
 
-async function postFramed<M>(path: string, body: Record<string, unknown>): Promise<{ meta: M; buf: ArrayBuffer; offset: number } | null> {
+async function postFramed<M>(path: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<{ meta: M; buf: ArrayBuffer; offset: number } | null> {
   const init: RequestInit = {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify(body), signal,
   };
   const base = bulkBase();
   let res: Response;
@@ -275,7 +275,8 @@ async function postFramed<M>(path: string, body: Record<string, unknown>): Promi
     res = await fetch(`${base}/${path}`, init);
   } catch (error) {
     // Unreachable directly (another port, a firewall): the proxy, from now on.
-    if (base === API) throw error;
+    // A request its caller gave up on says nothing about the route.
+    if (base === API || signal?.aborted) throw error;
     directFailed = true;
     res = await fetch(`${API}/${path}`, init);
   }
@@ -305,9 +306,10 @@ export async function fetchAiMasks(body: LinearRequest): Promise<{ data: Uint8Ar
 // directly: [u32 header length][JSON header, padded so the pixels stay 4-byte
 // aligned][linear RGB in header.dtype]. float16 payloads (half the bytes of
 // float32) stay as Uint16Array and upload straight into an RGB16F texture.
-// Returns null on 404 (source evicted server-side).
-export async function fetchLinear(body: LinearRequest): Promise<{ meta: LinearMeta; pixels: LinearPixels } | null> {
-  const r = await postFramed<LinearMeta>("render-linear", body);
+// Returns null on 404 (source evicted server-side). `signal` gives the request
+// up, the download included; it then rejects with the fetch's AbortError.
+export async function fetchLinear(body: LinearRequest, signal?: AbortSignal): Promise<{ meta: LinearMeta; pixels: LinearPixels } | null> {
+  const r = await postFramed<LinearMeta>("render-linear", body, signal);
   if (!r) return null;
   const { meta, buf, offset } = r;
   const pixels = meta.dtype === "float16" ? new Uint16Array(buf, offset) : new Float32Array(buf, offset);

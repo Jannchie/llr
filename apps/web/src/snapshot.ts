@@ -1,11 +1,6 @@
 // One photo's edit: the shape that is stored in the catalog, embedded in an
 // export's XMP, handed to the assistant and copied between photos — and every
-// rule about reading one that was stored by an older build.
-//
-// It used to be a type private to App.vue, with those rules written into the
-// function that loads a snapshot into the live state. Anything that read a
-// stored snapshot some other way (an export of a photo that is not open, its
-// background preview) got none of them, and nothing here could be tested.
+// rule about reading one that was stored by an older build (normalizeSnapshot).
 
 import type { LookTweaks } from "./api";
 import { DEFAULT_ASPECT } from "./composables/useCropEditor";
@@ -71,7 +66,7 @@ export const defaultGrading = () => ({
   blend: 50,
   balance: 0,
 });
-export type Grading = ReturnType<typeof defaultGrading>;
+type Grading = ReturnType<typeof defaultGrading>;
 
 // ── Creative Look and DRO ──
 
@@ -147,7 +142,7 @@ export type NormalizedSnapshot = Required<Omit<Snapshot, "look" | "lookStyle" | 
 // Sony's own engine for Sony's own files: ARW (and the older SRF/SR2) carry the
 // calibration it renders from, and the worker falls back to the DCP when a shot
 // has none. Anything else has only the DCP, so Adobe is the honest default.
-export function defaultProfile(name?: string): ProfileId {
+function defaultProfile(name?: string): ProfileId {
   return /\.(arw|srf|sr2)$/i.test(name ?? "") ? "sony" : "standard";
 }
 
